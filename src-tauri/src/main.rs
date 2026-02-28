@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
 
+use commands::livekit::LiveKitState;
 use commands::media_devices::MediaState;
 use commands::webrtc::WebRtcState;
 use elementium_webrtc::WebRtcEngine;
@@ -24,10 +25,17 @@ fn main() {
     let mut builder = tauri::Builder::default();
 
     // Register shared state
+    let engine = WebRtcEngine::new();
+    let video_frames = engine.video_frames.clone();
+
     builder = builder
-        .manage(WebRtcState(Arc::new(Mutex::new(WebRtcEngine::new()))))
+        .manage(WebRtcState(Arc::new(Mutex::new(engine))))
         .manage(MediaState {
             active_tracks: Mutex::new(Vec::new()),
+        })
+        .manage(LiveKitState {
+            rooms: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            video_frames,
         });
 
     builder = builder
@@ -50,6 +58,10 @@ fn main() {
         commands::media_devices::stop_track,
         commands::screen_capture::get_display_media,
         commands::screen_capture::get_capture_sources,
+        commands::livekit::livekit_connect,
+        commands::livekit::livekit_publish_track,
+        commands::livekit::livekit_disconnect,
+        commands::livekit::livekit_set_subscriber_volume,
     ]);
 
     builder = builder.register_asynchronous_uri_scheme_protocol(

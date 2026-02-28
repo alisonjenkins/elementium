@@ -1,4 +1,5 @@
 import { defineConfig } from "vite";
+import path from "path";
 
 export default defineConfig({
   // Tauri expects a fixed port for dev
@@ -12,6 +13,13 @@ export default defineConfig({
 
   // Environment variables that start with TAURI_ are exposed to the client
   envPrefix: ["VITE_", "TAURI_"],
+
+  resolve: {
+    alias: {
+      // Intercept livekit-client imports and route to our native bridge
+      "livekit-client": path.resolve(__dirname, "src/shim/livekit-bridge.ts"),
+    },
+  },
 
   build: {
     // Tauri uses WebKit on Linux which has limited ES module support

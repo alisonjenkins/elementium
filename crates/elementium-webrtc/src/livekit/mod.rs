@@ -12,15 +12,16 @@
 //! 4. Manage room state: participants, tracks, subscriptions
 //! 5. Use str0m for the actual WebRTC transport to the SFU
 //!
-//! ## Key message types (from LiveKit protocol)
+//! ## Dual PeerConnection model
 //!
-//! - `JoinRequest` / `JoinResponse` — Room join
-//! - `AddTrackRequest` — Publish a track
-//! - `TrackPublishedResponse` — Track accepted by SFU
-//! - `SignalRequest` / `SignalResponse` — SDP offer/answer exchange
-//! - `UpdateSubscription` — Subscribe/unsubscribe to remote tracks
-//! - `ParticipantUpdate` — Participant join/leave events
+//! LiveKit uses two PeerConnections per client:
+//! - **Publisher**: Client → SFU. Client creates SDP offers when publishing tracks.
+//! - **Subscriber**: SFU → Client. SFU creates SDP offers when remote tracks appear.
 
+pub mod room;
 pub mod signaling;
+pub mod transport;
 
-pub use signaling::LiveKitClient;
+pub use room::{LiveKitRoom, RoomEvent};
+pub use signaling::{SignalClient, SignalError};
+pub use transport::Transport;

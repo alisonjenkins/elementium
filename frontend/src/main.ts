@@ -7,12 +7,16 @@
 
 import { setupWebRtcShim } from "./shim/webrtc-shim";
 import { setupMediaDevicesShim } from "./shim/media-devices";
+import { Room, RoomEvent } from "./shim/livekit-bridge";
 
 // Install shims before Element Web loads
 setupWebRtcShim();
 setupMediaDevicesShim();
 
-console.log("[Elementium] Shims installed, loading Element Web...");
+// Make the LiveKit bridge available globally for Element Call widget
+(window as unknown as Record<string, unknown>)["__elementium_livekit"] = { Room, RoomEvent };
+
+console.log("[Elementium] Shims installed (WebRTC, mediaDevices, LiveKit), loading Element Web...");
 
 // For now, show a placeholder until Element Web is integrated
 const loading = document.getElementById("loading")!;

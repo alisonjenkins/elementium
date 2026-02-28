@@ -55,6 +55,13 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 # Screen capture
 xcap = "0.4"
 
+# LiveKit signaling
+livekit-protocol = "0.7"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+prost = "0.12"
+url = "2"
+
 # Tauri
 tauri = { version = "2", features = [] }
 tauri-build = "2"

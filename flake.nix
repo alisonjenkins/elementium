@@ -52,6 +52,9 @@
           pango
           webkitgtk_4_1
 
+          # System tray
+          libayatana-appindicator
+
           # Audio
           alsa-lib
           pipewire
@@ -73,6 +76,7 @@
         runtimeLibs = with pkgs; [
           webkitgtk_4_1
           gtk3
+          libayatana-appindicator
           cairo
           gdk-pixbuf
           glib
