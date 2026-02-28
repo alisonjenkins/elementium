@@ -8,5 +8,6 @@ description = "Audio/video capture and playback (cpal, nokhwa)"
 [dependencies]
 elementium-types = { workspace = true }
 cpal = { workspace = true }
+nokhwa = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

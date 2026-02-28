@@ -15,6 +15,12 @@ interface NativeTrackId {
   "0": string;
 }
 
+interface NativeCaptureSource {
+  id: string;
+  name: string;
+  kind: "monitor" | "window";
+}
+
 /**
  * Install the media devices shim, replacing navigator.mediaDevices.
  */
@@ -58,11 +64,11 @@ export function setupMediaDevicesShim(): void {
           deviceId: typeof constraints.video === "object" ?
             (constraints.video as MediaTrackConstraints).deviceId as string | undefined : undefined,
           width: typeof constraints.video === "object" ?
-            (constraints.video as MediaTrackConstraints).width as number | undefined : undefined,
+            extractConstraintValue((constraints.video as MediaTrackConstraints).width) : undefined,
           height: typeof constraints.video === "object" ?
-            (constraints.video as MediaTrackConstraints).height as number | undefined : undefined,
+            extractConstraintValue((constraints.video as MediaTrackConstraints).height) : undefined,
           frameRate: typeof constraints.video === "object" ?
-            (constraints.video as MediaTrackConstraints).frameRate as number | undefined : undefined,
+            extractConstraintValue((constraints.video as MediaTrackConstraints).frameRate) : undefined,
         } : null,
       };
 
@@ -70,9 +76,41 @@ export function setupMediaDevicesShim(): void {
         const trackIds = await invoke<NativeTrackId[]>("get_user_media", {
           constraints: nativeConstraints,
         });
-        // Create a synthetic MediaStream with dummy tracks
-        // Real tracks are handled entirely in Rust
+
+        // Create a synthetic MediaStream with tracks
         const stream = new MediaStream();
+
+        for (const tid of trackIds) {
+          const id = tid["0"];
+          if (id.startsWith("audio-")) {
+            // Create a silent audio track (real audio is in Rust)
+            try {
+              const audioCtx = new AudioContext();
+              const oscillator = audioCtx.createOscillator();
+              const dest = audioCtx.createMediaStreamDestination();
+              oscillator.connect(dest);
+              oscillator.frequency.value = 0;
+              oscillator.start();
+              const audioTrack = dest.stream.getAudioTracks()[0];
+              if (audioTrack) {
+                stream.addTrack(audioTrack);
+              }
+            } catch {
+              // AudioContext may not be available
+            }
+          } else if (id.startsWith("video-")) {
+            // Create a canvas-based video track
+            const canvas = document.createElement("canvas");
+            canvas.width = 640;
+            canvas.height = 480;
+            const canvasStream = canvas.captureStream(30);
+            const videoTrack = canvasStream.getVideoTracks()[0];
+            if (videoTrack) {
+              stream.addTrack(videoTrack);
+            }
+          }
+        }
+
         console.log(`[Elementium] getUserMedia returned ${trackIds.length} tracks`);
         return stream;
       } catch (e) {
@@ -84,12 +122,33 @@ export function setupMediaDevicesShim(): void {
     async getDisplayMedia(_constraints?: DisplayMediaStreamOptions): Promise<MediaStream> {
       console.log("[Elementium] getDisplayMedia called");
       try {
-        // First get available sources for a picker
-        await invoke("get_capture_sources");
-        // TODO: Show source picker UI, let user select
-        // For now, just try to start with the first source
-        await invoke("get_display_media", { sourceId: "default" });
-        return new MediaStream();
+        // Get available capture sources
+        const sources = await invoke<NativeCaptureSource[]>("get_capture_sources");
+
+        let sourceId = "default";
+        if (sources.length > 0) {
+          // Use the first monitor source, or the first available source
+          const monitor = sources.find(s => s.kind === "monitor");
+          sourceId = (monitor || sources[0]).id;
+        }
+
+        // Start screen capture for the selected source
+        const trackId = await invoke<NativeTrackId>("get_display_media", { sourceId });
+        const id = trackId["0"];
+
+        // Create a canvas-based MediaStream for the screen capture
+        const stream = new MediaStream();
+        const canvas = document.createElement("canvas");
+        canvas.width = 1920;
+        canvas.height = 1080;
+        const canvasStream = canvas.captureStream(30);
+        const videoTrack = canvasStream.getVideoTracks()[0];
+        if (videoTrack) {
+          stream.addTrack(videoTrack);
+        }
+
+        console.log(`[Elementium] getDisplayMedia started with source: ${sourceId}, track: ${id}`);
+        return stream;
       } catch (e) {
         console.error("[Elementium] getDisplayMedia failed:", e);
         throw new DOMException("Could not start screen capture", "NotAllowedError");
@@ -119,4 +178,18 @@ function mapDeviceKind(kind: string): MediaDeviceKind {
     case "videoInput": return "videoinput";
     default: return "audioinput";
   }
+}
+
+/**
+ * Extract a numeric value from a MediaTrackConstraints constraint value.
+ * Handles plain numbers, ConstrainLong, and ConstrainDouble.
+ */
+function extractConstraintValue(value: unknown): number | undefined {
+  if (typeof value === "number") return value;
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if ("ideal" in obj) return obj.ideal as number;
+    if ("exact" in obj) return obj.exact as number;
+  }
+  return undefined;
 }

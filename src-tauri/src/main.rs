@@ -5,15 +5,30 @@ mod commands;
 mod protocols;
 mod tray;
 
+use std::sync::{Arc, Mutex};
+
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
 
+use commands::media_devices::MediaState;
+use commands::webrtc::WebRtcState;
+use elementium_webrtc::WebRtcEngine;
+
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let mut builder = tauri::Builder::default();
+
+    // Register shared state
+    builder = builder
+        .manage(WebRtcState(Arc::new(Mutex::new(WebRtcEngine::new()))))
+        .manage(MediaState {
+            active_tracks: Mutex::new(Vec::new()),
+        });
 
     builder = builder
         .plugin(tauri_plugin_notification::init())
@@ -45,7 +60,6 @@ fn main() {
     builder = builder.setup(|app| {
         tray::create_tray(app)?;
 
-        // Inject WebRTC shim into all webviews
         if let Some(webview) = app.get_webview_window("main") {
             let _ = webview
                 .eval("console.log('[Elementium] Native WebRTC backend active');");

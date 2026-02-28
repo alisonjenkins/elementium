@@ -46,7 +46,11 @@ cpal = "0.15"
 opus = "0.3"
 
 # Video
-libvpx-sys = "0.2"
+vpx-encode = "0.6"
+env-libvpx-sys = { version = "5.1", features = ["generate"] }
+
+# Camera
+nokhwa = { version = "0.10", features = ["input-native"] }
 
 # Screen capture
 xcap = "0.4"

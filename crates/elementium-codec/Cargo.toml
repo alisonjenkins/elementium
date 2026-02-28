@@ -8,5 +8,7 @@ description = "Audio/video codec wrappers (Opus, VP8/VP9, pixel conversion)"
 [dependencies]
 elementium-types = { workspace = true }
 opus = { workspace = true }
+vpx-encode = { workspace = true }
+env-libvpx-sys = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

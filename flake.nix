@@ -30,6 +30,9 @@
           nodePackages.pnpm
           cargo-tauri
           just
+          llvmPackages.clang
+          llvmPackages.libclang
+          mold
         ];
 
         # Libraries needed for linking
@@ -91,6 +94,7 @@
             export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:$XDG_DATA_DIRS"
             export GIO_MODULE_PATH="${pkgs.glib-networking}/lib/gio/modules"
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           '';
         };
 
