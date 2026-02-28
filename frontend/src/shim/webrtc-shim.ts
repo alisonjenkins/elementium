@@ -480,10 +480,28 @@ class ElementiumRTCPeerConnection extends EventTarget {
 }
 
 /**
+ * Stub RTCRtpScriptTransform so that Element Call's E2EE support check
+ * (typeof window.RTCRtpScriptTransform !== "undefined") passes.
+ * Without this, Element Call throws E2EE_NOT_SUPPORTED on WebKitGTK.
+ */
+class ElementiumRTCRtpScriptTransform {
+  constructor(_worker: Worker, _options?: unknown, _transfer?: Transferable[]) {
+    // No-op: E2EE transform is a stub for now
+  }
+}
+
+/**
  * Install the WebRTC shim, replacing the global RTCPeerConnection.
  */
 export function setupWebRtcShim(): void {
-  (window as unknown as Record<string, unknown>).RTCPeerConnection = ElementiumRTCPeerConnection;
-  (window as unknown as Record<string, unknown>).webkitRTCPeerConnection = ElementiumRTCPeerConnection;
+  const w = window as unknown as Record<string, unknown>;
+  w.RTCPeerConnection = ElementiumRTCPeerConnection;
+  w.webkitRTCPeerConnection = ElementiumRTCPeerConnection;
+
+  // Stub RTCRtpScriptTransform for E2EE support detection
+  if (typeof w.RTCRtpScriptTransform === "undefined") {
+    w.RTCRtpScriptTransform = ElementiumRTCRtpScriptTransform;
+  }
+
   console.log("[Elementium] RTCPeerConnection shim installed");
 }
