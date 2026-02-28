@@ -12,4 +12,4 @@ cd frontend && pnpm run build:shims && cd ..
 ./scripts/patch-element-web.sh
 
 echo "=== Elementium: serving element-web-dist on port 5173 ==="
-exec npx serve element-web-dist -l 5173 --no-clipboard
+exec npx http-server element-web-dist -p 5173 -c-1

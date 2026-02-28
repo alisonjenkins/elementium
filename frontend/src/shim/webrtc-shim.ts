@@ -38,6 +38,8 @@ class ElementiumRTCPeerConnection extends EventTarget {
   private _initPromise: Promise<void>;
   private _unlisten: UnlistenFn | null = null;
   private _senders: RTCRtpSender[] = [];
+  private _transceivers: RTCRtpTransceiver[] = [];
+  private _dataChannelIdCounter = 0;
   private _hasVideo = false;
 
   // Event handler properties (on* style)
@@ -353,19 +355,112 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   addTransceiver(
     trackOrKind: MediaStreamTrack | string,
-    _init?: RTCRtpTransceiverInit,
+    init?: RTCRtpTransceiverInit,
   ): RTCRtpTransceiver {
     const kind = typeof trackOrKind === "string" ? trackOrKind : trackOrKind.kind;
+    const track = typeof trackOrKind === "string" ? null : trackOrKind;
     console.log(`[Elementium] addTransceiver called: kind=${kind}`);
     if (kind === "video") {
       this._hasVideo = true;
     }
-    return {} as RTCRtpTransceiver;
+
+    const mid = String(this._transceivers.length);
+    const direction = init?.direction ?? "sendrecv";
+
+    const sender = {
+      track,
+      dtmf: null,
+      transport: null,
+      replaceTrack: async (newTrack: MediaStreamTrack | null) => {
+        (sender as Record<string, unknown>).track = newTrack;
+      },
+      getParameters: () => ({
+        codecs: [],
+        headerExtensions: [],
+        rtcp: { cname: "", reducedSize: false },
+        encodings: init?.sendEncodings ?? [{}],
+        transactionId: "",
+      }),
+      setParameters: async (params: RTCRtpSendParameters) => params,
+      getStats: async () => new Map() as unknown as RTCStatsReport,
+      setStreams: () => {},
+    } as unknown as RTCRtpSender;
+
+    const receiver = {
+      track: null,
+      transport: null,
+      getParameters: () => ({
+        codecs: [],
+        headerExtensions: [],
+        rtcp: { cname: "", reducedSize: false },
+      }),
+      getStats: async () => new Map() as unknown as RTCStatsReport,
+      getContributingSources: () => [],
+      getSynchronizationSources: () => [],
+    } as unknown as RTCRtpReceiver;
+
+    const transceiver = {
+      mid,
+      sender,
+      receiver,
+      direction,
+      currentDirection: null as string | null,
+      stopped: false,
+      setDirection: (dir: RTCRtpTransceiverDirection) => {
+        (transceiver as Record<string, unknown>).direction = dir;
+      },
+      stop: () => {
+        (transceiver as Record<string, unknown>).stopped = true;
+        (transceiver as Record<string, unknown>).currentDirection = null;
+      },
+      setCodecPreferences: () => {},
+    } as unknown as RTCRtpTransceiver;
+
+    this._transceivers.push(transceiver);
+    this._senders.push(sender);
+    return transceiver;
   }
 
-  createDataChannel(_label: string, _dataChannelDict?: RTCDataChannelInit): RTCDataChannel {
-    console.log("[Elementium] createDataChannel called");
-    return {} as RTCDataChannel;
+  createDataChannel(label: string, dataChannelDict?: RTCDataChannelInit): RTCDataChannel {
+    console.log(`[Elementium] createDataChannel called: label=${label}`);
+    const channelId = dataChannelDict?.id ?? this._dataChannelIdCounter++;
+
+    const target = new EventTarget();
+    const channel = Object.assign(target, {
+      label,
+      id: channelId,
+      ordered: dataChannelDict?.ordered ?? true,
+      protocol: dataChannelDict?.protocol ?? "",
+      readyState: "connecting" as RTCDataChannelState,
+      bufferedAmount: 0,
+      bufferedAmountLowThreshold: 0,
+      maxPacketLifeTime: dataChannelDict?.maxPacketLifeTime ?? null,
+      maxRetransmits: dataChannelDict?.maxRetransmits ?? null,
+      negotiated: dataChannelDict?.negotiated ?? false,
+      binaryType: "arraybuffer" as BinaryType,
+      onopen: null as ((ev: Event) => void) | null,
+      onmessage: null as ((ev: MessageEvent) => void) | null,
+      onclose: null as ((ev: Event) => void) | null,
+      onerror: null as ((ev: Event) => void) | null,
+      onbufferedamountlow: null as ((ev: Event) => void) | null,
+      send: (_data: string | Blob | ArrayBuffer | ArrayBufferView) => {},
+      close: () => {
+        channel.readyState = "closed";
+        const ev = new Event("close");
+        target.dispatchEvent(ev);
+        channel.onclose?.call(channel as unknown as RTCDataChannel, ev);
+      },
+    });
+
+    // Fire open event asynchronously (classic script-order: after current microtask)
+    setTimeout(() => {
+      channel.readyState = "open";
+      const ev = new Event("open");
+      target.dispatchEvent(ev);
+      channel.onopen?.call(channel as unknown as RTCDataChannel, ev);
+    }, 0);
+
+    return channel as unknown as RTCDataChannel;
   }
 
   getConfiguration(): RTCConfiguration { return {}; }
@@ -373,7 +468,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   getSenders(): RTCRtpSender[] { return this._senders; }
   getReceivers(): RTCRtpReceiver[] { return []; }
-  getTransceivers(): RTCRtpTransceiver[] { return []; }
+  getTransceivers(): RTCRtpTransceiver[] { return [...this._transceivers]; }
 
   async getStats(_selector?: MediaStreamTrack | null): Promise<RTCStatsReport> {
     return new Map() as unknown as RTCStatsReport;

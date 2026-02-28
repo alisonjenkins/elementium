@@ -13,6 +13,15 @@
     "integrations_rest_url": "https://scalar.vector.im/api",
     "bug_report_endpoint_url": "",
     "show_labs_settings": true,
+    "features": {
+        "feature_video_rooms": true,
+        "feature_element_call_video_rooms": true
+    },
+    "element_call": {
+        "url": "./widgets/element-call",
+        "use_exclusively": true,
+        "brand": "Element Call"
+    },
     "room_directory": {
         "servers": ["matrix.org"]
     }

@@ -30,6 +30,26 @@ export function setupMediaDevicesShim(): void {
   const shimmedDevices: MediaDevices = {
     ...original,
 
+    getSupportedConstraints(): MediaTrackSupportedConstraints {
+      return {
+        width: true,
+        height: true,
+        aspectRatio: true,
+        frameRate: true,
+        facingMode: true,
+        resizeMode: true,
+        sampleRate: true,
+        sampleSize: true,
+        echoCancellation: true,
+        autoGainControl: true,
+        noiseSuppression: true,
+        latency: true,
+        channelCount: true,
+        deviceId: true,
+        groupId: true,
+      };
+    },
+
     async enumerateDevices(): Promise<MediaDeviceInfo[]> {
       try {
         const devices = await invoke<NativeMediaDevice[]>("enumerate_devices");

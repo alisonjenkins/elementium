@@ -64,6 +64,11 @@
           libvpx
           libopus
 
+          # GStreamer (needed by WebKitGTK for media playback)
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
+
           # Screen capture
           libx11
           libxrandr
@@ -88,6 +93,9 @@
           pipewire
           libvpx
           libopus
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
         ];
 
       in {
@@ -99,6 +107,7 @@
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:$XDG_DATA_DIRS"
             export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules"
             export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+            export GST_PLUGIN_PATH="${pkgs.gst_all_1.gst-plugins-base}/lib/gstreamer-1.0:${pkgs.gst_all_1.gst-plugins-good}/lib/gstreamer-1.0''${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
           '';
         };
 

@@ -56,3 +56,39 @@ else
     mv "$INDEX.tmp" "$INDEX"
     echo "[patch] Injected shims script tag into $INDEX"
 fi
+
+# 5. Patch Element Call widget (if present) to inject IPC bridge + shims
+EC_DIR="$DIST_DIR/widgets/element-call"
+EC_INDEX="$EC_DIR/index.html"
+EC_MARKER="<!-- elementium-ec-shims-injected -->"
+
+if [[ -d "$EC_DIR" && -f "$EC_INDEX" ]]; then
+    # Copy shims into widget directory
+    cp "$SHIMS_SRC" "$EC_DIR/elementium-shims.js"
+    echo "[patch] Copied shims to $EC_DIR/elementium-shims.js"
+
+    if grep -qF "$EC_MARKER" "$EC_INDEX"; then
+        echo "[patch] Element Call shims already injected, skipping."
+    else
+        # Inject IPC bridge + shims before the first <script> tag
+        awk -v marker="$EC_MARKER" '
+            !done && /<script/ {
+                print "    " marker
+                print "    <script>"
+                print "      // Bridge Tauri IPC from parent frame into Element Call iframe"
+                print "      if (window.parent && window.parent.__TAURI_INTERNALS__ && !window.__TAURI_INTERNALS__) {"
+                print "        window.__TAURI_INTERNALS__ = window.parent.__TAURI_INTERNALS__;"
+                print "        console.log(\"[Elementium] Bridged __TAURI_INTERNALS__ from parent into Element Call iframe\");"
+                print "      }"
+                print "    </script>"
+                print "    <script src=\"elementium-shims.js\"></script>"
+                done = 1
+            }
+            { print }
+        ' "$EC_INDEX" > "$EC_INDEX.tmp"
+        mv "$EC_INDEX.tmp" "$EC_INDEX"
+        echo "[patch] Injected IPC bridge + shims into $EC_INDEX"
+    fi
+else
+    echo "[patch] Element Call widget not found at $EC_DIR, skipping widget patch."
+fi
