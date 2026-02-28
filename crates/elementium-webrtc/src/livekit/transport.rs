@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_types::SessionDescription;
 
 use crate::peer_connection::{self, PcEvent, PeerConnectionHandle};
@@ -44,11 +45,17 @@ pub struct Transport {
     pub sub_socket: Arc<UdpSocket>,
     pub cmd_tx: mpsc::Sender<TransportCommand>,
     pub event_rx: Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
+    pub e2ee: Option<E2eeContext>,
 }
 
 impl Transport {
     /// Create a new dual-PC transport. Binds two UDP sockets and starts I/O loops.
     pub fn new(room_id: &str) -> Result<Self, String> {
+        Self::new_with_e2ee(room_id, None)
+    }
+
+    /// Create a new dual-PC transport with optional E2EE.
+    pub fn new_with_e2ee(room_id: &str, e2ee: Option<E2eeContext>) -> Result<Self, String> {
         // Create Publisher PC
         let pub_id = format!("{room_id}-pub");
         let mut pub_inner = peer_connection::create_peer_connection(pub_id);
@@ -81,15 +88,17 @@ impl Transport {
         // Spawn Publisher I/O loop
         let pub_h = pub_handle.clone();
         let pub_s = pub_socket.clone();
+        let pub_e2ee = e2ee.clone();
         tokio::task::spawn_blocking(move || {
-            pc_io_loop(pub_h, pub_s, Some(pub_cmd_rx), pub_event_tx);
+            pc_io_loop(pub_h, pub_s, Some(pub_cmd_rx), pub_event_tx, pub_e2ee);
         });
 
         // Spawn Subscriber I/O loop
         let sub_h = sub_handle.clone();
         let sub_s = sub_socket.clone();
+        let sub_e2ee = e2ee.clone();
         tokio::task::spawn_blocking(move || {
-            pc_io_loop(sub_h, sub_s, None, sub_event_tx);
+            pc_io_loop(sub_h, sub_s, None, sub_event_tx, sub_e2ee);
         });
 
         // Spawn dispatcher: routes TransportCommands to Publisher and merges events
@@ -108,6 +117,7 @@ impl Transport {
             sub_socket,
             cmd_tx,
             event_rx: Arc::new(Mutex::new(event_rx)),
+            e2ee,
         })
     }
 
@@ -176,9 +186,23 @@ fn pc_io_loop(
     socket: Arc<UdpSocket>,
     cmd_rx: Option<mpsc::Receiver<PcCommand>>,
     event_tx: mpsc::Sender<PcEvent>,
+    e2ee: Option<E2eeContext>,
 ) {
     let mut recv_buf = vec![0u8; 2000];
     let mut cmd_rx = cmd_rx;
+
+    // Helper: lock the PC handle, recovering from poisoned locks.
+    macro_rules! lock_pc {
+        ($handle:expr) => {
+            match $handle.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::warn!("Transport PC lock was poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            }
+        };
+    }
 
     loop {
         // Process commands (only Publisher has commands)
@@ -186,13 +210,25 @@ fn pc_io_loop(
             loop {
                 match rx.try_recv() {
                     Ok(PcCommand::WriteAudio(data)) => {
-                        let mut pc = handle.lock().unwrap();
+                        let data = match &e2ee {
+                            Some(ctx) => ctx
+                                .encrypt_frame(&data, E2eeMediaKind::Audio)
+                                .unwrap_or(data),
+                            None => data,
+                        };
+                        let mut pc = lock_pc!(handle);
                         if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
                             tracing::debug!("write_audio: {e}");
                         }
                     }
                     Ok(PcCommand::WriteVideo(data)) => {
-                        let mut pc = handle.lock().unwrap();
+                        let data = match &e2ee {
+                            Some(ctx) => ctx
+                                .encrypt_frame(&data, E2eeMediaKind::Video)
+                                .unwrap_or(data),
+                            None => data,
+                        };
+                        let mut pc = lock_pc!(handle);
                         if let Err(e) = peer_connection::write_video(&mut pc, &data) {
                             tracing::debug!("write_video: {e}");
                         }
@@ -209,10 +245,11 @@ fn pc_io_loop(
 
         // Poll str0m
         let deadline = {
-            let mut pc = handle.lock().unwrap();
+            let mut pc = lock_pc!(handle);
             match peer_connection::poll_once(&mut pc, &socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
+                        let event = maybe_decrypt_event(event, &e2ee);
                         let _ = event_tx.try_send(event);
                     }
                     deadline
@@ -228,7 +265,7 @@ fn pc_io_loop(
         let wait = wait.min(Duration::from_millis(20));
 
         {
-            let mut pc = handle.lock().unwrap();
+            let mut pc = lock_pc!(handle);
             if !pc.alive {
                 tracing::info!(pc_id = %pc.id, "Transport PC no longer alive");
                 return;
@@ -239,6 +276,29 @@ fn pc_io_loop(
                 tracing::debug!("recv_and_feed: {e}");
             }
         }
+    }
+}
+
+/// Attempt to decrypt inbound audio/video events if E2EE is active.
+fn maybe_decrypt_event(event: PcEvent, e2ee: &Option<E2eeContext>) -> PcEvent {
+    let Some(ctx) = e2ee else {
+        return event;
+    };
+
+    match event {
+        PcEvent::AudioData(data) => {
+            match ctx.decrypt_frame(&data, "", E2eeMediaKind::Audio) {
+                Ok(Some(decrypted)) => PcEvent::AudioData(decrypted),
+                _ => PcEvent::AudioData(data),
+            }
+        }
+        PcEvent::VideoData(data) => {
+            match ctx.decrypt_frame(&data, "", E2eeMediaKind::Video) {
+                Ok(Some(decrypted)) => PcEvent::VideoData(decrypted),
+                _ => PcEvent::VideoData(data),
+            }
+        }
+        other => other,
     }
 }
 

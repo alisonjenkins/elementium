@@ -11,6 +11,7 @@ use tauri::{WebviewUrl, WebviewWindowBuilder};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
+use commands::e2ee::E2eeState;
 use commands::livekit::LiveKitState;
 use commands::media_devices::MediaState;
 use commands::secrets::SecretStoreState;
@@ -80,6 +81,7 @@ fn main() {
         .manage(WebRtcState(Arc::new(Mutex::new(engine))))
         .manage(MediaState {
             active_tracks: Mutex::new(Vec::new()),
+            camera: Mutex::new(None),
         })
         .manage(LiveKitState {
             rooms: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -88,6 +90,9 @@ fn main() {
         .manage(SecretStoreState {
             store: Arc::new(Mutex::new(backend)),
             backend_type: Arc::new(Mutex::new(backend_type)),
+        })
+        .manage(E2eeState {
+            ctx: Arc::new(Mutex::new(None)),
         });
 
     builder = builder
@@ -120,6 +125,9 @@ fn main() {
         commands::secrets::secret_get_all,
         commands::secrets::secret_get_backend_status,
         commands::secrets::secret_setup_file_backend,
+        commands::e2ee::e2ee_init,
+        commands::e2ee::e2ee_set_key,
+        commands::e2ee::e2ee_set_local_identity,
     ]);
 
     builder = builder.register_asynchronous_uri_scheme_protocol(

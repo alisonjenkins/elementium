@@ -119,7 +119,7 @@ export function setupMediaDevicesShim(): void {
               // AudioContext may not be available
             }
           } else if (id.startsWith("video-")) {
-            // Create a canvas-based video track
+            // Create a canvas-based video track fed by native camera frames
             const canvas = document.createElement("canvas");
             canvas.width = 640;
             canvas.height = 480;
@@ -127,6 +127,8 @@ export function setupMediaDevicesShim(): void {
             const videoTrack = canvasStream.getVideoTracks()[0];
             if (videoTrack) {
               stream.addTrack(videoTrack);
+              // Start fetching real camera frames from the Rust backend
+              startLocalVideoFrameFetch(canvas, id);
             }
           }
         }
@@ -212,4 +214,54 @@ function extractConstraintValue(value: unknown): number | undefined {
     if ("exact" in obj) return obj.exact as number;
   }
   return undefined;
+}
+
+/**
+ * Fetch video frames from the Rust backend and render onto a canvas.
+ * Uses the elementium:// custom protocol to get RGBA frame data.
+ */
+function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): void {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  let running = true;
+
+  const fetchLoop = async () => {
+    if (!running) return;
+
+    try {
+      const resp = await fetch(`elementium://localhost/video-frame/${trackId}`);
+      if (resp.ok) {
+        const width = parseInt(resp.headers.get("X-Frame-Width") || "0", 10);
+        const height = parseInt(resp.headers.get("X-Frame-Height") || "0", 10);
+
+        if (width > 1 && height > 1) {
+          if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+          }
+          const buf = await resp.arrayBuffer();
+          const imageData = new ImageData(
+            new Uint8ClampedArray(buf),
+            width,
+            height,
+          );
+          ctx.putImageData(imageData, 0, 0);
+        }
+      }
+    } catch {
+      // Frame fetch failed, skip
+    }
+
+    if (running) {
+      requestAnimationFrame(fetchLoop);
+    }
+  };
+
+  requestAnimationFrame(fetchLoop);
+
+  // Store cleanup reference on the canvas for stop_track
+  (canvas as unknown as Record<string, unknown>).__stopFetch = () => {
+    running = false;
+  };
 }

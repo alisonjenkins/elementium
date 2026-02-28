@@ -9,6 +9,7 @@ description = "WebRTC engine (str0m sans-I/O) and LiveKit SFU client"
 elementium-types = { workspace = true }
 elementium-codec = { workspace = true }
 elementium-media = { workspace = true }
+elementium-e2ee = { workspace = true }
 str0m = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

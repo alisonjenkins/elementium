@@ -371,6 +371,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
       track,
       dtmf: null,
       transport: null,
+      transform: null as unknown,
       replaceTrack: async (newTrack: MediaStreamTrack | null) => {
         (sender as Record<string, unknown>).track = newTrack;
       },
@@ -389,6 +390,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
     const receiver = {
       track: null,
       transport: null,
+      transform: null as unknown,
       getParameters: () => ({
         codecs: [],
         headerExtensions: [],
@@ -480,13 +482,87 @@ class ElementiumRTCPeerConnection extends EventTarget {
 }
 
 /**
- * Stub RTCRtpScriptTransform so that Element Call's E2EE support check
- * (typeof window.RTCRtpScriptTransform !== "undefined") passes.
- * Without this, Element Call throws E2EE_NOT_SUPPORTED on WebKitGTK.
+ * RTCRtpScriptTransform shim that intercepts the E2EE Worker's messages
+ * and forwards encryption keys to the Rust backend via Tauri IPC.
+ *
+ * Element Call creates a Web Worker that handles E2EE frame encryption.
+ * The Worker receives `init` and `setKey` messages. We intercept these
+ * to extract key material and forward it to Rust, where encryption
+ * happens natively in the media pipeline.
  */
 class ElementiumRTCRtpScriptTransform {
-  constructor(_worker: Worker, _options?: unknown, _transfer?: Transferable[]) {
-    // No-op: E2EE transform is a stub for now
+  constructor(worker: Worker, options?: unknown, _transfer?: Transferable[]) {
+    try {
+      // Wrap the worker's postMessage to intercept E2EE messages
+      const origPostMessage = worker.postMessage.bind(worker);
+      worker.postMessage = function (msg: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) {
+        // Intercept E2EE messages — wrapped in try/catch so the real
+        // postMessage always fires even if our interception code fails.
+        try {
+          const m = msg as Record<string, unknown> | null;
+          if (m && typeof m === "object") {
+            interceptE2eeMessage(m);
+          }
+        } catch (e) {
+          console.warn("[Elementium] E2EE intercept error (non-fatal):", e);
+        }
+
+        // Always forward to the real worker
+        if (Array.isArray(transferOrOptions)) {
+          return origPostMessage(msg, transferOrOptions);
+        }
+        return origPostMessage(msg, transferOrOptions as StructuredSerializeOptions);
+      };
+    } catch (e) {
+      // If wrapping fails (e.g. postMessage not writable), fall through silently
+      console.warn("[Elementium] RTCRtpScriptTransform shim setup failed (non-fatal):", e);
+    }
+
+    void options;
+  }
+}
+
+/** Safe helper to invoke a Tauri command, catching both sync throws and async rejections. */
+function safeInvoke(cmd: string, args: Record<string, unknown>): void {
+  try {
+    invoke(cmd, args).catch((e: unknown) =>
+      console.warn(`[Elementium] IPC ${cmd} rejected:`, e),
+    );
+  } catch (e) {
+    console.warn(`[Elementium] IPC ${cmd} unavailable:`, e);
+  }
+}
+
+/** Extract and forward E2EE key/init messages to the Rust backend. */
+function interceptE2eeMessage(m: Record<string, unknown>): void {
+  // livekit-client may nest data under m.data
+  const data = (m.data && typeof m.data === "object" ? m.data : m) as Record<string, unknown>;
+  const kind = (m.kind ?? m.type ?? "") as string;
+
+  if (kind === "setKey") {
+    const participantIdentity = ((data.participantIdentity ?? data.participantId ?? "") as string);
+    const keyIndex = (data.keyIndex ?? 0) as number;
+    const keyData = data.key;
+
+    if (keyData && (keyData instanceof ArrayBuffer || keyData instanceof Uint8Array)) {
+      const keyArray = Array.from(
+        keyData instanceof Uint8Array ? keyData : new Uint8Array(keyData),
+      );
+      console.log(
+        `[Elementium] E2EE key received for participant ${participantIdentity} index=${keyIndex} len=${keyArray.length}`,
+      );
+      safeInvoke("e2ee_set_key", {
+        participant: participantIdentity,
+        keyIndex,
+        keyMaterial: keyArray,
+      });
+    }
+  }
+
+  if (kind === "init") {
+    const keyProviderOptions = (data.keyProviderOptions ?? null) as Record<string, unknown> | null;
+    console.log("[Elementium] E2EE Worker init intercepted", keyProviderOptions);
+    safeInvoke("e2ee_init", { options: keyProviderOptions });
   }
 }
 

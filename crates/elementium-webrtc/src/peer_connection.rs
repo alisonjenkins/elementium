@@ -53,11 +53,16 @@ pub type PeerConnectionHandle = Arc<Mutex<PeerConnectionInner>>;
 
 /// Create a new peer connection configured for audio and video.
 pub fn create_peer_connection(id: String) -> PeerConnectionInner {
-    let rtc = RtcConfig::new()
+    let now = Instant::now();
+    let mut rtc = RtcConfig::new()
         .clear_codecs()
         .enable_opus(true)
         .enable_vp8(true)
-        .build(Instant::now());
+        .build(now);
+
+    // str0m's DTLS layer (dimpl) requires handle_timeout before any poll_output.
+    // Set it immediately so no code path can hit poll_output with last_now=None.
+    let _ = rtc.handle_input(Input::Timeout(now));
 
     PeerConnectionInner {
         id,
@@ -225,6 +230,11 @@ pub fn poll_once(
     _recv_buf: &mut [u8],
 ) -> Result<(Vec<PcEvent>, Instant), String> {
     let mut events = Vec::new();
+
+    // str0m requires handle_timeout before each poll_output cycle
+    pc.rtc
+        .handle_input(Input::Timeout(Instant::now()))
+        .map_err(|e| format!("timeout error: {e}"))?;
 
     loop {
         match pc.rtc.poll_output() {

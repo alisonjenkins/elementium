@@ -79,16 +79,34 @@ impl CameraCapturer {
                         let w = res.width_x;
                         let h = res.height_y;
 
-                        // nokhwa returns RGB data, convert to RGBA for VideoFrame
-                        let rgb = buffer.buffer();
+                        let raw = buffer.buffer();
                         let pixel_count = (w * h) as usize;
-                        let mut rgba = Vec::with_capacity(pixel_count * 4);
-                        for i in 0..pixel_count {
-                            rgba.push(rgb[i * 3]); // R
-                            rgba.push(rgb[i * 3 + 1]); // G
-                            rgba.push(rgb[i * 3 + 2]); // B
-                            rgba.push(255); // A
-                        }
+                        let expected_rgb = pixel_count * 3;
+                        let expected_yuyv = pixel_count * 2;
+
+                        let rgba = if raw.len() >= expected_rgb {
+                            // RGB format (3 bytes per pixel) → RGBA
+                            let mut out = Vec::with_capacity(pixel_count * 4);
+                            for i in 0..pixel_count {
+                                out.push(raw[i * 3]);     // R
+                                out.push(raw[i * 3 + 1]); // G
+                                out.push(raw[i * 3 + 2]); // B
+                                out.push(255);             // A
+                            }
+                            out
+                        } else if raw.len() >= expected_yuyv {
+                            // YUYV format (2 bytes per pixel, packed) → RGBA
+                            yuyv_to_rgba(w, h, raw)
+                        } else {
+                            tracing::debug!(
+                                buf_len = raw.len(),
+                                expected_rgb,
+                                expected_yuyv,
+                                "Unknown camera buffer format, skipping frame"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        };
 
                         let frame = VideoFrame {
                             width: w,
@@ -149,4 +167,44 @@ impl Drop for CameraCapturer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Convert YUYV (YUY2) packed data to RGBA.
+///
+/// YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V].
+/// Each pair shares U and V chroma values.
+fn yuyv_to_rgba(width: u32, height: u32, yuyv: &[u8]) -> Vec<u8> {
+    let pixel_count = (width * height) as usize;
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+
+    // Process two pixels at a time (4 bytes of YUYV → 8 bytes of RGBA)
+    let pair_count = pixel_count / 2;
+    for i in 0..pair_count {
+        let base = i * 4;
+        let y0 = yuyv[base] as f32;
+        let u = yuyv[base + 1] as f32 - 128.0;
+        let y1 = yuyv[base + 2] as f32;
+        let v = yuyv[base + 3] as f32 - 128.0;
+
+        // BT.601 YUV → RGB
+        let r0 = (y0 + 1.402 * v).clamp(0.0, 255.0) as u8;
+        let g0 = (y0 - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
+        let b0 = (y0 + 1.772 * u).clamp(0.0, 255.0) as u8;
+
+        let r1 = (y1 + 1.402 * v).clamp(0.0, 255.0) as u8;
+        let g1 = (y1 - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
+        let b1 = (y1 + 1.772 * u).clamp(0.0, 255.0) as u8;
+
+        rgba.push(r0);
+        rgba.push(g0);
+        rgba.push(b0);
+        rgba.push(255);
+
+        rgba.push(r1);
+        rgba.push(g1);
+        rgba.push(b1);
+        rgba.push(255);
+    }
+
+    rgba
 }

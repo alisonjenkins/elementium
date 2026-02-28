@@ -15,6 +15,7 @@ elementium-media = { workspace = true }
 elementium-screen = { workspace = true }
 elementium-webrtc = { workspace = true }
 elementium-keyring = { workspace = true }
+elementium-e2ee = { workspace = true }
 nokhwa = { workspace = true }
 
 tauri = { workspace = true, features = ["tray-icon"] }

@@ -1,0 +1,17 @@
+[package]
+name = "elementium-e2ee"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LiveKit-compatible E2EE frame encryption for MatrixRTC calls"
+
+[dependencies]
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

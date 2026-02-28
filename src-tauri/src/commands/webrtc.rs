@@ -7,6 +7,8 @@ use elementium_types::{IceCandidate, SessionDescription};
 use elementium_webrtc::engine::WebRtcEngine;
 use elementium_webrtc::peer_connection;
 
+use super::media_devices::MediaState;
+
 /// Shared WebRTC engine state, managed by Tauri.
 #[derive(Clone)]
 pub struct WebRtcState(pub Arc<Mutex<WebRtcEngine>>);
@@ -85,13 +87,29 @@ pub async fn create_peer_connection(
 #[command]
 pub async fn create_offer(
     state: State<'_, WebRtcState>,
+    media_state: State<'_, MediaState>,
     pc_id: String,
     include_video: Option<bool>,
 ) -> Result<SessionDescription, String> {
     let video = include_video.unwrap_or(false);
     tracing::info!(pc_id = %pc_id, include_video = video, "Creating offer");
+
     let engine = state.0.lock().map_err(|e| e.to_string())?;
     let managed = engine.get(&pc_id).ok_or("Peer connection not found")?;
+
+    // If video is included, connect the camera pipeline to this PC's I/O channel
+    if video {
+        let io_cmd_tx = managed.io_cmd_tx.clone();
+        if let Ok(cam_guard) = media_state.camera.lock() {
+            if let Some(ref cam) = *cam_guard {
+                if let Ok(mut encode_guard) = cam.encode_tx.lock() {
+                    tracing::info!(pc_id = %pc_id, "Connecting camera pipeline to peer connection");
+                    *encode_guard = Some(io_cmd_tx);
+                }
+            }
+        }
+    }
+
     let mut pc = managed.handle.lock().map_err(|e| e.to_string())?;
     peer_connection::create_offer(&mut pc, video)
 }
