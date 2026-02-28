@@ -14,6 +14,9 @@ src-tauri/gen/
 
 # Element Web bundle (built or downloaded)
 frontend/element-web/
+element-web-dist/
+frontend/dist-shims/
+.element-web-src/
 
 # IDE
 .idea/

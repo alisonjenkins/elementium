@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "io.github.elementium",
   "build": {
-    "frontendDist": "../frontend/dist",
+    "frontendDist": "../element-web-dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd ../frontend && pnpm dev",
-    "beforeBuildCommand": "cd ../frontend && pnpm build"
+    "beforeDevCommand": "cd .. && bash scripts/prepare-dev.sh",
+    "beforeBuildCommand": "cd .. && bash scripts/prepare-build.sh"
   },
   "app": {
     "withGlobalTauri": true,
@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; font-src 'self' data:; media-src 'self' blob:; frame-src 'self' https:"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: mxc:; connect-src 'self' https: wss: http://localhost:*; font-src 'self' data:; media-src 'self' blob:; frame-src 'self' https: blob:"
     }
   },
   "bundle": {
