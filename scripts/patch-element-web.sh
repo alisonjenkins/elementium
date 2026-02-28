@@ -34,7 +34,13 @@ echo "[patch] Copied shims to $DIST_DIR/elementium-shims.js"
 cp "$CONFIG_SRC" "$DIST_DIR/config.json"
 echo "[patch] Copied config to $DIST_DIR/config.json"
 
-# 3. Inject shims script tag into index.html (before first <script> tag)
+# 3. Remove Element Web's CSP meta tag (Tauri's CSP is the security boundary)
+if grep -q 'http-equiv="Content-Security-Policy"' "$INDEX"; then
+    sed -i '/<meta http-equiv="Content-Security-Policy"/,/>/d' "$INDEX"
+    echo "[patch] Removed Element Web CSP meta tag (Tauri CSP is active)"
+fi
+
+# 4. Inject shims script tag into index.html (before first <script> tag)
 if grep -qF "$MARKER" "$INDEX"; then
     echo "[patch] Shims already injected, skipping."
 else
