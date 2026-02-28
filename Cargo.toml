@@ -7,6 +7,7 @@ members = [
     "crates/elementium-media",
     "crates/elementium-screen",
     "crates/elementium-webrtc",
+    "crates/elementium-keyring",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ elementium-codec = { path = "crates/elementium-codec" }
 elementium-media = { path = "crates/elementium-media" }
 elementium-screen = { path = "crates/elementium-screen" }
 elementium-webrtc = { path = "crates/elementium-webrtc" }
+elementium-keyring = { path = "crates/elementium-keyring" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

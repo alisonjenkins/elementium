@@ -6,10 +6,13 @@
  * are in place before Element Web initializes.
  */
 
+import { setupSecretStorageShim } from "./secret-storage";
 import { setupWebRtcShim } from "./webrtc-shim";
 import { setupMediaDevicesShim } from "./media-devices";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 
+// Secret storage must be first — before any code reads localStorage
+setupSecretStorageShim();
 setupWebRtcShim();
 setupMediaDevicesShim();
 
