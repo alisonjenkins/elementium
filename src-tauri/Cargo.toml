@@ -1,0 +1,33 @@
+[package]
+name = "elementium"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tauri-based Element Desktop replacement with native WebRTC"
+
+[build-dependencies]
+tauri-build = { workspace = true, features = [] }
+
+[dependencies]
+elementium-types = { workspace = true }
+elementium-codec = { workspace = true }
+elementium-media = { workspace = true }
+elementium-screen = { workspace = true }
+elementium-webrtc = { workspace = true }
+
+tauri = { workspace = true, features = ["tray-icon"] }
+tauri-plugin-notification = { workspace = true }
+tauri-plugin-store = { workspace = true }
+tauri-plugin-deep-link = { workspace = true }
+tauri-plugin-updater = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

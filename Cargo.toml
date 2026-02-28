@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "src-tauri",
+    "crates/elementium-types",
+    "crates/elementium-codec",
+    "crates/elementium-media",
+    "crates/elementium-screen",
+    "crates/elementium-webrtc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/anthropics/elementium"
+
+[workspace.dependencies]
+# Internal crates
+elementium-types = { path = "crates/elementium-types" }
+elementium-codec = { path = "crates/elementium-codec" }
+elementium-media = { path = "crates/elementium-media" }
+elementium-screen = { path = "crates/elementium-screen" }
+elementium-webrtc = { path = "crates/elementium-webrtc" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WebRTC
+str0m = "0.16"
+
+# Audio
+cpal = "0.15"
+opus = "0.3"
+
+# Video
+libvpx-sys = "0.2"
+
+# Screen capture
+xcap = "0.4"
+
+# Tauri
+tauri = { version = "2", features = [] }
+tauri-build = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-store = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-opener = "2"

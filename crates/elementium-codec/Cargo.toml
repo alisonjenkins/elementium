@@ -1,0 +1,12 @@
+[package]
+name = "elementium-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Audio/video codec wrappers (Opus, VP8/VP9, pixel conversion)"
+
+[dependencies]
+elementium-types = { workspace = true }
+opus = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

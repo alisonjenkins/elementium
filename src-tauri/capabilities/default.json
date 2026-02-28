@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema/capability.json",
+  "identifier": "default",
+  "description": "Default capabilities for Elementium",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "store:default",
+    "deep-link:default",
+    "updater:default",
+    "opener:default"
+  ]
+}

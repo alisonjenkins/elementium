@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Elementium</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body, #app { width: 100%; height: 100%; overflow: hidden; }
+      iframe#element-web {
+        width: 100%;
+        height: 100%;
+        border: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <!--
+        Element Web will be loaded here, either as:
+        1. An iframe pointing to the bundled Element Web
+        2. Or directly embedded once we set up the initialization scripts
+      -->
+      <div id="loading" style="display:flex;align-items:center;justify-content:center;height:100%;font-family:sans-serif;color:#666;">
+        Loading Elementium...
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

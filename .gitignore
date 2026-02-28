@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Element Web bundle (built or downloaded)
+frontend/element-web/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nix
+result
+result-*
+
+# Environment
+.env
+.env.*
+!.env.example
