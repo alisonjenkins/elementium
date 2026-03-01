@@ -116,12 +116,17 @@ pub async fn get_user_media(
             engine.video_frames.clone()
         };
 
-        // Stop any existing camera pipeline
-        if let Ok(mut cam) = media_state.camera.lock() {
-            if let Some(old) = cam.take() {
-                let _ = old.stop_tx.send(());
+        // Stop any existing camera pipeline and wait for the device to release
+        let had_previous = {
+            let mut had = false;
+            if let Ok(mut cam) = media_state.camera.lock() {
+                if let Some(old) = cam.take() {
+                    let _ = old.stop_tx.send(());
+                    had = true;
+                }
             }
-        }
+            had
+        };
 
         let req_width = video_constraints.width;
         let req_height = video_constraints.height;
@@ -132,8 +137,14 @@ pub async fn get_user_media(
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let tid = track_id.0.clone();
 
-        // Start the camera pipeline on a background thread
+        // Start the camera pipeline on a background thread.
+        // If we just stopped a previous pipeline, delay to let the V4L2
+        // device release (avoids EBUSY on Linux).
         std::thread::spawn(move || {
+            if had_previous {
+                tracing::info!("Waiting for previous camera to release device...");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
             camera_pipeline_loop(tid, video_frames, encode_tx_clone, stop_rx, req_width, req_height);
         });
 

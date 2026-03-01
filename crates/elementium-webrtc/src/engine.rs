@@ -47,7 +47,9 @@ pub struct WebRtcEngine {
     /// Shared video frame buffer for all connections.
     pub video_frames: VideoFrameBuffer,
     /// Shared E2EE context for frame encryption/decryption.
-    pub e2ee: Option<E2eeContext>,
+    /// Uses Arc<Mutex<>> so it can be shared with Tauri's E2eeState and
+    /// populated after I/O loops are already running.
+    pub e2ee: Arc<Mutex<Option<E2eeContext>>>,
 }
 
 impl WebRtcEngine {
@@ -55,13 +57,8 @@ impl WebRtcEngine {
         Self {
             connections: HashMap::new(),
             video_frames: Arc::new(Mutex::new(HashMap::new())),
-            e2ee: None,
+            e2ee: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// Set the E2EE context for frame encryption/decryption.
-    pub fn set_e2ee(&mut self, ctx: E2eeContext) {
-        self.e2ee = Some(ctx);
     }
 
     /// Create a new peer connection. Binds a UDP socket and starts the I/O loop.
@@ -98,7 +95,7 @@ impl WebRtcEngine {
         // Spawn the I/O loop as a blocking task (it does synchronous UDP I/O)
         let loop_handle = handle.clone();
         let loop_socket = socket.clone();
-        let loop_e2ee = self.e2ee.clone();
+        let loop_e2ee = self.e2ee.clone(); // clones the Arc, shares the Option
         tokio::task::spawn_blocking(move || {
             io_loop(loop_handle, loop_socket, io_cmd_rx, event_tx, loop_e2ee);
         });
@@ -147,7 +144,7 @@ fn io_loop(
     socket: Arc<UdpSocket>,
     mut cmd_rx: mpsc::Receiver<IoCommand>,
     event_tx: mpsc::Sender<PcEvent>,
-    e2ee: Option<E2eeContext>,
+    e2ee_ctx: Arc<Mutex<Option<E2eeContext>>>,
 ) {
     let mut recv_buf = vec![0u8; 2000];
 
@@ -167,6 +164,12 @@ fn io_loop(
     }
 
     loop {
+        // Snapshot the E2EE context for this iteration.
+        // E2eeContext::clone() is cheap (Arc::clone inside), and this picks up
+        // contexts that were initialized after the I/O loop started.
+        let e2ee: Option<E2eeContext> =
+            e2ee_ctx.lock().ok().and_then(|g| g.clone());
+
         // Process any pending commands (non-blocking)
         loop {
             match cmd_rx.try_recv() {
@@ -280,6 +283,9 @@ fn discover_and_add_srflx(
 }
 
 /// Attempt to decrypt inbound audio/video events if E2EE is active.
+///
+/// Uses `decrypt_frame_any` which tries all known participant keys, since we
+/// don't know which participant sent a particular RTP frame via the SFU.
 fn maybe_decrypt_event(event: PcEvent, e2ee: &Option<E2eeContext>) -> PcEvent {
     let Some(ctx) = e2ee else {
         return event;
@@ -287,14 +293,13 @@ fn maybe_decrypt_event(event: PcEvent, e2ee: &Option<E2eeContext>) -> PcEvent {
 
     match event {
         PcEvent::AudioData(data) => {
-            // Try to decrypt; on failure or no-key, pass through raw data
-            match ctx.decrypt_frame(&data, "", E2eeMediaKind::Audio) {
+            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
                 Ok(Some(decrypted)) => PcEvent::AudioData(decrypted),
                 _ => PcEvent::AudioData(data),
             }
         }
         PcEvent::VideoData(data) => {
-            match ctx.decrypt_frame(&data, "", E2eeMediaKind::Video) {
+            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
                 Ok(Some(decrypted)) => PcEvent::VideoData(decrypted),
                 _ => PcEvent::VideoData(data),
             }

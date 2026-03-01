@@ -119,7 +119,16 @@ fn main() {
     let mut builder = tauri::Builder::default();
 
     // Register shared state
-    let engine = WebRtcEngine::new();
+    //
+    // The E2EE context is shared between the WebRTC engine (for I/O loop
+    // encryption/decryption) and Tauri's E2eeState (for JS commands).
+    // This ensures that when e2ee_init/e2ee_set_key are called from JS,
+    // the running I/O loops immediately pick up the context and keys.
+    let shared_e2ee: Arc<Mutex<Option<elementium_e2ee::E2eeContext>>> =
+        Arc::new(Mutex::new(None));
+
+    let mut engine = WebRtcEngine::new();
+    engine.e2ee = shared_e2ee.clone();
     let video_frames = engine.video_frames.clone();
 
     builder = builder
@@ -139,7 +148,7 @@ fn main() {
             backend_type: Arc::new(Mutex::new(backend_type)),
         })
         .manage(E2eeState {
-            ctx: Arc::new(Mutex::new(None)),
+            ctx: shared_e2ee,
         });
 
     builder = builder

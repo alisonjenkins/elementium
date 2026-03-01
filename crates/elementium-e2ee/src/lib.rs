@@ -283,6 +283,39 @@ impl E2eeContext {
         Some(output)
     }
 
+    /// Decrypt a media frame, trying all known participant keys.
+    ///
+    /// Used when the sender's identity is unknown (e.g., inbound RTP from the SFU
+    /// where we only have the raw frame, not the participant identity).
+    pub fn decrypt_frame_any(
+        &self,
+        frame: &[u8],
+        kind: MediaKind,
+    ) -> Result<Option<Vec<u8>>, E2eeError> {
+        let participants: Vec<String> = {
+            let inner = self.inner.read().unwrap();
+            inner.key_manager.participants.keys().cloned().collect()
+        };
+
+        if participants.is_empty() {
+            return Ok(None);
+        }
+
+        for participant in &participants {
+            match self.decrypt_frame(frame, participant, kind) {
+                Ok(Some(decrypted)) => return Ok(Some(decrypted)),
+                Ok(None) => continue,
+                Err(_) => continue,
+            }
+        }
+
+        // All participants failed; return the last error for diagnostics
+        Err(E2eeError::DecryptionFailed(format!(
+            "tried {} participants, none could decrypt",
+            participants.len()
+        )))
+    }
+
     /// Decrypt a media frame using the LiveKit E2EE frame format.
     ///
     /// Returns `Err` if the frame is malformed or decryption fails.
