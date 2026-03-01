@@ -2,10 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, command};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use elementium_types::{IceCandidate, SessionDescription};
 use elementium_webrtc::engine::{IceServerConfig, WebRtcEngine};
 use elementium_webrtc::peer_connection;
+use elementium_webrtc::{AudioPipeline, PcEvent, VideoPipeline};
 
 use super::media_devices::MediaState;
 
@@ -139,10 +141,20 @@ pub async fn create_offer(
 
     let engine = state.0.lock().map_err(|e| e.to_string())?;
     let managed = engine.get(&pc_id).ok_or("Peer connection not found")?;
+    let io_cmd_tx = managed.io_cmd_tx.clone();
+
+    // Connect audio capture pipeline to this PC's I/O channel
+    if let Ok(audio_guard) = media_state.audio_capture.lock() {
+        if let Some(ref audio) = *audio_guard {
+            if let Ok(mut encode_guard) = audio.encode_tx.lock() {
+                tracing::info!(pc_id = %pc_id, "Connecting audio pipeline to peer connection");
+                *encode_guard = Some(io_cmd_tx.clone());
+            }
+        }
+    }
 
     // If video is included, connect the camera pipeline to this PC's I/O channel
     if video {
-        let io_cmd_tx = managed.io_cmd_tx.clone();
         if let Ok(cam_guard) = media_state.camera.lock() {
             if let Some(ref cam) = *cam_guard {
                 if let Ok(mut encode_guard) = cam.encode_tx.lock() {
@@ -242,6 +254,32 @@ pub async fn close_peer_connection(
 /// Tauri's permission check blocks listen() from non-local URLs
 /// (e.g. http://localhost:5173 in dev mode). eval() bypasses this entirely.
 async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
+    // Create relay channels for audio and video playback pipelines
+    let (audio_tx, audio_rx) = tokio_mpsc::channel::<PcEvent>(256);
+    let (video_tx, video_rx) = tokio_mpsc::channel::<PcEvent>(256);
+
+    // Get video frame buffer from engine
+    let video_frames = {
+        let engine = match state.0.lock() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        engine.video_frames.clone()
+    };
+
+    // Start audio playback pipeline (receives Opus → decodes → cpal output)
+    let audio_rx = Arc::new(Mutex::new(audio_rx));
+    if let Err(e) = AudioPipeline::start_playback(audio_rx) {
+        tracing::error!(pc_id = pc_id, "Failed to start audio playback: {e}");
+    }
+
+    // Start video playback pipeline (receives VP8 → decodes → frame buffer)
+    let video_rx = Arc::new(Mutex::new(video_rx));
+    let mut video_pipeline = VideoPipeline::new();
+    if let Err(e) = video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string()) {
+        tracing::error!(pc_id = pc_id, "Failed to start video playback: {e}");
+    }
+
     loop {
         let event = {
             let engine = match state.0.lock() {
@@ -262,45 +300,47 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
         match event {
             Some(pc_event) => {
                 let tauri_event = match pc_event {
-                    elementium_webrtc::PcEvent::IceConnectionStateChange(s) => {
+                    PcEvent::IceConnectionStateChange(s) => {
                         WebRtcEvent::IceConnectionStateChange {
                             pc_id: pc_id.to_string(),
                             state: format!("{s:?}").to_lowercase(),
                         }
                     }
-                    elementium_webrtc::PcEvent::ConnectionStateChange(s) => {
+                    PcEvent::ConnectionStateChange(s) => {
                         WebRtcEvent::ConnectionStateChange {
                             pc_id: pc_id.to_string(),
                             state: format!("{s:?}").to_lowercase(),
                         }
                     }
-                    elementium_webrtc::PcEvent::IceCandidate(candidate) => {
+                    PcEvent::IceCandidate(candidate) => {
                         WebRtcEvent::IceCandidate {
                             pc_id: pc_id.to_string(),
                             candidate,
                         }
                     }
-                    elementium_webrtc::PcEvent::IceGatheringComplete => {
+                    PcEvent::IceGatheringComplete => {
                         WebRtcEvent::IceGatheringComplete {
                             pc_id: pc_id.to_string(),
                         }
                     }
-                    elementium_webrtc::PcEvent::Connected => WebRtcEvent::Connected {
+                    PcEvent::Connected => WebRtcEvent::Connected {
                         pc_id: pc_id.to_string(),
                     },
-                    elementium_webrtc::PcEvent::RemoteTrackAdded { mid, kind } => {
+                    PcEvent::RemoteTrackAdded { mid, kind } => {
                         WebRtcEvent::RemoteTrackAdded {
                             pc_id: pc_id.to_string(),
                             mid,
                             kind,
                         }
                     }
-                    elementium_webrtc::PcEvent::AudioData(_) => {
-                        // Audio data is handled by the audio playback pipeline
+                    PcEvent::AudioData(data) => {
+                        // Relay to audio playback pipeline
+                        let _ = audio_tx.try_send(PcEvent::AudioData(data));
                         continue;
                     }
-                    elementium_webrtc::PcEvent::VideoData(_) => {
-                        // Video data is handled by the video playback pipeline
+                    PcEvent::VideoData(data) => {
+                        // Relay to video playback pipeline
+                        let _ = video_tx.try_send(PcEvent::VideoData(data));
                         continue;
                     }
                 };
