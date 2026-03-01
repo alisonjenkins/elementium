@@ -10,6 +10,7 @@ use elementium_types::{MediaConstraints, MediaDevice, TrackId, VideoFrame};
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
 use super::webrtc::WebRtcState;
+use crate::protocols::VideoFrameState;
 
 /// Handle to a running camera pipeline.
 pub struct CameraPipelineHandle {
@@ -67,7 +68,7 @@ pub async fn get_user_media(
         track_ids.push(track_id);
     }
 
-    if constraints.video.is_some() {
+    if let Some(ref video_constraints) = constraints.video {
         let track_id = TrackId(format!("video-{}", generate_track_id()));
         tracing::info!(track_id = %track_id, "Starting video capture");
 
@@ -84,6 +85,9 @@ pub async fn get_user_media(
             }
         }
 
+        let req_width = video_constraints.width;
+        let req_height = video_constraints.height;
+
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
             Arc::new(Mutex::new(None));
         let encode_tx_clone = encode_tx.clone();
@@ -92,7 +96,7 @@ pub async fn get_user_media(
 
         // Start the camera pipeline on a background thread
         std::thread::spawn(move || {
-            camera_pipeline_loop(tid, video_frames, encode_tx_clone, stop_rx);
+            camera_pipeline_loop(tid, video_frames, encode_tx_clone, stop_rx, req_width, req_height);
         });
 
         // Store the camera pipeline handle
@@ -138,6 +142,40 @@ pub async fn stop_track(
     Ok(())
 }
 
+/// Fetch the latest video frame for a track as raw bytes via IPC.
+///
+/// Returns an 8-byte header (width: u32 LE, height: u32 LE) followed by RGBA data.
+/// Returns an 8-byte zero header when no frame is available.
+#[command]
+pub fn get_video_frame(
+    state: State<'_, VideoFrameState>,
+    track_id: String,
+) -> tauri::ipc::Response {
+    let frame = state.0.lock().ok().and_then(|f| f.get(&track_id).cloned());
+
+    static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 3 || count % 300 == 0 {
+        tracing::info!(
+            track_id = %track_id,
+            has_frame = frame.is_some(),
+            count,
+            "get_video_frame IPC call"
+        );
+    }
+
+    match frame {
+        Some(f) => {
+            let mut body = Vec::with_capacity(8 + f.data.len());
+            body.extend_from_slice(&f.width.to_le_bytes());
+            body.extend_from_slice(&f.height.to_le_bytes());
+            body.extend_from_slice(&f.data);
+            tauri::ipc::Response::new(body)
+        }
+        None => tauri::ipc::Response::new(vec![0u8; 8]),
+    }
+}
+
 /// Background thread: reads camera frames, writes RGBA to VideoFrameBuffer for
 /// preview, and optionally VP8-encodes + sends to a peer connection.
 fn camera_pipeline_loop(
@@ -145,8 +183,10 @@ fn camera_pipeline_loop(
     video_frames: VideoFrameBuffer,
     encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     stop_rx: std::sync::mpsc::Receiver<()>,
+    req_width: Option<u32>,
+    req_height: Option<u32>,
 ) {
-    let capturer = match CameraCapturer::start() {
+    let capturer = match CameraCapturer::start(req_width, req_height) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to start camera: {e}");
@@ -159,6 +199,7 @@ fn camera_pipeline_loop(
     tracing::info!(width, height, track_id = %track_id, "Camera pipeline started");
 
     let mut encoder: Option<Vp8Encoder> = None;
+    let mut frame_count: u64 = 0;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -171,6 +212,17 @@ fn camera_pipeline_loop(
         }
 
         if let Some(frame) = capturer.try_recv() {
+            frame_count += 1;
+            if frame_count <= 3 || frame_count % 100 == 0 {
+                tracing::info!(
+                    track_id = %track_id,
+                    frame_count,
+                    w = frame.width,
+                    h = frame.height,
+                    data_len = frame.data.len(),
+                    "Camera frame received"
+                );
+            }
             // Write RGBA frame to VideoFrameBuffer for local preview
             if let Ok(mut buf) = video_frames.lock() {
                 buf.insert(

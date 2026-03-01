@@ -11,14 +11,17 @@ interface NativeMediaDevice {
   kind: "audioInput" | "audioOutput" | "videoInput";
 }
 
-interface NativeTrackId {
-  "0": string;
-}
+// TrackId is a Rust newtype struct TrackId(String), which serde serializes as a plain string.
+type NativeTrackId = string;
 
 interface NativeCaptureSource {
   id: string;
   name: string;
   kind: "monitor" | "window";
+}
+
+function debugLog(msg: string): void {
+  console.log(`[Elementium] ${msg}`);
 }
 
 /**
@@ -93,15 +96,17 @@ export function setupMediaDevicesShim(): void {
       };
 
       try {
+        debugLog("getUserMedia: calling invoke get_user_media...");
         const trackIds = await invoke<NativeTrackId[]>("get_user_media", {
           constraints: nativeConstraints,
         });
+        debugLog(`getUserMedia: got ${trackIds.length} tracks: ${JSON.stringify(trackIds)}`);
 
         // Create a synthetic MediaStream with tracks
         const stream = new MediaStream();
 
         for (const tid of trackIds) {
-          const id = tid["0"];
+          const id = tid;
           if (id.startsWith("audio-")) {
             // Create a silent audio track (real audio is in Rust)
             try {
@@ -115,16 +120,33 @@ export function setupMediaDevicesShim(): void {
               if (audioTrack) {
                 stream.addTrack(audioTrack);
               }
-            } catch {
-              // AudioContext may not be available
+              debugLog(`audio track added: ${audioTrack?.id}`);
+            } catch (e) {
+              debugLog(`audio track error: ${e}`);
             }
           } else if (id.startsWith("video-")) {
+            debugLog(`video track ${id}: creating canvas...`);
             // Create a canvas-based video track fed by native camera frames
             const canvas = document.createElement("canvas");
             canvas.width = 640;
             canvas.height = 480;
+            // Attach to DOM (hidden) so captureStream works reliably in WebKitGTK
+            canvas.style.position = "fixed";
+            canvas.style.top = "-9999px";
+            canvas.style.left = "-9999px";
+            canvas.style.pointerEvents = "none";
+            (document.body || document.documentElement).appendChild(canvas);
+            debugLog("video track: canvas in DOM");
+            // Draw an initial black frame so captureStream has content immediately
+            const initCtx = canvas.getContext("2d");
+            if (initCtx) {
+              initCtx.fillStyle = "#000";
+              initCtx.fillRect(0, 0, 640, 480);
+            }
+            debugLog(`video track: captureStream available? ${typeof canvas.captureStream}`);
             const canvasStream = canvas.captureStream(30);
             const videoTrack = canvasStream.getVideoTracks()[0];
+            debugLog(`video track: captureStream returned track? ${!!videoTrack} readyState=${videoTrack?.readyState}`);
             if (videoTrack) {
               stream.addTrack(videoTrack);
               // Start fetching real camera frames from the Rust backend
@@ -133,7 +155,7 @@ export function setupMediaDevicesShim(): void {
           }
         }
 
-        console.log(`[Elementium] getUserMedia returned ${trackIds.length} tracks`);
+        debugLog(`getUserMedia returning stream with ${stream.getTracks().length} tracks`);
         return stream;
       } catch (e) {
         console.error("[Elementium] getUserMedia failed:", e);
@@ -156,7 +178,7 @@ export function setupMediaDevicesShim(): void {
 
         // Start screen capture for the selected source
         const trackId = await invoke<NativeTrackId>("get_display_media", { sourceId });
-        const id = trackId["0"];
+        const id = trackId;
 
         // Create a canvas-based MediaStream for the screen capture
         const stream = new MediaStream();
@@ -217,51 +239,58 @@ function extractConstraintValue(value: unknown): number | undefined {
 }
 
 /**
- * Fetch video frames from the Rust backend and render onto a canvas.
- * Uses the elementium:// custom protocol to get RGBA frame data.
+ * Fetch video frames from the Rust backend via Tauri IPC and render onto a canvas.
+ *
+ * Uses invoke("get_video_frame") instead of fetch("elementium://...") because
+ * WebKitGTK blocks custom protocol fetches from http:// origins in dev mode.
+ * Uses setTimeout instead of requestAnimationFrame because rAF does not
+ * fire reliably for detached (off-DOM) canvases, especially inside iframes.
  */
 function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
   let running = true;
+  let timerId: ReturnType<typeof setTimeout> | null = null;
 
+  let frameCount = 0;
   const fetchLoop = async () => {
     if (!running) return;
 
     try {
-      const resp = await fetch(`elementium://localhost/video-frame/${trackId}`);
-      if (resp.ok) {
-        const width = parseInt(resp.headers.get("X-Frame-Width") || "0", 10);
-        const height = parseInt(resp.headers.get("X-Frame-Height") || "0", 10);
+      // invoke returns ArrayBuffer when Rust returns tauri::ipc::Response
+      const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
+      frameCount++;
+      if (buf && buf.byteLength > 8) {
+        const view = new DataView(buf);
+        const width = view.getUint32(0, true);
+        const height = view.getUint32(4, true);
 
         if (width > 1 && height > 1) {
           if (canvas.width !== width || canvas.height !== height) {
             canvas.width = width;
             canvas.height = height;
           }
-          const buf = await resp.arrayBuffer();
-          const imageData = new ImageData(
-            new Uint8ClampedArray(buf),
-            width,
-            height,
-          );
+          const rgba = new Uint8ClampedArray(buf, 8);
+          const imageData = new ImageData(rgba, width, height);
           ctx.putImageData(imageData, 0, 0);
         }
       }
-    } catch {
-      // Frame fetch failed, skip
+    } catch (err) {
+      debugLog(`fetchLoop error: ${err}`);
     }
 
     if (running) {
-      requestAnimationFrame(fetchLoop);
+      timerId = setTimeout(fetchLoop, 33);
     }
   };
 
-  requestAnimationFrame(fetchLoop);
+  debugLog(`fetchLoop: starting for ${trackId}`);
+  timerId = setTimeout(fetchLoop, 33);
 
   // Store cleanup reference on the canvas for stop_track
   (canvas as unknown as Record<string, unknown>).__stopFetch = () => {
     running = false;
+    if (timerId !== null) clearTimeout(timerId);
   };
 }

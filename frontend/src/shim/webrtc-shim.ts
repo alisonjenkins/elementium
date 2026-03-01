@@ -6,7 +6,6 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 interface PeerConnectionResult {
   id: string;
@@ -20,6 +19,25 @@ interface WebRtcEvent {
   mid?: string;
   kind?: string;
 }
+
+/**
+ * Get the top-level window (for registering callbacks reachable by Rust's webview.eval()).
+ * Falls back to current window if cross-origin.
+ */
+function getTopWindow(): Record<string, unknown> {
+  try {
+    // Same-origin check: accessing window.top properties throws if cross-origin
+    if (window.top && window.top.document) {
+      return window.top as unknown as Record<string, unknown>;
+    }
+  } catch {
+    // Cross-origin — fall back to current window
+  }
+  return window as unknown as Record<string, unknown>;
+}
+
+/** Module-level PC registry: maps pcId → event handler callback */
+const __pcRegistry = new Map<string, (event: WebRtcEvent) => void>();
 
 /**
  * Shimmed RTCPeerConnection that delegates to the Rust backend.
@@ -36,11 +54,13 @@ class ElementiumRTCPeerConnection extends EventTarget {
   private _localDescription: RTCSessionDescription | null = null;
   private _remoteDescription: RTCSessionDescription | null = null;
   private _initPromise: Promise<void>;
-  private _unlisten: UnlistenFn | null = null;
   private _senders: RTCRtpSender[] = [];
   private _transceivers: RTCRtpTransceiver[] = [];
   private _dataChannelIdCounter = 0;
   private _hasVideo = false;
+  // Tracked for passing to create_offer so the SDP includes the right m-lines
+  private _pendingDataChannels: { label: string; ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number; protocol?: string }[] = [];
+  private _pendingTransceivers: { kind: string; direction: string }[] = [];
 
   // Event handler properties (on* style)
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;
@@ -72,12 +92,8 @@ class ElementiumRTCPeerConnection extends EventTarget {
       this.pcId = handle.id;
       console.log(`[Elementium] PeerConnection created: ${this.pcId}`);
 
-      // Listen for WebRTC events from the Rust backend
-      this._unlisten = await listen<WebRtcEvent>("webrtc-event", (event) => {
-        if (event.payload.pcId === this.pcId) {
-          this.handleBackendEvent(event.payload);
-        }
-      });
+      // Register in global PC registry (Rust pushes events via webview.eval())
+      __pcRegistry.set(this.pcId, (event: WebRtcEvent) => this.handleBackendEvent(event));
     } catch (e) {
       console.error("[Elementium] Failed to create peer connection:", e);
     }
@@ -185,34 +201,32 @@ class ElementiumRTCPeerConnection extends EventTarget {
   }
 
   /**
-   * Fetch video frames from the Rust backend and render onto a canvas.
+   * Fetch video frames from the Rust backend via Tauri IPC and render onto a canvas.
    */
   private startVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     let running = true;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
 
     const fetchLoop = async () => {
       if (!running) return;
 
       try {
-        const resp = await fetch(`elementium://localhost/video-frame/${trackId}`);
-        if (resp.ok) {
-          const width = parseInt(resp.headers.get("X-Frame-Width") || "0", 10);
-          const height = parseInt(resp.headers.get("X-Frame-Height") || "0", 10);
+        const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
+        if (buf && buf.byteLength > 8) {
+          const view = new DataView(buf);
+          const width = view.getUint32(0, true);
+          const height = view.getUint32(4, true);
 
           if (width > 1 && height > 1) {
             if (canvas.width !== width || canvas.height !== height) {
               canvas.width = width;
               canvas.height = height;
             }
-            const buf = await resp.arrayBuffer();
-            const imageData = new ImageData(
-              new Uint8ClampedArray(buf),
-              width,
-              height,
-            );
+            const rgba = new Uint8ClampedArray(buf, 8);
+            const imageData = new ImageData(rgba, width, height);
             ctx.putImageData(imageData, 0, 0);
           }
         }
@@ -221,16 +235,17 @@ class ElementiumRTCPeerConnection extends EventTarget {
       }
 
       if (running) {
-        requestAnimationFrame(fetchLoop);
+        timerId = setTimeout(fetchLoop, 33);
       }
     };
 
-    requestAnimationFrame(fetchLoop);
+    timerId = setTimeout(fetchLoop, 33);
 
     // Store cleanup function (called on close)
     const originalClose = this.close.bind(this);
     this.close = () => {
       running = false;
+      if (timerId !== null) clearTimeout(timerId);
       originalClose();
     };
   }
@@ -259,19 +274,29 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   async createOffer(_options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
+    console.log(`[Elementium] createOffer: pcId=${this.pcId} hasVideo=${this._hasVideo} dc=${this._pendingDataChannels.length} tc=${this._pendingTransceivers.length}`);
     const desc = await invoke<{ sdpType: string; sdp: string }>("create_offer", {
       pcId: this.pcId,
       includeVideo: this._hasVideo,
+      dataChannels: this._pendingDataChannels.length > 0 ? this._pendingDataChannels : null,
+      transceivers: this._pendingTransceivers.length > 0 ? this._pendingTransceivers : null,
     });
+    // Clear pending lists after they've been applied
+    this._pendingDataChannels = [];
+    this._pendingTransceivers = [];
+    console.log(`[Elementium] createOffer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
+    console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
     const init: RTCSessionDescriptionInit = { type: desc.sdpType as RTCSdpType, sdp: desc.sdp };
     return init;
   }
 
   async createAnswer(_options?: RTCAnswerOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
+    console.log(`[Elementium] createAnswer: pcId=${this.pcId}`);
     const desc = await invoke<{ sdpType: string; sdp: string }>("create_answer", {
       pcId: this.pcId,
     });
+    console.log(`[Elementium] createAnswer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
     const init: RTCSessionDescriptionInit = { type: desc.sdpType as RTCSdpType, sdp: desc.sdp };
     return init;
   }
@@ -279,6 +304,8 @@ class ElementiumRTCPeerConnection extends EventTarget {
   async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
     if (!description) return;
+    console.log(`[Elementium] setLocalDescription: pcId=${this.pcId} type=${description.type}`);
+    console.log("[Elementium] setLocalDescription SDP (post-munge):\n" + (description.sdp ?? "(no sdp)"));
     await invoke("set_local_description", {
       pcId: this.pcId,
       description: { type: description.type, sdp: description.sdp },
@@ -290,6 +317,8 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
+    console.log(`[Elementium] setRemoteDescription: pcId=${this.pcId} type=${description.type} sdpLen=${description.sdp?.length ?? 0}`);
+    console.log("[Elementium] setRemoteDescription SDP:\n" + (description.sdp ?? "(no sdp)"));
 
     const result = await invoke<{ sdpType: string; sdp: string } | null>(
       "set_remote_description",
@@ -318,6 +347,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
   async addIceCandidate(candidate?: RTCIceCandidateInit | null): Promise<void> {
     await this.ensureReady();
     if (!candidate?.candidate) return;
+    console.log(`[Elementium] addIceCandidate: pcId=${this.pcId} candidate=${candidate.candidate.substring(0, 80)} sdpMid=${candidate.sdpMid} sdpMLineIndex=${candidate.sdpMLineIndex}`);
     await invoke("add_ice_candidate", {
       pcId: this.pcId,
       candidate: {
@@ -330,11 +360,12 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   close(): void {
     if (this.pcId) {
+      console.log(`[Elementium] close: pcId=${this.pcId}`);
+      __pcRegistry.delete(this.pcId);
       invoke("close_peer_connection", { pcId: this.pcId }).catch(console.error);
       this._connectionState = "closed";
       this._iceConnectionState = "closed";
       this._signalingState = "closed";
-      this._unlisten?.();
     }
   }
 
@@ -359,13 +390,15 @@ class ElementiumRTCPeerConnection extends EventTarget {
   ): RTCRtpTransceiver {
     const kind = typeof trackOrKind === "string" ? trackOrKind : trackOrKind.kind;
     const track = typeof trackOrKind === "string" ? null : trackOrKind;
-    console.log(`[Elementium] addTransceiver called: kind=${kind}`);
+    const direction = init?.direction ?? "sendrecv";
+    console.log(`[Elementium] addTransceiver called: kind=${kind} direction=${direction}`);
     if (kind === "video") {
       this._hasVideo = true;
     }
+    // Track for passing to create_offer
+    this._pendingTransceivers.push({ kind, direction });
 
     const mid = String(this._transceivers.length);
-    const direction = init?.direction ?? "sendrecv";
 
     const sender = {
       track,
@@ -424,8 +457,16 @@ class ElementiumRTCPeerConnection extends EventTarget {
   }
 
   createDataChannel(label: string, dataChannelDict?: RTCDataChannelInit): RTCDataChannel {
-    console.log(`[Elementium] createDataChannel called: label=${label}`);
+    console.log(`[Elementium] createDataChannel called: label=${label} ordered=${dataChannelDict?.ordered} maxRetransmits=${dataChannelDict?.maxRetransmits}`);
     const channelId = dataChannelDict?.id ?? this._dataChannelIdCounter++;
+    // Track for passing to create_offer so the SDP includes m=application
+    this._pendingDataChannels.push({
+      label,
+      ordered: dataChannelDict?.ordered,
+      maxRetransmits: dataChannelDict?.maxRetransmits ?? undefined,
+      maxPacketLifeTime: dataChannelDict?.maxPacketLifeTime ?? undefined,
+      protocol: dataChannelDict?.protocol,
+    });
 
     const target = new EventTarget();
     const channel = Object.assign(target, {
@@ -574,10 +615,307 @@ export function setupWebRtcShim(): void {
   w.RTCPeerConnection = ElementiumRTCPeerConnection;
   w.webkitRTCPeerConnection = ElementiumRTCPeerConnection;
 
+  // Register global event handler on window.top so Rust's webview.eval() can reach it.
+  // Rust calls: window.__elementium_webrtc_event({type,pcId,...})
+  // This dispatches to the correct PC's handler via the module-level registry.
+  const topWin = getTopWindow();
+  topWin.__elementium_webrtc_event = (payload: WebRtcEvent) => {
+    console.log(`[Elementium] eval event: type=${payload.type} pcId=${payload.pcId} registry_size=${__pcRegistry.size} has_handler=${__pcRegistry.has(payload.pcId)}`);
+    const handler = __pcRegistry.get(payload.pcId);
+    if (handler) {
+      handler(payload);
+    }
+  };
+
   // Stub RTCRtpScriptTransform for E2EE support detection
   if (typeof w.RTCRtpScriptTransform === "undefined") {
     w.RTCRtpScriptTransform = ElementiumRTCRtpScriptTransform;
   }
+
+  // Polyfill RTCSessionDescription if missing (WebKitGTK lacks it).
+  // livekit-client uses `new RTCSessionDescription({type, sdp})` for SDP munging.
+  if (typeof w.RTCSessionDescription === "undefined") {
+    w.RTCSessionDescription = class RTCSessionDescription {
+      readonly type: RTCSdpType;
+      readonly sdp: string;
+      constructor(init: RTCSessionDescriptionInit) {
+        this.type = init.type!;
+        this.sdp = init.sdp ?? "";
+      }
+      toJSON(): RTCSessionDescriptionInit {
+        return { type: this.type, sdp: this.sdp };
+      }
+    } as unknown as typeof globalThis.RTCSessionDescription;
+  }
+
+  // Polyfill RTCIceCandidate if missing (WebKitGTK may lack it).
+  if (typeof w.RTCIceCandidate === "undefined") {
+    w.RTCIceCandidate = class RTCIceCandidate {
+      readonly candidate: string;
+      readonly sdpMid: string | null;
+      readonly sdpMLineIndex: number | null;
+      readonly usernameFragment: string | null;
+      constructor(init?: RTCIceCandidateInit) {
+        this.candidate = init?.candidate ?? "";
+        this.sdpMid = init?.sdpMid ?? null;
+        this.sdpMLineIndex = init?.sdpMLineIndex ?? null;
+        this.usernameFragment = init?.usernameFragment ?? null;
+      }
+      toJSON(): RTCIceCandidateInit {
+        return {
+          candidate: this.candidate,
+          sdpMid: this.sdpMid,
+          sdpMLineIndex: this.sdpMLineIndex,
+          usernameFragment: this.usernameFragment,
+        };
+      }
+    } as unknown as typeof globalThis.RTCIceCandidate;
+  }
+
+  // LiveKit signaling WebSocket interceptor.
+  //
+  // Fixes a race condition where our Tauri IPC latency causes the publisher
+  // offer to be sent BEFORE the subscriber answer. The SFU expects its
+  // subscriber offer to be answered before it will accept a publisher offer;
+  // otherwise it responds with STATE_MISMATCH and disconnects.
+  //
+  // Protobuf SignalRequest field tags (first byte of each message):
+  //   10 = field 1 (offer)   — publisher offer
+  //   18 = field 2 (answer)  — subscriber answer
+  //   26 = field 3 (trickle)
+  //   ...
+  // Protobuf SignalResponse field tags (first byte of each recv message):
+  //   26 = field 3 (offer)   — subscriber offer from SFU
+  //
+  // Strategy: when a subscriber offer is received, buffer any outgoing
+  // publisher offers until the subscriber answer has been sent.
+
+  const PROTO_TAG_REQ_OFFER = 10;   // SignalRequest.offer (field 1, wire type 2)
+  const PROTO_TAG_REQ_ANSWER = 18;  // SignalRequest.answer (field 2, wire type 2)
+  const PROTO_TAG_RESP_OFFER = 26;  // SignalResponse.offer (field 3, wire type 2)
+
+  // --- Protobuf patching helpers ---
+  // livekit-client's proto3 encoding omits SessionDescription.type (field 1)
+  // when it's the default empty string. The LiveKit SFU requires this field
+  // to be present ("offer" or "answer"), sending STATE_MISMATCH without it.
+  // We inject the type field into outgoing messages at the WebSocket level.
+
+  function readVarint(bytes: Uint8Array, offset: number): { value: number; bytesRead: number } {
+    let value = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (offset + bytesRead < bytes.length) {
+      const b = bytes[offset + bytesRead];
+      value |= (b & 0x7f) << shift;
+      bytesRead++;
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+    }
+    return { value, bytesRead };
+  }
+
+  function encodeVarint(value: number): number[] {
+    const result: number[] = [];
+    do {
+      let byte = value & 0x7f;
+      value >>>= 7;
+      if (value > 0) byte |= 0x80;
+      result.push(byte);
+    } while (value > 0);
+    return result;
+  }
+
+  // Inject `type` field (proto field 1) into a SessionDescription inside
+  // a SignalRequest.offer (tag=10) or SignalRequest.answer (tag=18).
+  function injectTypeField(rawBytes: Uint8Array): Uint8Array {
+    if (rawBytes.length < 3) return rawBytes;
+    const outerTag = rawBytes[0];
+    if (outerTag !== PROTO_TAG_REQ_OFFER && outerTag !== PROTO_TAG_REQ_ANSWER) {
+      return rawBytes;
+    }
+    const { value: innerLen, bytesRead: lenBytes } = readVarint(rawBytes, 1);
+    const innerStart = 1 + lenBytes;
+    if (innerStart >= rawBytes.length) return rawBytes;
+    // If inner already starts with field 1 tag (10), type is present — skip
+    if (rawBytes[innerStart] === 10) return rawBytes;
+    // If inner doesn't start with field 2 tag (18 = sdp), unexpected — skip
+    if (rawBytes[innerStart] !== 18) return rawBytes;
+
+    const typeStr = outerTag === PROTO_TAG_REQ_OFFER ? "offer" : "answer";
+    const typeEncoded = new TextEncoder().encode(typeStr);
+    // Type field: tag=10 (field 1, wire type 2) + length byte + string bytes
+    const typeFieldLen = 1 + 1 + typeEncoded.length;
+
+    const newInnerLen = innerLen + typeFieldLen;
+    const newLenBytes = encodeVarint(newInnerLen);
+
+    const result = new Uint8Array(1 + newLenBytes.length + newInnerLen);
+    let pos = 0;
+    result[pos++] = outerTag;
+    for (const b of newLenBytes) result[pos++] = b;
+    // Injected type field
+    result[pos++] = 10; // field 1, wire type 2
+    result[pos++] = typeEncoded.length;
+    result.set(typeEncoded, pos);
+    pos += typeEncoded.length;
+    // Original inner bytes (sdp + id)
+    result.set(rawBytes.subarray(innerStart, innerStart + innerLen), pos);
+
+    return result;
+  }
+
+  function patchOutgoingMessage(
+    data: string | ArrayBufferLike | Blob | ArrayBufferView,
+  ): { data: string | ArrayBufferLike | Blob | ArrayBufferView; patched: boolean } {
+    let bytes: Uint8Array | null = null;
+    if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    }
+    if (bytes === null) return { data, patched: false };
+    const result = injectTypeField(bytes);
+    if (result === bytes) return { data, patched: false };
+    return { data: result.buffer, patched: true };
+  }
+
+  const OrigWebSocket = window.WebSocket;
+  w.WebSocket = class MonitoredWebSocket extends OrigWebSocket {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols);
+      const wsUrl = url.toString();
+      const isLk = wsUrl.includes("livekit") || wsUrl.includes("matrixrtc") || wsUrl.includes("rtc");
+      if (isLk) {
+        console.log(`[Elementium] WebSocket opening: ${wsUrl}`);
+        let recvCount = 0;
+        let sendCount = 0;
+        // Reorder state: buffer publisher offers while waiting for subscriber answer
+        let awaitingSubscriberAnswer = false;
+        let bufferedOffers: (string | ArrayBufferLike | Blob | ArrayBufferView)[] = [];
+        let reorderTimer: ReturnType<typeof setTimeout> | null = null;
+
+        this.addEventListener("open", () => {
+          console.log(`[Elementium] WebSocket opened: ${wsUrl}`);
+        });
+        this.addEventListener("close", (e) => {
+          console.log(`[Elementium] WebSocket closed: ${wsUrl} code=${e.code} reason=${e.reason} wasClean=${e.wasClean}`);
+          // Clean up on close
+          awaitingSubscriberAnswer = false;
+          bufferedOffers = [];
+          if (reorderTimer !== null) { clearTimeout(reorderTimer); reorderTimer = null; }
+        });
+        this.addEventListener("error", () => {
+          console.log(`[Elementium] WebSocket error: ${wsUrl}`);
+        });
+
+        // Intercept incoming messages — detect subscriber offers from SFU
+        this.addEventListener("message", (e) => {
+          const idx = recvCount++;
+          let firstByte = -1;
+          if (e.data instanceof ArrayBuffer) {
+            const bytes = new Uint8Array(e.data);
+            firstByte = bytes.length > 0 ? bytes[0] : -1;
+            if (idx < 5) {
+              console.log(`[Elementium] WS recv #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte} FULL:`, Array.from(bytes));
+            } else {
+              console.log(`[Elementium] WS recv #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte}`, bytes.slice(0, 32));
+            }
+          } else if (e.data instanceof Blob) {
+            console.log(`[Elementium] WS recv #${idx}: blob ${e.data.size} bytes`);
+          } else {
+            const str = String(e.data);
+            console.log(`[Elementium] WS recv #${idx}: text ${str.length} chars`, str.slice(0, 200));
+          }
+
+          // If SFU sent a subscriber offer, mark that we need to answer it
+          // before sending any publisher offer.
+          if (firstByte === PROTO_TAG_RESP_OFFER) {
+            console.log(`[Elementium] SFU subscriber offer received — buffering publisher offers until answer sent`);
+            awaitingSubscriberAnswer = true;
+            // Safety timeout: don't hold offers forever (500ms max)
+            if (reorderTimer !== null) clearTimeout(reorderTimer);
+            reorderTimer = setTimeout(() => {
+              if (awaitingSubscriberAnswer && bufferedOffers.length > 0) {
+                console.warn(`[Elementium] Reorder timeout — flushing ${bufferedOffers.length} buffered publisher offer(s)`);
+                for (const buf of bufferedOffers) origSend(buf);
+                bufferedOffers = [];
+                awaitingSubscriberAnswer = false;
+              }
+            }, 500);
+          }
+        });
+
+        // Intercept outgoing messages — reorder offers after answers
+        const origSend = this.send.bind(this);
+        this.send = (data: string | ArrayBufferLike | Blob | ArrayBufferView) => {
+          const idx = sendCount++;
+
+          // Inject missing `type` field into outgoing SessionDescription messages
+          const patchCheck = patchOutgoingMessage(data);
+          if (patchCheck.patched) {
+            let tag = -1;
+            if (data instanceof ArrayBuffer) {
+              tag = new Uint8Array(data)[0];
+            } else if (ArrayBuffer.isView(data)) {
+              tag = new Uint8Array(data.buffer, data.byteOffset, data.byteLength)[0];
+            }
+            const typeStr = tag === PROTO_TAG_REQ_OFFER ? "offer" : "answer";
+            console.log(`[Elementium] Injected type="${typeStr}" into outgoing SessionDescription`);
+            data = patchCheck.data;
+          }
+
+          // Determine the protobuf tag of the outgoing message
+          let firstByte = -1;
+          if (data instanceof ArrayBuffer) {
+            const bytes = new Uint8Array(data);
+            firstByte = bytes.length > 0 ? bytes[0] : -1;
+            if (idx < 5) {
+              console.log(`[Elementium] WS send #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte} FULL:`, Array.from(bytes));
+            } else {
+              console.log(`[Elementium] WS send #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte}`, bytes.slice(0, 32));
+            }
+          } else if (data instanceof Blob) {
+            console.log(`[Elementium] WS send #${idx}: blob ${data.size} bytes`);
+          } else if (ArrayBuffer.isView(data)) {
+            const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            firstByte = bytes.length > 0 ? bytes[0] : -1;
+            if (idx < 5) {
+              console.log(`[Elementium] WS send #${idx}: view ${bytes.byteLength} bytes tag=${firstByte} FULL:`, Array.from(bytes));
+            } else {
+              console.log(`[Elementium] WS send #${idx}: view ${bytes.byteLength} bytes tag=${firstByte}`, bytes.slice(0, 32));
+            }
+          } else {
+            const str = String(data);
+            console.log(`[Elementium] WS send #${idx}: text ${str.length} chars`, str.slice(0, 200));
+          }
+
+          // Reorder logic: buffer publisher offers while subscriber answer is pending
+          if (firstByte === PROTO_TAG_REQ_OFFER && awaitingSubscriberAnswer) {
+            console.log(`[Elementium] Buffering publisher offer (waiting for subscriber answer)`);
+            bufferedOffers.push(data);
+            return;
+          }
+
+          // Send the message
+          origSend(data);
+
+          // If this was the subscriber answer, flush buffered publisher offers after a delay
+          // to give the SFU time to process the answer before receiving the offer
+          if (firstByte === PROTO_TAG_REQ_ANSWER && bufferedOffers.length > 0) {
+            console.log(`[Elementium] Subscriber answer sent — will flush ${bufferedOffers.length} buffered publisher offer(s) after 100ms`);
+            awaitingSubscriberAnswer = false;
+            if (reorderTimer !== null) { clearTimeout(reorderTimer); reorderTimer = null; }
+            const toFlush = [...bufferedOffers];
+            bufferedOffers = [];
+            setTimeout(() => {
+              console.log(`[Elementium] Flushing ${toFlush.length} buffered publisher offer(s) now`);
+              for (const buf of toFlush) origSend(buf);
+            }, 100);
+          }
+        };
+      }
+    }
+  } as unknown as typeof WebSocket;
 
   console.log("[Elementium] RTCPeerConnection shim installed");
 }

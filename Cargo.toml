@@ -55,6 +55,7 @@ env-libvpx-sys = { version = "5.1", features = ["generate"] }
 
 # Camera
 nokhwa = { version = "0.10", features = ["input-native"] }
+turbojpeg = { version = "1", default-features = false, features = ["pkg-config"] }
 
 # Screen capture
 xcap = "0.4"

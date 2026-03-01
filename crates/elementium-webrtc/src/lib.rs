@@ -2,6 +2,7 @@ pub mod audio_pipeline;
 pub mod engine;
 pub mod livekit;
 pub mod peer_connection;
+pub mod stun;
 pub mod video_pipeline;
 
 pub use audio_pipeline::AudioPipeline;

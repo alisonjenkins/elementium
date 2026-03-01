@@ -9,7 +9,11 @@
 import { setupSecretStorageShim } from "./secret-storage";
 import { setupWebRtcShim } from "./webrtc-shim";
 import { setupMediaDevicesShim } from "./media-devices";
+import { setupConsoleBridge } from "./console-bridge";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
+
+// Set up console bridge to forward JS console output to Rust (works in iframes too)
+setupConsoleBridge();
 
 // Secret storage must be first — before any code reads localStorage
 setupSecretStorageShim();

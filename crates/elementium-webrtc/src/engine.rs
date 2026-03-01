@@ -9,6 +9,15 @@ use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_types::VideoFrame;
 
 use crate::peer_connection::{self, PcEvent, PeerConnectionHandle};
+use crate::stun;
+
+/// ICE server configuration (STUN/TURN) passed from the signaling layer.
+#[derive(Debug, Clone)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
 
 /// Command sent to the I/O loop task.
 pub enum IoCommand {
@@ -56,7 +65,14 @@ impl WebRtcEngine {
     }
 
     /// Create a new peer connection. Binds a UDP socket and starts the I/O loop.
-    pub fn create_connection(&mut self, id: String) -> Result<(), String> {
+    ///
+    /// If `ice_servers` are provided, performs STUN discovery to find the
+    /// server-reflexive (public) address and adds it as an srflx candidate.
+    pub fn create_connection(
+        &mut self,
+        id: String,
+        ice_servers: Option<&[IceServerConfig]>,
+    ) -> Result<(), String> {
         let mut pc_inner = peer_connection::create_peer_connection(id.clone());
 
         // Bind a UDP socket for this connection
@@ -64,8 +80,13 @@ impl WebRtcEngine {
             UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind socket: {e}"))?;
         let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
 
-        // Add the socket address as a local ICE candidate
+        // Add the socket address as a local ICE candidate (host)
         peer_connection::add_local_candidate(&mut pc_inner, local_addr);
+
+        // Perform STUN discovery using provided ICE servers
+        if let Some(servers) = ice_servers {
+            discover_and_add_srflx(&socket, &mut pc_inner, local_addr, servers);
+        }
 
         let handle: PeerConnectionHandle = Arc::new(Mutex::new(pc_inner));
         let socket = Arc::new(socket);
@@ -222,6 +243,40 @@ fn io_loop(
             }
         }
     }
+}
+
+/// Perform STUN discovery using ICE servers and add srflx candidates.
+fn discover_and_add_srflx(
+    socket: &UdpSocket,
+    pc: &mut peer_connection::PeerConnectionInner,
+    local_addr: std::net::SocketAddr,
+    servers: &[IceServerConfig],
+) {
+    for server in servers {
+        for url in &server.urls {
+            if let Some(stun_addr) = stun::parse_stun_url(url) {
+                tracing::info!(
+                    pc_id = %pc.id,
+                    %url,
+                    %stun_addr,
+                    "Attempting STUN discovery"
+                );
+                if let Some(srflx_addr) = stun::discover_srflx(socket, stun_addr) {
+                    // Use the real local IP as the base (not 0.0.0.0)
+                    let base = if local_addr.ip().is_unspecified() {
+                        let real_ip = peer_connection::get_local_ip()
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                        std::net::SocketAddr::new(real_ip, local_addr.port())
+                    } else {
+                        local_addr
+                    };
+                    peer_connection::add_srflx_candidate(pc, srflx_addr, base);
+                    return; // One srflx candidate is enough
+                }
+            }
+        }
+    }
+    tracing::warn!(pc_id = %pc.id, "STUN discovery failed on all ICE servers");
 }
 
 /// Attempt to decrypt inbound audio/video events if E2EE is active.

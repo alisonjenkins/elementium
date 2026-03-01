@@ -63,6 +63,7 @@
           libv4l
           libvpx
           libopus
+          libjpeg
 
           # GStreamer (needed by WebKitGTK for media playback)
           gst_all_1.gstreamer
@@ -93,6 +94,7 @@
           pipewire
           libvpx
           libopus
+          libjpeg
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good

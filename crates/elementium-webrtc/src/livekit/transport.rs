@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_types::SessionDescription;
 
+use crate::engine::IceServerConfig;
 use crate::peer_connection::{self, PcEvent, PeerConnectionHandle};
+use crate::stun;
 
 /// Events from the transport layer to the room.
 #[derive(Debug)]
@@ -51,11 +53,15 @@ pub struct Transport {
 impl Transport {
     /// Create a new dual-PC transport. Binds two UDP sockets and starts I/O loops.
     pub fn new(room_id: &str) -> Result<Self, String> {
-        Self::new_with_e2ee(room_id, None)
+        Self::new_with_e2ee(room_id, None, None)
     }
 
-    /// Create a new dual-PC transport with optional E2EE.
-    pub fn new_with_e2ee(room_id: &str, e2ee: Option<E2eeContext>) -> Result<Self, String> {
+    /// Create a new dual-PC transport with optional E2EE and ICE servers.
+    pub fn new_with_e2ee(
+        room_id: &str,
+        e2ee: Option<E2eeContext>,
+        ice_servers: Option<&[IceServerConfig]>,
+    ) -> Result<Self, String> {
         // Create Publisher PC
         let pub_id = format!("{room_id}-pub");
         let mut pub_inner = peer_connection::create_peer_connection(pub_id);
@@ -63,6 +69,10 @@ impl Transport {
             UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Bind pub socket: {e}"))?;
         let pub_addr = pub_socket.local_addr().map_err(|e| e.to_string())?;
         peer_connection::add_local_candidate(&mut pub_inner, pub_addr);
+        // STUN discovery for publisher
+        if let Some(servers) = ice_servers {
+            discover_and_add_srflx(&pub_socket, &mut pub_inner, pub_addr, servers);
+        }
         let pub_handle: PeerConnectionHandle = Arc::new(Mutex::new(pub_inner));
         let pub_socket = Arc::new(pub_socket);
 
@@ -73,6 +83,10 @@ impl Transport {
             UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Bind sub socket: {e}"))?;
         let sub_addr = sub_socket.local_addr().map_err(|e| e.to_string())?;
         peer_connection::add_local_candidate(&mut sub_inner, sub_addr);
+        // STUN discovery for subscriber
+        if let Some(servers) = ice_servers {
+            discover_and_add_srflx(&sub_socket, &mut sub_inner, sub_addr, servers);
+        }
         let sub_handle: PeerConnectionHandle = Arc::new(Mutex::new(sub_inner));
         let sub_socket = Arc::new(sub_socket);
 
@@ -127,7 +141,17 @@ impl Transport {
         include_video: bool,
     ) -> Result<SessionDescription, String> {
         let mut pc = self.publisher.lock().map_err(|e| e.to_string())?;
-        peer_connection::create_offer(&mut pc, include_video)
+        let mut transceivers = vec![peer_connection::TransceiverInfo {
+            kind: str0m::media::MediaKind::Audio,
+            direction: str0m::media::Direction::SendRecv,
+        }];
+        if include_video {
+            transceivers.push(peer_connection::TransceiverInfo {
+                kind: str0m::media::MediaKind::Video,
+                direction: str0m::media::Direction::SendRecv,
+            });
+        }
+        peer_connection::create_offer(&mut pc, &[], &transceivers)
     }
 
     /// Set the SDP answer on the Publisher PC (received from SFU).
@@ -300,6 +324,39 @@ fn maybe_decrypt_event(event: PcEvent, e2ee: &Option<E2eeContext>) -> PcEvent {
         }
         other => other,
     }
+}
+
+/// Perform STUN discovery using ICE servers and add srflx candidates.
+fn discover_and_add_srflx(
+    socket: &UdpSocket,
+    pc: &mut peer_connection::PeerConnectionInner,
+    local_addr: std::net::SocketAddr,
+    servers: &[IceServerConfig],
+) {
+    for server in servers {
+        for url in &server.urls {
+            if let Some(stun_addr) = stun::parse_stun_url(url) {
+                tracing::info!(
+                    pc_id = %pc.id,
+                    %url,
+                    %stun_addr,
+                    "Attempting STUN discovery (transport)"
+                );
+                if let Some(srflx_addr) = stun::discover_srflx(socket, stun_addr) {
+                    let base = if local_addr.ip().is_unspecified() {
+                        let real_ip = peer_connection::get_local_ip()
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                        std::net::SocketAddr::new(real_ip, local_addr.port())
+                    } else {
+                        local_addr
+                    };
+                    peer_connection::add_srflx_candidate(pc, srflx_addr, base);
+                    return;
+                }
+            }
+        }
+    }
+    tracing::warn!(pc_id = %pc.id, "STUN discovery failed on all ICE servers (transport)");
 }
 
 /// Async dispatcher: routes TransportCommands to the Publisher and merges PC events.

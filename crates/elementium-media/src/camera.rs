@@ -25,15 +25,15 @@ pub struct CameraCapturer {
 }
 
 impl CameraCapturer {
-    /// Start capturing from the default camera (index 0).
-    pub fn start() -> Result<Self, CameraError> {
-        Self::start_with_index(0)
+    /// Start capturing from the default camera (index 0) at a given resolution.
+    pub fn start(width: Option<u32>, height: Option<u32>) -> Result<Self, CameraError> {
+        Self::start_with_index(0, width, height)
     }
 
     /// Start capturing from a specific camera index.
     ///
     /// The camera is opened on a background thread since `nokhwa::Camera` is not `Send`.
-    pub fn start_with_index(camera_index: u32) -> Result<Self, CameraError> {
+    pub fn start_with_index(camera_index: u32, width: Option<u32>, height: Option<u32>) -> Result<Self, CameraError> {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<VideoFrame>(4);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         // Channel to report initial resolution (or error) back to caller
@@ -41,10 +41,21 @@ impl CameraCapturer {
 
         std::thread::spawn(move || {
             let index = nokhwa::utils::CameraIndex::Index(camera_index);
-            let requested =
+            let requested = if let (Some(w), Some(h)) = (width, height) {
+                nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
+                    nokhwa::utils::RequestedFormatType::Closest(
+                        nokhwa::utils::CameraFormat::new(
+                            nokhwa::utils::Resolution::new(w, h),
+                            nokhwa::utils::FrameFormat::MJPEG,
+                            30,
+                        ),
+                    ),
+                )
+            } else {
                 nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
                     nokhwa::utils::RequestedFormatType::AbsoluteHighestFrameRate,
-                );
+                )
+            };
 
             let mut camera = match nokhwa::Camera::new(index, requested) {
                 Ok(c) => c,
@@ -81,10 +92,46 @@ impl CameraCapturer {
 
                         let raw = buffer.buffer();
                         let pixel_count = (w * h) as usize;
+                        let expected_rgba = pixel_count * 4;
                         let expected_rgb = pixel_count * 3;
                         let expected_yuyv = pixel_count * 2;
 
-                        let rgba = if raw.len() >= expected_rgb {
+                        // Log format on first frame for debugging
+                        static LOGGED_FORMAT: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::info!(
+                                buf_len = raw.len(),
+                                expected_rgba,
+                                expected_rgb,
+                                expected_yuyv,
+                                first_bytes = ?&raw[..raw.len().min(16)],
+                                "Camera buffer format detected"
+                            );
+                        }
+
+                        let rgba = if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
+                            // MJPEG frame — decode JPEG to RGBA via libjpeg-turbo
+                            match turbojpeg::decompress(&raw, turbojpeg::PixelFormat::RGBA) {
+                                Ok(image) => image.pixels,
+                                Err(e) => {
+                                    tracing::debug!("JPEG decode error: {e}");
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                    continue;
+                                }
+                            }
+                        } else if raw.len() == expected_rgba {
+                            // BGRA or RGBA format (4 bytes per pixel)
+                            let mut out = Vec::with_capacity(pixel_count * 4);
+                            for i in 0..pixel_count {
+                                let base = i * 4;
+                                out.push(raw[base + 2]); // R (was B in BGRA)
+                                out.push(raw[base + 1]); // G
+                                out.push(raw[base]);     // B (was R in BGRA)
+                                out.push(255);           // A
+                            }
+                            out
+                        } else if raw.len() == expected_rgb {
                             // RGB format (3 bytes per pixel) → RGBA
                             let mut out = Vec::with_capacity(pixel_count * 4);
                             for i in 0..pixel_count {
@@ -96,10 +143,11 @@ impl CameraCapturer {
                             out
                         } else if raw.len() >= expected_yuyv {
                             // YUYV format (2 bytes per pixel, packed) → RGBA
-                            yuyv_to_rgba(w, h, raw)
+                            yuyv_to_rgba(w, h, &raw)
                         } else {
                             tracing::debug!(
                                 buf_len = raw.len(),
+                                expected_rgba,
                                 expected_rgb,
                                 expected_yuyv,
                                 "Unknown camera buffer format, skipping frame"

@@ -69,7 +69,52 @@ fn main() {
         None => std::collections::HashMap::new(),
     };
 
-    let init_script = build_secrets_init_script(&initial_secrets, backend_type);
+    let secrets_script = build_secrets_init_script(&initial_secrets, backend_type);
+
+    // Console interceptor: forwards all JS console output to Rust via Tauri IPC.
+    // Uses __TAURI_INTERNALS__ directly (available before npm packages load).
+    // Runs in all frames including Element Call iframe.
+    let console_bridge = r#"(function(){
+        if(window.__elementium_console_bridged) return;
+        window.__elementium_console_bridged = true;
+        var orig = {
+            log: console.log.bind(console),
+            warn: console.warn.bind(console),
+            error: console.error.bind(console),
+            debug: console.debug.bind(console),
+            info: console.info.bind(console)
+        };
+        function send(level, args) {
+            try {
+                var strs = [];
+                for (var i = 0; i < args.length; i++) {
+                    try {
+                        strs.push(typeof args[i] === 'string' ? args[i] : JSON.stringify(args[i]));
+                    } catch(e) {
+                        strs.push(String(args[i]));
+                    }
+                }
+                var t = window.__TAURI_INTERNALS__;
+                if (t && t.invoke) {
+                    t.invoke('console_log', { level: level, args: strs }).catch(function(){});
+                }
+            } catch(e) {}
+        }
+        console.log = function() { orig.log.apply(console, arguments); send('info', arguments); };
+        console.info = function() { orig.info.apply(console, arguments); send('info', arguments); };
+        console.warn = function() { orig.warn.apply(console, arguments); send('warn', arguments); };
+        console.error = function() { orig.error.apply(console, arguments); send('error', arguments); };
+        console.debug = function() { orig.debug.apply(console, arguments); send('debug', arguments); };
+        // Also capture unhandled errors and promise rejections
+        window.addEventListener('error', function(e) {
+            send('error', ['[Uncaught] ' + e.message + ' at ' + e.filename + ':' + e.lineno]);
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            send('error', ['[UnhandledRejection] ' + (e.reason && e.reason.stack ? e.reason.stack : String(e.reason))]);
+        });
+    })();"#;
+
+    let init_script = format!("{console_bridge}\n{secrets_script}");
 
     let mut builder = tauri::Builder::default();
 
@@ -83,6 +128,7 @@ fn main() {
             active_tracks: Mutex::new(Vec::new()),
             camera: Mutex::new(None),
         })
+        .manage(protocols::VideoFrameState(video_frames.clone()))
         .manage(LiveKitState {
             rooms: Arc::new(Mutex::new(std::collections::HashMap::new())),
             video_frames,
@@ -112,6 +158,7 @@ fn main() {
         commands::webrtc::close_peer_connection,
         commands::media_devices::enumerate_devices,
         commands::media_devices::get_user_media,
+        commands::media_devices::get_video_frame,
         commands::media_devices::stop_track,
         commands::screen_capture::get_display_media,
         commands::screen_capture::get_capture_sources,
@@ -128,6 +175,7 @@ fn main() {
         commands::e2ee::e2ee_init,
         commands::e2ee::e2ee_set_key,
         commands::e2ee::e2ee_set_local_identity,
+        commands::console::console_log,
     ]);
 
     builder = builder.register_asynchronous_uri_scheme_protocol(

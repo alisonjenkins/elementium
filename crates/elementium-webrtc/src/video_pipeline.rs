@@ -51,7 +51,7 @@ impl VideoPipeline {
         self.capture_active = true;
 
         std::thread::spawn(move || {
-            let capturer = match elementium_media::camera::CameraCapturer::start() {
+            let capturer = match elementium_media::camera::CameraCapturer::start(None, None) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to start camera: {e}");

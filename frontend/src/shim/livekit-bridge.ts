@@ -63,7 +63,7 @@ export class Track {
 export class RemoteTrack extends Track {
   private _canvas: HTMLCanvasElement | null = null;
   private _rendering = false;
-  private _rafId: number | null = null;
+  private _timerId: ReturnType<typeof setTimeout> | null = null;
 
   /** Attach video rendering to an element. */
   attach(element?: HTMLMediaElement): HTMLMediaElement {
@@ -90,9 +90,9 @@ export class RemoteTrack extends Track {
   /** Detach video rendering. */
   detach(element?: HTMLMediaElement): HTMLMediaElement[] {
     this._rendering = false;
-    if (this._rafId !== null) {
-      cancelAnimationFrame(this._rafId);
-      this._rafId = null;
+    if (this._timerId !== null) {
+      clearTimeout(this._timerId);
+      this._timerId = null;
     }
     return element ? [element] : [];
   }
@@ -115,7 +115,7 @@ export class RemoteTrack extends Track {
       }
     }
 
-    this._rafId = requestAnimationFrame(() => this._renderLoop());
+    this._timerId = setTimeout(() => this._renderLoop(), 33);
   }
 }
 
