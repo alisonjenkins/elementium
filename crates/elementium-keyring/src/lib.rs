@@ -21,9 +21,20 @@ pub const SENSITIVE_KEYS: &[&str] = &[
 
 /// Unified interface for secret storage backends.
 pub trait SecretStore: Send + Sync {
+    /// # Errors
+    /// Returns an error if the backend fails to read the value.
     fn get(&self, key: &str) -> Result<Option<String>>;
+
+    /// # Errors
+    /// Returns an error if the backend fails to store the value.
     fn set(&self, key: &str, value: &str) -> Result<()>;
+
+    /// # Errors
+    /// Returns an error if the backend fails to delete the value.
     fn delete(&self, key: &str) -> Result<()>;
+
+    /// # Errors
+    /// Returns an error if the backend fails to enumerate stored values.
     fn get_all(&self) -> Result<HashMap<String, String>>;
 }
 
@@ -52,6 +63,7 @@ pub fn create_backend() -> (Option<Box<dyn SecretStore>>, BackendType) {
 }
 
 /// Check if a given localStorage key is sensitive.
+#[must_use]
 pub fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS.contains(&key)
 }

@@ -22,6 +22,10 @@ pub struct FileBackend {
 impl FileBackend {
     /// Create a new file backend with the given password.
     /// The file is created at `~/.config/Elementium/secrets.enc` (or platform equivalent).
+    ///
+    /// # Errors
+    /// Returns an error if the config directory cannot be determined, the secrets
+    /// file cannot be read or created, or the password fails to decrypt existing data.
     pub fn new(password: &str) -> Result<Self> {
         let path = secrets_file_path()?;
         if let Some(parent) = path.parent() {
@@ -36,7 +40,9 @@ impl FileBackend {
                     "secrets file too short".into(),
                 ));
             }
-            let salt = &data[..SALT_LEN];
+            let salt = data.get(..SALT_LEN).ok_or_else(|| {
+                SecretStoreError::Decryption("secrets file too short".into())
+            })?;
             derive_key(password, salt)?
         } else {
             // New file — generate salt + write empty store
@@ -71,9 +77,14 @@ impl FileBackend {
         let nonce_start = SALT_LEN;
         let ciphertext_start = SALT_LEN + NONCE_LEN;
 
+        let nonce_bytes = data.get(nonce_start..ciphertext_start).ok_or_else(|| {
+            SecretStoreError::Decryption("secrets file too short".into())
+        })?;
         #[allow(deprecated)]
-        let nonce = aes_gcm::Nonce::from_slice(&data[nonce_start..ciphertext_start]);
-        let ciphertext = &data[ciphertext_start..];
+        let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+        let ciphertext = data.get(ciphertext_start..).ok_or_else(|| {
+            SecretStoreError::Decryption("secrets file too short".into())
+        })?;
 
         let cipher = Aes256Gcm::new_from_slice(&self.key)
             .map_err(|e| SecretStoreError::Decryption(e.to_string()))?;
@@ -92,13 +103,11 @@ impl FileBackend {
         // Read existing salt or generate new one
         let salt = if self.path.exists() {
             let existing = fs::read(&self.path)?;
-            if existing.len() >= SALT_LEN {
+            existing.get(..SALT_LEN).map_or_else(random_bytes::<SALT_LEN>, |salt_bytes| {
                 let mut s = [0u8; SALT_LEN];
-                s.copy_from_slice(&existing[..SALT_LEN]);
+                s.copy_from_slice(salt_bytes);
                 s
-            } else {
-                random_bytes::<SALT_LEN>()
-            }
+            })
         } else {
             random_bytes::<SALT_LEN>()
         };
@@ -113,7 +122,11 @@ impl FileBackend {
             .map_err(|e| SecretStoreError::Encryption(e.to_string()))?;
 
         // Build output: [salt][nonce][ciphertext]
-        let mut output = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+        let capacity = SALT_LEN
+            .checked_add(NONCE_LEN)
+            .and_then(|n| n.checked_add(ciphertext.len()))
+            .ok_or_else(|| SecretStoreError::Encryption("output size overflow".into()))?;
+        let mut output = Vec::with_capacity(capacity);
         output.extend_from_slice(&salt);
         output.extend_from_slice(&nonce);
         output.extend_from_slice(&ciphertext);
@@ -192,29 +205,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+    fn roundtrip() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(SecretStoreError::Io)?;
         let path = dir.path().join("secrets.enc");
 
         let backend = FileBackend {
-            path: path.clone(),
-            key: derive_key("test-password", &random_bytes::<SALT_LEN>()).unwrap(),
+            path,
+            key: derive_key("test-password", &random_bytes::<SALT_LEN>())?,
         };
 
-        backend.set("mx_access_token", "syt_secret123").unwrap();
-        backend.set("mx_pickle_key", "pickle!").unwrap();
+        backend.set("mx_access_token", "syt_secret123")?;
+        backend.set("mx_pickle_key", "pickle!")?;
 
-        assert_eq!(
-            backend.get("mx_access_token").unwrap(),
-            Some("syt_secret123".to_string())
-        );
-        assert_eq!(
-            backend.get("mx_pickle_key").unwrap(),
-            Some("pickle!".to_string())
-        );
-        assert_eq!(backend.get("nonexistent").unwrap(), None);
+        let check = |cond: bool, msg: &str| -> Result<()> {
+            if cond {
+                Ok(())
+            } else {
+                Err(SecretStoreError::Decryption(msg.to_string()))
+            }
+        };
 
-        backend.delete("mx_access_token").unwrap();
-        assert_eq!(backend.get("mx_access_token").unwrap(), None);
+        check(
+            backend.get("mx_access_token")? == Some("syt_secret123".to_string()),
+            "mx_access_token mismatch",
+        )?;
+        check(
+            backend.get("mx_pickle_key")? == Some("pickle!".to_string()),
+            "mx_pickle_key mismatch",
+        )?;
+        check(backend.get("nonexistent")?.is_none(), "nonexistent should be None")?;
+
+        backend.delete("mx_access_token")?;
+        check(
+            backend.get("mx_access_token")?.is_none(),
+            "mx_access_token should be deleted",
+        )?;
+
+        Ok(())
     }
 }

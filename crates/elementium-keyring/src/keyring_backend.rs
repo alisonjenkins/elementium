@@ -11,6 +11,10 @@ pub struct KeyringBackend;
 impl KeyringBackend {
     /// Attempt to create a keyring backend by testing read/write/delete of a probe entry.
     /// Returns `Err` if the OS keyring is unavailable.
+    ///
+    /// # Errors
+    /// Returns an error if the OS keyring cannot be reached, or the probe entry
+    /// cannot be written, read back correctly, or deleted.
     pub fn try_new() -> Result<Self> {
         let test_key = "__elementium_test";
         let test_value = "probe";
@@ -70,8 +74,7 @@ impl SecretStore for KeyringBackend {
             Entry::new(SERVICE_NAME, key).map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
 
         match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()), // already gone
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()), // already gone
             Err(e) => Err(SecretStoreError::Keyring(e.to_string())),
         }
     }
