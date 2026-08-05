@@ -34,16 +34,16 @@ crates, P3 full-workspace verification), matching plan.md's crate-by-crate struc
 
 **Independent Test**: `nix develop --command bash -c 'cargo clippy -p elementium-codec --all-targets'`
 
-- [ ] T002 [US1] Re-run `cargo clippy -p elementium-codec --all-targets` inside `nix develop` to get current file:line list for `crates/elementium-codec/src/`
-- [ ] T003 [US1] Fix all `as_conversions` violations in `crates/elementium-codec/src/` per research.md fix pattern (`f32::from`/`try_from`, or propagate as `Result`)
-- [ ] T004 [US1] Fix all `arithmetic_side_effects` violations in `crates/elementium-codec/src/` (`checked_sub`/`checked_add` etc., propagated)
-- [ ] T005 [US1] Fix all `indexing_slicing` violations in `crates/elementium-codec/src/` (`.get()`/`.get_mut()` propagated as `Option`)
-- [ ] T006 [US1] Apply `mul_add` rewrites for `suboptimal_flops` hits in `crates/elementium-codec/src/`
-- [ ] T007 [US1] Fix `unwrap_used`/`expect_used` violations in `crates/elementium-codec/src/` (propagate via `?`, or scoped justified `#[allow]` only where structurally infallible per research.md)
-- [ ] T008 [US1] Add missing `# Errors`/`# Panics` doc sections and `#[must_use]` attributes flagged in `crates/elementium-codec/src/`
-- [ ] T009 [US1] Fix remaining one-off lints (float/int casts, doc backticks, `could_be_const_fn`, redundant clones, wildcard imports, etc.) in `crates/elementium-codec/src/`
-- [ ] T010 [US1] Re-run `cargo clippy -p elementium-codec --all-targets` inside `nix develop`; repeat T003-T009 for any remaining errors (including test-target-only errors surfaced now)
-- [ ] T011 [US1] Run `cargo test -p elementium-codec` inside `nix develop`; fix any regressions introduced by T003-T009
+- [X] T002 [US1] Re-run `cargo clippy -p elementium-codec --all-targets` inside `nix develop` to get current file:line list for `crates/elementium-codec/src/`
+- [X] T003 [US1] Fix all `as_conversions` violations in `crates/elementium-codec/src/` per research.md fix pattern (`f32::from`/`try_from`, or propagate as `Result`)
+- [X] T004 [US1] Fix all `arithmetic_side_effects` violations in `crates/elementium-codec/src/` (`checked_sub`/`checked_add` etc., propagated)
+- [X] T005 [US1] Fix all `indexing_slicing` violations in `crates/elementium-codec/src/` (`.get()`/`.get_mut()` propagated as `Option`)
+- [X] T006 [US1] Apply `mul_add` rewrites for `suboptimal_flops` hits in `crates/elementium-codec/src/`
+- [X] T007 [US1] Fix `unwrap_used`/`expect_used` violations in `crates/elementium-codec/src/` (propagate via `?`, or scoped justified `#[allow]` only where structurally infallible per research.md)
+- [X] T008 [US1] Add missing `# Errors`/`# Panics` doc sections and `#[must_use]` attributes flagged in `crates/elementium-codec/src/`
+- [X] T009 [US1] Fix remaining one-off lints (float/int casts, doc backticks, `could_be_const_fn`, redundant clones, wildcard imports, etc.) in `crates/elementium-codec/src/`
+- [X] T010 [US1] Re-run `cargo clippy -p elementium-codec --all-targets` inside `nix develop`; repeat T003-T009 for any remaining errors (including test-target-only errors surfaced now)
+- [X] T011 [US1] Run `cargo test -p elementium-codec` inside `nix develop`; fix any regressions introduced by T003-T009
 
 **Checkpoint**: `elementium-codec` is independently clippy-clean and test-green (SC-004).
 
@@ -87,6 +87,13 @@ pass `cargo clippy -p <crate> --all-targets` and `cargo test -p <crate>`.
 
 **Checkpoint**: All 4 crates independently clippy-clean and test-green (SC-004). The four
 sub-tracks (media / e2ee / keyring / screen) are mutually parallel — no shared files.
+
+### elementium-webrtc (discovered during Phase 5 verification — not in original baseline)
+
+- [ ] T028b [US2] Re-run `cargo clippy -p elementium-webrtc --all-targets` inside `nix develop` for current file:line list in `crates/elementium-webrtc/src/` (252 lib + 255 lib-test errors found 2026-08-05 during T029, missed by the original `--keep-going` baseline capture)
+- [ ] T028c [US2] Fix all flagged violations in `crates/elementium-webrtc/src/` per research.md fix patterns (depends on T028b)
+- [ ] T028d [US2] Re-run clippy for `elementium-webrtc`; repeat T028c until clean (depends on T028c)
+- [ ] T028e [US2] Run `cargo test -p elementium-webrtc` inside `nix develop`; fix any regressions (depends on T028d)
 
 ---
 
