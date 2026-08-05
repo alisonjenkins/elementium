@@ -128,6 +128,7 @@ fn decode_rgb(pixel_count: usize, raw: &[u8]) -> Option<Vec<u8>> {
 
 /// Poll the camera in a loop, sending decoded frames until a stop signal is received.
 fn run_capture_loop(
+    device_id: &str,
     mut camera: nokhwa::Camera,
     frame_tx: &mpsc::SyncSender<VideoFrame>,
     stop_rx: &mpsc::Receiver<()>,
@@ -135,7 +136,7 @@ fn run_capture_loop(
     loop {
         // Check for stop signal
         if stop_rx.try_recv().is_ok() {
-            tracing::info!("Camera capture stopping");
+            tracing::info!(device_id = %device_id, "Camera capture stopping");
             break;
         }
 
@@ -162,7 +163,12 @@ fn run_capture_loop(
                 let _ = frame_tx.try_send(frame);
             }
             Err(e) => {
-                tracing::debug!("Camera frame error: {e}");
+                tracing::debug!(
+                    device_id = %device_id,
+                    error_kind = "frame_read",
+                    error = %e,
+                    "Camera frame read error"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -200,35 +206,64 @@ impl CameraCapturer {
 
         std::thread::spawn(move || {
             let index = nokhwa::utils::CameraIndex::Index(camera_index);
+            let device_id = format!("camera-{camera_index}");
             let requested = requested_format(width, height);
 
             let mut camera = match nokhwa::Camera::new(index, requested) {
                 Ok(c) => c,
                 Err(e) => {
+                    tracing::error!(
+                        device_id = %device_id,
+                        requested_width = width,
+                        requested_height = height,
+                        error_kind = "open",
+                        error = %e,
+                        "Failed to open camera device"
+                    );
                     let _ = init_tx.send(Err(CameraError::Camera(e.to_string())));
                     return;
                 }
             };
 
             if let Err(e) = camera.open_stream() {
+                tracing::error!(
+                    device_id = %device_id,
+                    requested_width = width,
+                    requested_height = height,
+                    error_kind = "open_stream",
+                    error = %e,
+                    "Failed to open camera stream"
+                );
                 let _ = init_tx.send(Err(CameraError::Camera(e.to_string())));
                 return;
             }
 
             let resolution = camera.resolution();
-            let width = resolution.width_x;
-            let height = resolution.height_y;
+            let actual_width = resolution.width_x;
+            let actual_height = resolution.height_y;
 
-            tracing::info!(width, height, "Camera capture started");
-            let _ = init_tx.send(Ok((width, height)));
+            tracing::info!(
+                device_id = %device_id,
+                requested_width = width,
+                requested_height = height,
+                width = actual_width,
+                height = actual_height,
+                "Camera capture started"
+            );
+            let _ = init_tx.send(Ok((actual_width, actual_height)));
 
-            run_capture_loop(camera, &frame_tx, &stop_rx);
+            run_capture_loop(&device_id, camera, &frame_tx, &stop_rx);
         });
 
         // Wait for the camera thread to initialize
-        let (width, height) = init_rx
-            .recv()
-            .map_err(|_| CameraError::Camera("Camera thread died during init".into()))??;
+        let (width, height) = init_rx.recv().map_err(|_| {
+            tracing::error!(
+                camera_index,
+                error_kind = "thread_died",
+                "Camera thread died during initialization"
+            );
+            CameraError::Camera("Camera thread died during init".into())
+        })??;
 
         Ok(Self {
             frame_rx,

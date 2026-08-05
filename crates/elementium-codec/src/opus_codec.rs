@@ -27,11 +27,26 @@ impl OpusEncoder {
         let ch = match channels {
             1 => opus::Channels::Mono,
             2 => opus::Channels::Stereo,
-            _ => return Err(OpusError::Encoder(format!("unsupported channel count: {channels}"))),
+            _ => {
+                tracing::error!(
+                    channels,
+                    error_kind = "unsupported_channels",
+                    "Opus encoder: unsupported channel count"
+                );
+                return Err(OpusError::Encoder(format!("unsupported channel count: {channels}")));
+            }
         };
 
-        let encoder = opus::Encoder::new(sample_rate, ch, opus::Application::Voip)
-            .map_err(|e| OpusError::Encoder(e.to_string()))?;
+        let encoder = opus::Encoder::new(sample_rate, ch, opus::Application::Voip).map_err(|e| {
+            tracing::error!(
+                sample_rate,
+                channels,
+                error_kind = "encoder_init",
+                error = %e,
+                "Failed to initialize Opus encoder"
+            );
+            OpusError::Encoder(e.to_string())
+        })?;
 
         Ok(Self {
             inner: encoder,
@@ -48,10 +63,17 @@ impl OpusEncoder {
     pub fn encode(&mut self, frame: &AudioFrame) -> Result<Vec<u8>, OpusError> {
         // Opus max packet size
         let mut output = vec![0u8; 4000];
-        let len = self
-            .inner
-            .encode_float(&frame.data, &mut output)
-            .map_err(|e| OpusError::Encoder(e.to_string()))?;
+        let len = self.inner.encode_float(&frame.data, &mut output).map_err(|e| {
+            tracing::error!(
+                sample_rate = self.sample_rate,
+                channels = self.channels,
+                input_samples = frame.data.len(),
+                error_kind = "encode",
+                error = %e,
+                "Opus encode failed"
+            );
+            OpusError::Encoder(e.to_string())
+        })?;
         output.truncate(len);
         Ok(output)
     }
@@ -85,11 +107,26 @@ impl OpusDecoder {
         let ch = match channels {
             1 => opus::Channels::Mono,
             2 => opus::Channels::Stereo,
-            _ => return Err(OpusError::Decoder(format!("unsupported channel count: {channels}"))),
+            _ => {
+                tracing::error!(
+                    channels,
+                    error_kind = "unsupported_channels",
+                    "Opus decoder: unsupported channel count"
+                );
+                return Err(OpusError::Decoder(format!("unsupported channel count: {channels}")));
+            }
         };
 
-        let decoder = opus::Decoder::new(sample_rate, ch)
-            .map_err(|e| OpusError::Decoder(e.to_string()))?;
+        let decoder = opus::Decoder::new(sample_rate, ch).map_err(|e| {
+            tracing::error!(
+                sample_rate,
+                channels,
+                error_kind = "decoder_init",
+                error = %e,
+                "Failed to initialize Opus decoder"
+            );
+            OpusError::Decoder(e.to_string())
+        })?;
 
         Ok(Self {
             inner: decoder,
@@ -108,10 +145,18 @@ impl OpusDecoder {
         let channels = usize::from(self.channels);
         let total_samples = frame_size.saturating_mul(channels);
         let mut output = vec![0.0f32; total_samples];
-        let decoded = self
-            .inner
-            .decode_float(packet, &mut output, false)
-            .map_err(|e| OpusError::Decoder(e.to_string()))?;
+        let decoded = self.inner.decode_float(packet, &mut output, false).map_err(|e| {
+            tracing::error!(
+                sample_rate = self.sample_rate,
+                channels = self.channels,
+                packet_len = packet.len(),
+                frame_size,
+                error_kind = "decode",
+                error = %e,
+                "Opus decode failed"
+            );
+            OpusError::Decoder(e.to_string())
+        })?;
         output.truncate(decoded.saturating_mul(channels));
 
         Ok(AudioFrame {

@@ -33,8 +33,17 @@ impl Vp8Encoder {
             codec: vpx_encode::VideoCodecId::VP8,
         };
 
-        let encoder =
-            vpx_encode::Encoder::new(config).map_err(|e| format!("VP8 encoder init: {e}"))?;
+        let encoder = vpx_encode::Encoder::new(config).map_err(|e| {
+            tracing::error!(
+                width,
+                height,
+                bitrate_kbps,
+                error_kind = "encoder_init",
+                error = %e,
+                "Failed to initialize VP8 encoder"
+            );
+            format!("VP8 encoder init: {e}")
+        })?;
 
         Ok(Self {
             encoder,
@@ -53,6 +62,14 @@ impl Vp8Encoder {
     /// encoder fails.
     pub fn encode(&mut self, frame: &I420Frame) -> Result<Vec<Vp8Packet>, String> {
         if frame.width != self.width || frame.height != self.height {
+            tracing::error!(
+                encoder_width = self.width,
+                encoder_height = self.height,
+                frame_width = frame.width,
+                frame_height = frame.height,
+                error_kind = "frame_size_mismatch",
+                "VP8 encode: frame size does not match encoder configuration"
+            );
             return Err(format!(
                 "Frame size mismatch: encoder={}x{}, frame={}x{}",
                 self.width, self.height, frame.width, frame.height
@@ -66,10 +83,18 @@ impl Vp8Encoder {
         i420_buf.extend_from_slice(&frame.u);
         i420_buf.extend_from_slice(&frame.v);
 
-        let packets = self
-            .encoder
-            .encode(self.pts, &i420_buf)
-            .map_err(|e| format!("VP8 encode: {e}"))?;
+        let packets = self.encoder.encode(self.pts, &i420_buf).map_err(|e| {
+            tracing::error!(
+                width = self.width,
+                height = self.height,
+                buffer_len = i420_buf.len(),
+                pts = self.pts,
+                error_kind = "encode",
+                error = %e,
+                "VP8 encode failed"
+            );
+            format!("VP8 encode: {e}")
+        })?;
 
         let result = packets
             .into_iter()
@@ -143,6 +168,11 @@ impl Vp8Decoder {
             );
 
             if ret != VPX_CODEC_OK {
+                tracing::error!(
+                    error_kind = "decoder_init",
+                    vpx_error_code = ?ret,
+                    "Failed to initialize VP8 decoder"
+                );
                 return Err(format!("VP8 decoder init failed: error code {ret:?}"));
             }
 
@@ -165,8 +195,14 @@ impl Vp8Decoder {
         // Narrowing usize -> u32 cast for the FFI call. VP8/WebRTC packets
         // are bounded well under u32::MAX in practice; guard explicitly
         // rather than silently truncating an oversized buffer.
-        let data_len = u32::try_from(data.len())
-            .map_err(|_| "VP8 decode: packet too large".to_string())?;
+        let data_len = u32::try_from(data.len()).map_err(|_| {
+            tracing::error!(
+                buffer_len = data.len(),
+                error_kind = "packet_too_large",
+                "VP8 decode: packet exceeds u32 length"
+            );
+            "VP8 decode: packet too large".to_string()
+        })?;
 
         // SAFETY: `self.ctx` was initialized by `Vp8Decoder::new`. `data`
         // is a valid slice for `data.len()` bytes for the duration of this
@@ -182,6 +218,12 @@ impl Vp8Decoder {
             );
 
             if ret != VPX_CODEC_OK {
+                tracing::error!(
+                    buffer_len = data.len(),
+                    error_kind = "decode",
+                    vpx_error_code = ?ret,
+                    "VP8 decode failed"
+                );
                 return Err(format!("VP8 decode failed: error code {ret:?}"));
             }
 

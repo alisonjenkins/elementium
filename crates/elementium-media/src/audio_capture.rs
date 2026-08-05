@@ -32,28 +32,72 @@ impl AudioCapturer {
     /// config cannot be read, or the audio stream cannot be built/started.
     pub fn start() -> Result<Self, CaptureError> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or(CaptureError::NoDevice)?;
+        let device = host.default_input_device().ok_or_else(|| {
+            tracing::error!(error_kind = "no_device", "No audio input device available");
+            CaptureError::NoDevice
+        })?;
 
-        let config = device
-            .default_input_config()
-            .map_err(|e| CaptureError::Config(e.to_string()))?;
+        let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
+
+        let config = device.default_input_config().map_err(|e| {
+            tracing::error!(
+                device_id = %device_id,
+                error_kind = "config",
+                error = %e,
+                "Failed to get audio input device config"
+            );
+            CaptureError::Config(e.to_string())
+        })?;
 
         let sample_rate = config.sample_rate().0;
         let channels = config.channels();
+        let sample_format = config.sample_format();
         let (tx, rx) = mpsc::channel();
 
-        let stream = match config.sample_format() {
+        let stream = match sample_format {
             SampleFormat::F32 => build_stream::<f32>(&device, &config.into(), tx, sample_rate, channels),
             SampleFormat::I16 => build_stream::<i16>(&device, &config.into(), tx, sample_rate, channels),
             SampleFormat::U16 => build_stream::<u16>(&device, &config.into(), tx, sample_rate, channels),
-            _ => return Err(CaptureError::Config("unsupported sample format".into())),
-        }?;
+            _ => {
+                tracing::error!(
+                    device_id = %device_id,
+                    sample_rate,
+                    channels,
+                    sample_format = ?sample_format,
+                    error_kind = "unsupported_sample_format",
+                    "Unsupported audio sample format"
+                );
+                return Err(CaptureError::Config("unsupported sample format".into()));
+            }
+        }
+        .map_err(|e| {
+            tracing::error!(
+                device_id = %device_id,
+                sample_rate,
+                channels,
+                error_kind = "build_stream",
+                error = %e,
+                "Failed to build audio input stream"
+            );
+            e
+        })?;
 
-        stream
-            .play()
-            .map_err(|e| CaptureError::Stream(e.to_string()))?;
+        stream.play().map_err(|e| {
+            tracing::error!(
+                device_id = %device_id,
+                error_kind = "stream_play",
+                error = %e,
+                "Failed to start audio input stream"
+            );
+            CaptureError::Stream(e.to_string())
+        })?;
+
+        tracing::info!(
+            device_id = %device_id,
+            sample_rate,
+            channels,
+            "Audio input device started"
+        );
 
         Ok(Self {
             _stream: stream,
@@ -93,7 +137,17 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
     sample_rate: u32,
     channels: u16,
 ) -> Result<Stream, CaptureError> {
-    let err_fn = |err| tracing::error!("Audio capture error: {err}");
+    let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
+    let err_fn = move |err| {
+        tracing::error!(
+            device_id = %device_id,
+            sample_rate,
+            channels,
+            error_kind = "stream_callback",
+            error = %err,
+            "Audio capture stream error"
+        );
+    };
 
     let stream = device
         .build_input_stream(

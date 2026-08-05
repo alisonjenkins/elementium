@@ -14,6 +14,7 @@ use elementium_codec::{OpusEncoder, Vp8Encoder};
 use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::camera::CameraCapturer;
 use elementium_media::device_enumeration;
+use elementium_types::observability::CorrelationId;
 use elementium_types::{AudioFrame, MediaConstraints, MediaDevice, TrackId, VideoFrame};
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
@@ -74,6 +75,15 @@ pub async fn get_user_media(
     media_state: State<'_, MediaState>,
     constraints: MediaConstraints,
 ) -> Result<Vec<TrackId>, String> {
+    let call_id = CorrelationId::new();
+    let call_span = tracing::info_span!(
+        "call",
+        correlation_id = %call_id,
+        audio_requested = constraints.audio.is_some(),
+        video_requested = constraints.video.is_some(),
+    );
+    let _call_guard = call_span.enter();
+
     tracing::info!(?constraints, "getUserMedia request");
     let mut track_ids = Vec::new();
 
@@ -93,8 +103,12 @@ pub async fn get_user_media(
         let encode_tx_clone = encode_tx.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
-        // Start audio capture pipeline on a background thread
+        // Start audio capture pipeline on a background thread, inheriting the
+        // call's correlation span so every event it emits carries the same
+        // correlation_id.
+        let audio_span = tracing::Span::current();
         std::thread::spawn(move || {
+            let _guard = audio_span.enter();
             audio_capture_loop(&encode_tx_clone, &stop_rx);
         });
 
@@ -142,10 +156,14 @@ pub async fn get_user_media(
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let tid = track_id.0.clone();
 
-        // Start the camera pipeline on a background thread.
+        // Start the camera pipeline on a background thread, inheriting the
+        // call's correlation span so every event it emits carries the same
+        // correlation_id.
         // If we just stopped a previous pipeline, delay to let the V4L2
         // device release (avoids EBUSY on Linux).
+        let camera_span = tracing::Span::current();
         std::thread::spawn(move || {
+            let _guard = camera_span.enter();
             if had_previous {
                 tracing::info!("Waiting for previous camera to release device...");
                 std::thread::sleep(std::time::Duration::from_millis(500));
