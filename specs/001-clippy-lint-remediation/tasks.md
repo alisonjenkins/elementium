@@ -97,15 +97,24 @@ sub-tracks (media / e2ee / keyring / screen) are mutually parallel — no shared
 
 ---
 
+### src-tauri (discovered during Phase 5 verification — blocked by missing frontendDist until now)
+
+- [X] T028f [US2] Fix two mechanical pedantic violations in `src-tauri/src/main.rs` and `src-tauri/src/commands/media_devices.rs` (similar_names, needless_raw_string_hashes)
+- [X] T028g [US2] Create a local (gitignored) `element-web-dist/` placeholder so `tauri::generate_context!()` stops proc-macro-panicking and the rest of `src-tauri` can be clippy-checked (2026-08-05: 117 more errors surfaced once unblocked — `unreachable!` (22), significant-drop-tempories (12), pass-by-value (10), `as_conversions` (9), doc backticks (9), `arithmetic_side_effects` (9), `unwrap_used` (7), and ~1-4 each of a long tail — full breakdown in the T029 verification run)
+- [X] T028h [US2] Re-run `cargo clippy -p elementium --all-targets` inside `nix develop` for current file:line list in `src-tauri/src/` (depends on T028g)
+- [X] T028i [US2] Fix all flagged violations in `src-tauri/src/` per research.md fix patterns; for the 2 lints that fire inside `tauri::generate_context!()` itself (`large_stack_frames`, `exit`) in `main.rs`, a scoped `#[allow]` directly on the `.run(tauri::generate_context!())` call is correct since the macro expansion isn't our code (depends on T028h)
+- [X] T028j [US2] Re-run clippy for `src-tauri`; repeat T028i until clean (depends on T028i)
+- [X] T028k [US2] Run `cargo test -p elementium` inside `nix develop`; fix any regressions (depends on T028j)
+
 ## Phase 5: User Story 3 - Full workspace passes clean, config holds long-term (Priority: P3)
 
 **Goal**: `cargo clippy --workspace --all-targets` and `cargo test --workspace` both pass clean.
 
 **Independent Test**: `nix develop --command bash -c 'cargo clippy --workspace --all-targets'`
 
-- [ ] T029 [US3] Run `cargo clippy --workspace --all-targets` inside `nix develop`; confirm zero errors, including `src-tauri`, `elementium-types`, `elementium-webrtc` still at 0 (depends on Phase 3, Phase 4)
-- [ ] T030 [US3] Run `cargo test --workspace` inside `nix develop`; confirm 100% pass (depends on T029)
-- [ ] T031 [US3] Run `git diff main... -- '*.rs' | grep -n '#\[allow(clippy::'` per quickstart.md; confirm every hit is scoped (not module/crate-level) and has a one-line justification comment (SC-003) (depends on T030)
+- [X] T029 [US3] Run `cargo clippy --workspace --all-targets` inside `nix develop`; confirm zero errors, including `src-tauri`, `elementium-types`, `elementium-webrtc` still at 0 (depends on Phase 3, Phase 4)
+- [X] T030 [US3] Run `cargo test --workspace` inside `nix develop`; confirm 100% pass (depends on T029)
+- [X] T031 [US3] Run `git diff main... -- '*.rs' | grep -n '#\[allow(clippy::'` per quickstart.md; confirm every hit is scoped (not module/crate-level) and has a one-line justification comment (SC-003) (depends on T030)
 
 **Checkpoint**: SC-001 through SC-004 all satisfied.
 
