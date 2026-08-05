@@ -39,6 +39,10 @@ pub struct ManagedPc {
     pub socket: Arc<UdpSocket>,
     pub io_cmd_tx: mpsc::Sender<IoCommand>,
     pub event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
+    /// The `peer_connection` tracing span this connection was created under, carrying
+    /// its `correlation_id`. Retained so later operations on this connection (e.g.
+    /// closing it) can re-enter the same span.
+    pub span: tracing::Span,
 }
 
 /// The WebRTC engine manages all active peer connections.
@@ -82,6 +86,12 @@ impl WebRtcEngine {
         id: String,
         ice_servers: Option<&[IceServerConfig]>,
     ) -> Result<(), String> {
+        // Captured here (rather than at `spawn_blocking` time) so it reflects whatever
+        // span the caller was in when it asked for this connection to be created — in
+        // practice the `peer_connection` span entered by the Tauri command, carrying
+        // this connection's `correlation_id`.
+        let span = tracing::Span::current();
+
         let mut pc_inner = peer_connection::create_peer_connection(id.clone());
 
         // Bind a UDP socket for this connection
@@ -108,7 +118,9 @@ impl WebRtcEngine {
         let loop_handle = handle.clone();
         let loop_socket = socket.clone();
         let loop_e2ee = self.e2ee.clone(); // clones the Arc, shares the Option
+        let loop_span = span.clone();
         tokio::task::spawn_blocking(move || {
+            let _enter = loop_span.enter();
             io_loop(&loop_handle, &loop_socket, io_cmd_rx, &event_tx, &loop_e2ee);
         });
 
@@ -119,6 +131,7 @@ impl WebRtcEngine {
                 socket,
                 io_cmd_tx,
                 event_rx: Arc::new(Mutex::new(event_rx)),
+                span,
             },
         );
 
@@ -134,6 +147,9 @@ impl WebRtcEngine {
     /// Remove and shut down a peer connection.
     pub fn remove(&mut self, id: &str) -> Option<ManagedPc> {
         if let Some(managed) = self.connections.remove(id) {
+            let span = managed.span.clone();
+            let _enter = span.enter();
+            tracing::info!(pc_id = %id, "peer connection removed from engine");
             let _ = managed.io_cmd_tx.try_send(IoCommand::Shutdown);
             // Clean up video frames for this connection
             if let Ok(mut frames) = self.video_frames.lock() {
@@ -219,12 +235,12 @@ fn drain_io_commands(
                 }
             }
             Ok(IoCommand::Shutdown) => {
-                tracing::info!("I/O loop shutting down");
+                tracing::info!(reason = "shutdown_command", "peer connection closed");
                 return true;
             }
             Err(mpsc::error::TryRecvError::Empty) => return false,
             Err(mpsc::error::TryRecvError::Disconnected) => {
-                tracing::info!("I/O loop command channel closed");
+                tracing::info!(reason = "command_channel_closed", "peer connection closed");
                 return true;
             }
         }
@@ -265,7 +281,7 @@ fn io_loop(
                     deadline
                 }
                 Err(e) => {
-                    tracing::error!("poll_once error: {e}");
+                    tracing::error!(error = %e, "peer connection failed");
                     return;
                 }
             }

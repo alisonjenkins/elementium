@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, command};
 use tokio::sync::mpsc as tokio_mpsc;
+use tracing::Instrument;
 
-use elementium_types::{IceCandidate, SessionDescription};
+use elementium_types::{CorrelationId, IceCandidate, SessionDescription};
 use elementium_webrtc::engine::{IceServerConfig, WebRtcEngine};
 use elementium_webrtc::peer_connection;
 use elementium_webrtc::{AudioPipeline, PcEvent, VideoPipeline};
@@ -73,11 +74,19 @@ pub async fn create_peer_connection(
     app: AppHandle,
     config: Option<RtcConfiguration>,
 ) -> Result<PeerConnectionResult, String> {
+    let id = generate_id();
+    let correlation_id = CorrelationId::new();
+    let span = tracing::info_span!(
+        "peer_connection",
+        correlation_id = %correlation_id,
+        pc_id = %id
+    );
+    let _enter = span.enter();
+
     if let Some(ref cfg) = config {
         tracing::info!(?cfg, "ICE servers from signaling");
     }
-    let id = generate_id();
-    tracing::info!(pc_id = %id, "Creating peer connection");
+    tracing::info!(pc_id = %id, "peer connection created");
 
     // Convert ICE server config to engine format
     let ice_servers: Option<Vec<IceServerConfig>> = config.as_ref().and_then(|cfg| {
@@ -98,12 +107,18 @@ pub async fn create_peer_connection(
         engine.create_connection(id.clone(), ice_servers.as_deref())?;
     }
 
-    // Spawn a task to forward events from the I/O loop to the frontend
+    // Spawn a task to forward events from the I/O loop to the frontend. Instrumented
+    // with the same span so events emitted while forwarding carry this connection's
+    // correlation_id.
     let state_clone: WebRtcState = state.inner().clone();
     let id_clone = id.clone();
-    tokio::spawn(async move {
-        forward_events(&state_clone, &app, &id_clone).await;
-    });
+    let forward_span = span.clone();
+    tokio::spawn(
+        async move {
+            forward_events(&state_clone, &app, &id_clone).await;
+        }
+        .instrument(forward_span),
+    );
 
     Ok(PeerConnectionResult { id })
 }
@@ -267,8 +282,16 @@ pub async fn close_peer_connection(
     state: State<'_, WebRtcState>,
     pc_id: String,
 ) -> Result<(), String> {
-    tracing::info!(pc_id = %pc_id, "Closing peer connection");
-    state.0.lock().map_err(|e| e.to_string())?.remove(&pc_id);
+    let span = {
+        let mut engine = state.0.lock().map_err(|e| e.to_string())?;
+        let span = engine
+            .get(&pc_id)
+            .map_or_else(tracing::Span::current, |managed| managed.span.clone());
+        engine.remove(&pc_id);
+        span
+    };
+    let _enter = span.enter();
+    tracing::info!(pc_id = %pc_id, "peer connection closed");
     Ok(())
 }
 

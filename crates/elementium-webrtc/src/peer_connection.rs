@@ -634,7 +634,6 @@ const fn classify_packet(data: &[u8]) -> &'static str {
 fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<PcEvent> {
     match event {
         Event::IceConnectionStateChange(state) => {
-            tracing::info!(pc_id = %pc.id, ?state, "ICE state changed");
             let mapped = match state {
                 IceConnectionState::New => IceState::New,
                 IceConnectionState::Checking => IceState::Checking,
@@ -645,10 +644,20 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<PcEv
                     IceState::Disconnected
                 }
             };
+            if mapped == IceState::Disconnected {
+                tracing::warn!(
+                    pc_id = %pc.id,
+                    state = ?mapped,
+                    reason = "ice_disconnected",
+                    "peer connection failed"
+                );
+            } else {
+                tracing::info!(pc_id = %pc.id, state = ?mapped, "ICE connection state changed");
+            }
             Some(PcEvent::IceConnectionStateChange(mapped))
         }
         Event::Connected => {
-            tracing::info!(pc_id = %pc.id, "Peer connected (DTLS+ICE)");
+            tracing::info!(pc_id = %pc.id, "DTLS/ICE connection established");
             Some(PcEvent::Connected)
         }
         Event::MediaAdded(media) => {
