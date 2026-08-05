@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+use tracing::{Instrument, Span};
 
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_types::SessionDescription;
@@ -75,9 +76,14 @@ impl Transport {
         // Create Publisher PC
         let pub_id = format!("{room_id}-pub");
         let mut pub_inner = peer_connection::create_peer_connection(pub_id);
-        let pub_socket =
-            UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Bind pub socket: {e}"))?;
-        let pub_addr = pub_socket.local_addr().map_err(|e| e.to_string())?;
+        let pub_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
+            tracing::error!(reason = %e, "transport connect failed");
+            format!("Bind pub socket: {e}")
+        })?;
+        let pub_addr = pub_socket.local_addr().map_err(|e| {
+            tracing::error!(reason = %e, "transport connect failed");
+            e.to_string()
+        })?;
         peer_connection::add_local_candidate(&mut pub_inner, pub_addr);
         // STUN discovery for publisher
         if let Some(servers) = ice_servers {
@@ -89,9 +95,14 @@ impl Transport {
         // Create Subscriber PC
         let sub_id = format!("{room_id}-sub");
         let mut sub_inner = peer_connection::create_peer_connection(sub_id);
-        let sub_socket =
-            UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Bind sub socket: {e}"))?;
-        let sub_addr = sub_socket.local_addr().map_err(|e| e.to_string())?;
+        let sub_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
+            tracing::error!(reason = %e, "transport connect failed");
+            format!("Bind sub socket: {e}")
+        })?;
+        let sub_addr = sub_socket.local_addr().map_err(|e| {
+            tracing::error!(reason = %e, "transport connect failed");
+            e.to_string()
+        })?;
         peer_connection::add_local_candidate(&mut sub_inner, sub_addr);
         // STUN discovery for subscriber
         if let Some(servers) = ice_servers {
@@ -109,11 +120,17 @@ impl Transport {
         let (sub_event_tx, sub_event_rx) = mpsc::channel::<PcEvent>(256);
         let (pub_cmd_tx, pub_cmd_rx) = mpsc::channel::<PcCommand>(256);
 
+        // spawn_blocking doesn't propagate the ambient span on its own, so capture it
+        // here and enter it inside each closure to keep the same correlation_id.
+        let io_loop_span = Span::current();
+
         // Spawn Publisher I/O loop
         let pub_h = pub_handle.clone();
         let pub_s = pub_socket.clone();
         let pub_e2ee = e2ee.clone();
+        let pub_span = io_loop_span.clone();
         tokio::task::spawn_blocking(move || {
+            let _guard = pub_span.enter();
             pc_io_loop(pub_h, pub_s, Some(pub_cmd_rx), pub_event_tx, pub_e2ee);
         });
 
@@ -122,17 +139,15 @@ impl Transport {
         let sub_s = sub_socket.clone();
         let sub_e2ee = e2ee.clone();
         tokio::task::spawn_blocking(move || {
+            let _guard = io_loop_span.enter();
             pc_io_loop(sub_h, sub_s, None, sub_event_tx, sub_e2ee);
         });
 
         // Spawn dispatcher: routes TransportCommands to Publisher and merges events
-        tokio::spawn(transport_dispatch(
-            cmd_rx,
-            pub_cmd_tx,
-            pub_event_rx,
-            sub_event_rx,
-            event_tx,
-        ));
+        tokio::spawn(
+            transport_dispatch(cmd_rx, pub_cmd_tx, pub_event_rx, sub_event_rx, event_tx)
+                .instrument(Span::current()),
+        );
 
         Ok(Self {
             publisher: pub_handle,
@@ -290,7 +305,7 @@ fn pc_io_loop(
                         };
                         let mut pc = lock_pc!(handle);
                         if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
-                            tracing::debug!("write_audio: {e}");
+                            tracing::debug!(reason = %e, "write_audio failed");
                         }
                     }
                     Ok(PcCommand::WriteVideo(data)) => {
@@ -311,7 +326,7 @@ fn pc_io_loop(
                         };
                         let mut pc = lock_pc!(handle);
                         if let Err(e) = peer_connection::write_video(&mut pc, &data) {
-                            tracing::debug!("write_video: {e}");
+                            tracing::debug!(reason = %e, "write_video failed");
                         }
                     }
                     Ok(PcCommand::Shutdown) => {
@@ -336,7 +351,7 @@ fn pc_io_loop(
                     deadline
                 }
                 Err(e) => {
-                    tracing::error!("poll_once error: {e}");
+                    tracing::error!(reason = %e, "poll_once failed");
                     return;
                 }
             }
@@ -356,7 +371,7 @@ fn pc_io_loop(
             if let Err(e) =
                 peer_connection::recv_and_feed(&mut pc, &socket, &mut recv_buf, wait)
             {
-                tracing::debug!("recv_and_feed: {e}");
+                tracing::debug!(reason = %e, "recv_and_feed failed");
             }
         }
     }

@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State, command};
+use tracing::Instrument;
 
+use elementium_types::CorrelationId;
 use elementium_webrtc::engine::VideoFrameBuffer;
 use elementium_webrtc::livekit::room::{LiveKitRoom, RoomEvent};
 
@@ -37,45 +39,72 @@ pub async fn livekit_connect(
     sfu_url: String,
     token: String,
 ) -> Result<ConnectResult, String> {
-    tracing::info!(sfu_url = %sfu_url, "Connecting to LiveKit room");
+    let correlation_id = CorrelationId::new();
+    let span = tracing::info_span!("session", correlation_id = %correlation_id);
 
-    let video_frames = state.video_frames.clone();
-    let (room, mut event_rx) = LiveKitRoom::connect(&sfu_url, &token, video_frames).await?;
+    async move {
+        tracing::info!(sfu_url = %sfu_url, "connect attempt started");
 
-    let room_id = room.room_id.clone();
-    let room_name = room.room_name.clone();
-    let local_identity = room.local_identity.clone();
+        let video_frames = state.video_frames.clone();
+        let connect_result =
+            LiveKitRoom::connect(&sfu_url, &token, video_frames, correlation_id.clone()).await;
+        let (room, mut event_rx) = match connect_result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(reason = %e, "connect attempt failed");
+                return Err(e);
+            }
+        };
 
-    let room = Arc::new(tokio::sync::Mutex::new(room));
+        let room_id = room.room_id.clone();
+        let room_name = room.room_name.clone();
+        let local_identity = room.local_identity.clone();
 
-    // Store in state
-    {
-        let mut rooms = state.rooms.lock().map_err(|e| e.to_string())?;
-        rooms.insert(room_id.clone(), room);
-    }
+        tracing::info!(
+            room_id = %room_id,
+            room_name = %room_name,
+            local_identity = %local_identity,
+            "connected"
+        );
 
-    // Spawn event forwarder
-    let app_clone = app.clone();
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            let event_name = match &event {
-                RoomEvent::ParticipantJoined { .. } => "livekit-participant-joined",
-                RoomEvent::ParticipantLeft { .. } => "livekit-participant-left",
-                RoomEvent::TrackSubscribed { .. } => "livekit-track-subscribed",
-                RoomEvent::TrackUnsubscribed { .. } => "livekit-track-unsubscribed",
-                RoomEvent::ConnectionStateChanged { .. } => "livekit-connection-state",
-                RoomEvent::ActiveSpeakersChanged { .. } => "livekit-active-speakers",
-            };
-            let _ = app_clone.emit(event_name, &event);
+        let room = Arc::new(tokio::sync::Mutex::new(room));
+
+        // Store in state
+        {
+            let mut rooms = state.rooms.lock().map_err(|e| e.to_string())?;
+            rooms.insert(room_id.clone(), room);
         }
-        tracing::info!("LiveKit event forwarder ended");
-    });
 
-    Ok(ConnectResult {
-        room_id,
-        room_name,
-        local_identity,
-    })
+        // Spawn event forwarder, instrumented with the session span so its
+        // events keep the same correlation_id.
+        let app_clone = app.clone();
+        let forwarder_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                while let Some(event) = event_rx.recv().await {
+                    let event_name = match &event {
+                        RoomEvent::ParticipantJoined { .. } => "livekit-participant-joined",
+                        RoomEvent::ParticipantLeft { .. } => "livekit-participant-left",
+                        RoomEvent::TrackSubscribed { .. } => "livekit-track-subscribed",
+                        RoomEvent::TrackUnsubscribed { .. } => "livekit-track-unsubscribed",
+                        RoomEvent::ConnectionStateChanged { .. } => "livekit-connection-state",
+                        RoomEvent::ActiveSpeakersChanged { .. } => "livekit-active-speakers",
+                    };
+                    let _ = app_clone.emit(event_name, &event);
+                }
+                tracing::info!("LiveKit event forwarder ended");
+            }
+            .instrument(forwarder_span),
+        );
+
+        Ok(ConnectResult {
+            room_id,
+            room_name,
+            local_identity,
+        })
+    }
+    .instrument(span)
+    .await
 }
 
 /// Publish a local track (audio/video) to the `LiveKit` room.
@@ -97,15 +126,21 @@ pub async fn livekit_disconnect(
     state: State<'_, LiveKitState>,
     room_id: String,
 ) -> Result<(), String> {
-    tracing::info!(room_id = %room_id, "Disconnecting from LiveKit room");
-
     let room = {
         let mut rooms = state.rooms.lock().map_err(|e| e.to_string())?;
         rooms.remove(&room_id)
     };
 
     if let Some(room) = room {
-        room.lock().await.disconnect().await;
+        let mut room = room.lock().await;
+        let span =
+            tracing::info_span!("session", correlation_id = %room.correlation_id(), room_id = %room_id);
+        async {
+            tracing::info!("disconnect requested");
+            room.disconnect().await;
+        }
+        .instrument(span)
+        .await;
     }
 
     Ok(())

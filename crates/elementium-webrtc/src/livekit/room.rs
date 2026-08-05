@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use livekit_protocol::signal_request;
 use livekit_protocol::signal_response;
@@ -15,7 +16,7 @@ use livekit_protocol::{
     SessionDescription as LkSessionDescription, SignalTarget, TrackInfo, TrackSource, TrackType,
 };
 
-use elementium_types::{SdpType, SessionDescription};
+use elementium_types::{CorrelationId, SdpType, SessionDescription};
 
 use crate::engine::VideoFrameBuffer;
 use crate::livekit::signaling::{SignalClient, SignalSender};
@@ -78,9 +79,19 @@ pub struct LiveKitRoom {
     room_event_tx: mpsc::UnboundedSender<RoomEvent>,
     video_frames: VideoFrameBuffer,
     shutdown: bool,
+    correlation_id: CorrelationId,
 }
 
 impl LiveKitRoom {
+    /// Correlation ID for this room's session, minted by the caller at connect time.
+    ///
+    /// Reused to scope log spans for later operations on this room (disconnect,
+    /// track publish, etc.) so they share the same session's `correlation_id`.
+    #[must_use]
+    pub const fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
+
     /// Connect to a `LiveKit` SFU room.
     ///
     /// 1. Opens WebSocket signaling connection
@@ -94,25 +105,40 @@ impl LiveKitRoom {
     ///
     /// Returns `Err` if the signaling connection fails, the `JoinResponse` is
     /// never received (or times out), or the transport cannot be created.
+    // Structured connect-attempt/failure logging at each fallible step, plus session
+    // span setup, adds lines without adding branching complexity worth splitting out.
+    #[allow(clippy::too_many_lines)]
     pub async fn connect(
         sfu_url: &str,
         token: &str,
         video_frames: VideoFrameBuffer,
+        correlation_id: CorrelationId,
     ) -> Result<(Self, mpsc::UnboundedReceiver<RoomEvent>), String> {
         let room_id = generate_room_id();
 
         // Connect signaling
-        let mut signal_client = SignalClient::connect(sfu_url, token)
-            .await
-            .map_err(|e| format!("Signaling connect failed: {e}"))?;
+        let mut signal_client = match SignalClient::connect(sfu_url, token).await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!(reason = %e, "signaling connect failed");
+                return Err(format!("Signaling connect failed: {e}"));
+            }
+        };
 
         let signal_sender = signal_client.sender();
-        let mut signal_rx = signal_client
-            .take_receiver()
-            .ok_or("Failed to take signal receiver")?;
+        let Some(mut signal_rx) = signal_client.take_receiver() else {
+            tracing::error!(reason = "signal receiver already taken", "connect attempt failed");
+            return Err("Failed to take signal receiver".to_string());
+        };
 
         // Wait for JoinResponse
-        let join_response = wait_for_join(&mut signal_rx).await?;
+        let join_response = match wait_for_join(&mut signal_rx).await {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(reason = %e, "connect attempt failed");
+                return Err(e);
+            }
+        };
 
         let room_name = join_response
             .room
@@ -134,7 +160,7 @@ impl LiveKitRoom {
             room_id = %room_id,
             room_name = %room_name,
             local_identity = %local_identity,
-            "Joined LiveKit room"
+            "connected"
         );
 
         // Build initial participant list
@@ -144,25 +170,37 @@ impl LiveKitRoom {
         }
 
         // Create transport (Publisher + Subscriber PeerConnections)
-        let transport = Transport::new(&room_id)?;
+        let transport = match Transport::new(&room_id) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(reason = %e, "connect attempt failed");
+                return Err(e);
+            }
+        };
 
         // Room event channel
         let (room_event_tx, room_event_rx) = mpsc::unbounded_channel();
 
         // Emit initial participants
         for p in participants.values() {
-            let _ = room_event_tx.send(RoomEvent::ParticipantJoined {
-                room_id: room_id.clone(),
-                identity: p.identity.clone(),
-                sid: p.sid.clone(),
-                name: p.name.clone(),
-            });
+            send_room_event(
+                &room_event_tx,
+                RoomEvent::ParticipantJoined {
+                    room_id: room_id.clone(),
+                    identity: p.identity.clone(),
+                    sid: p.sid.clone(),
+                    name: p.name.clone(),
+                },
+            );
         }
 
-        let _ = room_event_tx.send(RoomEvent::ConnectionStateChanged {
-            room_id: room_id.clone(),
-            state: "connected".to_string(),
-        });
+        send_room_event(
+            &room_event_tx,
+            RoomEvent::ConnectionStateChanged {
+                room_id: room_id.clone(),
+                state: "connected".to_string(),
+            },
+        );
 
         let room = Self {
             room_id: room_id.clone(),
@@ -177,9 +215,12 @@ impl LiveKitRoom {
             room_event_tx: room_event_tx.clone(),
             video_frames,
             shutdown: false,
+            correlation_id,
         };
 
-        // Spawn signal processing loop
+        // Spawn signal processing loop, instrumented with the ambient session
+        // span so its events (and the transport-event blocking task it spawns)
+        // keep the same correlation_id.
         let sig_sender = signal_sender;
         let publisher_handle = room.transport.publisher.clone();
         let subscriber_handle = room.transport.subscriber.clone();
@@ -187,20 +228,24 @@ impl LiveKitRoom {
         let vf = room.video_frames.clone();
         let rid = room_id.clone();
         let evt_tx = room_event_tx;
+        let loop_span = tracing::Span::current();
 
-        tokio::spawn(async move {
-            signal_processing_loop(
-                signal_rx,
-                sig_sender,
-                publisher_handle,
-                subscriber_handle,
-                transport_event_rx,
-                vf,
-                rid,
-                evt_tx,
-            )
-            .await;
-        });
+        tokio::spawn(
+            async move {
+                signal_processing_loop(
+                    signal_rx,
+                    sig_sender,
+                    publisher_handle,
+                    subscriber_handle,
+                    transport_event_rx,
+                    vf,
+                    rid,
+                    evt_tx,
+                )
+                .await;
+            }
+            .instrument(loop_span),
+        );
 
         Ok((room, room_event_rx))
     }
@@ -236,16 +281,15 @@ impl LiveKitRoom {
         let cid = format!("{}-{kind}-{source}", self.local_sid);
         let is_video = kind == "video";
 
-        tracing::info!(
-            room_id = %self.room_id,
-            kind = kind,
-            source = source,
-            "Publishing track"
-        );
+        let span = tracing::info_span!("session", correlation_id = %self.correlation_id, room_id = %self.room_id);
+        let _guard = span.enter();
+
+        tracing::info!(kind = kind, source = source, "publishing track");
 
         // Send AddTrack request
         #[allow(deprecated)]
-        self.signal_sender
+        if let Err(e) = self
+            .signal_sender
             .send(signal_request::Message::AddTrack(AddTrackRequest {
                 cid,
                 name: format!("{kind}_{source}"),
@@ -255,19 +299,32 @@ impl LiveKitRoom {
                 height: if is_video { 480 } else { 0 },
                 ..Default::default()
             }))
-            .map_err(|e| format!("Failed to send AddTrack: {e}"))?;
+        {
+            tracing::error!(reason = %e, "publish track failed");
+            return Err(format!("Failed to send AddTrack: {e}"));
+        }
 
         // Trigger SDP renegotiation on Publisher
         let include_video = is_video || self.has_video_track();
-        let offer = self.transport.create_publisher_offer(include_video)?;
+        let offer = match self.transport.create_publisher_offer(include_video) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(reason = %e, "publish track failed");
+                return Err(e);
+            }
+        };
 
-        self.signal_sender
+        if let Err(e) = self
+            .signal_sender
             .send(signal_request::Message::Offer(LkSessionDescription {
                 r#type: "offer".to_string(),
                 sdp: offer.sdp,
                 ..Default::default()
             }))
-            .map_err(|e| format!("Failed to send publisher offer: {e}"))?;
+        {
+            tracing::error!(reason = %e, "publish track failed");
+            return Err(format!("Failed to send publisher offer: {e}"));
+        }
 
         Ok(())
     }
@@ -311,16 +368,74 @@ impl LiveKitRoom {
         }
         self.shutdown = true;
 
-        tracing::info!(room_id = %self.room_id, "Disconnecting from LiveKit room");
-
-        let _ = self.room_event_tx.send(RoomEvent::ConnectionStateChanged {
-            room_id: self.room_id.clone(),
-            state: "disconnected".to_string(),
-        });
+        send_room_event(
+            &self.room_event_tx,
+            RoomEvent::ConnectionStateChanged {
+                room_id: self.room_id.clone(),
+                state: "disconnected".to_string(),
+            },
+        );
 
         self.transport.shutdown().await;
         self.signal_client.disconnect().await;
     }
+}
+
+/// Send a room event to the Tauri layer, logging a structured tracing event
+/// first so every `RoomEvent` variant (including ones with no other log call
+/// site, such as `TrackUnsubscribed`) is observable in the session's log
+/// stream under its `correlation_id`.
+fn send_room_event(tx: &mpsc::UnboundedSender<RoomEvent>, event: RoomEvent) {
+    match &event {
+        RoomEvent::ParticipantJoined {
+            room_id,
+            identity,
+            sid,
+            ..
+        } => {
+            tracing::info!(room_id = %room_id, identity = %identity, sid = %sid, "participant joined");
+        }
+        RoomEvent::ParticipantLeft {
+            room_id,
+            identity,
+            sid,
+        } => {
+            tracing::info!(room_id = %room_id, identity = %identity, sid = %sid, "participant left");
+        }
+        RoomEvent::TrackSubscribed {
+            room_id,
+            participant_sid,
+            track_sid,
+            kind,
+        } => {
+            tracing::info!(
+                room_id = %room_id,
+                participant_sid = %participant_sid,
+                track_sid = %track_sid,
+                kind = %kind,
+                "track subscribed"
+            );
+        }
+        RoomEvent::TrackUnsubscribed {
+            room_id,
+            participant_sid,
+            track_sid,
+        } => {
+            tracing::info!(
+                room_id = %room_id,
+                participant_sid = %participant_sid,
+                track_sid = %track_sid,
+                "track unsubscribed"
+            );
+        }
+        RoomEvent::ConnectionStateChanged { room_id, state } => {
+            tracing::info!(room_id = %room_id, state = %state, "connection state changed");
+        }
+        RoomEvent::ActiveSpeakersChanged { room_id, speakers } => {
+            tracing::debug!(room_id = %room_id, speakers = ?speakers, "active speakers changed");
+        }
+    }
+    let _ = tx.send(event);
 }
 
 /// Wait for the `JoinResponse` from the signaling channel.
@@ -358,11 +473,15 @@ async fn signal_processing_loop(
     event_tx: mpsc::UnboundedSender<RoomEvent>,
 ) {
     // Spawn a blocking task to process transport events (audio/video from subscriber PC).
-    // Must be blocking because AudioPlayer (cpal) is not Send.
+    // Must be blocking because AudioPlayer (cpal) is not Send. spawn_blocking doesn't
+    // propagate the ambient span on its own, so capture it and enter it inside the
+    // closure to keep the same correlation_id on its events.
     let vf = video_frames;
     let rid = room_id.clone();
     let evt = event_tx.clone();
+    let transport_events_span = tracing::Span::current();
     tokio::task::spawn_blocking(move || {
+        let _guard = transport_events_span.enter();
         process_transport_events(&transport_event_rx, &vf, &rid, &evt);
     });
 
@@ -379,7 +498,7 @@ async fn signal_processing_loop(
                     continue;
                 };
                 if let Err(e) = crate::peer_connection::set_remote_description(&mut pc, &desc) {
-                    tracing::error!("Failed to set publisher answer: {e}");
+                    tracing::error!(reason = %e, "publisher answer failed");
                 }
             }
             signal_response::Message::Offer(offer) => {
@@ -395,11 +514,14 @@ async fn signal_processing_loop(
                     match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                         Ok(Some(ans)) => ans,
                         Ok(None) => {
-                            tracing::error!("Expected answer from subscriber offer");
+                            tracing::error!(
+                                reason = "no answer produced",
+                                "subscriber offer failed"
+                            );
                             continue;
                         }
                         Err(e) => {
-                            tracing::error!("Failed to set subscriber offer: {e}");
+                            tracing::error!(reason = %e, "subscriber offer failed");
                             continue;
                         }
                     }
@@ -412,7 +534,7 @@ async fn signal_processing_loop(
                         ..Default::default()
                     }))
                 {
-                    tracing::error!("Failed to send subscriber answer: {e}");
+                    tracing::error!(reason = %e, "sending subscriber answer failed");
                 }
             }
             signal_response::Message::Trickle(trickle) => {
@@ -440,20 +562,26 @@ async fn signal_processing_loop(
             signal_response::Message::Update(update) => {
                 for p in &update.participants {
                     if p.state == i32::from(livekit_protocol::participant_info::State::Active) {
-                        let _ = event_tx.send(RoomEvent::ParticipantJoined {
-                            room_id: room_id.clone(),
-                            identity: p.identity.clone(),
-                            sid: p.sid.clone(),
-                            name: p.name.clone(),
-                        });
+                        send_room_event(
+                            &event_tx,
+                            RoomEvent::ParticipantJoined {
+                                room_id: room_id.clone(),
+                                identity: p.identity.clone(),
+                                sid: p.sid.clone(),
+                                name: p.name.clone(),
+                            },
+                        );
                     } else if p.state
                         == i32::from(livekit_protocol::participant_info::State::Disconnected)
                     {
-                        let _ = event_tx.send(RoomEvent::ParticipantLeft {
-                            room_id: room_id.clone(),
-                            identity: p.identity.clone(),
-                            sid: p.sid.clone(),
-                        });
+                        send_room_event(
+                            &event_tx,
+                            RoomEvent::ParticipantLeft {
+                                room_id: room_id.clone(),
+                                identity: p.identity.clone(),
+                                sid: p.sid.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -471,21 +599,27 @@ async fn signal_processing_loop(
                     .filter(|s| s.active)
                     .map(|s| s.sid.clone())
                     .collect();
-                let _ = event_tx.send(RoomEvent::ActiveSpeakersChanged {
-                    room_id: room_id.clone(),
-                    speakers: identities,
-                });
+                send_room_event(
+                    &event_tx,
+                    RoomEvent::ActiveSpeakersChanged {
+                        room_id: room_id.clone(),
+                        speakers: identities,
+                    },
+                );
             }
             signal_response::Message::Leave(leave) => {
                 tracing::info!(
                     room_id = %room_id,
                     reason = leave.reason,
-                    "Server requested leave"
+                    "server requested leave"
                 );
-                let _ = event_tx.send(RoomEvent::ConnectionStateChanged {
-                    room_id: room_id.clone(),
-                    state: "disconnected".to_string(),
-                });
+                send_room_event(
+                    &event_tx,
+                    RoomEvent::ConnectionStateChanged {
+                        room_id: room_id.clone(),
+                        state: "disconnected".to_string(),
+                    },
+                );
                 break;
             }
             _ => {
@@ -548,18 +682,15 @@ fn process_transport_events(
                 }
             }
             Some(TransportEvent::SubscriberEvent(PcEvent::RemoteTrackAdded { mid, kind })) => {
-                tracing::info!(
-                    room_id = %room_id,
-                    mid = %mid,
-                    kind = %kind,
-                    "Remote track added from subscriber PC"
+                send_room_event(
+                    event_tx,
+                    RoomEvent::TrackSubscribed {
+                        room_id: room_id.to_string(),
+                        participant_sid: "unknown".to_string(),
+                        track_sid: mid,
+                        kind,
+                    },
                 );
-                let _ = event_tx.send(RoomEvent::TrackSubscribed {
-                    room_id: room_id.to_string(),
-                    participant_sid: "unknown".to_string(),
-                    track_sid: mid,
-                    kind,
-                });
             }
             Some(TransportEvent::PublisherEvent(PcEvent::IceCandidate(candidate))) => {
                 tracing::debug!("Publisher ICE candidate (local): {candidate}");

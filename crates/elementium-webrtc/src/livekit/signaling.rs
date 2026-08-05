@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tracing::Instrument;
 use url::Url;
 
 use livekit_protocol::signal_request;
@@ -73,13 +74,19 @@ impl SignalClient {
     /// WebSocket handshake fails.
     pub async fn connect(sfu_url: &str, token: &str) -> Result<Self, SignalError> {
         let ws_url = build_ws_url(sfu_url, token)?;
-        tracing::info!(url = %ws_url, "Connecting to LiveKit SFU");
+        tracing::info!(url = %ws_url, "connect attempt started");
 
-        let (ws_stream, _resp) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .map_err(|e| SignalError::Connection(format!("WebSocket connect failed: {e}")))?;
+        let (ws_stream, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(reason = %e, "signaling connect failed");
+                return Err(SignalError::Connection(format!(
+                    "WebSocket connect failed: {e}"
+                )));
+            }
+        };
 
-        tracing::info!("WebSocket connected to LiveKit SFU");
+        tracing::info!("websocket connected to LiveKit SFU");
 
         let (write, read) = ws_stream.split();
 
@@ -90,11 +97,15 @@ impl SignalClient {
         // Shutdown signal
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
+        // Propagate the ambient session span into these detached tasks so their
+        // events keep the same correlation_id.
+        let span = tracing::Span::current();
+
         // Spawn writer task: reads from out_rx, encodes, sends to WebSocket
-        tokio::spawn(ws_writer_loop(out_rx, write));
+        tokio::spawn(ws_writer_loop(out_rx, write).instrument(span.clone()));
 
         // Spawn reader task: reads from WebSocket, decodes, sends to in_tx
-        tokio::spawn(ws_reader_loop(read, in_tx, shutdown_rx));
+        tokio::spawn(ws_reader_loop(read, in_tx, shutdown_rx).instrument(span));
 
         let sender = SignalSender { tx: out_tx };
 
@@ -190,15 +201,15 @@ async fn ws_writer_loop(
     while let Some(req) = rx.recv().await {
         let mut buf = Vec::with_capacity(req.encoded_len());
         if let Err(e) = req.encode(&mut buf) {
-            tracing::error!("Failed to encode SignalRequest: {e}");
+            tracing::error!(reason = %e, "encoding SignalRequest failed");
             continue;
         }
         if let Err(e) = ws_write.send(WsMessage::Binary(buf)).await {
-            tracing::error!("WebSocket send error: {e}");
+            tracing::error!(reason = %e, "websocket send failed");
             break;
         }
     }
-    tracing::info!("Signal writer loop ended");
+    tracing::info!("signal writer loop ended");
     let _ = ws_write.close().await;
 }
 
@@ -223,32 +234,32 @@ async fn ws_reader_loop(
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to decode SignalResponse: {e}");
+                                tracing::warn!(reason = %e, "decoding SignalResponse failed");
                             }
                         }
                     }
                     Some(Ok(WsMessage::Close(_))) => {
-                        tracing::info!("WebSocket closed by server");
+                        tracing::info!("websocket closed by server");
                         break;
                     }
                     Some(Ok(_)) => {
                         // Ping/Pong/Text frames — ignore
                     }
                     Some(Err(e)) => {
-                        tracing::error!("WebSocket read error: {e}");
+                        tracing::error!(reason = %e, "websocket read failed");
                         break;
                     }
                     None => {
-                        tracing::info!("WebSocket stream ended");
+                        tracing::info!("websocket stream ended");
                         break;
                     }
                 }
             }
             _ = shutdown_rx.recv() => {
-                tracing::info!("Signal reader received shutdown");
+                tracing::info!("signal reader received shutdown");
                 break;
             }
         }
     }
-    tracing::info!("Signal reader loop ended");
+    tracing::info!("signal reader loop ended");
 }
