@@ -17,6 +17,12 @@ pub struct OpusEncoder {
 }
 
 impl OpusEncoder {
+    /// Creates a new Opus encoder for the given sample rate and channel count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpusError::Encoder`] if `channels` is not 1 or 2, or if the
+    /// underlying `opus` encoder fails to initialize.
     pub fn new(sample_rate: u32, channels: u16) -> Result<Self, OpusError> {
         let ch = match channels {
             1 => opus::Channels::Mono,
@@ -35,6 +41,10 @@ impl OpusEncoder {
     }
 
     /// Encode a frame of f32 PCM samples to Opus. Returns encoded bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpusError::Encoder`] if the underlying `opus` encoder fails.
     pub fn encode(&mut self, frame: &AudioFrame) -> Result<Vec<u8>, OpusError> {
         // Opus max packet size
         let mut output = vec![0u8; 4000];
@@ -46,11 +56,13 @@ impl OpusEncoder {
         Ok(output)
     }
 
-    pub fn sample_rate(&self) -> u32 {
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
-    pub fn channels(&self) -> u16 {
+    #[must_use]
+    pub const fn channels(&self) -> u16 {
         self.channels
     }
 }
@@ -63,6 +75,12 @@ pub struct OpusDecoder {
 }
 
 impl OpusDecoder {
+    /// Creates a new Opus decoder for the given sample rate and channel count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpusError::Decoder`] if `channels` is not 1 or 2, or if the
+    /// underlying `opus` decoder fails to initialize.
     pub fn new(sample_rate: u32, channels: u16) -> Result<Self, OpusError> {
         let ch = match channels {
             1 => opus::Channels::Mono,
@@ -80,16 +98,21 @@ impl OpusDecoder {
         })
     }
 
-    /// Decode an Opus packet to f32 PCM samples. Returns an AudioFrame.
+    /// Decode an Opus packet to f32 PCM samples. Returns an `AudioFrame`.
     /// `frame_size` is the number of samples per channel expected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpusError::Decoder`] if the underlying `opus` decoder fails.
     pub fn decode(&mut self, packet: &[u8], frame_size: usize) -> Result<AudioFrame, OpusError> {
-        let total_samples = frame_size * self.channels as usize;
+        let channels = usize::from(self.channels);
+        let total_samples = frame_size.saturating_mul(channels);
         let mut output = vec![0.0f32; total_samples];
         let decoded = self
             .inner
             .decode_float(packet, &mut output, false)
             .map_err(|e| OpusError::Decoder(e.to_string()))?;
-        output.truncate(decoded * self.channels as usize);
+        output.truncate(decoded.saturating_mul(channels));
 
         Ok(AudioFrame {
             sample_rate: self.sample_rate,
@@ -99,11 +122,13 @@ impl OpusDecoder {
         })
     }
 
-    pub fn sample_rate(&self) -> u32 {
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
-    pub fn channels(&self) -> u16 {
+    #[must_use]
+    pub const fn channels(&self) -> u16 {
         self.channels
     }
 }
@@ -113,17 +138,27 @@ mod tests {
     use super::*;
 
     #[test]
+    // Test-only: panicking on failure via unwrap/expect is the idiomatic
+    // way to fail a `#[test]`; this function intentionally does not
+    // propagate errors via `Result`.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn opus_roundtrip() {
         let sample_rate = 48000;
         let channels = 1u16;
         let frame_size = 960; // 20ms at 48kHz
 
-        let mut encoder = OpusEncoder::new(sample_rate, channels).unwrap();
-        let mut decoder = OpusDecoder::new(sample_rate, channels).unwrap();
+        let mut encoder = OpusEncoder::new(sample_rate, channels).expect("encoder creation");
+        let mut decoder = OpusDecoder::new(sample_rate, channels).expect("decoder creation");
 
-        // Generate a 440Hz sine wave
+        // Generate a 440Hz sine wave. The index -> f32 cast is an
+        // intentional, bounded lossy conversion for waveform generation,
+        // not a value that must round-trip exactly.
+        #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
         let samples: Vec<f32> = (0..frame_size)
-            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32).sin())
+            .map(|i| {
+                let phase = 2.0 * std::f32::consts::PI * 440.0 * i as f32 / sample_rate as f32;
+                phase.sin()
+            })
             .collect();
 
         let frame = AudioFrame {
@@ -133,13 +168,13 @@ mod tests {
             timestamp_us: 0,
         };
 
-        let encoded = encoder.encode(&frame).unwrap();
-        assert!(!encoded.is_empty());
-        assert!(encoded.len() < samples.len() * 4); // Should be compressed
+        let opus_bytes = encoder.encode(&frame).expect("encode");
+        assert!(!opus_bytes.is_empty());
+        assert!(opus_bytes.len() < samples.len().saturating_mul(4)); // Should be compressed
 
-        let decoded = decoder.decode(&encoded, frame_size).unwrap();
-        assert_eq!(decoded.data.len(), frame_size);
-        assert_eq!(decoded.sample_rate, sample_rate);
-        assert_eq!(decoded.channels, channels);
+        let pcm_frame = decoder.decode(&opus_bytes, frame_size).expect("decode");
+        assert_eq!(pcm_frame.data.len(), frame_size);
+        assert_eq!(pcm_frame.sample_rate, sample_rate);
+        assert_eq!(pcm_frame.channels, channels);
     }
 }
