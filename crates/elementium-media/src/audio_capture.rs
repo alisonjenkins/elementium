@@ -25,6 +25,11 @@ pub struct AudioCapturer {
 
 impl AudioCapturer {
     /// Start capturing audio from the default input device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError`] if no input device is available, the device
+    /// config cannot be read, or the audio stream cannot be built/started.
     pub fn start() -> Result<Self, CaptureError> {
         let host = cpal::default_host();
         let device = host
@@ -59,20 +64,24 @@ impl AudioCapturer {
     }
 
     /// Receive the next audio frame (blocking).
+    #[must_use]
     pub fn recv(&self) -> Option<AudioFrame> {
         self.receiver.recv().ok()
     }
 
     /// Try to receive an audio frame (non-blocking).
+    #[must_use]
     pub fn try_recv(&self) -> Option<AudioFrame> {
         self.receiver.try_recv().ok()
     }
 
-    pub fn sample_rate(&self) -> u32 {
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
-    pub fn channels(&self) -> u16 {
+    #[must_use]
+    pub const fn channels(&self) -> u16 {
         self.channels
     }
 }

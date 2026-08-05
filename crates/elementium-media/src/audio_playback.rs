@@ -25,6 +25,11 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     /// Start an audio output stream on the default device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlaybackError`] if no output device is available, the device
+    /// config cannot be read, or the audio stream cannot be built/started.
     pub fn start() -> Result<Self, PlaybackError> {
         let host = cpal::default_host();
         let device = host
@@ -59,11 +64,13 @@ impl AudioPlayer {
         let _ = self.sender.try_send(frame);
     }
 
-    pub fn sample_rate(&self) -> u32 {
+    #[must_use]
+    pub const fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
-    pub fn channels(&self) -> u16 {
+    #[must_use]
+    pub const fn channels(&self) -> u16 {
         self.channels
     }
 }
@@ -87,29 +94,43 @@ fn build_output_stream(
                 while written < output.len() {
                     // Refill buffer if needed
                     if buf_pos >= sample_buf.len() {
-                        match rx.try_recv() {
-                            Ok(frame) => {
-                                sample_buf = frame.data;
-                                buf_pos = 0;
-                            }
-                            Err(_) => {
-                                // No data available — output silence
-                                for sample in &mut output[written..] {
+                        if let Ok(frame) = rx.try_recv() {
+                            sample_buf = frame.data;
+                            buf_pos = 0;
+                        } else {
+                            // No data available — output silence
+                            if let Some(rest) = output.get_mut(written..) {
+                                for sample in rest {
                                     *sample = 0.0;
                                 }
-                                return;
                             }
+                            return;
                         }
                     }
 
-                    let available = sample_buf.len() - buf_pos;
-                    let needed = output.len() - written;
+                    let Some(available) = sample_buf.len().checked_sub(buf_pos) else {
+                        return;
+                    };
+                    let Some(needed) = output.len().checked_sub(written) else {
+                        return;
+                    };
                     let to_copy = available.min(needed);
+                    let Some(buf_pos_end) = buf_pos.checked_add(to_copy) else {
+                        return;
+                    };
+                    let Some(written_end) = written.checked_add(to_copy) else {
+                        return;
+                    };
 
-                    output[written..written + to_copy]
-                        .copy_from_slice(&sample_buf[buf_pos..buf_pos + to_copy]);
-                    buf_pos += to_copy;
-                    written += to_copy;
+                    let (Some(dest), Some(src)) = (
+                        output.get_mut(written..written_end),
+                        sample_buf.get(buf_pos..buf_pos_end),
+                    ) else {
+                        return;
+                    };
+                    dest.copy_from_slice(src);
+                    buf_pos = buf_pos_end;
+                    written = written_end;
                 }
             },
             err_fn,

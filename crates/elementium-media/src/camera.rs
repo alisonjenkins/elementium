@@ -1,4 +1,4 @@
-//! Camera capture using nokhwa (V4L2 on Linux, AVFoundation on macOS, MediaFoundation on Windows).
+//! Camera capture using `nokhwa` (`V4L2` on Linux, `AVFoundation` on macOS, `MediaFoundation` on Windows).
 
 use std::sync::mpsc;
 
@@ -24,8 +24,158 @@ pub struct CameraCapturer {
     height: u32,
 }
 
+/// Tracks whether the detected camera buffer format has already been logged,
+/// to avoid spamming logs on every frame.
+static LOGGED_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Build the requested camera format for the given optional resolution.
+fn requested_format(
+    width: Option<u32>,
+    height: Option<u32>,
+) -> nokhwa::utils::RequestedFormat<'static> {
+    if let (Some(w), Some(h)) = (width, height) {
+        nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
+            nokhwa::utils::RequestedFormatType::Closest(nokhwa::utils::CameraFormat::new(
+                nokhwa::utils::Resolution::new(w, h),
+                nokhwa::utils::FrameFormat::MJPEG,
+                30,
+            )),
+        )
+    } else {
+        nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
+            nokhwa::utils::RequestedFormatType::AbsoluteHighestFrameRate,
+        )
+    }
+}
+
+/// Decode a raw camera frame buffer into RGBA pixel data.
+///
+/// Returns `None` when the frame should be skipped (undecodable JPEG or an
+/// unrecognized buffer layout).
+fn decode_frame_to_rgba(w: u32, h: u32, raw: &[u8]) -> Option<Vec<u8>> {
+    let pixel_count = usize::try_from(w).ok()?.checked_mul(usize::try_from(h).ok()?)?;
+    let expected_rgba = pixel_count.checked_mul(4)?;
+    let expected_rgb = pixel_count.checked_mul(3)?;
+    let expected_yuyv = pixel_count.checked_mul(2)?;
+
+    // Log format on first frame for debugging
+    if !LOGGED_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            buf_len = raw.len(),
+            expected_rgba,
+            expected_rgb,
+            expected_yuyv,
+            first_bytes = ?raw.get(..raw.len().min(16)),
+            "Camera buffer format detected"
+        );
+    }
+
+    if raw.len() >= 2 && raw.first() == Some(&0xFF) && raw.get(1) == Some(&0xD8) {
+        // MJPEG frame — decode JPEG to RGBA via libjpeg-turbo
+        match turbojpeg::decompress(raw, turbojpeg::PixelFormat::RGBA) {
+            Ok(image) => Some(image.pixels),
+            Err(e) => {
+                tracing::debug!("JPEG decode error: {e}");
+                None
+            }
+        }
+    } else if raw.len() == expected_rgba {
+        // BGRA or RGBA format (4 bytes per pixel)
+        decode_bgra(pixel_count, raw)
+    } else if raw.len() == expected_rgb {
+        // RGB format (3 bytes per pixel) → RGBA
+        decode_rgb(pixel_count, raw)
+    } else if raw.len() >= expected_yuyv {
+        // YUYV format (2 bytes per pixel, packed) → RGBA
+        Some(yuyv_to_rgba(w, h, raw))
+    } else {
+        tracing::debug!(
+            buf_len = raw.len(),
+            expected_rgba,
+            expected_rgb,
+            expected_yuyv,
+            "Unknown camera buffer format, skipping frame"
+        );
+        None
+    }
+}
+
+/// Convert a BGRA (4 bytes per pixel) buffer into RGBA.
+fn decode_bgra(pixel_count: usize, raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(pixel_count.checked_mul(4)?);
+    for i in 0..pixel_count {
+        let base = i.checked_mul(4)?;
+        out.push(*raw.get(base.checked_add(2)?)?); // R (was B in BGRA)
+        out.push(*raw.get(base.checked_add(1)?)?); // G
+        out.push(*raw.get(base)?); // B (was R in BGRA)
+        out.push(255); // A
+    }
+    Some(out)
+}
+
+/// Convert an RGB (3 bytes per pixel) buffer into RGBA.
+fn decode_rgb(pixel_count: usize, raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(pixel_count.checked_mul(4)?);
+    for i in 0..pixel_count {
+        let base = i.checked_mul(3)?;
+        out.push(*raw.get(base)?); // R
+        out.push(*raw.get(base.checked_add(1)?)?); // G
+        out.push(*raw.get(base.checked_add(2)?)?); // B
+        out.push(255); // A
+    }
+    Some(out)
+}
+
+/// Poll the camera in a loop, sending decoded frames until a stop signal is received.
+fn run_capture_loop(
+    mut camera: nokhwa::Camera,
+    frame_tx: &mpsc::SyncSender<VideoFrame>,
+    stop_rx: &mpsc::Receiver<()>,
+) {
+    loop {
+        // Check for stop signal
+        if stop_rx.try_recv().is_ok() {
+            tracing::info!("Camera capture stopping");
+            break;
+        }
+
+        match camera.frame() {
+            Ok(buffer) => {
+                let res = buffer.resolution();
+                let w = res.width_x;
+                let h = res.height_y;
+                let raw = buffer.buffer();
+
+                let Some(rgba) = decode_frame_to_rgba(w, h, raw) else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+
+                let frame = VideoFrame {
+                    width: w,
+                    height: h,
+                    data: rgba,
+                    timestamp_us: 0,
+                };
+
+                // Non-blocking send; drop frame if buffer full
+                let _ = frame_tx.try_send(frame);
+            }
+            Err(e) => {
+                tracing::debug!("Camera frame error: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 impl CameraCapturer {
     /// Start capturing from the default camera (index 0) at a given resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CameraError`] if no camera is found or the camera cannot be
+    /// opened/started.
     pub fn start(width: Option<u32>, height: Option<u32>) -> Result<Self, CameraError> {
         Self::start_with_index(0, width, height)
     }
@@ -33,7 +183,16 @@ impl CameraCapturer {
     /// Start capturing from a specific camera index.
     ///
     /// The camera is opened on a background thread since `nokhwa::Camera` is not `Send`.
-    pub fn start_with_index(camera_index: u32, width: Option<u32>, height: Option<u32>) -> Result<Self, CameraError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CameraError`] if the camera thread dies during initialization
+    /// or the camera cannot be opened/started.
+    pub fn start_with_index(
+        camera_index: u32,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Self, CameraError> {
         let (frame_tx, frame_rx) = mpsc::sync_channel::<VideoFrame>(4);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         // Channel to report initial resolution (or error) back to caller
@@ -41,21 +200,7 @@ impl CameraCapturer {
 
         std::thread::spawn(move || {
             let index = nokhwa::utils::CameraIndex::Index(camera_index);
-            let requested = if let (Some(w), Some(h)) = (width, height) {
-                nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
-                    nokhwa::utils::RequestedFormatType::Closest(
-                        nokhwa::utils::CameraFormat::new(
-                            nokhwa::utils::Resolution::new(w, h),
-                            nokhwa::utils::FrameFormat::MJPEG,
-                            30,
-                        ),
-                    ),
-                )
-            } else {
-                nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
-                    nokhwa::utils::RequestedFormatType::AbsoluteHighestFrameRate,
-                )
-            };
+            let requested = requested_format(width, height);
 
             let mut camera = match nokhwa::Camera::new(index, requested) {
                 Ok(c) => c,
@@ -77,101 +222,7 @@ impl CameraCapturer {
             tracing::info!(width, height, "Camera capture started");
             let _ = init_tx.send(Ok((width, height)));
 
-            loop {
-                // Check for stop signal
-                if stop_rx.try_recv().is_ok() {
-                    tracing::info!("Camera capture stopping");
-                    break;
-                }
-
-                match camera.frame() {
-                    Ok(buffer) => {
-                        let res = buffer.resolution();
-                        let w = res.width_x;
-                        let h = res.height_y;
-
-                        let raw = buffer.buffer();
-                        let pixel_count = (w * h) as usize;
-                        let expected_rgba = pixel_count * 4;
-                        let expected_rgb = pixel_count * 3;
-                        let expected_yuyv = pixel_count * 2;
-
-                        // Log format on first frame for debugging
-                        static LOGGED_FORMAT: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(false);
-                        if !LOGGED_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            tracing::info!(
-                                buf_len = raw.len(),
-                                expected_rgba,
-                                expected_rgb,
-                                expected_yuyv,
-                                first_bytes = ?&raw[..raw.len().min(16)],
-                                "Camera buffer format detected"
-                            );
-                        }
-
-                        let rgba = if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8 {
-                            // MJPEG frame — decode JPEG to RGBA via libjpeg-turbo
-                            match turbojpeg::decompress(&raw, turbojpeg::PixelFormat::RGBA) {
-                                Ok(image) => image.pixels,
-                                Err(e) => {
-                                    tracing::debug!("JPEG decode error: {e}");
-                                    std::thread::sleep(std::time::Duration::from_millis(5));
-                                    continue;
-                                }
-                            }
-                        } else if raw.len() == expected_rgba {
-                            // BGRA or RGBA format (4 bytes per pixel)
-                            let mut out = Vec::with_capacity(pixel_count * 4);
-                            for i in 0..pixel_count {
-                                let base = i * 4;
-                                out.push(raw[base + 2]); // R (was B in BGRA)
-                                out.push(raw[base + 1]); // G
-                                out.push(raw[base]);     // B (was R in BGRA)
-                                out.push(255);           // A
-                            }
-                            out
-                        } else if raw.len() == expected_rgb {
-                            // RGB format (3 bytes per pixel) → RGBA
-                            let mut out = Vec::with_capacity(pixel_count * 4);
-                            for i in 0..pixel_count {
-                                out.push(raw[i * 3]);     // R
-                                out.push(raw[i * 3 + 1]); // G
-                                out.push(raw[i * 3 + 2]); // B
-                                out.push(255);             // A
-                            }
-                            out
-                        } else if raw.len() >= expected_yuyv {
-                            // YUYV format (2 bytes per pixel, packed) → RGBA
-                            yuyv_to_rgba(w, h, &raw)
-                        } else {
-                            tracing::debug!(
-                                buf_len = raw.len(),
-                                expected_rgba,
-                                expected_rgb,
-                                expected_yuyv,
-                                "Unknown camera buffer format, skipping frame"
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                            continue;
-                        };
-
-                        let frame = VideoFrame {
-                            width: w,
-                            height: h,
-                            data: rgba,
-                            timestamp_us: 0,
-                        };
-
-                        // Non-blocking send; drop frame if buffer full
-                        let _ = frame_tx.try_send(frame);
-                    }
-                    Err(e) => {
-                        tracing::debug!("Camera frame error: {e}");
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            }
+            run_capture_loop(camera, &frame_tx, &stop_rx);
         });
 
         // Wait for the camera thread to initialize
@@ -188,11 +239,13 @@ impl CameraCapturer {
     }
 
     /// Try to get the next frame (non-blocking).
+    #[must_use]
     pub fn try_recv(&self) -> Option<VideoFrame> {
         self.frame_rx.try_recv().ok()
     }
 
     /// Get the next frame (blocking).
+    #[must_use]
     pub fn recv(&self) -> Option<VideoFrame> {
         self.frame_rx.recv().ok()
     }
@@ -202,11 +255,13 @@ impl CameraCapturer {
         let _ = self.stop_tx.send(());
     }
 
-    pub fn width(&self) -> u32 {
+    #[must_use]
+    pub const fn width(&self) -> u32 {
         self.width
     }
 
-    pub fn height(&self) -> u32 {
+    #[must_use]
+    pub const fn height(&self) -> u32 {
         self.height
     }
 }
@@ -222,26 +277,57 @@ impl Drop for CameraCapturer {
 /// YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V].
 /// Each pair shares U and V chroma values.
 fn yuyv_to_rgba(width: u32, height: u32, yuyv: &[u8]) -> Vec<u8> {
-    let pixel_count = (width * height) as usize;
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    // Pixel dimensions comfortably fit in usize on all supported platforms.
+    let Some(pixel_count) = usize::try_from(width)
+        .ok()
+        .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+    else {
+        return Vec::new();
+    };
+    let Some(capacity) = pixel_count.checked_mul(4) else {
+        return Vec::new();
+    };
+    let mut rgba = Vec::with_capacity(capacity);
 
     // Process two pixels at a time (4 bytes of YUYV → 8 bytes of RGBA)
     let pair_count = pixel_count / 2;
     for i in 0..pair_count {
-        let base = i * 4;
-        let y0 = yuyv[base] as f32;
-        let u = yuyv[base + 1] as f32 - 128.0;
-        let y1 = yuyv[base + 2] as f32;
-        let v = yuyv[base + 3] as f32 - 128.0;
+        let Some(base) = i.checked_mul(4) else {
+            break;
+        };
+        let (Some(&y0_raw), Some(&u_raw), Some(&y1_raw), Some(&v_raw)) = (
+            yuyv.get(base),
+            base.checked_add(1).and_then(|idx| yuyv.get(idx)),
+            base.checked_add(2).and_then(|idx| yuyv.get(idx)),
+            base.checked_add(3).and_then(|idx| yuyv.get(idx)),
+        ) else {
+            break;
+        };
+
+        let y0 = f32::from(y0_raw);
+        let u = f32::from(u_raw) - 128.0;
+        let y1 = f32::from(y1_raw);
+        let v = f32::from(v_raw) - 128.0;
 
         // BT.601 YUV → RGB
-        let r0 = (y0 + 1.402 * v).clamp(0.0, 255.0) as u8;
-        let g0 = (y0 - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
-        let b0 = (y0 + 1.772 * u).clamp(0.0, 255.0) as u8;
+        // Intentional lossy conversion: clamped to [0, 255] before truncation to u8.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        let r0 = 1.402f32.mul_add(v, y0).clamp(0.0, 255.0) as u8;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        let g0 = 0.714f32
+            .mul_add(-v, 0.344f32.mul_add(-u, y0))
+            .clamp(0.0, 255.0) as u8;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        let b0 = 1.772f32.mul_add(u, y0).clamp(0.0, 255.0) as u8;
 
-        let r1 = (y1 + 1.402 * v).clamp(0.0, 255.0) as u8;
-        let g1 = (y1 - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
-        let b1 = (y1 + 1.772 * u).clamp(0.0, 255.0) as u8;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        let r1 = 1.402f32.mul_add(v, y1).clamp(0.0, 255.0) as u8;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        let g1 = 0.714f32
+            .mul_add(-v, 0.344f32.mul_add(-u, y1))
+            .clamp(0.0, 255.0) as u8;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        let b1 = 1.772f32.mul_add(u, y1).clamp(0.0, 255.0) as u8;
 
         rgba.push(r0);
         rgba.push(g0);

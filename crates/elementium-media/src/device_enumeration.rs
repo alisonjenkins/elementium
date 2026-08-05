@@ -2,6 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use elementium_types::{MediaDevice, MediaDeviceKind};
 
 /// Enumerate all available audio input and output devices.
+#[must_use]
 pub fn enumerate_audio_devices() -> Vec<MediaDevice> {
     let host = cpal::default_host();
     let mut devices = Vec::new();
@@ -36,6 +37,7 @@ pub fn enumerate_audio_devices() -> Vec<MediaDevice> {
 }
 
 /// Get the default input device config (sample rate, channels).
+#[must_use]
 pub fn default_input_config() -> Option<(u32, u16)> {
     let host = cpal::default_host();
     let device = host.default_input_device()?;
@@ -44,6 +46,7 @@ pub fn default_input_config() -> Option<(u32, u16)> {
 }
 
 /// Get the default output device config.
+#[must_use]
 pub fn default_output_config() -> Option<(u32, u16)> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
