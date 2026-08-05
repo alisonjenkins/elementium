@@ -8,3 +8,6 @@ description = "Shared types for Elementium (no heavy deps)"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true
