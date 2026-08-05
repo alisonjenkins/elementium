@@ -417,10 +417,10 @@ fn audio_capture_loop(
                     };
 
                     match encoder.encode(&audio_frame) {
-                        Ok(encoded) => {
+                        Ok(encoded_frame) => {
                             if let Ok(guard) = encode_tx.lock() {
                                 if let Some(ref tx) = *guard {
-                                    let _ = tx.try_send(IoCommand::WriteAudio(encoded));
+                                    let _ = tx.try_send(IoCommand::WriteAudio(encoded_frame));
                                 }
                             }
                         }

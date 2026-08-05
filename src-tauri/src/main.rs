@@ -74,7 +74,7 @@ fn main() {
     // Console interceptor: forwards all JS console output to Rust via Tauri IPC.
     // Uses __TAURI_INTERNALS__ directly (available before npm packages load).
     // Runs in all frames including Element Call iframe.
-    let console_bridge = r#"(function(){
+    let console_bridge = r"(function(){
         if(window.__elementium_console_bridged) return;
         window.__elementium_console_bridged = true;
         var orig = {
@@ -112,7 +112,7 @@ fn main() {
         window.addEventListener('unhandledrejection', function(e) {
             send('error', ['[UnhandledRejection] ' + (e.reason && e.reason.stack ? e.reason.stack : String(e.reason))]);
         });
-    })();"#;
+    })();";
 
     let init_script = format!("{console_bridge}\n{secrets_script}");
 
