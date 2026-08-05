@@ -20,9 +20,9 @@ regression check on every task that touches `.rs` files).
 
 ## Phase 1: Setup
 
-- [ ] T001 Add `"json"` to the `tracing-subscriber` feature list in `/home/ali/git/elementium/Cargo.toml` (`features = ["env-filter", "json"]`)
-- [ ] T002 Add a `CorrelationId` newtype (UUIDv4-backed `String`, `Display`/`Clone`/`Debug`) to `crates/elementium-types/src/` — check whether the `uuid` crate needs adding to `[workspace.dependencies]` in `/home/ali/git/elementium/Cargo.toml`, or generate via an existing dependency's RNG if one is already present; prefer `uuid` with the `v4` feature if none exists, since it's a common, small, well-audited dependency
-- [ ] T003 Verify `cargo clippy --workspace --all-targets` and `cargo test --workspace` remain clean after T001-T002 (baseline check before feature work begins)
+- [X] T001 Add `"json"` to the `tracing-subscriber` feature list in `/home/ali/git/elementium/Cargo.toml` (`features = ["env-filter", "json"]`)
+- [X] T002 Add a `CorrelationId` newtype (UUIDv4-backed `String`, `Display`/`Clone`/`Debug`) to `crates/elementium-types/src/` — check whether the `uuid` crate needs adding to `[workspace.dependencies]` in `/home/ali/git/elementium/Cargo.toml`, or generate via an existing dependency's RNG if one is already present; prefer `uuid` with the `v4` feature if none exists, since it's a common, small, well-audited dependency
+- [X] T003 Verify `cargo clippy --workspace --all-targets` and `cargo test --workspace` remain clean after T001-T002 (baseline check before feature work begins)
 
 ---
 
@@ -30,10 +30,10 @@ regression check on every task that touches `.rs` files).
 
 **⚠️ No user story implementation should begin until this phase is complete.**
 
-- [ ] T004 Switch `src-tauri/src/main.rs`'s `tracing_subscriber::fmt()` call to `tracing_subscriber::fmt().json()`, keeping the existing `EnvFilter` composition unchanged
-- [ ] T005 In `src-tauri/src/main.rs`, generate one `CorrelationId` at process startup (before `tauri::Builder` runs) and enter it as a root `tracing::info_span!("app_instance", correlation_id = %id)` for the remainder of `main()`'s scope, satisfying FR-010's pre-call fallback
-- [ ] T006 Confirm (manually, via `cargo run -p elementium` + `jq`) that stdout log lines are now valid JSON and every line carries a `correlation_id` field per quickstart.md's Story 1 section
-- [ ] T007 Run `cargo clippy --workspace --all-targets` and `cargo test --workspace` inside `nix develop`; fix any regressions from T004-T005 before proceeding
+- [X] T004 Switch `src-tauri/src/main.rs`'s `tracing_subscriber::fmt()` call to `tracing_subscriber::fmt().json()`, keeping the existing `EnvFilter` composition unchanged
+- [X] T005 In `src-tauri/src/main.rs`, generate one `CorrelationId` at process startup (before `tauri::Builder` runs) and enter it as a root `tracing::info_span!("app_instance", correlation_id = %id)` for the remainder of `main()`'s scope, satisfying FR-010's pre-call fallback
+- [X] T006 Confirm (manually, via `cargo run -p elementium` + `jq`) that stdout log lines are now valid JSON and every line carries a `correlation_id` field per quickstart.md's Story 1 section
+- [X] T007 Run `cargo clippy --workspace --all-targets` and `cargo test --workspace` inside `nix develop`; fix any regressions from T004-T005 before proceeding
 
 **Checkpoint**: JSON structured output + a always-present correlation ID field exist. User stories can now build on this.
 

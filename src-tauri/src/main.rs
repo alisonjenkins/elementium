@@ -17,6 +17,7 @@ use commands::media_devices::MediaState;
 use commands::secrets::SecretStoreState;
 use commands::webrtc::WebRtcState;
 use elementium_keyring::{BackendType, create_backend};
+use elementium_types::CorrelationId;
 use elementium_webrtc::WebRtcEngine;
 
 /// Build the JavaScript snippet that pre-populates localStorage with secrets
@@ -201,10 +202,18 @@ fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::err
 
 fn main() -> tauri::Result<()> {
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Root correlation ID for the whole process lifetime. Every event emitted before a
+    // call/session-scoped span is entered (e.g. device enumeration, startup) inherits this
+    // instead of being logged uncorrelated; call/session spans layer their own more specific
+    // correlation_id field on top once a call starts.
+    let app_instance_id = CorrelationId::new();
+    let _app_span = tracing::info_span!("app_instance", correlation_id = %app_instance_id).entered();
 
     // Initialize secret storage backend
     let (backend, backend_type) = create_backend();
