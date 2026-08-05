@@ -7,18 +7,25 @@ use crate::traits::ScreenCapturer;
 /// Flow:
 /// 1. Request screencast via `ashpd::desktop::screencast`
 /// 2. User selects source in the portal dialog
-/// 3. Portal returns a PipeWire node ID
-/// 4. Connect to PipeWire and read frames from the stream
+/// 3. Portal returns a `PipeWire` node ID
+/// 4. Connect to `PipeWire` and read frames from the stream
 ///
-/// Note: PipeWire integration requires the `pipewire` crate which adds
+/// Note: `PipeWire` integration requires the `pipewire` crate which adds
 /// a significant native dependency. For now, the portal dialog and
-/// PipeWire stream setup is implemented as a best-effort flow.
+/// `PipeWire` stream setup is implemented as a best-effort flow.
 pub struct WaylandCapturer {
     active: bool,
 }
 
+impl Default for WaylandCapturer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WaylandCapturer {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self { active: false }
     }
 }

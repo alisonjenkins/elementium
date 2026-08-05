@@ -10,7 +10,14 @@ pub struct X11Capturer {
     active: Arc<AtomicBool>,
 }
 
+impl Default for X11Capturer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl X11Capturer {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             active: Arc::new(AtomicBool::new(false)),
@@ -99,8 +106,8 @@ impl ScreenCapturer for X11Capturer {
 
                 // Sleep to maintain target frame rate
                 let elapsed = start.elapsed();
-                if elapsed < frame_interval {
-                    std::thread::sleep(frame_interval - elapsed);
+                if let Some(remaining) = frame_interval.checked_sub(elapsed) {
+                    std::thread::sleep(remaining);
                 }
             }
 
