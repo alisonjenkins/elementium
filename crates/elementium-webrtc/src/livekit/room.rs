@@ -1,7 +1,7 @@
-//! LiveKit room state management.
+//! `LiveKit` room state management.
 //!
 //! Manages the connection lifecycle, participant state, track publishing/subscribing,
-//! and bridges signaling messages to the dual PeerConnection transport.
+//! and bridges signaling messages to the dual `PeerConnection` transport.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -64,7 +64,7 @@ pub enum RoomEvent {
     },
 }
 
-/// The LiveKit room manages signaling, transport, and participant state.
+/// The `LiveKit` room manages signaling, transport, and participant state.
 pub struct LiveKitRoom {
     pub room_id: String,
     pub room_name: String,
@@ -81,14 +81,19 @@ pub struct LiveKitRoom {
 }
 
 impl LiveKitRoom {
-    /// Connect to a LiveKit SFU room.
+    /// Connect to a `LiveKit` SFU room.
     ///
     /// 1. Opens WebSocket signaling connection
-    /// 2. Waits for JoinResponse
-    /// 3. Creates dual PeerConnection transport
+    /// 2. Waits for `JoinResponse`
+    /// 3. Creates dual `PeerConnection` transport
     /// 4. Starts the signal processing loop
     ///
     /// Returns the room and a receiver for room events.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the signaling connection fails, the `JoinResponse` is
+    /// never received (or times out), or the transport cannot be created.
     pub async fn connect(
         sfu_url: &str,
         token: &str,
@@ -176,8 +181,8 @@ impl LiveKitRoom {
 
         // Spawn signal processing loop
         let sig_sender = signal_sender;
-        let transport_pub = room.transport.publisher.clone();
-        let transport_sub = room.transport.subscriber.clone();
+        let publisher_handle = room.transport.publisher.clone();
+        let subscriber_handle = room.transport.subscriber.clone();
         let transport_event_rx = room.transport.event_rx.clone();
         let vf = room.video_frames.clone();
         let rid = room_id.clone();
@@ -187,8 +192,8 @@ impl LiveKitRoom {
             signal_processing_loop(
                 signal_rx,
                 sig_sender,
-                transport_pub,
-                transport_sub,
+                publisher_handle,
+                subscriber_handle,
                 transport_event_rx,
                 vf,
                 rid,
@@ -202,8 +207,13 @@ impl LiveKitRoom {
 
     /// Publish a local track (audio or video) to the SFU.
     ///
-    /// Sends an AddTrackRequest to the SFU, then triggers an SDP renegotiation
-    /// on the Publisher PeerConnection.
+    /// Sends an `AddTrackRequest` to the SFU, then triggers an SDP renegotiation
+    /// on the Publisher `PeerConnection`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `kind` is unrecognized, or if sending the `AddTrack`
+    /// request, creating the publisher offer, or sending the offer fails.
     pub fn publish_track(
         &mut self,
         kind: &str,
@@ -237,7 +247,7 @@ impl LiveKitRoom {
         #[allow(deprecated)]
         self.signal_sender
             .send(signal_request::Message::AddTrack(AddTrackRequest {
-                cid: cid.clone(),
+                cid,
                 name: format!("{kind}_{source}"),
                 r#type: track_type,
                 source: track_source,
@@ -269,12 +279,19 @@ impl LiveKitRoom {
     }
 
     /// Send a media command to the transport (audio/video data).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the command cannot be sent to the transport.
     pub async fn write_audio(&self, data: Vec<u8>) -> Result<(), String> {
         self.transport
             .send_command(TransportCommand::WriteAudio(data))
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns `Err` if the command cannot be sent to the transport.
     pub async fn write_video(&self, data: Vec<u8>) -> Result<(), String> {
         self.transport
             .send_command(TransportCommand::WriteVideo(data))
@@ -282,6 +299,7 @@ impl LiveKitRoom {
     }
 
     /// Get the list of current participants.
+    #[must_use]
     pub fn participants(&self) -> Vec<&ParticipantInfo> {
         self.participants.values().collect()
     }
@@ -305,7 +323,7 @@ impl LiveKitRoom {
     }
 }
 
-/// Wait for the JoinResponse from the signaling channel.
+/// Wait for the `JoinResponse` from the signaling channel.
 async fn wait_for_join(
     rx: &mut mpsc::UnboundedReceiver<signal_response::Message>,
 ) -> Result<JoinResponse, String> {
@@ -319,14 +337,16 @@ async fn wait_for_join(
         Err("Signal channel closed before JoinResponse".to_string())
     });
 
-    match timeout.await {
-        Ok(result) => result,
-        Err(_) => Err("Timeout waiting for JoinResponse".to_string()),
-    }
+    timeout
+        .await
+        .unwrap_or_else(|_| Err("Timeout waiting for JoinResponse".to_string()))
 }
 
 /// Background loop: processes signaling messages and transport events.
 #[allow(clippy::too_many_arguments)]
+// Splitting this match-driven event loop would scatter the signaling state machine
+// across multiple functions with no behavioral benefit; length comes from an exhaustive match.
+#[allow(clippy::too_many_lines)]
 async fn signal_processing_loop(
     mut signal_rx: mpsc::UnboundedReceiver<signal_response::Message>,
     signal_sender: SignalSender,
@@ -343,7 +363,7 @@ async fn signal_processing_loop(
     let rid = room_id.clone();
     let evt = event_tx.clone();
     tokio::task::spawn_blocking(move || {
-        process_transport_events(transport_event_rx, vf, rid, evt);
+        process_transport_events(&transport_event_rx, &vf, &rid, &evt);
     });
 
     // Process signaling messages
@@ -355,9 +375,8 @@ async fn signal_processing_loop(
                     sdp_type: SdpType::Answer,
                     sdp: answer.sdp,
                 };
-                let mut pc = match publisher.lock() {
-                    Ok(pc) => pc,
-                    Err(_) => continue,
+                let Ok(mut pc) = publisher.lock() else {
+                    continue;
                 };
                 if let Err(e) = crate::peer_connection::set_remote_description(&mut pc, &desc) {
                     tracing::error!("Failed to set publisher answer: {e}");
@@ -370,9 +389,8 @@ async fn signal_processing_loop(
                     sdp: offer.sdp,
                 };
                 let answer = {
-                    let mut pc = match subscriber.lock() {
-                        Ok(pc) => pc,
-                        Err(_) => continue,
+                    let Ok(mut pc) = subscriber.lock() else {
+                        continue;
                     };
                     match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                         Ok(Some(ans)) => ans,
@@ -403,30 +421,25 @@ async fn signal_processing_loop(
                 let candidate_json = &trickle.candidate_init;
 
                 // candidate_init is JSON: {"candidate": "...", "sdpMid": "...", "sdpMLineIndex": 0}
-                if let Ok(parsed) =
-                    serde_json::from_str::<serde_json::Value>(candidate_json)
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(candidate_json)
+                    && let Some(candidate) = parsed.get("candidate").and_then(|c| c.as_str())
                 {
-                    if let Some(candidate) = parsed.get("candidate").and_then(|c| c.as_str()) {
-                        let handle = if target == SignalTarget::Publisher as i32 {
-                            &publisher
-                        } else {
-                            &subscriber
-                        };
-                        let mut pc = match handle.lock() {
-                            Ok(pc) => pc,
-                            Err(_) => continue,
-                        };
-                        if let Err(e) =
-                            crate::peer_connection::add_ice_candidate(&mut pc, candidate)
-                        {
-                            tracing::debug!("Failed to add ICE candidate: {e}");
-                        }
+                    let handle = if target == i32::from(SignalTarget::Publisher) {
+                        &publisher
+                    } else {
+                        &subscriber
+                    };
+                    let Ok(mut pc) = handle.lock() else {
+                        continue;
+                    };
+                    if let Err(e) = crate::peer_connection::add_ice_candidate(&mut pc, candidate) {
+                        tracing::debug!("Failed to add ICE candidate: {e}");
                     }
                 }
             }
             signal_response::Message::Update(update) => {
                 for p in &update.participants {
-                    if p.state == livekit_protocol::participant_info::State::Active as i32 {
+                    if p.state == i32::from(livekit_protocol::participant_info::State::Active) {
                         let _ = event_tx.send(RoomEvent::ParticipantJoined {
                             room_id: room_id.clone(),
                             identity: p.identity.clone(),
@@ -434,7 +447,7 @@ async fn signal_processing_loop(
                             name: p.name.clone(),
                         });
                     } else if p.state
-                        == livekit_protocol::participant_info::State::Disconnected as i32
+                        == i32::from(livekit_protocol::participant_info::State::Disconnected)
                     {
                         let _ = event_tx.send(RoomEvent::ParticipantLeft {
                             room_id: room_id.clone(),
@@ -444,10 +457,10 @@ async fn signal_processing_loop(
                     }
                 }
             }
-            signal_response::Message::TrackPublished(published) => {
+            signal_response::Message::TrackPublished(track_published) => {
                 tracing::info!(
                     room_id = %room_id,
-                    track = ?published.track,
+                    track = ?track_published.track,
                     "Track published confirmed by SFU"
                 );
             }
@@ -487,10 +500,10 @@ async fn signal_processing_loop(
 ///
 /// Runs as a blocking task because `AudioPlayer` (cpal) is not `Send`.
 fn process_transport_events(
-    event_rx: Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
-    video_frames: VideoFrameBuffer,
-    room_id: String,
-    event_tx: mpsc::UnboundedSender<RoomEvent>,
+    event_rx: &Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
+    video_frames: &VideoFrameBuffer,
+    room_id: &str,
+    event_tx: &mpsc::UnboundedSender<RoomEvent>,
 ) {
     let mut opus_decoders: HashMap<String, elementium_codec::OpusDecoder> = HashMap::new();
     let mut vp8_decoder = elementium_codec::Vp8Decoder::new().ok();
@@ -498,36 +511,38 @@ fn process_transport_events(
 
     loop {
         let event = {
-            let mut rx = match event_rx.lock() {
-                Ok(rx) => rx,
-                Err(_) => return,
+            let Ok(mut rx) = event_rx.lock() else {
+                return;
             };
             rx.try_recv().ok()
         };
 
         match event {
             Some(TransportEvent::SubscriberEvent(PcEvent::AudioData(opus_data))) => {
+                // Opus decoder creation with fixed, known-valid parameters (48kHz, stereo)
+                // cannot fail in practice; entry() requires an infallible closure here.
+                #[allow(clippy::unwrap_used)]
                 let decoder = opus_decoders
                     .entry("default".to_string())
                     .or_insert_with(|| {
                         elementium_codec::OpusDecoder::new(48000, 2).unwrap()
                     });
 
-                if let Ok(frame) = decoder.decode(&opus_data, 960) {
-                    if let Some(ref p) = player {
-                        p.play(frame);
-                    }
+                if let Ok(frame) = decoder.decode(&opus_data, 960)
+                    && let Some(ref p) = player
+                {
+                    p.play(frame);
                 }
             }
             Some(TransportEvent::SubscriberEvent(PcEvent::VideoData(vp8_data))) => {
-                if let Some(ref mut decoder) = vp8_decoder {
-                    if let Ok(frames) = decoder.decode(&vp8_data) {
-                        for i420_frame in frames {
-                            let rgba = elementium_codec::i420_to_rgba(&i420_frame);
-                            let track_key = format!("{room_id}-sub-video");
-                            if let Ok(mut buf) = video_frames.lock() {
-                                buf.insert(track_key, rgba);
-                            }
+                if let Some(ref mut decoder) = vp8_decoder
+                    && let Ok(frames) = decoder.decode(&vp8_data)
+                {
+                    for i420_frame in frames {
+                        let rgba = elementium_codec::i420_to_rgba(&i420_frame);
+                        let track_key = format!("{room_id}-sub-video");
+                        if let Ok(mut buf) = video_frames.lock() {
+                            buf.insert(track_key, rgba);
                         }
                     }
                 }
@@ -540,7 +555,7 @@ fn process_transport_events(
                     "Remote track added from subscriber PC"
                 );
                 let _ = event_tx.send(RoomEvent::TrackSubscribed {
-                    room_id: room_id.clone(),
+                    room_id: room_id.to_string(),
                     participant_sid: "unknown".to_string(),
                     track_sid: mid,
                     kind,
@@ -562,6 +577,9 @@ fn process_transport_events(
 
 fn generate_room_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // System clock is expected to be valid (post-epoch); a failure here would
+    // indicate a broken host clock, not a recoverable runtime condition.
+    #[allow(clippy::unwrap_used)]
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

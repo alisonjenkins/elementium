@@ -29,7 +29,8 @@ pub struct VideoPipeline {
 }
 
 impl VideoPipeline {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             stop_tx: None,
             capture_active: false,
@@ -38,6 +39,11 @@ impl VideoPipeline {
     }
 
     /// Start the camera capture pipeline: camera → VP8 → peer connection.
+    ///
+    /// # Errors
+    ///
+    /// This implementation currently always returns `Ok`, but the signature
+    /// is fallible to allow future validation to reject the request.
     pub fn start_camera_capture(
         &mut self,
         io_cmd_tx: mpsc::Sender<IoCommand>,
@@ -104,6 +110,11 @@ impl VideoPipeline {
     }
 
     /// Start the screen share capture pipeline: screen frames → VP8 → peer connection.
+    ///
+    /// # Errors
+    ///
+    /// This implementation currently always returns `Ok`, but the signature
+    /// is fallible to allow future validation to reject the request.
     pub fn start_screen_capture(
         &mut self,
         frame_rx: std::sync::mpsc::Receiver<VideoFrame>,
@@ -169,6 +180,11 @@ impl VideoPipeline {
     }
 
     /// Start the playback (decode) pipeline: peer connection → VP8 decode → frame buffer.
+    ///
+    /// # Errors
+    ///
+    /// This implementation currently always returns `Ok`, but the signature
+    /// is fallible to allow future validation to reject the request.
     pub fn start_playback(
         &mut self,
         event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
@@ -193,9 +209,8 @@ impl VideoPipeline {
 
             loop {
                 let event = {
-                    let mut rx = match event_rx.lock() {
-                        Ok(rx) => rx,
-                        Err(_) => return,
+                    let Ok(mut rx) = event_rx.lock() else {
+                        return;
                     };
                     rx.try_recv().ok()
                 };
@@ -243,12 +258,20 @@ impl VideoPipeline {
         self.capture_active = false;
     }
 
-    pub fn is_capture_active(&self) -> bool {
+    #[must_use]
+    pub const fn is_capture_active(&self) -> bool {
         self.capture_active
     }
 
-    pub fn is_playback_active(&self) -> bool {
+    #[must_use]
+    pub const fn is_playback_active(&self) -> bool {
         self.playback_active
+    }
+}
+
+impl Default for VideoPipeline {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -54,7 +54,9 @@ pub fn discover_srflx(socket: &UdpSocket, stun_server: SocketAddr) -> Option<Soc
                     len,
                     "Received STUN response"
                 );
-                if let Some(addr) = parse_binding_response(&buf[..len], &transaction_id) {
+                if let Some(slice) = buf.get(..len)
+                    && let Some(addr) = parse_binding_response(slice, &transaction_id)
+                {
                     tracing::info!(
                         %stun_server,
                         srflx = %addr,
@@ -90,6 +92,7 @@ pub fn discover_srflx(socket: &UdpSocket, stun_server: SocketAddr) -> Option<Soc
 /// - `turn:host:port?transport=udp`
 /// - `stun:host` (default port 3478)
 /// - `turn:host` (default port 3478)
+#[must_use]
 pub fn parse_stun_url(url: &str) -> Option<SocketAddr> {
     // Strip the scheme
     let rest = url
@@ -109,7 +112,13 @@ pub fn parse_stun_url(url: &str) -> Option<SocketAddr> {
     addr_str.to_socket_addrs().ok()?.next()
 }
 
+// Process-lifetime counter used to mix extra entropy into generated
+// transaction IDs, in place of a raw pointer address (which clippy flags as
+// a dangerous `as`/raw-pointer cast).
+static TXID_COUNTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 fn generate_transaction_id() -> [u8; 12] {
+    use std::sync::atomic::Ordering;
     use std::time::{SystemTime, UNIX_EPOCH};
     let mut id = [0u8; 12];
     let nanos = SystemTime::now()
@@ -117,10 +126,10 @@ fn generate_transaction_id() -> [u8; 12] {
         .unwrap_or_default()
         .as_nanos();
     id[..12].copy_from_slice(&nanos.to_le_bytes()[..12]);
-    // Mix in some extra entropy from the address of a stack variable
-    let stack_addr = &id as *const _ as u64;
-    id[0] ^= (stack_addr & 0xFF) as u8;
-    id[1] ^= ((stack_addr >> 8) & 0xFF) as u8;
+    let c0 = TXID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let c1 = TXID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    id[0] ^= c0;
+    id[1] ^= c1;
     id
 }
 
@@ -143,41 +152,51 @@ fn parse_binding_response(data: &[u8], transaction_id: &[u8; 12]) -> Option<Sock
     }
 
     // Check message type: Binding Response (0x0101)
-    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    let msg_type = u16::from_be_bytes([*data.first()?, *data.get(1)?]);
     if msg_type != BINDING_RESPONSE {
         tracing::debug!(msg_type, "Not a STUN Binding Response");
         return None;
     }
 
     // Verify magic cookie
-    let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let cookie = u32::from_be_bytes([
+        *data.get(4)?,
+        *data.get(5)?,
+        *data.get(6)?,
+        *data.get(7)?,
+    ]);
     if cookie != MAGIC_COOKIE {
         tracing::debug!("Invalid STUN magic cookie");
         return None;
     }
 
     // Verify transaction ID
-    if &data[8..20] != transaction_id {
+    if data.get(8..20)? != transaction_id {
         tracing::debug!("STUN transaction ID mismatch");
         return None;
     }
 
-    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-    let end = (20 + msg_len).min(data.len());
-    let mut pos = 20;
+    let msg_len = usize::from(u16::from_be_bytes([*data.get(2)?, *data.get(3)?]));
+    let end = 20usize.checked_add(msg_len)?.min(data.len());
+    let mut pos = 20usize;
 
     // Parse attributes, preferring XOR-MAPPED-ADDRESS
     let mut mapped_addr = None;
 
-    while pos + 4 <= end {
-        let attr_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let attr_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+    while pos.checked_add(4)? <= end {
+        let attr_type = u16::from_be_bytes([*data.get(pos)?, *data.get(pos.checked_add(1)?)?]);
+        let attr_len = usize::from(u16::from_be_bytes([
+            *data.get(pos.checked_add(2)?)?,
+            *data.get(pos.checked_add(3)?)?,
+        ]));
 
-        if pos + 4 + attr_len > end {
+        let attr_start = pos.checked_add(4)?;
+        let attr_end = attr_start.checked_add(attr_len)?;
+        if attr_end > end {
             break;
         }
 
-        let attr_data = &data[pos + 4..pos + 4 + attr_len];
+        let attr_data = data.get(attr_start..attr_end)?;
 
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
@@ -192,25 +211,33 @@ fn parse_binding_response(data: &[u8], transaction_id: &[u8; 12]) -> Option<Sock
         }
 
         // Attributes are padded to 4-byte boundary
-        pos += 4 + ((attr_len + 3) & !3);
+        let padded_len = attr_len.checked_add(3)? & !3usize;
+        pos = attr_start.checked_add(padded_len)?;
     }
 
     mapped_addr
 }
 
-fn parse_xor_mapped_address(data: &[u8], _transaction_id: &[u8; 12]) -> Option<SocketAddr> {
+fn parse_xor_mapped_address(data: &[u8], transaction_id: &[u8; 12]) -> Option<SocketAddr> {
     if data.len() < 8 {
         return None;
     }
 
-    let family = data[1];
-    let xor_port = u16::from_be_bytes([data[2], data[3]]);
-    let port = xor_port ^ (MAGIC_COOKIE >> 16) as u16;
+    let family = *data.get(1)?;
+    let xor_port = u16::from_be_bytes([*data.get(2)?, *data.get(3)?]);
+    // (MAGIC_COOKIE >> 16) always fits in u16 since it discards the low 16 bits.
+    let cookie_high = u16::try_from(MAGIC_COOKIE >> 16).ok()?;
+    let port = xor_port ^ cookie_high;
 
     match family {
         0x01 => {
             // IPv4
-            let xor_ip = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+            let xor_ip = u32::from_be_bytes([
+                *data.get(4)?,
+                *data.get(5)?,
+                *data.get(6)?,
+                *data.get(7)?,
+            ]);
             let ip = xor_ip ^ MAGIC_COOKIE;
             let addr = std::net::Ipv4Addr::from(ip);
             Some(SocketAddr::new(std::net::IpAddr::V4(addr), port))
@@ -221,15 +248,20 @@ fn parse_xor_mapped_address(data: &[u8], _transaction_id: &[u8; 12]) -> Option<S
                 return None;
             }
             let mut ip_bytes = [0u8; 16];
-            ip_bytes.copy_from_slice(&data[4..20]);
+            ip_bytes.copy_from_slice(data.get(4..20)?);
             // XOR first 4 bytes with magic cookie
             let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
-            for i in 0..4 {
-                ip_bytes[i] ^= cookie_bytes[i];
+            for i in 0..4usize {
+                if let (Some(b), Some(c)) = (ip_bytes.get_mut(i), cookie_bytes.get(i)) {
+                    *b ^= *c;
+                }
             }
             // XOR remaining 12 bytes with transaction ID
-            for i in 0..12 {
-                ip_bytes[4 + i] ^= _transaction_id[i];
+            for i in 0..12usize {
+                let dst_idx = i.checked_add(4)?;
+                if let (Some(b), Some(t)) = (ip_bytes.get_mut(dst_idx), transaction_id.get(i)) {
+                    *b ^= *t;
+                }
             }
             let addr = std::net::Ipv6Addr::from(ip_bytes);
             Some(SocketAddr::new(std::net::IpAddr::V6(addr), port))
@@ -243,12 +275,17 @@ fn parse_mapped_address(data: &[u8]) -> Option<SocketAddr> {
         return None;
     }
 
-    let family = data[1];
-    let port = u16::from_be_bytes([data[2], data[3]]);
+    let family = *data.get(1)?;
+    let port = u16::from_be_bytes([*data.get(2)?, *data.get(3)?]);
 
     match family {
         0x01 => {
-            let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+            let ip = std::net::Ipv4Addr::new(
+                *data.get(4)?,
+                *data.get(5)?,
+                *data.get(6)?,
+                *data.get(7)?,
+            );
             Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
         }
         _ => None,
@@ -263,16 +300,18 @@ mod tests {
     fn test_parse_stun_url_turn_with_port_and_transport() {
         let addr = parse_stun_url("turn:54.171.90.130:3479?transport=udp");
         assert!(addr.is_some());
-        let addr = addr.unwrap();
-        assert_eq!(addr.ip().to_string(), "54.171.90.130");
-        assert_eq!(addr.port(), 3479);
+        if let Some(addr) = addr {
+            assert_eq!(addr.ip().to_string(), "54.171.90.130");
+            assert_eq!(addr.port(), 3479);
+        }
     }
 
     #[test]
     fn test_parse_stun_url_stun_default_port() {
         let addr = parse_stun_url("stun:stun.l.google.com");
-        // DNS resolution may or may not work in CI, so just check the format
-        assert!(addr.is_some() || true);
+        // DNS resolution may or may not work in CI, so we don't assert on the
+        // outcome -- just confirm the call completes without panicking.
+        let _ = addr;
     }
 
     #[test]
@@ -312,8 +351,11 @@ mod tests {
             xor_ip[3],
         ];
 
-        let addr = parse_xor_mapped_address(&data, &tid).unwrap();
-        assert_eq!(addr.ip().to_string(), "203.0.113.5");
-        assert_eq!(addr.port(), 12345);
+        let addr = parse_xor_mapped_address(&data, &tid);
+        assert!(addr.is_some());
+        if let Some(addr) = addr {
+            assert_eq!(addr.ip().to_string(), "203.0.113.5");
+            assert_eq!(addr.port(), 12345);
+        }
     }
 }

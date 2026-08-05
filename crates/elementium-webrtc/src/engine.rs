@@ -47,12 +47,19 @@ pub struct WebRtcEngine {
     /// Shared video frame buffer for all connections.
     pub video_frames: VideoFrameBuffer,
     /// Shared E2EE context for frame encryption/decryption.
-    /// Uses Arc<Mutex<>> so it can be shared with Tauri's E2eeState and
+    /// Uses `Arc<Mutex<>>` so it can be shared with Tauri's `E2eeState` and
     /// populated after I/O loops are already running.
     pub e2ee: Arc<Mutex<Option<E2eeContext>>>,
 }
 
+impl Default for WebRtcEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebRtcEngine {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
@@ -65,6 +72,11 @@ impl WebRtcEngine {
     ///
     /// If `ice_servers` are provided, performs STUN discovery to find the
     /// server-reflexive (public) address and adds it as an srflx candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the UDP socket cannot be bound or its local
+    /// address cannot be determined.
     pub fn create_connection(
         &mut self,
         id: String,
@@ -97,7 +109,7 @@ impl WebRtcEngine {
         let loop_socket = socket.clone();
         let loop_e2ee = self.e2ee.clone(); // clones the Arc, shares the Option
         tokio::task::spawn_blocking(move || {
-            io_loop(loop_handle, loop_socket, io_cmd_rx, event_tx, loop_e2ee);
+            io_loop(&loop_handle, &loop_socket, io_cmd_rx, &event_tx, &loop_e2ee);
         });
 
         self.connections.insert(
@@ -114,6 +126,7 @@ impl WebRtcEngine {
     }
 
     /// Get a reference to a managed peer connection.
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<&ManagedPc> {
         self.connections.get(id)
     }
@@ -133,35 +146,100 @@ impl WebRtcEngine {
     }
 
     /// Get the IDs of all active connections.
+    #[must_use]
     pub fn connection_ids(&self) -> Vec<String> {
         self.connections.keys().cloned().collect()
     }
 }
 
-/// The blocking I/O loop that drives a single peer connection.
-fn io_loop(
-    handle: PeerConnectionHandle,
-    socket: Arc<UdpSocket>,
-    mut cmd_rx: mpsc::Receiver<IoCommand>,
-    event_tx: mpsc::Sender<PcEvent>,
-    e2ee_ctx: Arc<Mutex<Option<E2eeContext>>>,
-) {
-    let mut recv_buf = vec![0u8; 2000];
+/// Lock the PC handle, recovering from poisoned locks.
+///
+/// A poisoned lock means a previous holder panicked — we recover the
+/// inner data and keep going rather than cascading the panic.
+fn lock_pc(
+    handle: &PeerConnectionHandle,
+) -> std::sync::MutexGuard<'_, peer_connection::PeerConnectionInner> {
+    match handle.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("PC lock was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 
-    // Helper: lock the PC handle, recovering from poisoned locks.
-    // A poisoned lock means a previous holder panicked — we recover
-    // the inner data and keep going rather than cascading the panic.
-    macro_rules! lock_pc {
-        ($handle:expr) => {
-            match $handle.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::warn!("PC lock was poisoned, recovering");
-                    poisoned.into_inner()
+/// E2EE fail-closed: if encryption is configured but fails (no key,
+/// poisoned lock, or frame-counter exhaustion), drop the frame rather
+/// than sending it in plaintext.
+fn encrypt_or_drop(
+    e2ee: Option<&E2eeContext>,
+    data: Vec<u8>,
+    kind: E2eeMediaKind,
+    label: &str,
+) -> Option<Vec<u8>> {
+    let Some(ctx) = e2ee else {
+        return Some(data);
+    };
+    ctx.encrypt_frame(&data, kind).map_or_else(
+        || {
+            tracing::warn!("Dropping outbound {label} frame: E2EE encryption failed");
+            None
+        },
+        Some,
+    )
+}
+
+/// Drain any pending I/O commands (non-blocking). Returns `true` if the
+/// I/O loop should shut down.
+fn drain_io_commands(
+    cmd_rx: &mut mpsc::Receiver<IoCommand>,
+    handle: &PeerConnectionHandle,
+    e2ee: Option<&E2eeContext>,
+) -> bool {
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(IoCommand::WriteAudio(opus_data)) => {
+                let Some(data) = encrypt_or_drop(e2ee, opus_data, E2eeMediaKind::Audio, "audio")
+                else {
+                    continue;
+                };
+                let mut pc = lock_pc(handle);
+                if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
+                    tracing::debug!("write_audio: {e}");
                 }
             }
-        };
+            Ok(IoCommand::WriteVideo(vp8_data)) => {
+                let Some(data) = encrypt_or_drop(e2ee, vp8_data, E2eeMediaKind::Video, "video")
+                else {
+                    continue;
+                };
+                let mut pc = lock_pc(handle);
+                if let Err(e) = peer_connection::write_video(&mut pc, &data) {
+                    tracing::debug!("write_video: {e}");
+                }
+            }
+            Ok(IoCommand::Shutdown) => {
+                tracing::info!("I/O loop shutting down");
+                return true;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return false,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                tracing::info!("I/O loop command channel closed");
+                return true;
+            }
+        }
     }
+}
+
+/// The blocking I/O loop that drives a single peer connection.
+fn io_loop(
+    handle: &PeerConnectionHandle,
+    socket: &Arc<UdpSocket>,
+    mut cmd_rx: mpsc::Receiver<IoCommand>,
+    event_tx: &mpsc::Sender<PcEvent>,
+    e2ee_ctx: &Arc<Mutex<Option<E2eeContext>>>,
+) {
+    let mut recv_buf = vec![0u8; 2000];
 
     loop {
         // Snapshot the E2EE context for this iteration.
@@ -171,53 +249,17 @@ fn io_loop(
             e2ee_ctx.lock().ok().and_then(|g| g.clone());
 
         // Process any pending commands (non-blocking)
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(IoCommand::WriteAudio(opus_data)) => {
-                    // Encrypt if E2EE is active
-                    let data = match &e2ee {
-                        Some(ctx) => ctx
-                            .encrypt_frame(&opus_data, E2eeMediaKind::Audio)
-                            .unwrap_or(opus_data),
-                        None => opus_data,
-                    };
-                    let mut pc = lock_pc!(handle);
-                    if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
-                        tracing::debug!("write_audio: {e}");
-                    }
-                }
-                Ok(IoCommand::WriteVideo(vp8_data)) => {
-                    // Encrypt if E2EE is active
-                    let data = match &e2ee {
-                        Some(ctx) => ctx
-                            .encrypt_frame(&vp8_data, E2eeMediaKind::Video)
-                            .unwrap_or(vp8_data),
-                        None => vp8_data,
-                    };
-                    let mut pc = lock_pc!(handle);
-                    if let Err(e) = peer_connection::write_video(&mut pc, &data) {
-                        tracing::debug!("write_video: {e}");
-                    }
-                }
-                Ok(IoCommand::Shutdown) => {
-                    tracing::info!("I/O loop shutting down");
-                    return;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    tracing::info!("I/O loop command channel closed");
-                    return;
-                }
-            }
+        if drain_io_commands(&mut cmd_rx, handle, e2ee.as_ref()) {
+            return;
         }
 
         // Poll str0m for outputs, decrypt inbound if E2EE is active
         let deadline = {
-            let mut pc = lock_pc!(handle);
-            match peer_connection::poll_once(&mut pc, &socket, &mut recv_buf) {
+            let mut pc = lock_pc(handle);
+            match peer_connection::poll_once(&mut pc, socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        let event = maybe_decrypt_event(event, &e2ee);
+                        let event = maybe_decrypt_event(event, e2ee.as_ref());
                         let _ = event_tx.try_send(event);
                     }
                     deadline
@@ -230,17 +272,19 @@ fn io_loop(
         };
 
         // Wait for UDP data or timeout
-        let wait = (deadline - Instant::now()).max(Duration::from_millis(1));
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
         let wait = wait.min(Duration::from_millis(20)); // Cap at 20ms for responsiveness
 
         {
-            let mut pc = lock_pc!(handle);
+            let mut pc = lock_pc(handle);
             if !pc.alive {
                 tracing::info!(pc_id = %pc.id, "Peer connection no longer alive");
                 return;
             }
             if let Err(e) =
-                peer_connection::recv_and_feed(&mut pc, &socket, &mut recv_buf, wait)
+                peer_connection::recv_and_feed(&mut pc, socket, &mut recv_buf, wait)
             {
                 tracing::debug!("recv_and_feed: {e}");
             }
@@ -286,7 +330,7 @@ fn discover_and_add_srflx(
 ///
 /// Uses `decrypt_frame_any` which tries all known participant keys, since we
 /// don't know which participant sent a particular RTP frame via the SFU.
-fn maybe_decrypt_event(event: PcEvent, e2ee: &Option<E2eeContext>) -> PcEvent {
+fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> PcEvent {
     let Some(ctx) = e2ee else {
         return event;
     };
