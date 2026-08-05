@@ -199,10 +199,14 @@ impl KeyManager {
             .entry(participant.to_string())
             .or_insert_with(KeyRing::new);
         ring.set_key(key_index, material);
+        // Only the key length (a size, not secret material) and identifiers are
+        // logged here. The key bytes/derived cipher material must never appear
+        // in a log event.
         tracing::info!(
             participant = participant,
             key_index = key_index,
-            "E2EE key set"
+            key_len = material.len(),
+            "E2EE key set for participant"
         );
     }
 }
@@ -243,13 +247,19 @@ impl E2eeContext {
     /// Acquire the read lock, translating poisoning into a proper error
     /// instead of panicking.
     fn lock_read(&self) -> Result<RwLockReadGuard<'_, E2eeContextInner>, E2eeError> {
-        self.inner.read().map_err(|_| E2eeError::LockPoisoned)
+        self.inner.read().map_err(|_| {
+            tracing::error!(reason = "lock_poisoned", "E2EE internal read lock poisoned");
+            E2eeError::LockPoisoned
+        })
     }
 
     /// Acquire the write lock, translating poisoning into a proper error
     /// instead of panicking.
     fn lock_write(&self) -> Result<RwLockWriteGuard<'_, E2eeContextInner>, E2eeError> {
-        self.inner.write().map_err(|_| E2eeError::LockPoisoned)
+        self.inner.write().map_err(|_| {
+            tracing::error!(reason = "lock_poisoned", "E2EE internal write lock poisoned");
+            E2eeError::LockPoisoned
+        })
     }
 
     /// Set the local participant identity (used for choosing the encryption key).
@@ -258,10 +268,14 @@ impl E2eeContext {
     /// this call is a documented no-op (the identity is not updated).
     pub fn set_local_identity(&self, identity: &str) {
         let Ok(mut inner) = self.inner.write() else {
-            tracing::error!("E2EE lock poisoned; failed to set local identity");
+            tracing::error!(
+                reason = "lock_poisoned",
+                "E2EE lock poisoned; failed to set local identity"
+            );
             return;
         };
         inner.key_manager.local_identity = Some(identity.to_string());
+        tracing::info!(participant = identity, "E2EE local identity set");
     }
 
     /// Store an encryption key for a participant.
@@ -270,7 +284,11 @@ impl E2eeContext {
     /// this call is a documented no-op (the key is not stored).
     pub fn set_key(&self, participant: &str, key_index: u8, key_material: &[u8]) {
         let Ok(mut inner) = self.inner.write() else {
-            tracing::error!("E2EE lock poisoned; failed to set key");
+            tracing::error!(
+                reason = "lock_poisoned",
+                participant = participant,
+                "E2EE lock poisoned; failed to set key"
+            );
             return;
         };
         inner.key_manager.set_key(participant, key_index, key_material);
@@ -313,32 +331,82 @@ impl E2eeContext {
     /// has been exhausted (which would otherwise force IV/nonce reuse).
     pub fn encrypt_frame(&self, frame: &[u8], kind: MediaKind) -> Option<Vec<u8>> {
         let Ok(mut inner) = self.inner.write() else {
-            tracing::error!("E2EE lock poisoned; refusing to encrypt");
+            tracing::error!(
+                reason = "lock_poisoned",
+                "E2EE dropping outbound frame: internal lock poisoned"
+            );
             return None;
         };
 
         // Get the local participant's current key index
-        let identity = inner.key_manager.local_identity.clone()?;
+        let Some(identity) = inner.key_manager.local_identity.clone() else {
+            tracing::warn!(
+                reason = "no_local_identity",
+                "E2EE dropping outbound frame: local identity not set"
+            );
+            return None;
+        };
 
         // Generate IV from frame counter (mutate before borrowing participants).
         // Use checked_add so we fail closed instead of wrapping the counter and
         // reusing an IV/nonce pair, which would be a catastrophic AES-GCM break.
         let counter = inner.frame_counter;
-        inner.frame_counter = inner.frame_counter.checked_add(1)?;
+        let Some(next_counter) = inner.frame_counter.checked_add(1) else {
+            tracing::error!(
+                reason = "frame_counter_exhausted",
+                participant = %identity,
+                "E2EE dropping outbound frame: frame counter exhausted"
+            );
+            return None;
+        };
+        inner.frame_counter = next_counter;
 
-        let ring = inner.key_manager.participants.get(&identity)?;
-        let (cipher, key_index) = ring.current_cipher()?;
+        let Some(ring) = inner.key_manager.participants.get(&identity) else {
+            tracing::warn!(
+                reason = "no_key_for_participant",
+                participant = %identity,
+                "E2EE dropping outbound frame: no key ring for local participant"
+            );
+            return None;
+        };
+        let Some((cipher, key_index)) = ring.current_cipher() else {
+            tracing::warn!(
+                reason = "no_current_key",
+                participant = %identity,
+                "E2EE dropping outbound frame: no current key set"
+            );
+            return None;
+        };
 
         let header_size = unencrypted_header_size(frame, kind);
-        let header = frame.get(..header_size)?;
-        let payload = frame.get(header_size..)?;
+        let Some(header) = frame.get(..header_size) else {
+            tracing::error!(
+                reason = "malformed_header",
+                participant = %identity,
+                "E2EE dropping outbound frame: frame shorter than expected header"
+            );
+            return None;
+        };
+        let Some(payload) = frame.get(header_size..) else {
+            tracing::error!(
+                reason = "malformed_payload",
+                participant = %identity,
+                "E2EE dropping outbound frame: frame shorter than expected payload"
+            );
+            return None;
+        };
 
         let iv = build_iv(counter);
         let nonce = Nonce::from(iv);
         let ciphertext = match cipher.encrypt(&nonce, payload) {
             Ok(ct) => ct,
             Err(e) => {
-                tracing::warn!("E2EE encrypt failed: {e}");
+                tracing::warn!(
+                    reason = "cipher_error",
+                    participant = %identity,
+                    error = %e,
+                    "E2EE dropping outbound frame: AES-GCM encryption failed"
+                );
                 return None;
             }
         };
@@ -380,6 +448,10 @@ impl E2eeContext {
         };
 
         if participants.is_empty() {
+            tracing::warn!(
+                reason = "no_participants_with_keys",
+                "E2EE dropping inbound frame: no participant keys known"
+            );
             return Ok(None);
         }
 
@@ -463,6 +535,11 @@ impl E2eeContext {
         let options = inner.options.clone();
 
         let Some(ring) = inner.key_manager.participants.get(participant) else {
+            tracing::warn!(
+                reason = "no_key_for_participant",
+                participant = %participant,
+                "E2EE dropping inbound frame: no key ring for participant"
+            );
             return Ok(None);
         };
 
@@ -504,6 +581,13 @@ impl E2eeContext {
             }
         }
 
+        tracing::warn!(
+            reason = "decryption_failed",
+            participant = %participant,
+            key_index = key_index,
+            ratchet_window_size = options.ratchet_window_size,
+            "E2EE dropping inbound frame: AES-GCM decryption failed for all tried keys"
+        );
         Err(E2eeError::DecryptionFailed(format!(
             "participant={participant}, key_index={key_index}"
         )))
