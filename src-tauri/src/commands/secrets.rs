@@ -1,3 +1,10 @@
+// Every `#[tauri::command]` async fn below that takes a `State<'_, T>` parameter causes
+// the `#[command]` macro to generate a sibling IPC-dispatch wrapper item in this module
+// containing an internal match with an arm clippy flags as unreachable. That wrapper is
+// framework codegen (not nested inside the fn item itself, so a function- or
+// statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
+// module-level allow here rather than the usual per-item scoping.
+#![allow(clippy::unreachable)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -19,10 +26,9 @@ pub async fn secret_get(
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let guard = store.lock().map_err(|e| e.to_string())?;
-        match guard.as_ref() {
-            Some(s) => s.get(&key).map_err(|e| e.to_string()),
-            None => Ok(None),
-        }
+        guard
+            .as_ref()
+            .map_or(Ok(None), |s| s.get(&key).map_err(|e| e.to_string()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -37,27 +43,23 @@ pub async fn secret_set(
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let guard = store.lock().map_err(|e| e.to_string())?;
-        match guard.as_ref() {
-            Some(s) => s.set(&key, &value).map_err(|e| e.to_string()),
-            None => Ok(()), // no backend, silently ignore
-        }
+        // no backend, silently ignore
+        guard
+            .as_ref()
+            .map_or(Ok(()), |s| s.set(&key, &value).map_err(|e| e.to_string()))
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
 #[command]
-pub async fn secret_delete(
-    key: String,
-    state: State<'_, SecretStoreState>,
-) -> Result<(), String> {
+pub async fn secret_delete(key: String, state: State<'_, SecretStoreState>) -> Result<(), String> {
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let guard = store.lock().map_err(|e| e.to_string())?;
-        match guard.as_ref() {
-            Some(s) => s.delete(&key).map_err(|e| e.to_string()),
-            None => Ok(()),
-        }
+        guard
+            .as_ref()
+            .map_or(Ok(()), |s| s.delete(&key).map_err(|e| e.to_string()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -70,10 +72,10 @@ pub async fn secret_get_all(
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         let guard = store.lock().map_err(|e| e.to_string())?;
-        match guard.as_ref() {
-            Some(s) => s.get_all().map_err(|e| e.to_string()),
-            None => Ok(HashMap::new()),
-        }
+        guard.as_ref().map_or_else(
+            || Ok(HashMap::new()),
+            |s| s.get_all().map_err(|e| e.to_string()),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -99,11 +101,15 @@ pub async fn secret_setup_file_backend(
         let backend = FileBackend::new(&password).map_err(|e| e.to_string())?;
         let boxed: Box<dyn SecretStore> = Box::new(backend);
 
-        let mut store_guard = store_arc.lock().map_err(|e| e.to_string())?;
-        *store_guard = Some(boxed);
+        {
+            let mut store_guard = store_arc.lock().map_err(|e| e.to_string())?;
+            *store_guard = Some(boxed);
+        }
 
-        let mut bt_guard = backend_type_arc.lock().map_err(|e| e.to_string())?;
-        *bt_guard = BackendType::EncryptedFile;
+        {
+            let mut bt_guard = backend_type_arc.lock().map_err(|e| e.to_string())?;
+            *bt_guard = BackendType::EncryptedFile;
+        }
 
         Ok(())
     })

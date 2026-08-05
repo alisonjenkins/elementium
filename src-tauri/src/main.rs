@@ -28,13 +28,12 @@ fn build_secrets_init_script(
     let needs_setup = backend_type == BackendType::NeedsSetup;
 
     if needs_setup {
-        return format!(
-            "(function(){{\
+        return "(function(){\
                 window.__elementium_secrets_loaded=false;\
                 window.__elementium_needs_secret_setup=true;\
                 console.warn('[Elementium] No secret storage backend available — secrets stored in localStorage only');\
-            }})();"
-        );
+            })();"
+            .to_string();
     }
 
     // Serialize secrets as JSON for injection
@@ -50,88 +49,78 @@ fn build_secrets_init_script(
     )
 }
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+// Console interceptor: forwards all JS console output to Rust via Tauri IPC.
+// Uses __TAURI_INTERNALS__ directly (available before npm packages load).
+// Runs in all frames including Element Call iframe.
+const CONSOLE_BRIDGE_SCRIPT: &str = r"(function(){
+    if(window.__elementium_console_bridged) return;
+    window.__elementium_console_bridged = true;
+    var orig = {
+        log: console.log.bind(console),
+        warn: console.warn.bind(console),
+        error: console.error.bind(console),
+        debug: console.debug.bind(console),
+        info: console.info.bind(console)
+    };
+    function send(level, args) {
+        try {
+            var strs = [];
+            for (var i = 0; i < args.length; i++) {
+                try {
+                    strs.push(typeof args[i] === 'string' ? args[i] : JSON.stringify(args[i]));
+                } catch(e) {
+                    strs.push(String(args[i]));
+                }
+            }
+            var t = window.__TAURI_INTERNALS__;
+            if (t && t.invoke) {
+                t.invoke('console_log', { level: level, args: strs }).catch(function(){});
+            }
+        } catch(e) {}
+    }
+    console.log = function() { orig.log.apply(console, arguments); send('info', arguments); };
+    console.info = function() { orig.info.apply(console, arguments); send('info', arguments); };
+    console.warn = function() { orig.warn.apply(console, arguments); send('warn', arguments); };
+    console.error = function() { orig.error.apply(console, arguments); send('error', arguments); };
+    console.debug = function() { orig.debug.apply(console, arguments); send('debug', arguments); };
+    // Also capture unhandled errors and promise rejections
+    window.addEventListener('error', function(e) {
+        send('error', ['[Uncaught] ' + e.message + ' at ' + e.filename + ':' + e.lineno]);
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+        send('error', ['[UnhandledRejection] ' + (e.reason && e.reason.stack ? e.reason.stack : String(e.reason))]);
+    });
+})();";
 
-    // Initialize secret storage backend
-    let (backend, backend_type) = create_backend();
-
-    // Load secrets for init script injection
-    let initial_secrets = match &backend {
-        Some(store) => store.get_all().unwrap_or_else(|e| {
+/// Load persisted secrets (if any backend is configured) for init-script injection.
+fn load_initial_secrets(
+    backend: Option<&dyn elementium_keyring::SecretStore>,
+) -> std::collections::HashMap<String, String> {
+    backend.map_or_else(std::collections::HashMap::new, |store| {
+        store.get_all().unwrap_or_else(|e| {
             warn!("failed to load secrets from keyring: {e}");
             std::collections::HashMap::new()
-        }),
-        None => std::collections::HashMap::new(),
-    };
+        })
+    })
+}
 
-    let secrets_script = build_secrets_init_script(&initial_secrets, backend_type);
-
-    // Console interceptor: forwards all JS console output to Rust via Tauri IPC.
-    // Uses __TAURI_INTERNALS__ directly (available before npm packages load).
-    // Runs in all frames including Element Call iframe.
-    let console_bridge = r"(function(){
-        if(window.__elementium_console_bridged) return;
-        window.__elementium_console_bridged = true;
-        var orig = {
-            log: console.log.bind(console),
-            warn: console.warn.bind(console),
-            error: console.error.bind(console),
-            debug: console.debug.bind(console),
-            info: console.info.bind(console)
-        };
-        function send(level, args) {
-            try {
-                var strs = [];
-                for (var i = 0; i < args.length; i++) {
-                    try {
-                        strs.push(typeof args[i] === 'string' ? args[i] : JSON.stringify(args[i]));
-                    } catch(e) {
-                        strs.push(String(args[i]));
-                    }
-                }
-                var t = window.__TAURI_INTERNALS__;
-                if (t && t.invoke) {
-                    t.invoke('console_log', { level: level, args: strs }).catch(function(){});
-                }
-            } catch(e) {}
-        }
-        console.log = function() { orig.log.apply(console, arguments); send('info', arguments); };
-        console.info = function() { orig.info.apply(console, arguments); send('info', arguments); };
-        console.warn = function() { orig.warn.apply(console, arguments); send('warn', arguments); };
-        console.error = function() { orig.error.apply(console, arguments); send('error', arguments); };
-        console.debug = function() { orig.debug.apply(console, arguments); send('debug', arguments); };
-        // Also capture unhandled errors and promise rejections
-        window.addEventListener('error', function(e) {
-            send('error', ['[Uncaught] ' + e.message + ' at ' + e.filename + ':' + e.lineno]);
-        });
-        window.addEventListener('unhandledrejection', function(e) {
-            send('error', ['[UnhandledRejection] ' + (e.reason && e.reason.stack ? e.reason.stack : String(e.reason))]);
-        });
-    })();";
-
-    let init_script = format!("{console_bridge}\n{secrets_script}");
-
-    let mut builder = tauri::Builder::default();
-
-    // Register shared state
-    //
+/// Register all app-managed state (`WebRtcEngine`, media, `LiveKit`, secrets, E2EE).
+fn register_state(
+    builder: tauri::Builder<tauri::Wry>,
+    backend: Option<Box<dyn elementium_keyring::SecretStore>>,
+    backend_type: BackendType,
+) -> tauri::Builder<tauri::Wry> {
     // The E2EE context is shared between the WebRTC engine (for I/O loop
     // encryption/decryption) and Tauri's E2eeState (for JS commands).
     // This ensures that when e2ee_init/e2ee_set_key are called from JS,
     // the running I/O loops immediately pick up the context and keys.
-    let shared_e2ee: Arc<Mutex<Option<elementium_e2ee::E2eeContext>>> =
-        Arc::new(Mutex::new(None));
+    let shared_e2ee: Arc<Mutex<Option<elementium_e2ee::E2eeContext>>> = Arc::new(Mutex::new(None));
 
     let mut engine = WebRtcEngine::new();
     engine.e2ee = shared_e2ee.clone();
     let video_frames = engine.video_frames.clone();
 
-    builder = builder
+    builder
         .manage(WebRtcState(Arc::new(Mutex::new(engine))))
         .manage(MediaState {
             active_tracks: Mutex::new(Vec::new()),
@@ -147,18 +136,12 @@ fn main() {
             store: Arc::new(Mutex::new(backend)),
             backend_type: Arc::new(Mutex::new(backend_type)),
         })
-        .manage(E2eeState {
-            ctx: shared_e2ee,
-        });
+        .manage(E2eeState { ctx: shared_e2ee })
+}
 
-    builder = builder
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_opener::init());
-
-    builder = builder.invoke_handler(tauri::generate_handler![
+/// Register the IPC command handlers for every `#[tauri::command]` in `commands::*`.
+fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder.invoke_handler(tauri::generate_handler![
         commands::webrtc::create_peer_connection,
         commands::webrtc::create_offer,
         commands::webrtc::create_answer,
@@ -186,38 +169,67 @@ fn main() {
         commands::e2ee::e2ee_set_key,
         commands::e2ee::e2ee_set_local_identity,
         commands::console::console_log,
-    ]);
+    ])
+}
 
+/// Create the tray and main webview window during Tauri's `setup` hook.
+fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::error::Error>> {
+    tray::create_tray(app)?;
+
+    // Programmatic window creation with initialization_script for secret injection.
+    // The debug-mode URL is a fixed literal, so the parse cannot fail in practice.
+    #[allow(clippy::unwrap_used)]
+    let url = if cfg!(debug_assertions) {
+        WebviewUrl::External("http://localhost:5173".parse().unwrap())
+    } else {
+        WebviewUrl::App("index.html".into())
+    };
+
+    let win = WebviewWindowBuilder::new(app, "main", url)
+        .title("Elementium")
+        .inner_size(1280.0, 800.0)
+        .min_inner_size(800.0, 600.0)
+        .resizable(true)
+        .fullscreen(false)
+        .initialization_script(init_script)
+        .build()?;
+
+    let _ = win.eval("console.log('[Elementium] Native WebRTC backend active');");
+
+    Ok(())
+}
+
+fn main() -> tauri::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    // Initialize secret storage backend
+    let (backend, backend_type) = create_backend();
+    let initial_secrets = load_initial_secrets(backend.as_deref());
+    let secrets_script = build_secrets_init_script(&initial_secrets, backend_type);
+    let init_script = format!("{CONSOLE_BRIDGE_SCRIPT}\n{secrets_script}");
+
+    let mut builder = tauri::Builder::default();
+    builder = register_state(builder, backend, backend_type);
+    builder = builder
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init());
+    builder = register_commands(builder);
     builder = builder.register_asynchronous_uri_scheme_protocol(
         "elementium",
         protocols::handle_video_frame_protocol,
     );
+    builder = builder.setup(move |app| setup_app(app, &init_script));
 
-    builder = builder.setup(move |app| {
-        tray::create_tray(app)?;
-
-        // Programmatic window creation with initialization_script for secret injection
-        let url = if cfg!(debug_assertions) {
-            WebviewUrl::External("http://localhost:5173".parse().unwrap())
-        } else {
-            WebviewUrl::App("index.html".into())
-        };
-
-        let win = WebviewWindowBuilder::new(app, "main", url)
-            .title("Elementium")
-            .inner_size(1280.0, 800.0)
-            .min_inner_size(800.0, 600.0)
-            .resizable(true)
-            .fullscreen(false)
-            .initialization_script(&init_script)
-            .build()?;
-
-        let _ = win.eval("console.log('[Elementium] Native WebRTC backend active');");
-
-        Ok(())
-    });
-
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running Elementium");
+    // Both `large_stack_frames` and `usage of process::exit` fire on this line because
+    // they originate inside the expansion of `tauri::generate_context!()` (framework
+    // codegen), not in our code.
+    #[allow(clippy::large_stack_frames, clippy::exit)]
+    builder.run(tauri::generate_context!())
 }

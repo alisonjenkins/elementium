@@ -1,3 +1,10 @@
+// Every `#[tauri::command]` async fn below that takes a `State<'_, T>` parameter causes
+// the `#[command]` macro to generate a sibling IPC-dispatch wrapper item in this module
+// containing an internal match with an arm clippy flags as unreachable. That wrapper is
+// framework codegen (not nested inside the fn item itself, so a function- or
+// statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
+// module-level allow here rather than the usual per-item scoping.
+#![allow(clippy::unreachable)]
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -38,8 +45,10 @@ pub async fn e2ee_init(
     };
 
     let ctx = E2eeContext::new(opts);
-    let mut guard = state.ctx.lock().map_err(|e| e.to_string())?;
-    *guard = Some(ctx);
+    {
+        let mut guard = state.ctx.lock().map_err(|e| e.to_string())?;
+        *guard = Some(ctx);
+    }
 
     tracing::info!("E2EE context initialized");
     Ok(())
@@ -52,11 +61,6 @@ pub async fn e2ee_set_key(
     key_index: u8,
     key_material: Vec<u8>,
 ) -> Result<(), String> {
-    let guard = state.ctx.lock().map_err(|e| e.to_string())?;
-    let ctx = guard
-        .as_ref()
-        .ok_or("E2EE not initialized — call e2ee_init first")?;
-
     tracing::info!(
         participant = %participant,
         key_index = key_index,
@@ -64,7 +68,13 @@ pub async fn e2ee_set_key(
         "E2EE key received"
     );
 
-    ctx.set_key(&participant, key_index, &key_material);
+    state
+        .ctx
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .ok_or("E2EE not initialized — call e2ee_init first")?
+        .set_key(&participant, key_index, &key_material);
     Ok(())
 }
 
@@ -73,12 +83,14 @@ pub async fn e2ee_set_local_identity(
     state: State<'_, E2eeState>,
     identity: String,
 ) -> Result<(), String> {
-    let guard = state.ctx.lock().map_err(|e| e.to_string())?;
-    let ctx = guard
-        .as_ref()
-        .ok_or("E2EE not initialized — call e2ee_init first")?;
-
     tracing::info!(identity = %identity, "E2EE local identity set");
-    ctx.set_local_identity(&identity);
+
+    state
+        .ctx
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .ok_or("E2EE not initialized — call e2ee_init first")?
+        .set_local_identity(&identity);
     Ok(())
 }

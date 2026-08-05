@@ -1,3 +1,10 @@
+// Every `#[tauri::command]` async fn below that takes a `State<'_, T>` parameter causes
+// the `#[command]` macro to generate a sibling IPC-dispatch wrapper item in this module
+// containing an internal match with an arm clippy flags as unreachable. That wrapper is
+// framework codegen (not nested inside the fn item itself, so a function- or
+// statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
+// module-level allow here rather than the usual per-item scoping.
+#![allow(clippy::unreachable)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +14,7 @@ use tauri::{AppHandle, Emitter, State, command};
 use elementium_webrtc::engine::VideoFrameBuffer;
 use elementium_webrtc::livekit::room::{LiveKitRoom, RoomEvent};
 
-/// Shared state holding active LiveKit rooms, managed by Tauri.
+/// Shared state holding active `LiveKit` rooms, managed by Tauri.
 #[derive(Clone)]
 pub struct LiveKitState {
     pub rooms: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<LiveKitRoom>>>>>,
@@ -22,7 +29,7 @@ pub struct ConnectResult {
     pub local_identity: String,
 }
 
-/// Connect to a LiveKit SFU room.
+/// Connect to a `LiveKit` SFU room.
 #[command]
 pub async fn livekit_connect(
     state: State<'_, LiveKitState>,
@@ -33,8 +40,7 @@ pub async fn livekit_connect(
     tracing::info!(sfu_url = %sfu_url, "Connecting to LiveKit room");
 
     let video_frames = state.video_frames.clone();
-    let (room, mut event_rx) =
-        LiveKitRoom::connect(&sfu_url, &token, video_frames).await?;
+    let (room, mut event_rx) = LiveKitRoom::connect(&sfu_url, &token, video_frames).await?;
 
     let room_id = room.room_id.clone();
     let room_name = room.room_name.clone();
@@ -72,7 +78,7 @@ pub async fn livekit_connect(
     })
 }
 
-/// Publish a local track (audio/video) to the LiveKit room.
+/// Publish a local track (audio/video) to the `LiveKit` room.
 #[command]
 pub async fn livekit_publish_track(
     state: State<'_, LiveKitState>,
@@ -85,7 +91,7 @@ pub async fn livekit_publish_track(
     room.publish_track(&kind, &source)
 }
 
-/// Disconnect from a LiveKit room.
+/// Disconnect from a `LiveKit` room.
 #[command]
 pub async fn livekit_disconnect(
     state: State<'_, LiveKitState>,
@@ -99,8 +105,7 @@ pub async fn livekit_disconnect(
     };
 
     if let Some(room) = room {
-        let mut room = room.lock().await;
-        room.disconnect().await;
+        room.lock().await.disconnect().await;
     }
 
     Ok(())

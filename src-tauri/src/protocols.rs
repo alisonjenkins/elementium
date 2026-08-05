@@ -11,11 +11,19 @@ pub struct VideoFrameState(pub VideoFrameBuffer);
 ///
 /// Returns the latest RGBA frame for the given track as raw bytes,
 /// with `X-Frame-Width` and `X-Frame-Height` headers.
+// `ctx` and `request` are only borrowed internally, but the signature is dictated by
+// tauri's `register_asynchronous_uri_scheme_protocol`, which requires
+// `Fn(UriSchemeContext<'_, R>, Request<Vec<u8>>, UriSchemeResponder)` — the params can't
+// be changed to references without breaking that trait bound.
+#[allow(clippy::needless_pass_by_value)]
 pub fn handle_video_frame_protocol(
     ctx: UriSchemeContext<'_, tauri::Wry>,
     request: Request<Vec<u8>>,
     responder: UriSchemeResponder,
 ) {
+    // Log first few requests for debugging.
+    static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let uri = request.uri().to_string();
 
     // Parse track ID from URI: elementium://video-frame/{track-id}
@@ -25,6 +33,8 @@ pub fn handle_video_frame_protocol(
         .unwrap_or("");
 
     if track_id.is_empty() {
+        // Fixed status/body literals — `Response::builder().body()` cannot fail here.
+        #[allow(clippy::unwrap_used)]
         responder.respond(
             Response::builder()
                 .status(400)
@@ -41,10 +51,8 @@ pub fn handle_video_frame_protocol(
         state.0.lock().ok().and_then(|f| f.get(track_id).cloned())
     };
 
-    // Log first few requests for debugging
-    static FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count < 5 || count % 300 == 0 {
+    if count < 5 || count.is_multiple_of(300) {
         tracing::info!(
             track_id = %track_id,
             has_frame = frame.is_some(),
@@ -53,40 +61,32 @@ pub fn handle_video_frame_protocol(
         );
     }
 
-    match frame {
-        Some(video_frame) => {
-            responder.respond(
-                Response::builder()
-                    .status(200)
-                    .header("Content-Type", "application/octet-stream")
-                    .header("X-Frame-Width", video_frame.width.to_string())
-                    .header("X-Frame-Height", video_frame.height.to_string())
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header(
-                        "Access-Control-Expose-Headers",
-                        "X-Frame-Width, X-Frame-Height",
-                    )
-                    .body(video_frame.data)
-                    .unwrap(),
-            );
-        }
-        None => {
-            // No frame available yet — return a 1x1 transparent pixel
-            let placeholder = vec![0u8; 4];
-            responder.respond(
-                Response::builder()
-                    .status(200)
-                    .header("Content-Type", "application/octet-stream")
-                    .header("X-Frame-Width", "1")
-                    .header("X-Frame-Height", "1")
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header(
-                        "Access-Control-Expose-Headers",
-                        "X-Frame-Width, X-Frame-Height",
-                    )
-                    .body(placeholder)
-                    .unwrap(),
-            );
-        }
-    }
+    let (width, height, body) = frame.map_or_else(
+        // No frame available yet — return a 1x1 transparent pixel.
+        || ("1".to_string(), "1".to_string(), vec![0u8; 4]),
+        |video_frame| {
+            (
+                video_frame.width.to_string(),
+                video_frame.height.to_string(),
+                video_frame.data,
+            )
+        },
+    );
+
+    // Fixed header names and a numeric-string/status-200 body — cannot fail here.
+    #[allow(clippy::unwrap_used)]
+    responder.respond(
+        Response::builder()
+            .status(200)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Frame-Width", width)
+            .header("X-Frame-Height", height)
+            .header("Access-Control-Allow-Origin", "*")
+            .header(
+                "Access-Control-Expose-Headers",
+                "X-Frame-Width, X-Frame-Height",
+            )
+            .body(body)
+            .unwrap(),
+    );
 }

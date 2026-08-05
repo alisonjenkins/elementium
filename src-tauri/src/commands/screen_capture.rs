@@ -1,3 +1,10 @@
+// `get_display_media` below takes a `State<'_, T>` parameter, which causes the
+// `#[command]` macro to generate a sibling IPC-dispatch wrapper item in this module
+// containing an internal match with an arm clippy flags as unreachable. That wrapper is
+// framework codegen (not nested inside the fn item itself, so a function- or
+// statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
+// module-level allow here rather than the usual per-item scoping.
+#![allow(clippy::unreachable)]
 use tauri::{State, command};
 
 use elementium_types::{CaptureSource, TrackId};
@@ -11,19 +18,19 @@ pub async fn get_capture_sources() -> Result<Vec<CaptureSource>, String> {
     // Use the appropriate platform capturer
     #[cfg(target_os = "linux")]
     {
+        use elementium_screen::ScreenCapturer;
+
         // Try X11 first (works on both X11 and XWayland)
         let capturer = elementium_screen::x11::X11Capturer::new();
-        use elementium_screen::ScreenCapturer;
         match capturer.sources() {
-            Ok(sources) => return Ok(sources),
+            Ok(sources) => Ok(sources),
             Err(e) => {
                 tracing::warn!("X11 source enumeration failed: {e}, trying Wayland");
+                // Fall back to Wayland (returns empty list, portal handles selection)
+                let capturer = elementium_screen::wayland::WaylandCapturer::new();
+                capturer.sources().map_err(|e| e.to_string())
             }
         }
-
-        // Fall back to Wayland (returns empty list, portal handles selection)
-        let capturer = elementium_screen::wayland::WaylandCapturer::new();
-        return capturer.sources().map_err(|e| e.to_string());
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -68,7 +75,7 @@ fn generate_track_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     format!("{t:x}")
 }

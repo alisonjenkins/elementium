@@ -1,3 +1,10 @@
+// Every `#[tauri::command]` async fn below that takes a `State<'_, T>` parameter causes
+// the `#[command]` macro to generate a sibling IPC-dispatch wrapper item in this module
+// containing an internal match with an arm clippy flags as unreachable. That wrapper is
+// framework codegen (not nested inside the fn item itself, so a function- or
+// statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
+// module-level allow here rather than the usual per-item scoping.
+#![allow(clippy::unreachable)]
 use std::sync::{Arc, Mutex};
 
 use tauri::{State, command};
@@ -52,7 +59,7 @@ pub async fn enumerate_devices() -> Result<Vec<MediaDevice>, String> {
         for (i, cam) in cameras.iter().enumerate() {
             devices.push(MediaDevice {
                 id: format!("video-input-{i}"),
-                label: cam.human_name().to_string(),
+                label: cam.human_name().clone(),
                 kind: elementium_types::MediaDeviceKind::VideoInput,
             });
         }
@@ -75,10 +82,10 @@ pub async fn get_user_media(
         tracing::info!(track_id = %track_id, "Starting audio capture");
 
         // Stop any existing audio capture pipeline
-        if let Ok(mut audio) = media_state.audio_capture.lock() {
-            if let Some(old) = audio.take() {
-                let _ = old.stop_tx.send(());
-            }
+        if let Ok(mut audio) = media_state.audio_capture.lock()
+            && let Some(old) = audio.take()
+        {
+            let _ = old.stop_tx.send(());
         }
 
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
@@ -88,7 +95,7 @@ pub async fn get_user_media(
 
         // Start audio capture pipeline on a background thread
         std::thread::spawn(move || {
-            audio_capture_loop(encode_tx_clone, stop_rx);
+            audio_capture_loop(&encode_tx_clone, &stop_rx);
         });
 
         // Store the audio capture handle
@@ -117,15 +124,13 @@ pub async fn get_user_media(
         };
 
         // Stop any existing camera pipeline and wait for the device to release
-        let had_previous = {
-            let mut had = false;
-            if let Ok(mut cam) = media_state.camera.lock() {
-                if let Some(old) = cam.take() {
-                    let _ = old.stop_tx.send(());
-                    had = true;
-                }
-            }
-            had
+        let had_previous = if let Ok(mut cam) = media_state.camera.lock()
+            && let Some(old) = cam.take()
+        {
+            let _ = old.stop_tx.send(());
+            true
+        } else {
+            false
         };
 
         let req_width = video_constraints.width;
@@ -145,7 +150,14 @@ pub async fn get_user_media(
                 tracing::info!("Waiting for previous camera to release device...");
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            camera_pipeline_loop(tid, video_frames, encode_tx_clone, stop_rx, req_width, req_height);
+            camera_pipeline_loop(
+                &tid,
+                &video_frames,
+                &encode_tx_clone,
+                &stop_rx,
+                req_width,
+                req_height,
+            );
         });
 
         // Store the camera pipeline handle
@@ -174,27 +186,23 @@ pub async fn stop_track(
     tracing::info!(%track_id, "Stopping track");
 
     // If this is the camera track, stop the pipeline
-    if track_id.0.starts_with("video-") {
-        if let Ok(mut cam) = media_state.camera.lock() {
-            if let Some(ref handle) = *cam {
-                if handle.track_id == track_id.0 {
-                    let _ = handle.stop_tx.send(());
-                    *cam = None;
-                }
-            }
-        }
+    if track_id.0.starts_with("video-")
+        && let Ok(mut cam) = media_state.camera.lock()
+        && let Some(ref handle) = *cam
+        && handle.track_id == track_id.0
+    {
+        let _ = handle.stop_tx.send(());
+        *cam = None;
     }
 
     // If this is an audio track, stop the audio capture pipeline
-    if track_id.0.starts_with("audio-") {
-        if let Ok(mut audio) = media_state.audio_capture.lock() {
-            if let Some(ref handle) = *audio {
-                if handle.track_id == track_id.0 {
-                    let _ = handle.stop_tx.send(());
-                    *audio = None;
-                }
-            }
-        }
+    if track_id.0.starts_with("audio-")
+        && let Ok(mut audio) = media_state.audio_capture.lock()
+        && let Some(ref handle) = *audio
+        && handle.track_id == track_id.0
+    {
+        let _ = handle.stop_tx.send(());
+        *audio = None;
     }
 
     if let Ok(mut tracks) = media_state.active_tracks.lock() {
@@ -207,16 +215,22 @@ pub async fn stop_track(
 ///
 /// Returns an 8-byte header (width: u32 LE, height: u32 LE) followed by RGBA data.
 /// Returns an 8-byte zero header when no frame is available.
+// `state` and `track_id` are only borrowed internally, but tauri's IPC command
+// extractors require owned `State<'_, T>` and `String` parameters (the latter must be
+// owned because it's deserialized from the IPC payload) — the signature can't be
+// changed to take references without breaking command registration.
+#[allow(clippy::needless_pass_by_value)]
 #[command]
 pub fn get_video_frame(
     state: State<'_, VideoFrameState>,
     track_id: String,
 ) -> tauri::ipc::Response {
+    static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let frame = state.0.lock().ok().and_then(|f| f.get(&track_id).cloned());
 
-    static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count < 3 || count % 300 == 0 {
+    if count < 3 || count.is_multiple_of(300) {
         tracing::info!(
             track_id = %track_id,
             has_frame = frame.is_some(),
@@ -227,7 +241,7 @@ pub fn get_video_frame(
 
     match frame {
         Some(f) => {
-            let mut body = Vec::with_capacity(8 + f.data.len());
+            let mut body = Vec::with_capacity(f.data.len().saturating_add(8));
             body.extend_from_slice(&f.width.to_le_bytes());
             body.extend_from_slice(&f.height.to_le_bytes());
             body.extend_from_slice(&f.data);
@@ -237,13 +251,13 @@ pub fn get_video_frame(
     }
 }
 
-/// Background thread: reads camera frames, writes RGBA to VideoFrameBuffer for
+/// Background thread: reads camera frames, writes RGBA to `VideoFrameBuffer` for
 /// preview, and optionally VP8-encodes + sends to a peer connection.
 fn camera_pipeline_loop(
-    track_id: String,
-    video_frames: VideoFrameBuffer,
-    encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
-    stop_rx: std::sync::mpsc::Receiver<()>,
+    track_id: &str,
+    video_frames: &VideoFrameBuffer,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
     req_width: Option<u32>,
     req_height: Option<u32>,
 ) {
@@ -267,14 +281,14 @@ fn camera_pipeline_loop(
             tracing::info!(track_id = %track_id, "Camera pipeline stopping");
             // Clean up the frame buffer entry
             if let Ok(mut buf) = video_frames.lock() {
-                buf.remove(&track_id);
+                buf.remove(track_id);
             }
             break;
         }
 
         if let Some(frame) = capturer.try_recv() {
-            frame_count += 1;
-            if frame_count <= 3 || frame_count % 100 == 0 {
+            frame_count = frame_count.wrapping_add(1);
+            if frame_count <= 3 || frame_count.is_multiple_of(100) {
                 tracing::info!(
                     track_id = %track_id,
                     frame_count,
@@ -287,7 +301,7 @@ fn camera_pipeline_loop(
             // Write RGBA frame to VideoFrameBuffer for local preview
             if let Ok(mut buf) = video_frames.lock() {
                 buf.insert(
-                    track_id.clone(),
+                    track_id.to_string(),
                     VideoFrame {
                         width: frame.width,
                         height: frame.height,
@@ -298,10 +312,7 @@ fn camera_pipeline_loop(
             }
 
             // VP8 encode and send if encoding is active
-            let should_encode = encode_tx
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
+            let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
 
             if should_encode {
                 // Lazily create the encoder
@@ -323,11 +334,11 @@ fn camera_pipeline_loop(
 
                     match enc.encode(&i420) {
                         Ok(packets) => {
-                            if let Ok(guard) = encode_tx.lock() {
-                                if let Some(ref tx) = *guard {
-                                    for packet in packets {
-                                        let _ = tx.try_send(IoCommand::WriteVideo(packet.data));
-                                    }
+                            if let Ok(guard) = encode_tx.lock()
+                                && let Some(ref tx) = *guard
+                            {
+                                for packet in packets {
+                                    let _ = tx.try_send(IoCommand::WriteVideo(packet.data));
                                 }
                             }
                         }
@@ -346,8 +357,8 @@ fn camera_pipeline_loop(
 /// Background thread: captures mic audio, Opus-encodes, and sends to a peer
 /// connection when `encode_tx` is connected (deferred connection pattern).
 fn audio_capture_loop(
-    encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
-    stop_rx: std::sync::mpsc::Receiver<()>,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
 ) {
     let capturer = match AudioCapturer::start() {
         Ok(c) => c,
@@ -363,7 +374,6 @@ fn audio_capture_loop(
     // Opus supports 8/12/16/24/48kHz; resample 44.1k → 48k
     let opus_rate = match sample_rate {
         8000 | 12000 | 16000 | 24000 | 48000 => sample_rate,
-        44100 => 48000,
         _ => 48000,
     };
 
@@ -377,10 +387,16 @@ fn audio_capture_loop(
 
     tracing::info!(sample_rate, channels, opus_rate, "Audio capture started");
 
-    // Opus frame size: 20ms at the given sample rate
-    let frame_samples = (opus_rate as usize * 20) / 1000;
-    let frame_total_samples = frame_samples * channels.min(2) as usize;
-    let mut accumulator: Vec<f32> = Vec::with_capacity(frame_total_samples * 2);
+    // Opus frame size: 20ms at the given sample rate. `opus_rate` is always one of the
+    // small fixed constants above, so these conversions/multiplications cannot overflow
+    // or lose precision in practice.
+    let channels_usize = usize::from(channels.min(2));
+    let frame_samples = usize::try_from(opus_rate)
+        .unwrap_or(48_000)
+        .saturating_mul(20)
+        / 1000;
+    let frame_total_samples = frame_samples.saturating_mul(channels_usize);
+    let mut accumulator: Vec<f32> = Vec::with_capacity(frame_total_samples.saturating_mul(2));
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -393,7 +409,7 @@ fn audio_capture_loop(
 
             // Simple sample rate conversion for 44.1kHz → 48kHz
             if sample_rate == 44100 && opus_rate == 48000 {
-                data = resample_44100_to_48000(&data, channels as usize);
+                data = resample_44100_to_48000(&data, usize::from(channels));
             }
 
             accumulator.extend_from_slice(&data);
@@ -403,10 +419,7 @@ fn audio_capture_loop(
                 let frame_data: Vec<f32> = accumulator.drain(..frame_total_samples).collect();
 
                 // Only encode and send if connected to a peer connection
-                let should_encode = encode_tx
-                    .lock()
-                    .map(|g| g.is_some())
-                    .unwrap_or(false);
+                let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
 
                 if should_encode {
                     let audio_frame = AudioFrame {
@@ -418,10 +431,10 @@ fn audio_capture_loop(
 
                     match encoder.encode(&audio_frame) {
                         Ok(encoded_frame) => {
-                            if let Ok(guard) = encode_tx.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.try_send(IoCommand::WriteAudio(encoded_frame));
-                                }
+                            if let Ok(guard) = encode_tx.lock()
+                                && let Some(ref tx) = *guard
+                            {
+                                let _ = tx.try_send(IoCommand::WriteAudio(encoded_frame));
                             }
                         }
                         Err(e) => {
@@ -437,7 +450,21 @@ fn audio_capture_loop(
 }
 
 /// Simple linear interpolation resampling from 44100 to 48000 Hz.
+///
+/// Sample counts here are bounded by a single ~20ms audio frame (at most a few
+/// thousand samples), so the `usize`<->`f64`/`f32` conversions below never approach
+/// either type's precision limits; the casts are inherent to the interpolation math,
+/// not something `try_from` can meaningfully replace.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::arithmetic_side_effects
+)]
 fn resample_44100_to_48000(samples: &[f32], channels: usize) -> Vec<f32> {
+    // Guard against a misbehaving capture device reporting zero channels.
+    let channels = channels.max(1);
     let ratio = 48000.0 / 44100.0;
     let input_frames = samples.len() / channels;
     let output_frames = (input_frames as f64 * ratio) as usize;
@@ -454,7 +481,7 @@ fn resample_44100_to_48000(samples: &[f32], channels: usize) -> Vec<f32> {
                 .get((src_idx + 1) * channels + ch)
                 .copied()
                 .unwrap_or(s0);
-            output.push(s0 + (s1 - s0) * frac);
+            output.push((s1 - s0).mul_add(frac, s0));
         }
     }
 
@@ -465,7 +492,7 @@ fn generate_track_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     format!("{t:x}")
 }

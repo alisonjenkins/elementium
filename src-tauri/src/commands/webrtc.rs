@@ -1,3 +1,10 @@
+// Every `#[tauri::command]` async fn below that takes a `State<'_, T>` parameter causes
+// the `#[command]` macro to generate a sibling IPC-dispatch wrapper item in this module
+// containing an internal match with an arm clippy flags as unreachable. That wrapper is
+// framework codegen (not nested inside the fn item itself, so a function- or
+// statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
+// module-level allow here rather than the usual per-item scoping.
+#![allow(clippy::unreachable)]
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -93,10 +100,9 @@ pub async fn create_peer_connection(
 
     // Spawn a task to forward events from the I/O loop to the frontend
     let state_clone: WebRtcState = state.inner().clone();
-    let app_clone = app.clone();
     let id_clone = id.clone();
     tokio::spawn(async move {
-        forward_events(&state_clone, &app_clone, &id_clone).await;
+        forward_events(&state_clone, &app, &id_clone).await;
     });
 
     Ok(PeerConnectionResult { id })
@@ -134,35 +140,36 @@ pub async fn create_offer(
     tracing::info!(
         pc_id = %pc_id,
         include_video = video,
-        num_dc = data_channels.as_ref().map(|d| d.len()).unwrap_or(0),
-        num_tc = transceivers.as_ref().map(|t| t.len()).unwrap_or(0),
+        num_dc = data_channels.as_ref().map_or(0, Vec::len),
+        num_tc = transceivers.as_ref().map_or(0, Vec::len),
         "Creating offer"
     );
 
-    let engine = state.0.lock().map_err(|e| e.to_string())?;
-    let managed = engine.get(&pc_id).ok_or("Peer connection not found")?;
-    let io_cmd_tx = managed.io_cmd_tx.clone();
+    let (handle, io_cmd_tx) = state
+        .0
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&pc_id)
+        .ok_or("Peer connection not found")
+        .map(|managed| (managed.handle.clone(), managed.io_cmd_tx.clone()))?;
 
     // Connect audio capture pipeline to this PC's I/O channel
-    if let Ok(audio_guard) = media_state.audio_capture.lock() {
-        if let Some(ref audio) = *audio_guard {
-            if let Ok(mut encode_guard) = audio.encode_tx.lock() {
-                tracing::info!(pc_id = %pc_id, "Connecting audio pipeline to peer connection");
-                *encode_guard = Some(io_cmd_tx.clone());
-            }
-        }
+    if let Ok(audio_guard) = media_state.audio_capture.lock()
+        && let Some(ref audio) = *audio_guard
+        && let Ok(mut encode_guard) = audio.encode_tx.lock()
+    {
+        tracing::info!(pc_id = %pc_id, "Connecting audio pipeline to peer connection");
+        *encode_guard = Some(io_cmd_tx.clone());
     }
 
     // If video is included, connect the camera pipeline to this PC's I/O channel
-    if video {
-        if let Ok(cam_guard) = media_state.camera.lock() {
-            if let Some(ref cam) = *cam_guard {
-                if let Ok(mut encode_guard) = cam.encode_tx.lock() {
-                    tracing::info!(pc_id = %pc_id, "Connecting camera pipeline to peer connection");
-                    *encode_guard = Some(io_cmd_tx);
-                }
-            }
-        }
+    if video
+        && let Ok(cam_guard) = media_state.camera.lock()
+        && let Some(ref cam) = *cam_guard
+        && let Ok(mut encode_guard) = cam.encode_tx.lock()
+    {
+        tracing::info!(pc_id = %pc_id, "Connecting camera pipeline to peer connection");
+        *encode_guard = Some(io_cmd_tx);
     }
 
     // Convert data channel info
@@ -185,7 +192,7 @@ pub async fn create_offer(
         .map(|tc| peer_connection::TransceiverInfo::from_js(&tc.kind, tc.direction.as_deref()))
         .collect();
 
-    let mut pc = managed.handle.lock().map_err(|e| e.to_string())?;
+    let mut pc = handle.lock().map_err(|e| e.to_string())?;
     peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos)
 }
 
@@ -195,9 +202,15 @@ pub async fn create_answer(
     pc_id: String,
 ) -> Result<SessionDescription, String> {
     tracing::info!(pc_id = %pc_id, "Creating answer");
-    let engine = state.0.lock().map_err(|e| e.to_string())?;
-    let managed = engine.get(&pc_id).ok_or("Peer connection not found")?;
-    let mut pc = managed.handle.lock().map_err(|e| e.to_string())?;
+    let handle = {
+        let engine = state.0.lock().map_err(|e| e.to_string())?;
+        engine
+            .get(&pc_id)
+            .ok_or("Peer connection not found")?
+            .handle
+            .clone()
+    };
+    let mut pc = handle.lock().map_err(|e| e.to_string())?;
     peer_connection::create_answer(&mut pc)
 }
 
@@ -218,9 +231,15 @@ pub async fn set_remote_description(
     description: SessionDescription,
 ) -> Result<Option<SessionDescription>, String> {
     tracing::info!(pc_id = %pc_id, sdp_type = ?description.sdp_type, "Setting remote description");
-    let engine = state.0.lock().map_err(|e| e.to_string())?;
-    let managed = engine.get(&pc_id).ok_or("Peer connection not found")?;
-    let mut pc = managed.handle.lock().map_err(|e| e.to_string())?;
+    let handle = {
+        let engine = state.0.lock().map_err(|e| e.to_string())?;
+        engine
+            .get(&pc_id)
+            .ok_or("Peer connection not found")?
+            .handle
+            .clone()
+    };
+    let mut pc = handle.lock().map_err(|e| e.to_string())?;
     peer_connection::set_remote_description(&mut pc, &description)
 }
 
@@ -231,9 +250,15 @@ pub async fn add_ice_candidate(
     candidate: IceCandidate,
 ) -> Result<(), String> {
     tracing::info!(pc_id = %pc_id, candidate = %candidate.candidate, "Adding ICE candidate");
-    let engine = state.0.lock().map_err(|e| e.to_string())?;
-    let managed = engine.get(&pc_id).ok_or("Peer connection not found")?;
-    let mut pc = managed.handle.lock().map_err(|e| e.to_string())?;
+    let handle = {
+        let engine = state.0.lock().map_err(|e| e.to_string())?;
+        engine
+            .get(&pc_id)
+            .ok_or("Peer connection not found")?
+            .handle
+            .clone()
+    };
+    let mut pc = handle.lock().map_err(|e| e.to_string())?;
     peer_connection::add_ice_candidate(&mut pc, &candidate.candidate)
 }
 
@@ -243,16 +268,15 @@ pub async fn close_peer_connection(
     pc_id: String,
 ) -> Result<(), String> {
     tracing::info!(pc_id = %pc_id, "Closing peer connection");
-    let mut engine = state.0.lock().map_err(|e| e.to_string())?;
-    engine.remove(&pc_id);
+    state.0.lock().map_err(|e| e.to_string())?.remove(&pc_id);
     Ok(())
 }
 
-/// Forward events from the I/O loop to the Tauri frontend via webview.eval().
+/// Forward events from the I/O loop to the Tauri frontend via `webview.eval()`.
 ///
-/// Uses eval() instead of the Tauri event system (emit/listen) because
-/// Tauri's permission check blocks listen() from non-local URLs
-/// (e.g. http://localhost:5173 in dev mode). eval() bypasses this entirely.
+/// Uses `eval()` instead of the Tauri event system (`emit`/`listen`) because
+/// Tauri's permission check blocks `listen()` from non-local URLs
+/// (e.g. <http://localhost:5173> in dev mode). `eval()` bypasses this entirely.
 async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // Create relay channels for audio and video playback pipelines
     let (audio_tx, audio_rx) = tokio_mpsc::channel::<PcEvent>(256);
@@ -260,9 +284,8 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
 
     // Get video frame buffer from engine
     let video_frames = {
-        let engine = match state.0.lock() {
-            Ok(e) => e,
-            Err(_) => return,
+        let Ok(engine) = state.0.lock() else {
+            return;
         };
         engine.video_frames.clone()
     };
@@ -282,17 +305,14 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
 
     loop {
         let event = {
-            let engine = match state.0.lock() {
-                Ok(e) => e,
-                Err(_) => return,
+            let Ok(engine) = state.0.lock() else {
+                return;
             };
-            let managed = match engine.get(pc_id) {
-                Some(m) => m,
-                None => return,
+            let Some(managed) = engine.get(pc_id) else {
+                return;
             };
-            let mut rx = match managed.event_rx.lock() {
-                Ok(rx) => rx,
-                Err(_) => return,
+            let Ok(mut rx) = managed.event_rx.lock() else {
+                return;
             };
             rx.try_recv().ok()
         };
@@ -300,39 +320,29 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
         match event {
             Some(pc_event) => {
                 let tauri_event = match pc_event {
-                    PcEvent::IceConnectionStateChange(s) => {
-                        WebRtcEvent::IceConnectionStateChange {
-                            pc_id: pc_id.to_string(),
-                            state: format!("{s:?}").to_lowercase(),
-                        }
-                    }
-                    PcEvent::ConnectionStateChange(s) => {
-                        WebRtcEvent::ConnectionStateChange {
-                            pc_id: pc_id.to_string(),
-                            state: format!("{s:?}").to_lowercase(),
-                        }
-                    }
-                    PcEvent::IceCandidate(candidate) => {
-                        WebRtcEvent::IceCandidate {
-                            pc_id: pc_id.to_string(),
-                            candidate,
-                        }
-                    }
-                    PcEvent::IceGatheringComplete => {
-                        WebRtcEvent::IceGatheringComplete {
-                            pc_id: pc_id.to_string(),
-                        }
-                    }
+                    PcEvent::IceConnectionStateChange(s) => WebRtcEvent::IceConnectionStateChange {
+                        pc_id: pc_id.to_string(),
+                        state: format!("{s:?}").to_lowercase(),
+                    },
+                    PcEvent::ConnectionStateChange(s) => WebRtcEvent::ConnectionStateChange {
+                        pc_id: pc_id.to_string(),
+                        state: format!("{s:?}").to_lowercase(),
+                    },
+                    PcEvent::IceCandidate(candidate) => WebRtcEvent::IceCandidate {
+                        pc_id: pc_id.to_string(),
+                        candidate,
+                    },
+                    PcEvent::IceGatheringComplete => WebRtcEvent::IceGatheringComplete {
+                        pc_id: pc_id.to_string(),
+                    },
                     PcEvent::Connected => WebRtcEvent::Connected {
                         pc_id: pc_id.to_string(),
                     },
-                    PcEvent::RemoteTrackAdded { mid, kind } => {
-                        WebRtcEvent::RemoteTrackAdded {
-                            pc_id: pc_id.to_string(),
-                            mid,
-                            kind,
-                        }
-                    }
+                    PcEvent::RemoteTrackAdded { mid, kind } => WebRtcEvent::RemoteTrackAdded {
+                        pc_id: pc_id.to_string(),
+                        mid,
+                        kind,
+                    },
                     PcEvent::AudioData(data) => {
                         // Relay to audio playback pipeline
                         let _ = audio_tx.try_send(PcEvent::AudioData(data));
@@ -350,11 +360,10 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
                 if let Some(webview) = app.get_webview_window("main") {
                     if let Ok(json) = serde_json::to_string(&tauri_event) {
                         let js = format!(
-                            "if(window.__elementium_webrtc_event)window.__elementium_webrtc_event({})",
-                            json
+                            "if(window.__elementium_webrtc_event)window.__elementium_webrtc_event({json})"
                         );
                         match webview.eval(&js) {
-                            Ok(_) => tracing::debug!(pc_id = pc_id, "eval sent to JS"),
+                            Ok(()) => tracing::debug!(pc_id = pc_id, "eval sent to JS"),
                             Err(e) => tracing::error!(pc_id = pc_id, err = %e, "eval failed"),
                         }
                     }
@@ -373,7 +382,7 @@ fn generate_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     format!("pc-{t:x}")
 }
