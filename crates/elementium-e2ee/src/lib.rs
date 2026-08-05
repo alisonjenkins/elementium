@@ -1,4 +1,4 @@
-//! LiveKit-compatible E2EE frame encryption for MatrixRTC calls.
+//! `LiveKit`-compatible E2EE frame encryption for `MatrixRTC` calls.
 //!
 //! Implements the same frame format as `livekit-client`'s E2EE Worker so that
 //! Elementium can interoperate with other Element Call clients (browser, mobile).
@@ -16,7 +16,7 @@
 //! - Key derivation: HKDF-SHA256 with info `"LKFrameEncryptionKey"`
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
@@ -25,6 +25,12 @@ use sha2::Sha256;
 
 /// Maximum number of keys per participant in a key ring.
 const MAX_KEYS: usize = 16;
+
+/// Maximum number of keys per participant in a key ring, as a `u8`.
+///
+/// Kept as a separate constant (mirroring `MAX_KEYS`) so the wire-format code
+/// never needs an `as` cast between the two.
+const MAX_KEYS_U8: u8 = 16;
 
 /// Size of AES-GCM initialization vector.
 const IV_SIZE: usize = 12;
@@ -35,6 +41,22 @@ const TAG_SIZE: usize = 16;
 /// HKDF info string matching livekit-client's E2EE Worker.
 const HKDF_INFO: &[u8] = b"LKFrameEncryptionKey";
 
+/// Reduce a raw key index into the `0..MAX_KEYS` slot range.
+///
+/// `MAX_KEYS` is a nonzero compile-time constant, so this modulo can never panic.
+#[allow(clippy::arithmetic_side_effects)]
+fn key_slot(index: u8) -> usize {
+    usize::from(index) % MAX_KEYS
+}
+
+/// Reduce a raw key index into the `0..MAX_KEYS` range, as stored on the wire.
+///
+/// `MAX_KEYS_U8` is a nonzero compile-time constant, so this modulo can never panic.
+#[allow(clippy::arithmetic_side_effects)]
+const fn key_index_byte(index: u8) -> u8 {
+    index % MAX_KEYS_U8
+}
+
 /// Media kind for determining unencrypted header size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
@@ -42,7 +64,7 @@ pub enum MediaKind {
     Video,
 }
 
-/// Configuration options for E2EE, matching livekit-client's KeyProviderOptions.
+/// Configuration options for E2EE, matching livekit-client's `KeyProviderOptions`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct E2eeOptions {
@@ -57,11 +79,11 @@ pub struct E2eeOptions {
     pub auto_ratchet: bool,
 }
 
-fn default_ratchet_window() -> u32 {
+const fn default_ratchet_window() -> u32 {
     0
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -86,11 +108,13 @@ pub enum E2eeError {
     DecryptionFailed(String),
     #[error("invalid key index {0}")]
     InvalidKeyIndex(u8),
+    #[error("internal E2EE lock was poisoned by a panic in another thread")]
+    LockPoisoned,
 }
 
 /// A ring of encryption keys for a single participant.
 struct KeyRing {
-    /// Keys indexed by key_index (0..MAX_KEYS). `None` means slot is unused.
+    /// Keys indexed by `key_index` (`0..MAX_KEYS`). `None` means slot is unused.
     keys: [Option<DerivedKey>; MAX_KEYS],
     /// The currently active key index for encryption.
     current_index: u8,
@@ -113,18 +137,20 @@ impl KeyRing {
     }
 
     fn set_key(&mut self, index: u8, material: &[u8]) {
-        let idx = (index as usize) % MAX_KEYS;
+        let idx = key_slot(index);
         let cipher = derive_cipher(material);
-        self.keys[idx] = Some(DerivedKey {
-            raw_material: material.to_vec(),
-            cipher,
-        });
+        if let Some(slot) = self.keys.get_mut(idx) {
+            *slot = Some(DerivedKey {
+                raw_material: material.to_vec(),
+                cipher,
+            });
+        }
         self.current_index = index;
     }
 
     fn get_cipher(&self, index: u8) -> Option<&Aes128Gcm> {
-        let idx = (index as usize) % MAX_KEYS;
-        self.keys[idx].as_ref().map(|k| &k.cipher)
+        let idx = key_slot(index);
+        self.keys.get(idx).and_then(Option::as_ref).map(|k| &k.cipher)
     }
 
     fn current_cipher(&self) -> Option<(&Aes128Gcm, u8)> {
@@ -134,18 +160,20 @@ impl KeyRing {
 
     /// Ratchet the key at `index`: derive a new key from the current material.
     fn ratchet(&mut self, index: u8) -> bool {
-        let idx = (index as usize) % MAX_KEYS;
-        if let Some(ref key) = self.keys[idx] {
-            let new_material = ratchet_key(&key.raw_material);
-            let cipher = derive_cipher(&new_material);
-            self.keys[idx] = Some(DerivedKey {
-                raw_material: new_material,
-                cipher,
-            });
-            true
-        } else {
-            false
-        }
+        let idx = key_slot(index);
+        let Some(slot) = self.keys.get_mut(idx) else {
+            return false;
+        };
+        let Some(key) = slot.as_ref() else {
+            return false;
+        };
+        let new_material = ratchet_key(&key.raw_material);
+        let cipher = derive_cipher(&new_material);
+        *slot = Some(DerivedKey {
+            raw_material: new_material,
+            cipher,
+        });
+        true
     }
 }
 
@@ -201,6 +229,7 @@ impl Clone for E2eeContext {
 
 impl E2eeContext {
     /// Create a new E2EE context with the given options.
+    #[must_use]
     pub fn new(options: E2eeOptions) -> Self {
         Self {
             inner: Arc::new(RwLock::new(E2eeContextInner {
@@ -211,57 +240,98 @@ impl E2eeContext {
         }
     }
 
+    /// Acquire the read lock, translating poisoning into a proper error
+    /// instead of panicking.
+    fn lock_read(&self) -> Result<RwLockReadGuard<'_, E2eeContextInner>, E2eeError> {
+        self.inner.read().map_err(|_| E2eeError::LockPoisoned)
+    }
+
+    /// Acquire the write lock, translating poisoning into a proper error
+    /// instead of panicking.
+    fn lock_write(&self) -> Result<RwLockWriteGuard<'_, E2eeContextInner>, E2eeError> {
+        self.inner.write().map_err(|_| E2eeError::LockPoisoned)
+    }
+
     /// Set the local participant identity (used for choosing the encryption key).
+    ///
+    /// If the internal lock has been poisoned by a panic in another thread,
+    /// this call is a documented no-op (the identity is not updated).
     pub fn set_local_identity(&self, identity: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let Ok(mut inner) = self.inner.write() else {
+            tracing::error!("E2EE lock poisoned; failed to set local identity");
+            return;
+        };
         inner.key_manager.local_identity = Some(identity.to_string());
     }
 
     /// Store an encryption key for a participant.
+    ///
+    /// If the internal lock has been poisoned by a panic in another thread,
+    /// this call is a documented no-op (the key is not stored).
     pub fn set_key(&self, participant: &str, key_index: u8, key_material: &[u8]) {
-        let mut inner = self.inner.write().unwrap();
+        let Ok(mut inner) = self.inner.write() else {
+            tracing::error!("E2EE lock poisoned; failed to set key");
+            return;
+        };
         inner.key_manager.set_key(participant, key_index, key_material);
     }
 
     /// Check if E2EE has keys available for encryption.
+    ///
+    /// Returns `false` (fail closed) if the internal lock has been poisoned
+    /// by a panic in another thread.
+    #[must_use]
     pub fn has_encryption_key(&self) -> bool {
-        let inner = self.inner.read().unwrap();
-        if let Some(ref identity) = inner.key_manager.local_identity {
-            inner
-                .key_manager
-                .participants
-                .get(identity)
-                .and_then(|ring| ring.current_cipher())
-                .is_some()
-        } else {
-            // If no local identity set, check if any key exists
-            inner
-                .key_manager
-                .participants
-                .values()
-                .any(|ring| ring.current_cipher().is_some())
-        }
+        let Ok(inner) = self.inner.read() else {
+            tracing::error!("E2EE lock poisoned; treating as no encryption key available");
+            return false;
+        };
+        inner.key_manager.local_identity.as_ref().map_or_else(
+            || {
+                // If no local identity set, check if any key exists
+                inner
+                    .key_manager
+                    .participants
+                    .values()
+                    .any(|ring| ring.current_cipher().is_some())
+            },
+            |identity| {
+                inner
+                    .key_manager
+                    .participants
+                    .get(identity)
+                    .and_then(|ring| ring.current_cipher())
+                    .is_some()
+            },
+        )
     }
 
-    /// Encrypt a media frame using the LiveKit E2EE frame format.
+    /// Encrypt a media frame using the `LiveKit` E2EE frame format.
     ///
-    /// Returns `None` if no encryption key is available (passthrough mode).
+    /// Returns `None` if no encryption key is available (passthrough mode),
+    /// if the internal lock is poisoned, or if the outbound frame counter
+    /// has been exhausted (which would otherwise force IV/nonce reuse).
     pub fn encrypt_frame(&self, frame: &[u8], kind: MediaKind) -> Option<Vec<u8>> {
-        let mut inner = self.inner.write().unwrap();
+        let Ok(mut inner) = self.inner.write() else {
+            tracing::error!("E2EE lock poisoned; refusing to encrypt");
+            return None;
+        };
 
         // Get the local participant's current key index
         let identity = inner.key_manager.local_identity.clone()?;
 
-        // Generate IV from frame counter (mutate before borrowing participants)
+        // Generate IV from frame counter (mutate before borrowing participants).
+        // Use checked_add so we fail closed instead of wrapping the counter and
+        // reusing an IV/nonce pair, which would be a catastrophic AES-GCM break.
         let counter = inner.frame_counter;
-        inner.frame_counter += 1;
+        inner.frame_counter = inner.frame_counter.checked_add(1)?;
 
         let ring = inner.key_manager.participants.get(&identity)?;
         let (cipher, key_index) = ring.current_cipher()?;
 
         let header_size = unencrypted_header_size(frame, kind);
-        let header = &frame[..header_size];
-        let payload = &frame[header_size..];
+        let header = frame.get(..header_size)?;
+        let payload = frame.get(header_size..)?;
 
         let iv = build_iv(counter);
         let nonce = Nonce::from(iv);
@@ -272,13 +342,19 @@ impl E2eeContext {
                 return None;
             }
         };
+        // Nothing further needs the lock; release it before allocating the output.
+        drop(inner);
 
         // Build output: [header] [ciphertext (includes GCM tag)] [IV] [key_index]
-        let mut output = Vec::with_capacity(header_size + ciphertext.len() + IV_SIZE + 1);
+        let capacity = header_size
+            .saturating_add(ciphertext.len())
+            .saturating_add(IV_SIZE)
+            .saturating_add(1);
+        let mut output = Vec::with_capacity(capacity);
         output.extend_from_slice(header);
         output.extend_from_slice(&ciphertext);
         output.extend_from_slice(&iv);
-        output.push(key_index % MAX_KEYS as u8);
+        output.push(key_index_byte(key_index));
 
         Some(output)
     }
@@ -287,13 +363,19 @@ impl E2eeContext {
     ///
     /// Used when the sender's identity is unknown (e.g., inbound RTP from the SFU
     /// where we only have the raw frame, not the participant identity).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2eeError::LockPoisoned`] if the internal lock was poisoned, or
+    /// [`E2eeError::DecryptionFailed`] if no known participant's key(s) could
+    /// decrypt the frame.
     pub fn decrypt_frame_any(
         &self,
         frame: &[u8],
         kind: MediaKind,
     ) -> Result<Option<Vec<u8>>, E2eeError> {
         let participants: Vec<String> = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.lock_read()?;
             inner.key_manager.participants.keys().cloned().collect()
         };
 
@@ -302,10 +384,8 @@ impl E2eeContext {
         }
 
         for participant in &participants {
-            match self.decrypt_frame(frame, participant, kind) {
-                Ok(Some(decrypted)) => return Ok(Some(decrypted)),
-                Ok(None) => continue,
-                Err(_) => continue,
+            if let Ok(Some(decrypted)) = self.decrypt_frame(frame, participant, kind) {
+                return Ok(Some(decrypted));
             }
         }
 
@@ -316,10 +396,18 @@ impl E2eeContext {
         )))
     }
 
-    /// Decrypt a media frame using the LiveKit E2EE frame format.
+    /// Decrypt a media frame using the `LiveKit` E2EE frame format.
     ///
     /// Returns `Err` if the frame is malformed or decryption fails.
     /// Returns `Ok(None)` if no key is available for the participant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2eeError::FrameTooShort`] if the frame is too small to contain
+    /// the E2EE metadata, [`E2eeError::InvalidKeyIndex`] if the trailing key
+    /// index is out of range, [`E2eeError::LockPoisoned`] if the internal lock
+    /// was poisoned, or [`E2eeError::DecryptionFailed`] if AES-GCM decryption
+    /// fails for every key tried (including the ratchet window, if enabled).
     pub fn decrypt_frame(
         &self,
         frame: &[u8],
@@ -333,39 +421,62 @@ impl E2eeContext {
         }
 
         // Extract key_index (last byte)
-        let key_index = frame[frame.len() - 1];
-        if key_index as usize >= MAX_KEYS {
+        let key_index = *frame
+            .last()
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        if usize::from(key_index) >= MAX_KEYS {
             return Err(E2eeError::InvalidKeyIndex(key_index));
         }
 
-        // Extract IV (12 bytes before key_index)
-        let iv_start = frame.len() - 1 - IV_SIZE;
-        let iv = &frame[iv_start..iv_start + IV_SIZE];
+        // Extract IV (12 bytes before key_index). All offsets are re-derived with
+        // checked arithmetic rather than relying solely on the length check above,
+        // so a future refactor of `min_size` can't silently reintroduce a panic.
+        let without_key_index = frame
+            .len()
+            .checked_sub(1)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        let iv_start = without_key_index
+            .checked_sub(IV_SIZE)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        let iv_end = iv_start
+            .checked_add(IV_SIZE)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        let iv = frame
+            .get(iv_start..iv_end)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
 
         // The rest is [header][ciphertext]
-        let header_and_ciphertext = &frame[..iv_start];
+        let header_and_ciphertext = frame
+            .get(..iv_start)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
 
         // Determine unencrypted header size from the frame beginning
         let header_size = unencrypted_header_size(header_and_ciphertext, kind);
-        let header = &header_and_ciphertext[..header_size];
-        let ciphertext = &header_and_ciphertext[header_size..];
+        let header = header_and_ciphertext
+            .get(..header_size)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        let ciphertext = header_and_ciphertext
+            .get(header_size..)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
 
-        let inner = self.inner.read().unwrap();
+        let inner = self.lock_read()?;
         let options = inner.options.clone();
 
-        let ring = match inner.key_manager.participants.get(participant) {
-            Some(r) => r,
-            None => return Ok(None),
+        let Some(ring) = inner.key_manager.participants.get(participant) else {
+            return Ok(None);
         };
 
         // Copy IV into a fixed array for Nonce::from
-        let iv_array: [u8; IV_SIZE] = iv.try_into().map_err(|_| E2eeError::FrameTooShort(frame.len()))?;
+        let iv_array: [u8; IV_SIZE] = iv
+            .try_into()
+            .map_err(|_| E2eeError::FrameTooShort(frame.len()))?;
 
         // Try the indicated key index first
         if let Some(cipher) = ring.get_cipher(key_index) {
             let nonce = Nonce::from(iv_array);
             if let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) {
-                let mut output = Vec::with_capacity(header_size + plaintext.len());
+                let mut output =
+                    Vec::with_capacity(header_size.saturating_add(plaintext.len()));
                 output.extend_from_slice(header);
                 output.extend_from_slice(&plaintext);
                 return Ok(Some(output));
@@ -375,14 +486,15 @@ impl E2eeContext {
         // If ratcheting is enabled, try ratcheted keys
         if options.ratchet_window_size > 0 {
             drop(inner);
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.lock_write()?;
             if let Some(ring) = inner.key_manager.participants.get_mut(participant) {
                 for _ in 0..options.ratchet_window_size {
                     ring.ratchet(key_index);
                     if let Some(cipher) = ring.get_cipher(key_index) {
                         let nonce = Nonce::from(iv_array);
                         if let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) {
-                            let mut output = Vec::with_capacity(header_size + plaintext.len());
+                            let mut output =
+                                Vec::with_capacity(header_size.saturating_add(plaintext.len()));
                             output.extend_from_slice(header);
                             output.extend_from_slice(&plaintext);
                             return Ok(Some(output));
@@ -402,17 +514,28 @@ impl E2eeContext {
 fn derive_cipher(material: &[u8]) -> Aes128Gcm {
     let hk = Hkdf::<Sha256>::new(None, material);
     let mut okm = [0u8; 16]; // AES-128 = 16 bytes
+    // HKDF-Expand only fails when the requested output length exceeds
+    // 255 * hash_len (RFC 5869 section 2.3); a fixed 16-byte request is always valid.
+    #[allow(clippy::expect_used)]
     hk.expand(HKDF_INFO, &mut okm)
-        .expect("HKDF expand should not fail for 16-byte output");
-    Aes128Gcm::new_from_slice(&okm).expect("16 bytes is valid AES-128 key length")
+        .expect("HKDF expand output length (16 bytes) is within RFC 5869 bounds");
+    // `okm` is exactly 16 bytes, the required AES-128 key length, so this
+    // conversion cannot fail.
+    #[allow(clippy::expect_used)]
+    let cipher =
+        Aes128Gcm::new_from_slice(&okm).expect("16 bytes is valid AES-128 key length");
+    cipher
 }
 
 /// Ratchet a key: derive new key material from existing material.
 fn ratchet_key(material: &[u8]) -> Vec<u8> {
     let hk = Hkdf::<Sha256>::new(None, material);
     let mut okm = vec![0u8; material.len().max(16)];
+    // HKDF-Expand only fails when the requested output length exceeds
+    // 255 * hash_len (RFC 5869 section 2.3); `okm` is always well within that bound.
+    #[allow(clippy::expect_used)]
     hk.expand(b"LKFrameRatchet", &mut okm)
-        .expect("HKDF expand should not fail");
+        .expect("HKDF expand output length is within RFC 5869 bounds");
     okm
 }
 
@@ -441,13 +564,13 @@ fn unencrypted_header_size(frame: &[u8], kind: MediaKind) -> usize {
             // If X=1, second byte is present with I, L, T, K flags
             // If I=1, PictureID is present (1 or 2 more bytes)
             let mut size = 1;
-            if frame.len() > 1 && (frame[0] & 0x80) != 0 {
+            if frame.len() > 1 && frame.first().is_some_and(|b| b & 0x80 != 0) {
                 // Extension byte present
                 size = 2;
-                if frame.len() > 2 && (frame[1] & 0x80) != 0 {
+                if frame.len() > 2 && frame.get(1).is_some_and(|b| b & 0x80 != 0) {
                     // PictureID present
                     size = 3;
-                    if frame.len() > 3 && (frame[2] & 0x80) != 0 {
+                    if frame.len() > 3 && frame.get(2).is_some_and(|b| b & 0x80 != 0) {
                         // 2-byte PictureID (M bit set)
                         size = 4;
                     }
@@ -463,6 +586,9 @@ mod tests {
     use super::*;
 
     #[test]
+    // Test assertions are meant to panic on failure; expect()/unwrap() with a
+    // descriptive message is the idiomatic way to do that in test code.
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn encrypt_decrypt_audio_roundtrip() {
         let ctx = E2eeContext::new(E2eeOptions::default());
         ctx.set_local_identity("alice");
@@ -476,7 +602,8 @@ mod tests {
         // Encrypted frame should be larger (IV + tag + key_index)
         assert!(encrypted.len() > original.len());
         // Encrypted payload should differ from original
-        assert_ne!(&encrypted[..original.len()], &original[..]);
+        let prefix = encrypted.get(..original.len()).expect("frame has prefix");
+        assert_ne!(prefix, &original[..]);
 
         let decrypted = ctx
             .decrypt_frame(&encrypted, "alice", MediaKind::Audio)
@@ -487,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn encrypt_decrypt_video_roundtrip() {
         let ctx = E2eeContext::new(E2eeOptions::default());
         ctx.set_local_identity("alice");
@@ -501,7 +629,10 @@ mod tests {
             .expect("encryption should succeed");
 
         // First few bytes (VP8 header) should be unencrypted
-        assert_eq!(&encrypted[..3], &original[..3]);
+        assert_eq!(
+            encrypted.get(..3).expect("frame has header"),
+            original.get(..3).expect("original has header")
+        );
 
         let decrypted = ctx
             .decrypt_frame(&encrypted, "alice", MediaKind::Video)
@@ -512,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn decrypt_wrong_participant_returns_none() {
         let ctx = E2eeContext::new(E2eeOptions::default());
         ctx.set_local_identity("alice");
@@ -530,6 +662,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn decrypt_wrong_key_fails() {
         let ctx = E2eeContext::new(E2eeOptions::default());
         ctx.set_local_identity("alice");
@@ -548,6 +681,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn multiple_key_indices() {
         let ctx = E2eeContext::new(E2eeOptions::default());
         ctx.set_local_identity("alice");
@@ -596,6 +730,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     fn key_ratcheting() {
         // Simulate: sender ratchets key and encrypts, receiver uses ratchet window to find it
         let sender_opts = E2eeOptions {
@@ -608,15 +743,17 @@ mod tests {
         sender.set_key("alice", 0, b"initial-key-material-1234567890");
 
         // Sender ratchets their key, then encrypts
-        {
-            let mut inner = sender.inner.write().unwrap();
+        let ratcheted = {
+            let Ok(mut inner) = sender.inner.write() else {
+                panic!("test lock is not poisoned");
+            };
             inner
                 .key_manager
                 .participants
                 .get_mut("alice")
-                .unwrap()
-                .ratchet(0);
-        }
+                .map(|ring| ring.ratchet(0))
+        };
+        assert_eq!(ratcheted, Some(true));
 
         let encrypted = sender
             .encrypt_frame(b"test-data", MediaKind::Audio)
