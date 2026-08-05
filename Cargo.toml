@@ -9,6 +9,7 @@ members = [
     "crates/elementium-webrtc",
     "crates/elementium-keyring",
     "crates/elementium-e2ee",
+    "crates/elementium-observability-test",
 ]
 
 [workspace.lints.clippy]
@@ -43,6 +44,7 @@ elementium-screen = { path = "crates/elementium-screen" }
 elementium-webrtc = { path = "crates/elementium-webrtc" }
 elementium-keyring = { path = "crates/elementium-keyring" }
 elementium-e2ee = { path = "crates/elementium-e2ee" }
+elementium-observability-test = { path = "crates/elementium-observability-test" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -482,6 +482,12 @@ fn audio_capture_loop(
 )]
 fn resample_44100_to_48000(samples: &[f32], channels: usize) -> Vec<f32> {
     // Guard against a misbehaving capture device reporting zero channels.
+    if channels == 0 {
+        tracing::warn!(
+            requested_channels = 0,
+            "clamping anomalous zero-channel resample request"
+        );
+    }
     let channels = channels.max(1);
     let ratio = 48000.0 / 44100.0;
     let input_frames = samples.len() / channels;
@@ -513,4 +519,53 @@ fn generate_track_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{t:x}")
+}
+
+#[cfg(test)]
+mod resample_tests {
+    use elementium_observability_test::LogCapture;
+
+    use super::resample_44100_to_48000;
+
+    /// Regression test: a misbehaving capture device reporting `channels =
+    /// 0` must not panic (the `channels.max(1)` guard holds), and the
+    /// anomaly must be visible in structured logs rather than silently
+    /// masked forever by the guard.
+    ///
+    /// Manually confirmed this test's second assertion fails if the
+    /// `tracing::warn!` call guarding the zero-channels clamp is removed:
+    /// `find_event` then returns `None`.
+    #[test]
+    // Test assertions are meant to panic on failure; expect() with a
+    // descriptive message is the idiomatic way to do that in test code.
+    #[allow(clippy::expect_used)]
+    fn zero_channels_is_clamped_without_panic_and_logged() {
+        let capture = LogCapture::new();
+        let samples = [0.1_f32, 0.2, 0.3, 0.4];
+
+        let output = capture.run(|| resample_44100_to_48000(&samples, 0));
+
+        // No panic occurred (we got here), and output is non-empty (treated as
+        // 1 channel, per the `.max(1)` guard).
+        assert!(!output.is_empty());
+
+        let event = capture
+            .find_event("clamping anomalous zero-channel resample request")
+            .expect("a structured warning should have been emitted for the zero-channels input");
+        assert_eq!(event.field("requested_channels"), Some("0"));
+    }
+
+    #[test]
+    fn nonzero_channels_does_not_log_the_clamp_warning() {
+        let capture = LogCapture::new();
+        let samples = [0.1_f32, 0.2, 0.3, 0.4];
+
+        capture.run(|| resample_44100_to_48000(&samples, 2));
+
+        assert!(
+            capture
+                .find_event("clamping anomalous zero-channel resample request")
+                .is_none()
+        );
+    }
 }

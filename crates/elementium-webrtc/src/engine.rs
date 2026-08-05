@@ -198,7 +198,11 @@ fn encrypt_or_drop(
     };
     ctx.encrypt_frame(&data, kind).map_or_else(
         || {
-            tracing::warn!("Dropping outbound {label} frame: E2EE encryption failed");
+            tracing::warn!(
+                reason = "e2ee_encrypt_failed",
+                label,
+                "Dropping outbound frame: E2EE encryption failed"
+            );
             None
         },
         Some,
@@ -365,5 +369,60 @@ fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> PcEvent {
             }
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use elementium_e2ee::E2eeOptions;
+    use elementium_observability_test::LogCapture;
+
+    use super::*;
+
+    /// Regression test for the fail-open E2EE bug fixed in a prior commit:
+    /// when a frame can't be encrypted (e.g. no key set for the local
+    /// participant), `encrypt_or_drop` must drop it rather than let it
+    /// through as plaintext, and must emit a structured "frame dropped"
+    /// warning with a `reason` field so the drop is visible in logs, not
+    /// just inferred from an absent return value.
+    ///
+    /// Manually confirmed this test fails if `encrypt_or_drop`'s `None` arm
+    /// is reverted to return `Some(data)` (fail-open) instead of `None`
+    /// (fail-closed): the assertion on `result.is_none()` fails immediately.
+    #[test]
+    // Test assertions are meant to panic on failure; expect() with a
+    // descriptive message is the idiomatic way to do that in test code.
+    #[allow(clippy::expect_used)]
+    fn encrypt_or_drop_emits_structured_warning_when_no_key_set() {
+        // No key set for any participant -> encrypt_frame returns None.
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        let capture = LogCapture::new();
+
+        let result = capture.run(|| {
+            encrypt_or_drop(Some(&ctx), b"plaintext-frame".to_vec(), E2eeMediaKind::Audio, "audio")
+        });
+
+        // Fail closed: the frame must be dropped, never sent as plaintext.
+        assert!(result.is_none());
+
+        let event = capture
+            .find_event("Dropping outbound frame")
+            .expect("a structured 'frame dropped' warning should have been emitted");
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert!(event.field("reason").is_some());
+        assert_eq!(event.field("label"), Some("audio"));
+    }
+
+    /// Sanity check: when no E2EE context is configured at all,
+    /// `encrypt_or_drop` passes the frame through unmodified and emits no
+    /// drop warning.
+    #[test]
+    fn encrypt_or_drop_passes_through_when_no_e2ee_configured() {
+        let capture = LogCapture::new();
+        let result = capture.run(|| {
+            encrypt_or_drop(None, b"plaintext-frame".to_vec(), E2eeMediaKind::Audio, "audio")
+        });
+        assert_eq!(result, Some(b"plaintext-frame".to_vec()));
+        assert!(capture.find_event("Dropping outbound frame").is_none());
     }
 }

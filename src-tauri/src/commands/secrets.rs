@@ -116,3 +116,70 @@ pub async fn secret_setup_file_backend(
     .await
     .map_err(|e: tokio::task::JoinError| e.to_string())?
 }
+
+#[cfg(test)]
+mod secret_redaction_tests {
+    use elementium_e2ee::{E2eeContext, E2eeOptions};
+    use elementium_observability_test::LogCapture;
+
+    use super::FileBackend;
+    use elementium_keyring::SecretStore;
+
+    /// Secret material used in this test. Chosen to be distinctive enough
+    /// that an accidental substring collision with legitimate log output
+    /// (level names, field names, etc.) is not plausible.
+    const SECRET_KEY_MATERIAL: &[u8] = b"do-not-log-this-secret-3f9a7c21";
+    const SECRET_PASSWORD: &str = "correct-horse-battery-staple-9f2e";
+    const SECRET_STORED_VALUE: &str = "hunter2-access-token-1a2b3c4d";
+
+    /// Regression/redaction test (SC-005): drive both the E2EE key-set path
+    /// (`elementium-e2ee`) and the secret-store access path
+    /// (`elementium-keyring`'s `FileBackend`) under the log-capture fixture,
+    /// then assert that no captured event field contains the literal secret
+    /// bytes/strings used here — only presence/size metadata (e.g.
+    /// `key_len`) is allowed to appear.
+    #[test]
+    fn no_captured_event_field_contains_secret_material() {
+        let capture = LogCapture::new();
+
+        capture.run(|| {
+            // E2EE key-set path.
+            let ctx = E2eeContext::new(E2eeOptions::default());
+            ctx.set_local_identity("alice");
+            ctx.set_key("alice", 0, SECRET_KEY_MATERIAL);
+
+            // Keyring secret-access path (encrypted file backend).
+            if let Ok(backend) = FileBackend::new(SECRET_PASSWORD) {
+                let _ = backend.set("mx_access_token", SECRET_STORED_VALUE);
+                let _ = backend.get("mx_access_token");
+            }
+        });
+
+        let secret_needle_key = String::from_utf8_lossy(SECRET_KEY_MATERIAL).into_owned();
+
+        for event in capture.events() {
+            for (field_name, value) in &event.fields {
+                assert!(
+                    !value.contains(&secret_needle_key),
+                    "field {field_name:?} on event {:?} leaked E2EE key material: {value:?}",
+                    event.name
+                );
+                assert!(
+                    !value.contains(SECRET_PASSWORD),
+                    "field {field_name:?} on event {:?} leaked the file-backend password: {value:?}",
+                    event.name
+                );
+                assert!(
+                    !value.contains(SECRET_STORED_VALUE),
+                    "field {field_name:?} on event {:?} leaked the stored secret value: {value:?}",
+                    event.name
+                );
+            }
+            if let Some(message) = event.message() {
+                assert!(!message.contains(&secret_needle_key));
+                assert!(!message.contains(SECRET_PASSWORD));
+                assert!(!message.contains(SECRET_STORED_VALUE));
+            }
+        }
+    }
+}

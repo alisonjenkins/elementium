@@ -1,0 +1,13 @@
+[package]
+name = "elementium-observability-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory tracing event capture fixture for regression/secret-redaction tests"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
