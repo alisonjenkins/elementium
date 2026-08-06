@@ -77,6 +77,10 @@ pub struct LiveKitRoom {
     transport: Transport,
     participants: HashMap<String, ParticipantInfo>,
     local_tracks: Vec<TrackInfo>,
+    /// `cid` of the published audio/video track, kept so a later renegotiation re-states
+    /// the same msid track ids the SFU already associated with these tracks.
+    audio_cid: Option<String>,
+    video_cid: Option<String>,
     room_event_tx: mpsc::UnboundedSender<RoomEvent>,
     video_frames: VideoFrameBuffer,
     shutdown: bool,
@@ -218,6 +222,8 @@ impl LiveKitRoom {
             transport,
             participants,
             local_tracks: Vec::new(),
+            audio_cid: None,
+            video_cid: None,
             room_event_tx: room_event_tx.clone(),
             video_frames,
             shutdown: false,
@@ -284,6 +290,11 @@ impl LiveKitRoom {
             _ => TrackSource::Unknown.into(),
         };
 
+        // The SFU pairs this request with an m-line by matching `cid` against the offer's
+        // msid track id, so the same value has to reach both. livekit-client gets this for
+        // free (its cid *is* the MediaStreamTrack id); we have to thread it through
+        // explicitly, or the association falls back to the server's match-by-kind guess and
+        // becomes order-dependent.
         let cid = format!("{}-{kind}-{source}", self.local_sid);
         let is_video = kind == "video";
 
@@ -297,7 +308,7 @@ impl LiveKitRoom {
         if let Err(e) = self
             .signal_sender
             .send(signal_request::Message::AddTrack(AddTrackRequest {
-                cid,
+                cid: cid.clone(),
                 name: format!("{kind}_{source}"),
                 r#type: track_type,
                 source: track_source,
@@ -314,7 +325,18 @@ impl LiveKitRoom {
 
         // Trigger SDP renegotiation on Publisher
         let include_video = is_video || self.has_video_track();
-        let offer = match self.transport.create_publisher_offer(include_video) {
+        let (audio_cid, video_cid) = if is_video {
+            (self.audio_cid.clone(), Some(cid.clone()))
+        } else {
+            (Some(cid.clone()), self.video_cid.clone())
+        };
+        if is_video {
+            self.video_cid = Some(cid.clone());
+        } else {
+            self.audio_cid = Some(cid.clone());
+        }
+        tracing::info!(cid = %cid, kind, source, "AddTrack cid, also used as the offer msid track id");
+        let offer = match self.transport.create_publisher_offer(include_video, audio_cid, video_cid) {
             Ok(o) => o,
             Err(e) => {
                 tracing::error!(reason = %e, "publish track failed");

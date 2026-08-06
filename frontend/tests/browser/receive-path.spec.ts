@@ -193,6 +193,9 @@ async function measure(
   opts: { badFrames?: number; defaultTolerance?: boolean } = {},
 ): Promise<{ stats: InboundStats; sent: number | null; errors: string[] }> {
   const roomName = `elementium-recv-${Date.now()}`;
+  // Printed so a run can be correlated with the SFU's own logs, which are the only place
+  // the server's view of publication and subscription is visible.
+  console.log(`  room: ${roomName}`);
   const server = await startPageServer();
 
   // Forward the page's own diagnostics: a livekit connect or E2EE-worker failure reports

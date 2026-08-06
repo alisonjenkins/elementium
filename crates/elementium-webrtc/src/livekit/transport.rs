@@ -161,9 +161,17 @@ impl Transport {
     /// # Errors
     ///
     /// Returns `Err` if the Publisher PC lock is poisoned or offer creation fails.
+    /// Create the publisher offer.
+    ///
+    /// `audio_cid`/`video_cid` are the `cid` values sent in the matching `AddTrackRequest`,
+    /// and become the offer's msid track ids. The SFU pairs a published track with an
+    /// m-line by matching those two, so they must agree -- see
+    /// [`peer_connection::TransceiverInfo::track_id`].
     pub fn create_publisher_offer(
         &self,
         include_video: bool,
+        audio_cid: Option<String>,
+        video_cid: Option<String>,
     ) -> Result<SessionDescription, crate::error::WebRtcError> {
         let mut pc = self
             .publisher
@@ -172,11 +180,13 @@ impl Transport {
         let mut transceivers = vec![peer_connection::TransceiverInfo {
             kind: str0m::media::MediaKind::Audio,
             direction: str0m::media::Direction::SendRecv,
+            track_id: audio_cid,
         }];
         if include_video {
             transceivers.push(peer_connection::TransceiverInfo {
                 kind: str0m::media::MediaKind::Video,
                 direction: str0m::media::Direction::SendRecv,
+                track_id: video_cid,
             });
         }
         peer_connection::create_offer(&mut pc, &[], &transceivers)
