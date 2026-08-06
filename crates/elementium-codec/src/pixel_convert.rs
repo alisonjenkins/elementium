@@ -1,4 +1,8 @@
 use elementium_types::{I420Frame, VideoFrame};
+use yuv::{
+    BufferStoreMut, YuvConversionMode, YuvPlanarImage, YuvPlanarImageMut, YuvRange,
+    YuvStandardMatrix,
+};
 
 /// Converts a `u32` frame dimension to `usize`.
 // u32 always fits in usize on the 32/64-bit platforms this crate targets.
@@ -15,40 +19,40 @@ const fn half(n: usize) -> usize {
     n / 2
 }
 
-/// Quantizes a color-space conversion result to a byte. The value is
-/// clamped to the valid 0.0-255.0 range first, so the truncation is an
-/// intentional, bounded lossy step of the conversion (not an overflow bug).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::as_conversions
-)]
-const fn quantize(v: f32) -> u8 {
-    v.clamp(0.0, 255.0) as u8
+/// The color conversion standard used throughout this module. Matches the BT.601 full-range
+/// (0-255, not studio-range 16-235/16-240) coefficients the hand-rolled math this module used
+/// to use, so swapping to the `yuv` crate's SIMD-accelerated (AVX2/SSE/NEON, with scalar
+/// fallback) implementation doesn't change output pixel values.
+const RANGE: YuvRange = YuvRange::Full;
+const MATRIX: YuvStandardMatrix = YuvStandardMatrix::Bt601;
+
+/// Build a same-size zeroed `I420Frame`, used as the fail-safe fallback when a `yuv` crate
+/// conversion call errors (e.g. malformed/odd dimensions) -- callers of these `pub fn`s expect
+/// an infallible, always-correctly-sized frame back, matching the pre-SIMD behavior of quietly
+/// leaving pixels at their zeroed default rather than panicking or propagating a `Result`.
+fn empty_i420(width: u32, height: u32) -> I420Frame {
+    let w = dim(width);
+    let h = dim(height);
+    let uv_w = half(w);
+    let uv_h = half(h);
+    I420Frame {
+        width,
+        height,
+        y: vec![0u8; w.saturating_mul(h)],
+        u: vec![0u8; uv_w.saturating_mul(uv_h)],
+        v: vec![0u8; uv_w.saturating_mul(uv_h)],
+        timestamp_us: 0,
+    }
 }
 
-/// BT.601 RGB -> luma.
-fn luma(r: f32, g: f32, b: f32) -> u8 {
-    quantize(b.mul_add(0.114, g.mul_add(0.587, r * 0.299)))
-}
-
-/// BT.601 RGB -> chroma (U, V).
-const fn chroma(r: f32, g: f32, b: f32) -> (u8, u8) {
-    let chroma_u = quantize(b.mul_add(0.500, g.mul_add(-0.331, r.mul_add(-0.169, 128.0))));
-    let chroma_v = quantize(b.mul_add(-0.081, g.mul_add(-0.419, r.mul_add(0.500, 128.0))));
-    (chroma_u, chroma_v)
-}
-
-/// Shared row/column-subsampled RGB(A)-family -> I420 conversion.
-///
-/// `stride` is the number of bytes per pixel in `data`, and `extract` pulls
-/// the (r, g, b) triple (as widened `f32`s) out of one pixel's byte slice.
+/// Shared RGB(A)-family -> I420 conversion, dispatching to the `yuv` crate's SIMD-accelerated
+/// converter for the given source channel layout.
 fn convert_to_i420(
     width: u32,
     height: u32,
     data: &[u8],
     stride: usize,
-    extract: impl Fn(&[u8]) -> Option<(f32, f32, f32)>,
+    convert: impl FnOnce(&mut YuvPlanarImageMut<'_, u8>, &[u8], u32) -> Result<(), yuv::YuvError>,
 ) -> I420Frame {
     let w = dim(width);
     let h = dim(height);
@@ -59,32 +63,21 @@ fn convert_to_i420(
     let mut u_plane = vec![0u8; uv_w.saturating_mul(uv_h)];
     let mut v_plane = vec![0u8; uv_w.saturating_mul(uv_h)];
 
-    let row_bytes = w.saturating_mul(stride);
+    let mut target = YuvPlanarImageMut {
+        y_plane: BufferStoreMut::Borrowed(&mut y_plane),
+        y_stride: width,
+        u_plane: BufferStoreMut::Borrowed(&mut u_plane),
+        u_stride: u32::try_from(uv_w).unwrap_or(0),
+        v_plane: BufferStoreMut::Borrowed(&mut v_plane),
+        v_stride: u32::try_from(uv_w).unwrap_or(0),
+        width,
+        height,
+    };
 
-    for (y_row, data_row) in y_plane.chunks_mut(w).zip(data.chunks_exact(row_bytes)) {
-        for (y_px, px) in y_row.iter_mut().zip(data_row.chunks_exact(stride)) {
-            if let Some((r, g, b)) = extract(px) {
-                *y_px = luma(r, g, b);
-            }
-        }
-    }
-
-    for ((u_row, v_row), data_row) in u_plane
-        .chunks_mut(uv_w)
-        .zip(v_plane.chunks_mut(uv_w))
-        .zip(data.chunks_exact(row_bytes).step_by(2))
-    {
-        for ((u_px, v_px), px) in u_row
-            .iter_mut()
-            .zip(v_row.iter_mut())
-            .zip(data_row.chunks_exact(stride).step_by(2))
-        {
-            if let Some((r, g, b)) = extract(px) {
-                let (u, v) = chroma(r, g, b);
-                *u_px = u;
-                *v_px = v;
-            }
-        }
+    let row_stride = u32::try_from(w.saturating_mul(stride)).unwrap_or(0);
+    if let Err(e) = convert(&mut target, data, row_stride) {
+        tracing::error!(width, height, error = %e, "SIMD RGB->I420 conversion failed, returning blank frame");
+        return empty_i420(width, height);
     }
 
     I420Frame {
@@ -100,9 +93,8 @@ fn convert_to_i420(
 /// Convert BGRA pixel data to I420 (YUV 4:2:0 planar).
 #[must_use]
 pub fn bgra_to_i420(width: u32, height: u32, bgra: &[u8]) -> I420Frame {
-    convert_to_i420(width, height, bgra, 4, |px| match *px {
-        [b, g, r, _a] => Some((f32::from(r), f32::from(g), f32::from(b))),
-        _ => None,
+    convert_to_i420(width, height, bgra, 4, |target, data, stride| {
+        yuv::bgra_to_yuv420(target, data, stride, RANGE, MATRIX, YuvConversionMode::default())
     })
 }
 
@@ -110,9 +102,8 @@ pub fn bgra_to_i420(width: u32, height: u32, bgra: &[u8]) -> I420Frame {
 /// Used for camera frames that have been converted to RGBA format.
 #[must_use]
 pub fn rgba_to_i420(width: u32, height: u32, rgba: &[u8]) -> I420Frame {
-    convert_to_i420(width, height, rgba, 4, |px| match *px {
-        [r, g, b, _a] => Some((f32::from(r), f32::from(g), f32::from(b))),
-        _ => None,
+    convert_to_i420(width, height, rgba, 4, |target, data, stride| {
+        yuv::rgba_to_yuv420(target, data, stride, RANGE, MATRIX, YuvConversionMode::default())
     })
 }
 
@@ -120,9 +111,8 @@ pub fn rgba_to_i420(width: u32, height: u32, rgba: &[u8]) -> I420Frame {
 /// Used for camera frames from nokhwa which outputs RGB.
 #[must_use]
 pub fn rgb_to_i420(width: u32, height: u32, rgb: &[u8]) -> I420Frame {
-    convert_to_i420(width, height, rgb, 3, |px| match *px {
-        [r, g, b] => Some((f32::from(r), f32::from(g), f32::from(b))),
-        _ => None,
+    convert_to_i420(width, height, rgb, 3, |target, data, stride| {
+        yuv::rgb_to_yuv420(target, data, stride, RANGE, MATRIX, YuvConversionMode::default())
     })
 }
 
@@ -134,43 +124,27 @@ pub fn i420_to_rgba(frame: &I420Frame) -> VideoFrame {
     let uv_w = half(img_w);
 
     let mut rgba = vec![0u8; img_w.saturating_mul(img_h).saturating_mul(4)];
-    let row_bytes = img_w.saturating_mul(4);
 
-    for (row_idx, (rgba_row, y_row)) in rgba
-        .chunks_mut(row_bytes)
-        .zip(frame.y.chunks(img_w))
-        .enumerate()
-    {
-        let uv_row = half(row_idx);
-        let uv_start = uv_row.saturating_mul(uv_w);
-        let Some(blue_chroma_row) = frame.u.get(uv_start..uv_start.saturating_add(uv_w)) else {
-            continue;
-        };
-        let Some(red_chroma_row) = frame.v.get(uv_start..uv_start.saturating_add(uv_w)) else {
-            continue;
-        };
+    let source = YuvPlanarImage {
+        y_plane: &frame.y,
+        y_stride: frame.width,
+        u_plane: &frame.u,
+        u_stride: u32::try_from(uv_w).unwrap_or(0),
+        v_plane: &frame.v,
+        v_stride: u32::try_from(uv_w).unwrap_or(0),
+        width: frame.width,
+        height: frame.height,
+    };
+    let rgba_stride = u32::try_from(img_w.saturating_mul(4)).unwrap_or(0);
 
-        for (col_idx, (rgba_px, &y_u8)) in rgba_row.chunks_exact_mut(4).zip(y_row).enumerate() {
-            let uv_col = half(col_idx);
-            let (Some(&u_u8), Some(&v_u8)) = (blue_chroma_row.get(uv_col), red_chroma_row.get(uv_col)) else {
-                continue;
-            };
-
-            let y_val = f32::from(y_u8);
-            let u_val = f32::from(u_u8) - 128.0;
-            let v_val = f32::from(v_u8) - 128.0;
-
-            let r = quantize(v_val.mul_add(1.402, y_val));
-            let g = quantize(u_val.mul_add(-0.344, v_val.mul_add(-0.714, y_val)));
-            let b = quantize(u_val.mul_add(1.772, y_val));
-
-            if let [rp, gp, bp, ap] = rgba_px {
-                *rp = r;
-                *gp = g;
-                *bp = b;
-                *ap = 255;
-            }
-        }
+    if let Err(e) = yuv::yuv420_to_rgba(&source, &mut rgba, rgba_stride, RANGE, MATRIX) {
+        tracing::error!(
+            width = frame.width,
+            height = frame.height,
+            error = %e,
+            "SIMD I420->RGBA conversion failed, returning blank frame"
+        );
+        rgba.fill(0);
     }
 
     VideoFrame {

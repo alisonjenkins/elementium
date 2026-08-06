@@ -1,6 +1,6 @@
 //! VP8 video encoding and decoding via the `vpx-encode` crate and raw libvpx FFI.
 
-use elementium_types::I420Frame;
+use elementium_types::{I420Frame, PlaintextMedia};
 
 /// VP8 encoder wrapping `vpx_encode::Encoder`.
 pub struct Vp8Encoder {
@@ -11,8 +11,11 @@ pub struct Vp8Encoder {
 }
 
 /// A single encoded VP8 packet.
+#[derive(Debug, Clone)]
 pub struct Vp8Packet {
-    pub data: Vec<u8>,
+    /// Encoded VP8 bytes in the clear -- must be encrypted before reaching the wire.
+    /// See [`PlaintextMedia`] for why this is typed rather than a bare `Vec<u8>`.
+    pub data: PlaintextMedia,
     pub is_keyframe: bool,
     pub pts: i64,
 }
@@ -99,7 +102,7 @@ impl Vp8Encoder {
         let result = packets
             .into_iter()
             .map(|p| Vp8Packet {
-                data: p.data.to_vec(),
+                data: PlaintextMedia::from_encoder(p.data.to_vec()),
                 is_keyframe: p.key,
                 pts: p.pts,
             })
@@ -188,9 +191,11 @@ impl Vp8Decoder {
     ///
     /// Returns an error string if the underlying libvpx decoder rejects the
     /// packet.
-    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<I420Frame>, String> {
+    pub fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
         use std::ptr;
         use vpx_sys::{vpx_codec_decode, vpx_codec_get_frame, vpx_codec_iter_t, VPX_CODEC_OK};
+
+        let data = data.as_bytes();
 
         // Narrowing usize -> u32 cast for the FFI call. VP8/WebRTC packets
         // are bounded well under u32::MAX in practice; guard explicitly
@@ -386,5 +391,33 @@ mod tests {
             (avg_y - 150.0).abs() < 10.0,
             "Average Y should be ~150, got {avg_y}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn encode_rejects_mismatched_frame_dimensions() {
+        let mut encoder = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
+        let frame = I420Frame {
+            width: 640,
+            height: 480,
+            y: vec![0u8; 640 * 480],
+            u: vec![0u8; 320 * 240],
+            v: vec![0u8; 320 * 240],
+            timestamp_us: 0,
+        };
+        let result = encoder.encode(&frame);
+        assert!(
+            result.is_err_and(|e| e.contains("size mismatch")),
+            "expected a frame size mismatch error"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn decode_rejects_garbage_packet() {
+        let mut decoder = Vp8Decoder::new().expect("decoder creation");
+        // Not a valid VP8 bitstream -- libvpx must reject it, not panic or hang.
+        let garbage = PlaintextMedia::from_encoder(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(decoder.decode(&garbage).is_err());
     }
 }
