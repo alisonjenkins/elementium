@@ -199,5 +199,14 @@
     setState("connecting");
     await room.connect(url, token, { autoSubscribe: true });
     setState("connected");
+
+    // Control mode: publish from the browser too, using Chromium's fake capture device.
+    // A browser-to-browser run through the same SFU establishes whether a subscription
+    // failure involves our publisher at all -- if the control flakes the same way, the
+    // fault is in the environment or in livekit's own subscribe path, not in what we send.
+    if (params.get("publish") === "1") {
+      await room.localParticipant.setMicrophoneEnabled(true);
+      setState("publishing");
+    }
   </script>
 </body>

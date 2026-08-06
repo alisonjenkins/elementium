@@ -145,11 +145,27 @@ function startPublisher(
     ...(rotateFrames > 0 ? ["--rotate-frames", String(rotateFrames)] : []),
     ...(badFrames > 0 ? ["--bad-frames", String(badFrames)] : []),
   ];
-  const proc = spawn(PUBLISHER, args, { stdio: "pipe" });
+  // `RUST_LOG` at info: the publisher's own view of negotiation and ICE is the other half
+  // of any failure here, and discarding its stderr made a publisher-side fault look like a
+  // browser-side one.
+  const proc = spawn(PUBLISHER, args, {
+    stdio: "pipe",
+    env: { ...process.env, RUST_LOG: process.env.PUBLISHER_LOG ?? "warn" },
+  });
+  const echo = (c: Buffer) => {
+    for (const line of c.toString().split("\n")) {
+      // `PUBLISHING`/`SENT` are this process's protocol with the test, not diagnostics.
+      if (line.trim() && !/^(PUBLISHING|SENT |ROTATED |KEY_CORRECTED)/.test(line)) {
+        console.log(`  [publisher] ${line}`);
+      }
+    }
+  };
+  proc.stderr.on("data", echo);
   let sent: number | null = null;
   let out = "";
   const live = new Promise<void>((resolve, reject) => {
     proc.stdout.on("data", (chunk: Buffer) => {
+      echo(chunk);
       out += chunk.toString();
       if (out.includes("PUBLISHING")) resolve();
       const m = /SENT (\d+)/.exec(out);
@@ -414,5 +430,87 @@ test.describe("browser receive path", () => {
     });
     expect(errors, "no page errors").toEqual([]);
     assertHealthy(stats, "bad start, default tolerance");
+  });
+
+  // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.
+  //
+  // Establishes a baseline for every other test here: if this subscribes reliably and the
+  // Rust-publisher tests do not, the difference is in what we publish. If this flakes the
+  // same way, the flake is in livekit's subscribe path or the environment, and the other
+  // tests' failures say nothing about our code.
+  test("control: browser to browser through the SFU", async ({ browser }) => {
+    const roomName = `elementium-control-${Date.now()}`;
+    console.log(`  room: ${roomName}`);
+    const server = await startPageServer();
+    const ctx = await browser.newContext();
+
+    try {
+      const subscriber = await ctx.newPage();
+      subscriber.on("pageerror", (e) => console.log(`  [sub:error] ${e.message}`));
+      const subQuery = new URLSearchParams({
+        url: SFU_WS,
+        token: mintToken("browser-subscriber", roomName),
+      });
+      await subscriber.goto(`${server.origin}/?${subQuery.toString()}`);
+      await expect.poll(() => subscriber.textContent("#state"), { timeout: 20_000 }).toBe(
+        "connected",
+      );
+
+      // `CONTROL_PUBLISH_DELAY_MS` makes the control match the Rust tests' timing, where
+      // the publisher takes ~20s to start. A subscriber that has been idle in the room for
+      // a while is a different case for livekit's reconcile logic than one that sees a
+      // publisher arrive immediately, and this knob is what tells the two apart.
+      const delayMs = Number(process.env.CONTROL_PUBLISH_DELAY_MS ?? 0);
+      if (delayMs > 0) {
+        console.log(`  delaying publisher by ${delayMs}ms`);
+        await subscriber.waitForTimeout(delayMs);
+      }
+
+      const publisher = await ctx.newPage();
+      publisher.on("pageerror", (e) => console.log(`  [pub:error] ${e.message}`));
+      const pubQuery = new URLSearchParams({
+        url: SFU_WS,
+        token: mintToken("browser-publisher", roomName),
+        publish: "1",
+      });
+      await publisher.goto(`${server.origin}/?${pubQuery.toString()}`);
+      await expect.poll(() => publisher.textContent("#state"), { timeout: 20_000 }).toBe(
+        "publishing",
+      );
+
+      await expect
+        .poll(
+          () =>
+            subscriber.evaluate(
+              () => (window as never as { __subscribed: boolean }).__subscribed,
+            ),
+          { timeout: 30_000, message: "the subscriber never subscribed to the browser's track" },
+        )
+        .toBe(true);
+
+      await subscriber.waitForTimeout(5_000);
+      const read = async () =>
+        subscriber.evaluate(() =>
+          (window as never as {
+            __stats: () => Promise<InboundStats | { error: string }>;
+          }).__stats(),
+        );
+      const before = await read();
+      await subscriber.waitForTimeout(10_000);
+      const after = await read();
+      if ("error" in before || "error" in after) {
+        throw new Error(`control could not read stats: ${JSON.stringify({ before, after })}`);
+      }
+
+      console.log(`  control before: ${JSON.stringify(before)}`);
+      console.log(`  control after:  ${JSON.stringify(after)}`);
+      expect(
+        after.packetsReceived - before.packetsReceived,
+        "a browser publishing to a browser must deliver a steady packet rate",
+      ).toBeGreaterThan(400);
+    } finally {
+      await ctx.close();
+      server.close();
+    }
   });
 });

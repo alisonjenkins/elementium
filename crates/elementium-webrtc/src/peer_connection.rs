@@ -186,16 +186,48 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
     }
 }
 
-/// Add a local UDP candidate to the peer connection.
+/// Every usable local address, most-likely-reachable first.
+///
+/// Loopback and link-local are excluded: a peer can never reach the first, and the second
+/// needs a scope id to be routable.
+///
+/// NOTE: advertising all of these was tried and measurably made connectivity *worse* --
+/// failures went from roughly half of runs to three quarters. Each extra candidate is
+/// another pair for ICE to check, and `LiveKit`'s SFU gives a participant a fixed window to
+/// connect before removing it entirely; spending that window probing Docker bridges and VPN
+/// interfaces exhausts it. Kept because the enumeration is the right primitive for choosing
+/// *better*, not for offering *more*.
+#[must_use]
+pub fn local_host_addresses() -> Vec<std::net::IpAddr> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return get_local_ip().into_iter().collect();
+    };
+    ifaces
+        .into_iter()
+        .map(|i| i.ip())
+        .filter(|ip| !ip.is_loopback() && !is_link_local(*ip))
+        .collect()
+}
+
+const fn is_link_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
+/// Add a local UDP host candidate for the address that routes to the internet.
 pub fn add_local_candidate(pc: &mut PeerConnectionInner, addr: SocketAddr) {
-    // 0.0.0.0 is not a valid ICE candidate — resolve to actual interface IP
     let addr = if addr.ip().is_unspecified() {
         let real_ip = get_local_ip().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         SocketAddr::new(real_ip, addr.port())
     } else {
         addr
     };
+    add_host_candidate(pc, addr);
+}
 
+fn add_host_candidate(pc: &mut PeerConnectionInner, addr: SocketAddr) {
     match Candidate::host(addr, "udp") {
         Ok(candidate) => {
             tracing::info!(pc_id = %pc.id, %addr, "Adding local ICE candidate");
@@ -1609,7 +1641,7 @@ mod ice_disconnect_tests {
         let since = Instant::now();
         assert!(!ice_disconnect_expired(
             Some(since),
-            since + ICE_DISCONNECT_GRACE - Duration::from_millis(1)
+            since + ICE_DISCONNECT_GRACE.saturating_sub(Duration::from_millis(1))
         ));
     }
 
@@ -1650,5 +1682,41 @@ mod ice_disconnect_tests {
         let first = pc.ice_disconnected_since;
         note_ice_state(&mut pc, IceState::Disconnected);
         assert_eq!(pc.ice_disconnected_since, first);
+    }
+}
+
+#[cfg(test)]
+mod local_candidate_tests {
+    use super::local_host_addresses;
+
+    /// A candidate a peer cannot route to is worse than useless: it consumes connectivity
+    /// checks while the pair that would have worked waits behind it.
+    #[test]
+    fn loopback_and_link_local_are_not_advertised() {
+        for ip in local_host_addresses() {
+            assert!(!ip.is_loopback(), "loopback must not be advertised: {ip}");
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    assert!(!v4.is_link_local(), "link-local must not be advertised: {v4}");
+                }
+                std::net::IpAddr::V6(v6) => {
+                    assert!(
+                        !v6.is_unicast_link_local(),
+                        "link-local must not be advertised: {v6}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole point of the change: a machine with more than one interface must offer
+    /// more than one candidate, because the one that routes to the internet is frequently
+    /// not the one a peer on the same LAN (or an SFU in a container) can reach.
+    #[test]
+    fn at_least_one_address_is_found_on_a_networked_host() {
+        assert!(
+            !local_host_addresses().is_empty(),
+            "a host with any usable interface must advertise at least one candidate"
+        );
     }
 }

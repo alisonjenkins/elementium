@@ -529,16 +529,25 @@ async fn signal_processing_loop(
     while let Some(msg) = signal_rx.recv().await {
         match msg {
             signal_response::Message::Answer(answer) => {
-                // SFU answer for our Publisher offer
+                // SFU answer for our Publisher offer. Logged on arrival and on application:
+                // without this, a publisher that never completes negotiation is silent in
+                // the log, and looks identical to one whose media is being dropped later.
+                tracing::info!(sdp_len = answer.sdp.len(), "publisher answer received from SFU");
                 let desc = SessionDescription {
                     sdp_type: SdpType::Answer,
                     sdp: answer.sdp,
                 };
                 let Ok(mut pc) = publisher.lock() else {
+                    tracing::error!(
+                        reason = "lock_poisoned",
+                        "publisher answer dropped; the publisher connection cannot complete \
+                         negotiation and will never send media"
+                    );
                     continue;
                 };
-                if let Err(e) = crate::peer_connection::set_remote_description(&mut pc, &desc) {
-                    tracing::error!(reason = %e, "publisher answer failed");
+                match crate::peer_connection::set_remote_description(&mut pc, &desc) {
+                    Ok(_) => tracing::info!(pc_id = %pc.id, "publisher answer applied"),
+                    Err(e) => tracing::error!(pc_id = %pc.id, reason = %e, "publisher answer failed"),
                 }
             }
             signal_response::Message::Offer(offer) => {

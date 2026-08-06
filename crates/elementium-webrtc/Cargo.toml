@@ -21,6 +21,7 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 prost = { workspace = true }
 url = { workspace = true }
+if-addrs = "0.15.0"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
