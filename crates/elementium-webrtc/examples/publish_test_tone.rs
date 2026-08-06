@@ -20,6 +20,11 @@
 //! published unencrypted. Both are needed: comparing them is what separates "the browser
 //! cannot decrypt our frames" from "the browser cannot play our audio".
 //!
+//! `--bad-frames N` encrypts the first N frames with a key the far end does not hold, then
+//! switches to the correct one. This models the real join sequence, where media starts
+//! flowing before every peer has our key -- from the receiver's side the two are
+//! indistinguishable. It exists to test whether a receiver ever recovers.
+//!
 //! `--rotate-frames N` switches to the next key every N frames, cycling through keys derived
 //! from `--key-hex` by appending the index. Element Call rotates keys as participants come
 //! and go, and a rotation the two sides disagree about drops only the frames encrypted
@@ -119,6 +124,15 @@ fn rotated_key(base: &[u8], index: u8) -> Vec<u8> {
     key
 }
 
+/// A key the far end will not hold, at the same index as the real one.
+fn wrong_key(base: &[u8]) -> Vec<u8> {
+    let mut key = base.to_vec();
+    if let Some(b) = key.get_mut(1) {
+        *b ^= 0xFF;
+    }
+    key
+}
+
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
@@ -157,12 +171,17 @@ async fn main() {
     let rotate_frames: u64 = arg("--rotate-frames")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let bad_frames: u64 = arg("--bad-frames").and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let base_key = arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
     let ctx = base_key.as_ref().map(|material| {
         let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
         ctx.set_local_identity(&identity);
-        ctx.set_key(&identity, 0, &rotated_key(material, 0));
+        // Start on a key the far end does not have, if asked: `--bad-frames` needs the
+        // first frames to be undecryptable, and encrypting with the wrong key is exactly
+        // what the receiver sees when it has not yet been given the right one.
+        let start = if bad_frames > 0 { wrong_key(material) } else { rotated_key(material, 0) };
+        ctx.set_key(&identity, 0, &start);
         ctx
     });
     let policy = ctx.clone().map_or(EncryptionPolicy::ExplicitlyUnencrypted, EncryptionPolicy::Encrypted);
@@ -213,6 +232,15 @@ async fn main() {
     let mut key_index: u8 = 0;
     for i in 0..frames {
         ticker.tick().await;
+
+        // Switch to the key the far end actually holds, at the same index.
+        if bad_frames > 0
+            && i == bad_frames
+            && let (Some(ctx), Some(base)) = (ctx.as_ref(), base_key.as_ref())
+        {
+            ctx.set_key(&identity, 0, &rotated_key(base, 0));
+            println!("KEY_CORRECTED");
+        }
 
         // Rotate on schedule, exactly as a client would when the room membership changes.
         if rotate_frames > 0

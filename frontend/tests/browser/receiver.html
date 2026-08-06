@@ -24,7 +24,7 @@
   <script type="module">
     // Served by the Playwright fixture: /lk/ maps to livekit-client's dist directory, so
     // the page runs the same client library Element Call ships rather than a stand-in.
-    import { Room, ExternalE2EEKeyProvider } from "/lk/livekit-client.esm.mjs";
+    import { Room, ExternalE2EEKeyProvider, BaseKeyProvider } from "/lk/livekit-client.esm.mjs";
 
     const params = new URLSearchParams(location.search);
     const url = params.get("url");
@@ -54,7 +54,22 @@
       // Same construction Element Call uses: an externally supplied raw key, handed to the
       // insertable-streams worker. This is the path that must be exercised -- a browser
       // decrypting our frames is exactly what no Rust-only test can stand in for.
-      const keyProvider = new ExternalE2EEKeyProvider();
+      // Which key provider matters enormously, and is the whole point of the
+      // `invalidation` tests:
+      //
+      //   ExternalE2EEKeyProvider forces `failureTolerance: -1` -- "accept wrong keys
+      //   forever", per its own source comment -- so a receiver keeps trying regardless of
+      //   how many frames failed.
+      //
+      //   BaseKeyProvider's defaults are what Element Call's own provider inherits:
+      //   `failureTolerance: 10`. After ten failures at a key index the worker stops
+      //   attempting decryption entirely and silently drops every later frame
+      //   (livekit-client.e2ee.worker.mjs, `hasInvalidKeyAtIndex`), latched until a key
+      //   event resets it.
+      const useDefaultTolerance = params.get("provider") === "default";
+      const keyProvider = useDefaultTolerance
+        ? new BaseKeyProvider({ sharedKey: true })
+        : new ExternalE2EEKeyProvider();
       room = new Room({
         e2ee: {
           keyProvider,
@@ -163,6 +178,7 @@
           if (s.type === "codec" && s.id === inbound.codecId) codec = s;
         });
         return {
+          ssrc: inbound.ssrc ?? 0,
           mimeType: codec?.mimeType ?? null,
           packetsReceived: inbound.packetsReceived ?? 0,
           packetsLost: inbound.packetsLost ?? 0,

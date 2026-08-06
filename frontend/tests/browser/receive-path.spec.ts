@@ -134,6 +134,7 @@ function startPublisher(
   seconds: number,
   keyHex?: string,
   rotateFrames = 0,
+  badFrames = 0,
 ): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
@@ -142,6 +143,7 @@ function startPublisher(
     "--seconds", String(seconds),
     ...(keyHex ? ["--key-hex", keyHex] : []),
     ...(rotateFrames > 0 ? ["--rotate-frames", String(rotateFrames)] : []),
+    ...(badFrames > 0 ? ["--bad-frames", String(badFrames)] : []),
   ];
   const proc = spawn(PUBLISHER, args, { stdio: "pipe" });
   let sent: number | null = null;
@@ -163,6 +165,7 @@ function startPublisher(
 }
 
 interface InboundStats {
+  ssrc: number;
   mimeType: string | null;
   packetsReceived: number;
   packetsLost: number;
@@ -187,6 +190,7 @@ async function measure(
   keyHex?: string,
   rotateFrames = 0,
   keyDelayMs = 0,
+  opts: { badFrames?: number; defaultTolerance?: boolean } = {},
 ): Promise<{ stats: InboundStats; sent: number | null; errors: string[] }> {
   const roomName = `elementium-recv-${Date.now()}`;
   const server = await startPageServer();
@@ -203,6 +207,7 @@ async function measure(
   const token = mintToken("browser-subscriber", roomName);
   const query = new URLSearchParams({ url: SFU_WS, token });
   if (keyHex) query.set("key", keyHex);
+  if (opts.defaultTolerance) query.set("provider", "default");
   // 30s at 50fps, so the browser can pre-install every key the publisher will use.
   if (rotateFrames > 0) {
     query.set("rotations", String(Math.ceil(1500 / rotateFrames)));
@@ -214,7 +219,7 @@ async function measure(
     .poll(() => page.textContent("#state"), { timeout: 20_000 })
     .toBe("connected");
 
-  const publisher = startPublisher(roomName, 30, keyHex, rotateFrames);
+  const publisher = startPublisher(roomName, 30, keyHex, rotateFrames, opts.badFrames ?? 0);
 
   try {
     await publisher.live;
@@ -257,7 +262,20 @@ async function measure(
     await page.waitForTimeout(10_000);
     const after = await read();
 
+    // Raw samples, not just the delta: a track that restarts gets a new SSRC, and
+    // subtracting two different streams' counters produces a number that looks like loss
+    // but is arithmetic on unrelated series.
+    console.log(`  before: ${JSON.stringify(before)}`);
+    console.log(`  after:  ${JSON.stringify(after)}`);
+    if (before.ssrc !== after.ssrc) {
+      throw new Error(
+        `the inbound stream changed SSRC mid-measurement (${before.ssrc} -> ${after.ssrc}); ` +
+          `the track restarted, so a delta across it is meaningless`,
+      );
+    }
+
     const stats: InboundStats = {
+      ssrc: after.ssrc,
       mimeType: after.mimeType,
       jitter: after.jitter,
       packetsReceived: after.packetsReceived - before.packetsReceived,
@@ -334,15 +352,15 @@ test.describe("browser receive path", () => {
     assertHealthy(stats, "rotating");
   });
 
-  // REPRODUCTION, expected to fail until the sender stops encrypting with a key before the
-  // far end can possibly have it. `test.fail()` means this passes while the defect exists
-  // and starts failing the moment it is fixed -- at which point delete the marker.
+  // MEASURED CLEAN. This was briefly believed to reproduce the field symptom -- an early
+  // run showed 52 of ~500 packets usable and 89% of samples concealed. That did not hold
+  // up: with the retrying stats reader and raw before/after sampling in place, the same
+  // scenario recovers completely. The earlier numbers came from a window sampled while the
+  // track was still starting, which is also what produced the "never subscribed" failures.
   //
-  // Measured behaviour: 52 of ~500 packets usable, 426,630 of 480,480 samples concealed
-  // (89%), and `packetsLost` of 0 throughout. Zero reported loss is why every sender-side
-  // measurement of this bug came back clean.
+  // Kept because the scenario is worth guarding regardless, and because the negative result
+  // is itself worth recording: a receiver handles a key it learns about late.
   test("audio survives a key rotation the far end learns about late", async ({ page }) => {
-    test.fail();
     // The same rotation, but the receiver only learns each new key 500ms after the sender
     // starts using it -- a realistic delay for a key published over Matrix and fanned out
     // to a room. Any frame sent inside that window is undecryptable at the far end.
@@ -353,5 +371,45 @@ test.describe("browser receive path", () => {
     const { stats, errors } = await measure(page, KEY_HEX, 100, 500);
     expect(errors, "no page errors").toEqual([]);
     assertHealthy(stats, "rotating with late key delivery");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Key invalidation: does a receiver ever recover from a bad start?
+  //
+  // We begin publishing the moment the track is added, so our first frames can reach a
+  // peer before it holds our key. From the receiver's side that is indistinguishable from
+  // frames encrypted with a key it does not have -- which is how these two tests model it.
+  //
+  // The pair is the experiment: identical streams, differing only in the receiver's
+  // `failureTolerance`. If the tolerant one recovers and the default one does not, the
+  // damage is caused by livekit latching our key as invalid, not by anything about the
+  // frames themselves.
+  // ---------------------------------------------------------------------------
+
+  test("a receiver that never invalidates keys recovers from a bad start", async ({ page }) => {
+    // ExternalE2EEKeyProvider sets failureTolerance to -1, so it keeps trying forever.
+    // 50 bad frames (1 second), then correct ones for the rest of the run.
+    const { stats, errors } = await measure(page, KEY_HEX, 0, 0, { badFrames: 50 });
+    expect(errors, "no page errors").toEqual([]);
+    assertHealthy(stats, "bad start, tolerant receiver");
+  });
+
+  test("a receiver with livekit's default tolerance recovers from a bad start", async ({
+    page,
+  }) => {
+    // BaseKeyProvider's defaults are what Element Call's provider inherits, including
+    // `failureTolerance: 10`. 50 bad frames exhaust that in a fifth of a second, so if
+    // `hasInvalidKeyAtIndex` latched the way its source reads, every later frame at that
+    // index would be dropped without an attempt -- including the correct ones.
+    //
+    // It does not latch in practice at these parameters: this passes. Kept as the guard
+    // that would catch it if it ever did, and as the control for the tolerant variant
+    // above -- the pair differs only in the receiver's failure tolerance.
+    const { stats, errors } = await measure(page, KEY_HEX, 0, 0, {
+      badFrames: 50,
+      defaultTolerance: true,
+    });
+    expect(errors, "no page errors").toEqual([]);
+    assertHealthy(stats, "bad start, default tolerance");
   });
 });
