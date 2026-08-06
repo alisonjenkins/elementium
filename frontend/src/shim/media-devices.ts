@@ -34,6 +34,9 @@ export function setupMediaDevicesShim(): void {
     ...original,
 
     getSupportedConstraints(): MediaTrackSupportedConstraints {
+      // `resizeMode` is a real constraint that WebKit/Chrome expose, but it is absent
+      // from the TS DOM lib's `MediaTrackSupportedConstraints`, so the literal is widened
+      // rather than dropping a constraint callers legitimately probe for.
       return {
         width: true,
         height: true,
@@ -50,7 +53,7 @@ export function setupMediaDevicesShim(): void {
         channelCount: true,
         deviceId: true,
         groupId: true,
-      };
+      } as MediaTrackSupportedConstraints;
     },
 
     async enumerateDevices(): Promise<MediaDeviceInfo[]> {

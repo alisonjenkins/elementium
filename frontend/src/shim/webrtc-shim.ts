@@ -6,6 +6,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { interceptE2eeWorkerMessage } from "./e2ee-bridge";
 
 interface PeerConnectionResult {
   id: string;
@@ -406,7 +407,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
       transport: null,
       transform: null as unknown,
       replaceTrack: async (newTrack: MediaStreamTrack | null) => {
-        (sender as Record<string, unknown>).track = newTrack;
+        (sender as unknown as Record<string, unknown>).track = newTrack;
       },
       getParameters: () => ({
         codecs: [],
@@ -442,11 +443,11 @@ class ElementiumRTCPeerConnection extends EventTarget {
       currentDirection: null as string | null,
       stopped: false,
       setDirection: (dir: RTCRtpTransceiverDirection) => {
-        (transceiver as Record<string, unknown>).direction = dir;
+        (transceiver as unknown as Record<string, unknown>).direction = dir;
       },
       stop: () => {
-        (transceiver as Record<string, unknown>).stopped = true;
-        (transceiver as Record<string, unknown>).currentDirection = null;
+        (transceiver as unknown as Record<string, unknown>).stopped = true;
+        (transceiver as unknown as Record<string, unknown>).currentDirection = null;
       },
       setCodecPreferences: () => {},
     } as unknown as RTCRtpTransceiver;
@@ -540,10 +541,7 @@ class ElementiumRTCRtpScriptTransform {
         // Intercept E2EE messages — wrapped in try/catch so the real
         // postMessage always fires even if our interception code fails.
         try {
-          const m = msg as Record<string, unknown> | null;
-          if (m && typeof m === "object") {
-            interceptE2eeMessage(m);
-          }
+          interceptE2eeWorkerMessage(msg);
         } catch (e) {
           console.warn("[Elementium] E2EE intercept error (non-fatal):", e);
         }
@@ -563,49 +561,6 @@ class ElementiumRTCRtpScriptTransform {
   }
 }
 
-/** Safe helper to invoke a Tauri command, catching both sync throws and async rejections. */
-function safeInvoke(cmd: string, args: Record<string, unknown>): void {
-  try {
-    invoke(cmd, args).catch((e: unknown) =>
-      console.warn(`[Elementium] IPC ${cmd} rejected:`, e),
-    );
-  } catch (e) {
-    console.warn(`[Elementium] IPC ${cmd} unavailable:`, e);
-  }
-}
-
-/** Extract and forward E2EE key/init messages to the Rust backend. */
-function interceptE2eeMessage(m: Record<string, unknown>): void {
-  // livekit-client may nest data under m.data
-  const data = (m.data && typeof m.data === "object" ? m.data : m) as Record<string, unknown>;
-  const kind = (m.kind ?? m.type ?? "") as string;
-
-  if (kind === "setKey") {
-    const participantIdentity = ((data.participantIdentity ?? data.participantId ?? "") as string);
-    const keyIndex = (data.keyIndex ?? 0) as number;
-    const keyData = data.key;
-
-    if (keyData && (keyData instanceof ArrayBuffer || keyData instanceof Uint8Array)) {
-      const keyArray = Array.from(
-        keyData instanceof Uint8Array ? keyData : new Uint8Array(keyData),
-      );
-      console.log(
-        `[Elementium] E2EE key received for participant ${participantIdentity} index=${keyIndex} len=${keyArray.length}`,
-      );
-      safeInvoke("e2ee_set_key", {
-        participant: participantIdentity,
-        keyIndex,
-        keyMaterial: keyArray,
-      });
-    }
-  }
-
-  if (kind === "init") {
-    const keyProviderOptions = (data.keyProviderOptions ?? null) as Record<string, unknown> | null;
-    console.log("[Elementium] E2EE Worker init intercepted", keyProviderOptions);
-    safeInvoke("e2ee_init", { options: keyProviderOptions });
-  }
-}
 
 /**
  * Install the WebRTC shim, replacing the global RTCPeerConnection.
@@ -832,16 +787,6 @@ export function setupWebRtcShim(): void {
           if (firstByte === PROTO_TAG_RESP_OFFER) {
             console.log(`[Elementium] SFU subscriber offer received — buffering publisher offers until answer sent`);
             awaitingSubscriberAnswer = true;
-            // Safety timeout: don't hold offers forever (500ms max)
-            if (reorderTimer !== null) clearTimeout(reorderTimer);
-            reorderTimer = setTimeout(() => {
-              if (awaitingSubscriberAnswer && bufferedOffers.length > 0) {
-                console.warn(`[Elementium] Reorder timeout — flushing ${bufferedOffers.length} buffered publisher offer(s)`);
-                for (const buf of bufferedOffers) origSend(buf);
-                bufferedOffers = [];
-                awaitingSubscriberAnswer = false;
-              }
-            }, 500);
           }
         });
 
@@ -889,28 +834,54 @@ export function setupWebRtcShim(): void {
             console.log(`[Elementium] WS send #${idx}: text ${str.length} chars`, str.slice(0, 200));
           }
 
-          // Reorder logic: buffer publisher offers while subscriber answer is pending
+          // Reorder logic: buffer publisher offers while subscriber answer is pending.
+          //
+          // The safety timer is armed *here*, when an offer is actually held, rather than
+          // when the subscriber offer arrives. Arming it on arrival meant it could fire
+          // while the buffer was still empty, do nothing, and leave no timer running for
+          // an offer buffered afterwards -- stranding it indefinitely.
           if (firstByte === PROTO_TAG_REQ_OFFER && awaitingSubscriberAnswer) {
             console.log(`[Elementium] Buffering publisher offer (waiting for subscriber answer)`);
             bufferedOffers.push(data);
+            if (reorderTimer === null) {
+              reorderTimer = setTimeout(() => {
+                reorderTimer = null;
+                if (bufferedOffers.length === 0) return;
+                console.warn(
+                  `[Elementium] Reorder timeout — flushing ${bufferedOffers.length} buffered publisher offer(s)`,
+                );
+                const stranded = bufferedOffers;
+                bufferedOffers = [];
+                awaitingSubscriberAnswer = false;
+                for (const buf of stranded) origSend(buf);
+              }, 500);
+            }
             return;
           }
 
           // Send the message
           origSend(data);
 
-          // If this was the subscriber answer, flush buffered publisher offers after a delay
-          // to give the SFU time to process the answer before receiving the offer
-          if (firstByte === PROTO_TAG_REQ_ANSWER && bufferedOffers.length > 0) {
-            console.log(`[Elementium] Subscriber answer sent — will flush ${bufferedOffers.length} buffered publisher offer(s) after 100ms`);
+          // The subscriber offer has now been answered, so publisher offers may flow again.
+          //
+          // This must clear the flag whether or not anything is buffered. It used to be
+          // guarded on `bufferedOffers.length > 0`, so an answer sent with an empty buffer
+          // left the flag latched at `true` forever: every subsequent publisher offer was
+          // buffered and never sent, the publisher transport never negotiated, and LiveKit
+          // dropped into an endless "reconnecting" loop ~15s later.
+          if (firstByte === PROTO_TAG_REQ_ANSWER) {
             awaitingSubscriberAnswer = false;
             if (reorderTimer !== null) { clearTimeout(reorderTimer); reorderTimer = null; }
-            const toFlush = [...bufferedOffers];
-            bufferedOffers = [];
-            setTimeout(() => {
-              console.log(`[Elementium] Flushing ${toFlush.length} buffered publisher offer(s) now`);
-              for (const buf of toFlush) origSend(buf);
-            }, 100);
+            if (bufferedOffers.length > 0) {
+              console.log(`[Elementium] Subscriber answer sent — will flush ${bufferedOffers.length} buffered publisher offer(s) after 100ms`);
+              const toFlush = [...bufferedOffers];
+              bufferedOffers = [];
+              // Brief delay so the SFU processes the answer before the offer lands.
+              setTimeout(() => {
+                console.log(`[Elementium] Flushing ${toFlush.length} buffered publisher offer(s) now`);
+                for (const buf of toFlush) origSend(buf);
+              }, 100);
+            }
           }
         };
       }
