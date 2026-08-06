@@ -266,19 +266,11 @@ fn pc_io_loop(
 ) {
     let mut recv_buf = vec![0u8; 2000];
     let mut cmd_rx = cmd_rx;
-
-    // Helper: lock the PC handle, recovering from poisoned locks.
-    macro_rules! lock_pc {
-        ($handle:expr) => {
-            match $handle.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::warn!("Transport PC lock was poisoned, recovering");
-                    poisoned.into_inner()
-                }
-            }
-        };
-    }
+    tracing::info!(
+        e2ee_active = e2ee.is_some(),
+        "PC I/O loop starting"
+    );
+    let mut inbound_audio_count: u64 = 0;
 
     loop {
         // Process commands (only Publisher has commands)
@@ -286,48 +278,20 @@ fn pc_io_loop(
             loop {
                 match rx.try_recv() {
                     Ok(PcCommand::WriteAudio(data)) => {
-                        // E2EE fail-closed: if encryption is configured but fails (no key,
-                        // poisoned lock, or frame-counter exhaustion), drop the frame rather
-                        // than sending it in plaintext.
-                        let data = if let Some(ctx) = &e2ee {
-                            if let Some(encrypted) =
-                                ctx.encrypt_frame(&data, E2eeMediaKind::Audio)
-                            {
-                                encrypted
-                            } else {
-                                tracing::warn!(
-                                    "Dropping outbound audio frame: E2EE encryption failed"
-                                );
-                                continue;
-                            }
-                        } else {
-                            data
-                        };
-                        let mut pc = lock_pc!(handle);
-                        if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
-                            tracing::debug!(reason = %e, "write_audio failed");
-                        }
+                        write_encrypted_or_drop(
+                            &handle,
+                            e2ee.as_ref(),
+                            data,
+                            E2eeMediaKind::Audio,
+                        );
                     }
                     Ok(PcCommand::WriteVideo(data)) => {
-                        // E2EE fail-closed: see WriteAudio above.
-                        let data = if let Some(ctx) = &e2ee {
-                            if let Some(encrypted) =
-                                ctx.encrypt_frame(&data, E2eeMediaKind::Video)
-                            {
-                                encrypted
-                            } else {
-                                tracing::warn!(
-                                    "Dropping outbound video frame: E2EE encryption failed"
-                                );
-                                continue;
-                            }
-                        } else {
-                            data
-                        };
-                        let mut pc = lock_pc!(handle);
-                        if let Err(e) = peer_connection::write_video(&mut pc, &data) {
-                            tracing::debug!(reason = %e, "write_video failed");
-                        }
+                        write_encrypted_or_drop(
+                            &handle,
+                            e2ee.as_ref(),
+                            data,
+                            E2eeMediaKind::Video,
+                        );
                     }
                     Ok(PcCommand::Shutdown) => {
                         tracing::info!("Transport PC I/O loop shutting down");
@@ -341,11 +305,13 @@ fn pc_io_loop(
 
         // Poll str0m
         let deadline = {
-            let mut pc = lock_pc!(handle);
+            let mut pc = lock_pc(&handle);
             match peer_connection::poll_once(&mut pc, &socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        if let Some(event) = maybe_decrypt_event(event, e2ee.as_ref()) {
+                        if let Some(event) =
+                            log_and_decrypt_event(event, e2ee.as_ref(), &mut inbound_audio_count)
+                        {
                             let _ = event_tx.try_send(event);
                         }
                     }
@@ -364,7 +330,7 @@ fn pc_io_loop(
         let wait = wait.min(Duration::from_millis(20));
 
         {
-            let mut pc = lock_pc!(handle);
+            let mut pc = lock_pc(&handle);
             if !pc.alive {
                 tracing::info!(pc_id = %pc.id, "Transport PC no longer alive");
                 return;
@@ -376,6 +342,79 @@ fn pc_io_loop(
             }
         }
     }
+}
+
+/// Lock a PC handle, recovering from a poisoned lock rather than propagating the panic.
+fn lock_pc(handle: &PeerConnectionHandle) -> std::sync::MutexGuard<'_, peer_connection::PeerConnectionInner> {
+    match handle.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("Transport PC lock was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Encrypt an outbound audio/video frame (if E2EE is active) and write it to the peer
+/// connection, or drop it with a warning if encryption is configured but fails -- fail-closed,
+/// never sends plaintext when E2EE is supposed to be protecting the frame.
+fn write_encrypted_or_drop(
+    handle: &PeerConnectionHandle,
+    e2ee: Option<&E2eeContext>,
+    data: Vec<u8>,
+    kind: E2eeMediaKind,
+) {
+    let data = if let Some(ctx) = e2ee {
+        let Some(encrypted) = ctx.encrypt_frame(&data, kind) else {
+            tracing::warn!(?kind, "Dropping outbound frame: E2EE encryption failed");
+            return;
+        };
+        encrypted
+    } else {
+        data
+    };
+    let result = {
+        let mut pc = lock_pc(handle);
+        match kind {
+            E2eeMediaKind::Audio => peer_connection::write_audio(&mut pc, &data),
+            E2eeMediaKind::Video => peer_connection::write_video(&mut pc, &data),
+        }
+    };
+    if let Err(e) = result {
+        tracing::debug!(?kind, reason = %e, "write failed");
+    }
+}
+
+/// Log throttled diagnostics for inbound audio events (every 100th frame), then delegate to
+/// [`maybe_decrypt_event`]. Split out from `pc_io_loop` to keep that function under clippy's
+/// line-count limit.
+fn log_and_decrypt_event(
+    event: PcEvent,
+    e2ee: Option<&E2eeContext>,
+    inbound_audio_count: &mut u64,
+) -> Option<PcEvent> {
+    if let PcEvent::AudioData(ref data) = event {
+        *inbound_audio_count = inbound_audio_count.saturating_add(1);
+        if inbound_audio_count.is_multiple_of(100) {
+            tracing::info!(
+                count = *inbound_audio_count,
+                encrypted_len = data.len(),
+                e2ee_active = e2ee.is_some(),
+                "Inbound audio RTP payload received"
+            );
+        }
+    }
+    let decrypted = maybe_decrypt_event(event, e2ee);
+    if let Some(PcEvent::AudioData(ref data)) = decrypted
+        && inbound_audio_count.is_multiple_of(100)
+    {
+        tracing::info!(
+            count = *inbound_audio_count,
+            decrypted_len = data.len(),
+            "Inbound audio payload after E2EE step"
+        );
+    }
+    decrypted
 }
 
 /// Attempt to decrypt inbound audio/video events if E2EE is active.

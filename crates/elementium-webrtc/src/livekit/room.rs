@@ -642,6 +642,11 @@ fn process_transport_events(
     let mut opus_decoders: HashMap<String, elementium_codec::OpusDecoder> = HashMap::new();
     let mut vp8_decoder = elementium_codec::Vp8Decoder::new().ok();
     let player = elementium_media::audio_playback::AudioPlayer::start().ok();
+    tracing::info!(
+        player_started = player.is_some(),
+        "Subscriber audio playback pipeline initialized"
+    );
+    let mut decoded_audio_count: u64 = 0;
 
     loop {
         let event = {
@@ -662,10 +667,31 @@ fn process_transport_events(
                         elementium_codec::OpusDecoder::new(48000, 2).unwrap()
                     });
 
-                if let Ok(frame) = decoder.decode(&opus_data, 960)
-                    && let Some(ref p) = player
-                {
-                    p.play(frame);
+                match decoder.decode(&opus_data, 960) {
+                    Ok(frame) => {
+                        decoded_audio_count = decoded_audio_count.saturating_add(1);
+                        if decoded_audio_count.is_multiple_of(100) {
+                            tracing::info!(
+                                count = decoded_audio_count,
+                                opus_len = opus_data.len(),
+                                decoded_samples = frame.data.len(),
+                                decoded_sample_rate = frame.sample_rate,
+                                decoded_channels = frame.channels,
+                                player_available = player.is_some(),
+                                "Decoded inbound Opus audio frame"
+                            );
+                        }
+                        if let Some(ref p) = player {
+                            p.play(frame);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            opus_len = opus_data.len(),
+                            error = %e,
+                            "Failed to decode inbound Opus frame, dropping"
+                        );
+                    }
                 }
             }
             Some(TransportEvent::SubscriberEvent(PcEvent::VideoData(vp8_data))) => {
