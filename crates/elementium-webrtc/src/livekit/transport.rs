@@ -345,8 +345,9 @@ fn pc_io_loop(
             match peer_connection::poll_once(&mut pc, &socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        let event = maybe_decrypt_event(event, e2ee.as_ref());
-                        let _ = event_tx.try_send(event);
+                        if let Some(event) = maybe_decrypt_event(event, e2ee.as_ref()) {
+                            let _ = event_tx.try_send(event);
+                        }
                     }
                     deadline
                 }
@@ -378,21 +379,34 @@ fn pc_io_loop(
 }
 
 /// Attempt to decrypt inbound audio/video events if E2EE is active.
-fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> PcEvent {
+///
+/// Returns `None` to drop the event (E2EE active but decryption failed) rather than passing
+/// through still-encrypted/undecryptable bytes as if they were valid media -- feeding
+/// ciphertext straight to the Opus/VP8 decoder produces garbage output (audible as noise),
+/// which is worse than silently dropping the frame.
+fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> Option<PcEvent> {
     let Some(ctx) = e2ee else {
-        return event;
+        return Some(event);
     };
 
     match event {
-        PcEvent::AudioData(data) => match ctx.decrypt_frame(&data, "", E2eeMediaKind::Audio) {
-            Ok(Some(decrypted)) => PcEvent::AudioData(decrypted),
-            _ => PcEvent::AudioData(data),
+        PcEvent::AudioData(data) => match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
+            Ok(Some(decrypted)) => Some(PcEvent::AudioData(decrypted)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(reason = %e, "E2EE dropping inbound audio frame: decrypt failed");
+                None
+            }
         },
-        PcEvent::VideoData(data) => match ctx.decrypt_frame(&data, "", E2eeMediaKind::Video) {
-            Ok(Some(decrypted)) => PcEvent::VideoData(decrypted),
-            _ => PcEvent::VideoData(data),
+        PcEvent::VideoData(data) => match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
+            Ok(Some(decrypted)) => Some(PcEvent::VideoData(decrypted)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(reason = %e, "E2EE dropping inbound video frame: decrypt failed");
+                None
+            }
         },
-        other => other,
+        other => Some(other),
     }
 }
 
