@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_types::VideoFrame;
 
+use crate::e2ee_io::{encrypt_or_drop, maybe_decrypt_event};
 use crate::peer_connection::{self, PcEvent, PeerConnectionHandle};
 use crate::stun;
 
@@ -184,31 +185,6 @@ fn lock_pc(
     }
 }
 
-/// E2EE fail-closed: if encryption is configured but fails (no key,
-/// poisoned lock, or frame-counter exhaustion), drop the frame rather
-/// than sending it in plaintext.
-fn encrypt_or_drop(
-    e2ee: Option<&E2eeContext>,
-    data: Vec<u8>,
-    kind: E2eeMediaKind,
-    label: &str,
-) -> Option<Vec<u8>> {
-    let Some(ctx) = e2ee else {
-        return Some(data);
-    };
-    ctx.encrypt_frame(&data, kind).map_or_else(
-        || {
-            tracing::warn!(
-                reason = "e2ee_encrypt_failed",
-                label,
-                "Dropping outbound frame: E2EE encryption failed"
-            );
-            None
-        },
-        Some,
-    )
-}
-
 /// Drain any pending I/O commands (non-blocking). Returns `true` if the
 /// I/O loop should shut down.
 fn drain_io_commands(
@@ -279,8 +255,9 @@ fn io_loop(
             match peer_connection::poll_once(&mut pc, socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        let event = maybe_decrypt_event(event, e2ee.as_ref());
-                        let _ = event_tx.try_send(event);
+                        if let Some(event) = maybe_decrypt_event(event, e2ee.as_ref()) {
+                            let _ = event_tx.try_send(event);
+                        }
                     }
                     deadline
                 }
@@ -346,83 +323,3 @@ fn discover_and_add_srflx(
     tracing::warn!(pc_id = %pc.id, "STUN discovery failed on all ICE servers");
 }
 
-/// Attempt to decrypt inbound audio/video events if E2EE is active.
-///
-/// Uses `decrypt_frame_any` which tries all known participant keys, since we
-/// don't know which participant sent a particular RTP frame via the SFU.
-fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> PcEvent {
-    let Some(ctx) = e2ee else {
-        return event;
-    };
-
-    match event {
-        PcEvent::AudioData(data) => {
-            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
-                Ok(Some(decrypted)) => PcEvent::AudioData(decrypted),
-                _ => PcEvent::AudioData(data),
-            }
-        }
-        PcEvent::VideoData(data) => {
-            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
-                Ok(Some(decrypted)) => PcEvent::VideoData(decrypted),
-                _ => PcEvent::VideoData(data),
-            }
-        }
-        other => other,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use elementium_e2ee::E2eeOptions;
-    use elementium_observability_test::LogCapture;
-
-    use super::*;
-
-    /// Regression test for the fail-open E2EE bug fixed in a prior commit:
-    /// when a frame can't be encrypted (e.g. no key set for the local
-    /// participant), `encrypt_or_drop` must drop it rather than let it
-    /// through as plaintext, and must emit a structured "frame dropped"
-    /// warning with a `reason` field so the drop is visible in logs, not
-    /// just inferred from an absent return value.
-    ///
-    /// Manually confirmed this test fails if `encrypt_or_drop`'s `None` arm
-    /// is reverted to return `Some(data)` (fail-open) instead of `None`
-    /// (fail-closed): the assertion on `result.is_none()` fails immediately.
-    #[test]
-    // Test assertions are meant to panic on failure; expect() with a
-    // descriptive message is the idiomatic way to do that in test code.
-    #[allow(clippy::expect_used)]
-    fn encrypt_or_drop_emits_structured_warning_when_no_key_set() {
-        // No key set for any participant -> encrypt_frame returns None.
-        let ctx = E2eeContext::new(E2eeOptions::default());
-        let capture = LogCapture::new();
-
-        let result = capture.run(|| {
-            encrypt_or_drop(Some(&ctx), b"plaintext-frame".to_vec(), E2eeMediaKind::Audio, "audio")
-        });
-
-        // Fail closed: the frame must be dropped, never sent as plaintext.
-        assert!(result.is_none());
-
-        let event = capture
-            .find_event("Dropping outbound frame")
-            .expect("a structured 'frame dropped' warning should have been emitted");
-        assert_eq!(event.level, tracing::Level::WARN);
-        assert!(event.field("reason").is_some());
-        assert_eq!(event.field("label"), Some("audio"));
-    }
-
-    /// Sanity check: when no E2EE context is configured at all,
-    /// `encrypt_or_drop` passes the frame through unmodified and emits no
-    /// drop warning.
-    #[test]
-    fn encrypt_or_drop_passes_through_when_no_e2ee_configured() {
-        let capture = LogCapture::new();
-        let result = capture.run(|| {
-            encrypt_or_drop(None, b"plaintext-frame".to_vec(), E2eeMediaKind::Audio, "audio")
-        });
-        assert_eq!(result, Some(b"plaintext-frame".to_vec()));
-        assert!(capture.find_event("Dropping outbound frame").is_none());
-    }
-}

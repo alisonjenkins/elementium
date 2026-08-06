@@ -184,6 +184,10 @@ impl AudioPipeline {
                 }
             };
 
+            // AudioPlayer::play() resamples/remixes to the device's actual negotiated
+            // rate/channels internally, so the decoder can stay fixed at Opus's native
+            // 48kHz/stereo regardless of what the output device negotiates -- no manual
+            // resample/remix step needed here.
             let play_rate = player.sample_rate();
             let play_channels = player.channels();
 
@@ -196,6 +200,7 @@ impl AudioPipeline {
             };
 
             tracing::info!(play_rate, play_channels, "Audio playback started");
+            let mut decoded_count: u64 = 0;
 
             loop {
                 let event = {
@@ -210,31 +215,26 @@ impl AudioPipeline {
                         // Decode the Opus packet
                         // 20ms at 48kHz = 960 samples per channel
                         match decoder.decode(&opus_packet, 960) {
-                            Ok(mut decoded_frame) => {
-                                // Adjust sample rate if needed
-                                if play_rate != 48000 {
-                                    decoded_frame.data = resample_48000_to_target(
-                                        &decoded_frame.data,
-                                        usize::from(decoded_frame.channels),
-                                        play_rate,
+                            Ok(decoded_frame) => {
+                                decoded_count = decoded_count.saturating_add(1);
+                                if decoded_count.is_multiple_of(100) {
+                                    tracing::info!(
+                                        count = decoded_count,
+                                        opus_len = opus_packet.len(),
+                                        decoded_samples = decoded_frame.data.len(),
+                                        decoded_sample_rate = decoded_frame.sample_rate,
+                                        decoded_channels = decoded_frame.channels,
+                                        "Decoded inbound Opus audio frame"
                                     );
-                                    decoded_frame.sample_rate = play_rate;
                                 }
-
-                                // Adjust channel count if needed
-                                if play_channels != decoded_frame.channels {
-                                    decoded_frame.data = adjust_channels(
-                                        &decoded_frame.data,
-                                        usize::from(decoded_frame.channels),
-                                        usize::from(play_channels),
-                                    );
-                                    decoded_frame.channels = play_channels;
-                                }
-
                                 player.play(decoded_frame);
                             }
                             Err(e) => {
-                                tracing::debug!("Opus decode error: {e}");
+                                tracing::warn!(
+                                    opus_len = opus_packet.len(),
+                                    error = %e,
+                                    "Failed to decode inbound Opus frame, dropping"
+                                );
                             }
                         }
                     }
@@ -271,11 +271,6 @@ impl Drop for AudioPipeline {
 /// Simple linear interpolation resampling from 44100 to 48000 Hz.
 fn resample_44100_to_48000(samples: &[f32], channels: usize) -> Vec<f32> {
     resample_linear(samples, channels, 48000.0 / 44100.0)
-}
-
-/// Simple resampling from 48000 Hz to a target rate.
-fn resample_48000_to_target(samples: &[f32], channels: usize, target_rate: u32) -> Vec<f32> {
-    resample_linear(samples, channels, f64::from(target_rate) / 48000.0)
 }
 
 /// Shared linear-interpolation resampling core used by the 44.1k↔48k helpers.
@@ -330,41 +325,3 @@ fn resample_linear(samples: &[f32], channels: usize, ratio: f64) -> Vec<f32> {
     output
 }
 
-/// Adjust the number of channels (mono↔stereo).
-fn adjust_channels(samples: &[f32], from_ch: usize, to_ch: usize) -> Vec<f32> {
-    if from_ch == to_ch || from_ch == 0 {
-        return samples.to_vec();
-    }
-
-    let Some(frames) = samples.len().checked_div(from_ch) else {
-        return Vec::new();
-    };
-    let Some(output_capacity) = frames.checked_mul(to_ch) else {
-        return Vec::new();
-    };
-    let mut output = Vec::with_capacity(output_capacity);
-
-    if from_ch == 1 && to_ch == 2 {
-        // Mono → Stereo: duplicate
-        for &s in samples {
-            output.push(s);
-            output.push(s);
-        }
-    } else if from_ch == 2 && to_ch == 1 {
-        // Stereo → Mono: average
-        for frame in samples.chunks(2) {
-            let first = frame.first().copied().unwrap_or(0.0);
-            let second = frame.get(1).copied().unwrap_or(0.0);
-            output.push((first + second) * 0.5);
-        }
-    } else {
-        // Generic: take first `to_ch` channels or zero-pad
-        for frame in samples.chunks(from_ch) {
-            for ch in 0..to_ch {
-                output.push(frame.get(ch).copied().unwrap_or(0.0));
-            }
-        }
-    }
-
-    output
-}

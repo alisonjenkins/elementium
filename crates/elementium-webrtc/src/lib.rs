@@ -1,4 +1,5 @@
 pub mod audio_pipeline;
+pub mod e2ee_io;
 pub mod engine;
 pub mod livekit;
 pub mod peer_connection;

@@ -355,23 +355,20 @@ fn lock_pc(handle: &PeerConnectionHandle) -> std::sync::MutexGuard<'_, peer_conn
     }
 }
 
-/// Encrypt an outbound audio/video frame (if E2EE is active) and write it to the peer
-/// connection, or drop it with a warning if encryption is configured but fails -- fail-closed,
-/// never sends plaintext when E2EE is supposed to be protecting the frame.
+/// Encrypt an outbound audio/video frame (if E2EE is active, via the shared
+/// [`crate::e2ee_io::encrypt_or_drop`]) and write it to the peer connection.
 fn write_encrypted_or_drop(
     handle: &PeerConnectionHandle,
     e2ee: Option<&E2eeContext>,
     data: Vec<u8>,
     kind: E2eeMediaKind,
 ) {
-    let data = if let Some(ctx) = e2ee {
-        let Some(encrypted) = ctx.encrypt_frame(&data, kind) else {
-            tracing::warn!(?kind, "Dropping outbound frame: E2EE encryption failed");
-            return;
-        };
-        encrypted
-    } else {
-        data
+    let label = match kind {
+        E2eeMediaKind::Audio => "audio",
+        E2eeMediaKind::Video => "video",
+    };
+    let Some(data) = crate::e2ee_io::encrypt_or_drop(e2ee, data, kind, label) else {
+        return;
     };
     let result = {
         let mut pc = lock_pc(handle);
@@ -404,7 +401,7 @@ fn log_and_decrypt_event(
             );
         }
     }
-    let decrypted = maybe_decrypt_event(event, e2ee);
+    let decrypted = crate::e2ee_io::maybe_decrypt_event(event, e2ee);
     if let Some(PcEvent::AudioData(ref data)) = decrypted
         && inbound_audio_count.is_multiple_of(100)
     {
@@ -415,38 +412,6 @@ fn log_and_decrypt_event(
         );
     }
     decrypted
-}
-
-/// Attempt to decrypt inbound audio/video events if E2EE is active.
-///
-/// Returns `None` to drop the event (E2EE active but decryption failed) rather than passing
-/// through still-encrypted/undecryptable bytes as if they were valid media -- feeding
-/// ciphertext straight to the Opus/VP8 decoder produces garbage output (audible as noise),
-/// which is worse than silently dropping the frame.
-fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> Option<PcEvent> {
-    let Some(ctx) = e2ee else {
-        return Some(event);
-    };
-
-    match event {
-        PcEvent::AudioData(data) => match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
-            Ok(Some(decrypted)) => Some(PcEvent::AudioData(decrypted)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(reason = %e, "E2EE dropping inbound audio frame: decrypt failed");
-                None
-            }
-        },
-        PcEvent::VideoData(data) => match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
-            Ok(Some(decrypted)) => Some(PcEvent::VideoData(decrypted)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(reason = %e, "E2EE dropping inbound video frame: decrypt failed");
-                None
-            }
-        },
-        other => Some(other),
-    }
 }
 
 /// Perform STUN discovery using ICE servers and add srflx candidates.
