@@ -165,14 +165,20 @@ async fn audio_survives_real_publish_subscribe_round_trip() {
         &alice_token,
         video_frames_alice,
         CorrelationId::new(),
+        elementium_webrtc::EncryptionPolicy::ExplicitlyUnencrypted,
     )
     .await
     .expect("alice should connect to the local dev server");
 
-    let (_bob, _bob_events) =
-        LiveKitRoom::connect(SFU_URL, &bob_token, video_frames_bob, CorrelationId::new())
-            .await
-            .expect("bob should connect to the local dev server");
+    let (_bob, _bob_events) = LiveKitRoom::connect(
+        SFU_URL,
+        &bob_token,
+        video_frames_bob,
+        CorrelationId::new(),
+        elementium_webrtc::EncryptionPolicy::ExplicitlyUnencrypted,
+    )
+    .await
+    .expect("bob should connect to the local dev server");
 
     // Give both sides a moment to finish ICE/DTLS after the initial join before publishing.
     // NOTE: generous fixed delay, not event-driven -- SignalSender::send() is fire-and-forget
