@@ -38,3 +38,7 @@ result-*
 .env.*
 !.env.example
 .direnv
+
+# Playwright run artifacts
+frontend/test-results/
+frontend/playwright-report/
