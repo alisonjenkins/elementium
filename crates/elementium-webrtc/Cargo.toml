@@ -23,6 +23,7 @@ prost = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 elementium-observability-test = { workspace = true }
 jsonwebtoken = { workspace = true }
 

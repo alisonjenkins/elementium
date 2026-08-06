@@ -1,0 +1,149 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Elementium receive-path probe</title>
+<body>
+  <p id="state">idle</p>
+  <script type="module">
+    // Served by the Playwright fixture: /lk/ maps to livekit-client's dist directory, so
+    // the page runs the same client library Element Call ships rather than a stand-in.
+    import { Room, ExternalE2EEKeyProvider } from "/lk/livekit-client.esm.mjs";
+
+    const params = new URLSearchParams(location.search);
+    const url = params.get("url");
+    const token = params.get("token");
+    const keyHex = params.get("key");
+
+    const state = document.getElementById("state");
+    const setState = (s) => {
+      state.textContent = s;
+    };
+
+    /** Errors surfaced to the driving test rather than dying silently in the console. */
+    window.__errors = [];
+    window.addEventListener("error", (e) => window.__errors.push(String(e.message)));
+    window.addEventListener("unhandledrejection", (e) => window.__errors.push(String(e.reason)));
+
+    function hexToBytes(hex) {
+      const out = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < out.length; i += 1) {
+        out[i] = parseInt(hex.substr(i * 2, 2), 16);
+      }
+      return out;
+    }
+
+    let room;
+    if (keyHex) {
+      // Same construction Element Call uses: an externally supplied raw key, handed to the
+      // insertable-streams worker. This is the path that must be exercised -- a browser
+      // decrypting our frames is exactly what no Rust-only test can stand in for.
+      const keyProvider = new ExternalE2EEKeyProvider();
+      room = new Room({
+        e2ee: {
+          keyProvider,
+          worker: new Worker("/lk/livekit-client.e2ee.worker.mjs", { type: "module" }),
+        },
+      });
+      await keyProvider.setKey(hexToBytes(keyHex));
+      await room.setE2EEEnabled(true);
+    } else {
+      room = new Room();
+    }
+
+    /** Set once an audio track from the publisher has actually been subscribed. */
+    window.__subscribed = false;
+
+    // Subscription-level visibility: a track that is never subscribed and a track that is
+    // subscribed but never decrypts are completely different faults, and without these the
+    // symptom is identical ("no stats").
+    window.__events = [];
+    for (const ev of [
+      "participantConnected",
+      "trackPublished",
+      "trackSubscribed",
+      "trackSubscriptionFailed",
+      "trackSubscriptionStatusChanged",
+      "encryptionError",
+      "disconnected",
+    ]) {
+      room.on(ev, (...a) => {
+        window.__events.push(`${ev}:${a.map((x) => x?.sid ?? x?.identity ?? x?.kind ?? String(x)).join(",")}`);
+      });
+    }
+
+    room.on("trackSubscribed", (track) => {
+      if (track.kind === "audio") {
+        // Attaching matters: an unattached track is not pulled through the jitter buffer,
+        // so concealment counters would stay at zero regardless of what arrived.
+        const el = track.attach();
+        el.muted = true;
+        document.body.appendChild(el);
+        window.__audioTrack = track;
+        window.__subscribed = true;
+        setState("subscribed");
+      }
+    });
+
+    /**
+     * Inbound audio stats, read from the receiving RTCPeerConnection.
+     *
+     * These are the numbers that separate the two remaining explanations for bad audio:
+     * `packetsLost` counts what never arrived, while `concealedSamples` and the
+     * accelerate/decelerate counters count what arrived and could not be played as sent --
+     * a decryption failure, a jitter-buffer stall or a sender whose clock runs off. All of
+     * those are invisible to RTCP, which is why the sending side kept reporting health.
+     *
+     * Reads off the track captured at subscription time rather than re-deriving it from the
+     * participant map: the wrapper livekit puts around an E2EE track does not always expose
+     * `receiver`, and silently finding nothing is indistinguishable from finding zeroes.
+     */
+    window.__stats = async () => {
+      const track = window.__audioTrack;
+      if (!track) return { error: "no audio track was subscribed" };
+
+      let report = null;
+      if (track.receiver?.getStats) {
+        report = await track.receiver.getStats();
+      } else if (typeof track.getRTCStatsReport === "function") {
+        report = await track.getRTCStatsReport();
+      }
+      if (!report) {
+        return {
+          error:
+            "no stats source on the subscribed track; track keys=" +
+            Object.keys(track).join("|") +
+            " proto=" +
+            Object.getOwnPropertyNames(Object.getPrototypeOf(track)).join("|") +
+            " engine=" + typeof room.engine +
+            " pcm=" + typeof room.engine?.pcManager,
+        };
+      }
+
+      let inbound = null;
+      let codec = null;
+      report.forEach((s) => {
+        if (s.type === "inbound-rtp" && s.kind === "audio") inbound = s;
+      });
+      if (!inbound) return { error: "no inbound-rtp audio stats in the report" };
+      report.forEach((s) => {
+        if (s.type === "codec" && s.id === inbound.codecId) codec = s;
+      });
+
+      return {
+        mimeType: codec?.mimeType ?? null,
+        packetsReceived: inbound.packetsReceived ?? 0,
+        packetsLost: inbound.packetsLost ?? 0,
+        concealedSamples: inbound.concealedSamples ?? 0,
+        silentConcealedSamples: inbound.silentConcealedSamples ?? 0,
+        concealmentEvents: inbound.concealmentEvents ?? 0,
+        totalSamplesReceived: inbound.totalSamplesReceived ?? 0,
+        insertedSamplesForDeceleration: inbound.insertedSamplesForDeceleration ?? 0,
+        removedSamplesForAcceleration: inbound.removedSamplesForAcceleration ?? 0,
+        jitter: inbound.jitter ?? 0,
+      };
+    };
+
+    setState("connecting");
+    await room.connect(url, token, { autoSubscribe: true });
+    setState("connected");
+  </script>
+</body>

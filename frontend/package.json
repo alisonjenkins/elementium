@@ -7,17 +7,21 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "build:shims": "vite build --config vite.shims.config.ts"
+    "build:shims": "vite build --config vite.shims.config.ts",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-deep-link": "^2",
     "@tauri-apps/plugin-notification": "^2",
     "@tauri-apps/plugin-store": "^2",
-    "@tauri-apps/plugin-deep-link": "^2",
     "@tauri-apps/plugin-updater": "^2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "livekit-client": "^2.21.0",
     "typescript": "^5.7",
-    "vite": "^6"
+    "vite": "^6",
+    "vitest": "^4.1.10"
   }
 }
