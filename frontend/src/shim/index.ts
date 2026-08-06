@@ -10,6 +10,7 @@ import { setupSecretStorageShim } from "./secret-storage";
 import { setupWebRtcShim } from "./webrtc-shim";
 import { setupMediaDevicesShim } from "./media-devices";
 import { setupConsoleBridge } from "./console-bridge";
+import { setupE2eeBridge } from "./e2ee-bridge";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 
 // Set up console bridge to forward JS console output to Rust (works in iframes too)
@@ -19,6 +20,10 @@ setupConsoleBridge();
 setupSecretStorageShim();
 setupWebRtcShim();
 setupMediaDevicesShim();
+
+// Must be installed before Element Call imports its keys: the bridge captures raw key
+// material at `crypto.subtle.importKey`, which only works for imports it front-runs.
+setupE2eeBridge();
 
 // Expose LiveKit shim on window for Element Call widget integration
 (window as unknown as Record<string, unknown>)["__elementium_livekit"] = {
