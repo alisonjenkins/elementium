@@ -8,22 +8,18 @@
 //! - VP8 decoding of received video
 //! - Writing decoded frames to a shared buffer for the webview
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use elementium_codec::{Vp8Decoder, Vp8Encoder};
-use elementium_types::VideoFrame;
+use elementium_codec::Vp8Decoder;
 
-use crate::engine::{IoCommand, VideoFrameBuffer};
+use crate::engine::VideoFrameBuffer;
 use crate::peer_connection::PcEvent;
 
 /// Manages the video pipeline for a call session.
 pub struct VideoPipeline {
-    /// Channel to stop the capture loop.
-    stop_tx: Option<mpsc::Sender<()>>,
-    /// Whether capture is currently active.
-    capture_active: bool,
     /// Whether playback (decode) is active.
     playback_active: bool,
 }
@@ -32,151 +28,8 @@ impl VideoPipeline {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            stop_tx: None,
-            capture_active: false,
             playback_active: false,
         }
-    }
-
-    /// Start the camera capture pipeline: camera → VP8 → peer connection.
-    ///
-    /// # Errors
-    ///
-    /// This implementation currently always returns `Ok`, but the signature
-    /// is fallible to allow future validation to reject the request.
-    pub fn start_camera_capture(
-        &mut self,
-        io_cmd_tx: mpsc::Sender<IoCommand>,
-    ) -> Result<(), String> {
-        if self.capture_active {
-            return Ok(());
-        }
-
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        self.stop_tx = Some(stop_tx);
-        self.capture_active = true;
-
-        std::thread::spawn(move || {
-            let capturer = match elementium_media::camera::CameraCapturer::start(None, None) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to start camera: {e}");
-                    return;
-                }
-            };
-
-            let width = capturer.width();
-            let height = capturer.height();
-
-            // VP8 encoder at camera resolution, 500 kbps
-            let mut encoder = match Vp8Encoder::new(width, height, 500) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!("Failed to create VP8 encoder: {e}");
-                    return;
-                }
-            };
-
-            tracing::info!(width, height, "Video capture pipeline started");
-
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    tracing::info!("Video capture stopping");
-                    break;
-                }
-
-                if let Some(frame) = capturer.try_recv() {
-                    // Camera provides RGB→RGBA, convert to I420 for VP8 encoding
-                    let i420 =
-                        elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
-
-                    match encoder.encode(&i420) {
-                        Ok(packets) => {
-                            for packet in packets {
-                                let _ = io_cmd_tx.try_send(IoCommand::WriteVideo(packet.data));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("VP8 encode error: {e}");
-                        }
-                    }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Start the screen share capture pipeline: screen frames → VP8 → peer connection.
-    ///
-    /// # Errors
-    ///
-    /// This implementation currently always returns `Ok`, but the signature
-    /// is fallible to allow future validation to reject the request.
-    pub fn start_screen_capture(
-        &mut self,
-        frame_rx: std::sync::mpsc::Receiver<VideoFrame>,
-        io_cmd_tx: mpsc::Sender<IoCommand>,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String> {
-        if self.capture_active {
-            return Ok(());
-        }
-
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        self.stop_tx = Some(stop_tx);
-        self.capture_active = true;
-
-        std::thread::spawn(move || {
-            let mut encoder = match Vp8Encoder::new(width, height, 1500) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!("Failed to create VP8 encoder for screen: {e}");
-                    return;
-                }
-            };
-
-            tracing::info!(width, height, "Screen capture pipeline started");
-
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    tracing::info!("Screen capture stopping");
-                    break;
-                }
-
-                match frame_rx.try_recv() {
-                    Ok(frame) => {
-                        // Screen capture frames are BGRA (from xcap)
-                        let i420 =
-                            elementium_codec::bgra_to_i420(frame.width, frame.height, &frame.data);
-
-                        match encoder.encode(&i420) {
-                            Ok(packets) => {
-                                for packet in packets {
-                                    let _ =
-                                        io_cmd_tx.try_send(IoCommand::WriteVideo(packet.data));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!("VP8 encode error: {e}");
-                            }
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        tracing::info!("Screen capture frame channel closed");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(())
     }
 
     /// Start the playback (decode) pipeline: peer connection → VP8 decode → frame buffer.
@@ -197,15 +50,20 @@ impl VideoPipeline {
         self.playback_active = true;
 
         std::thread::spawn(move || {
-            let mut decoder = match Vp8Decoder::new() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("Failed to create VP8 decoder: {e}");
-                    return;
-                }
-            };
+            // One decoder per remote track (`mid`), not one shared decoder for the whole
+            // PC -- a single PeerConnection can carry more than one remote video track
+            // (e.g. camera + screen share both active), and VP8 decoding is stateful
+            // (keyframe/interframe references), so interleaving two tracks' packets
+            // through one decoder would corrupt both. Same class of bug as the audio
+            // pipeline's per-mid Opus decoder fix.
+            let mut decoders: HashMap<String, Vp8Decoder> = HashMap::new();
 
             tracing::info!(pc_id = %pc_id, "Video playback pipeline started");
+            // The frontend looks this key up by pc_id alone (it doesn't know our
+            // internal per-mid decoder split), so every track's decoded frames land in
+            // the same display slot -- same external contract as before this fix,
+            // which only changed decoder *state* isolation, not the display key.
+            let track_key = format!("{pc_id}-video");
 
             loop {
                 let event = {
@@ -216,7 +74,19 @@ impl VideoPipeline {
                 };
 
                 match event {
-                    Some(PcEvent::VideoData(vp8_packet)) => {
+                    Some(PcEvent::VideoData { mid, data: vp8_packet }) => {
+                        let decoder = match decoders.entry(mid.clone()) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(v) => match Vp8Decoder::new()
+                            {
+                                Ok(d) => v.insert(d),
+                                Err(e) => {
+                                    tracing::error!(mid, error = %e, "Failed to create VP8 decoder for track");
+                                    continue;
+                                }
+                            },
+                        };
+
                         match decoder.decode(&vp8_packet) {
                             Ok(frames) => {
                                 for i420_frame in frames {
@@ -224,16 +94,18 @@ impl VideoPipeline {
                                     let rgba_frame =
                                         elementium_codec::i420_to_rgba(&i420_frame);
 
-                                    // Store in the shared frame buffer
-                                    let track_key =
-                                        format!("{pc_id}-video");
+                                    // Store in the shared frame buffer.
                                     if let Ok(mut buf) = frame_buffer.lock() {
-                                        buf.insert(track_key, rgba_frame);
+                                        if let Some(existing) = buf.get_mut(&track_key) {
+                                            *existing = rgba_frame;
+                                        } else {
+                                            buf.insert(track_key.clone(), rgba_frame);
+                                        }
                                     }
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!("VP8 decode error: {e}");
+                                tracing::debug!(mid, "VP8 decode error: {e}");
                             }
                         }
                     }
@@ -250,19 +122,6 @@ impl VideoPipeline {
         Ok(())
     }
 
-    /// Stop the capture pipeline.
-    pub fn stop_capture(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.try_send(());
-        }
-        self.capture_active = false;
-    }
-
-    #[must_use]
-    pub const fn is_capture_active(&self) -> bool {
-        self.capture_active
-    }
-
     #[must_use]
     pub const fn is_playback_active(&self) -> bool {
         self.playback_active
@@ -272,12 +131,6 @@ impl VideoPipeline {
 impl Default for VideoPipeline {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for VideoPipeline {
-    fn drop(&mut self) {
-        self.stop_capture();
     }
 }
 

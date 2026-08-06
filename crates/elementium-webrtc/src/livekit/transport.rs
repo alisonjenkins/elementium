@@ -17,9 +17,12 @@ use tracing::{Instrument, Span};
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_types::SessionDescription;
 
+use crate::e2ee_io::EncryptionPolicy;
+
 use crate::engine::IceServerConfig;
-use crate::peer_connection::{self, PcEvent, PeerConnectionHandle};
-use crate::stun;
+use crate::peer_connection::{
+    self, PcEvent, PeerConnectionHandle, discover_and_add_srflx, lock_pc,
+};
 
 /// Events from the transport layer to the room.
 #[derive(Debug)]
@@ -32,10 +35,13 @@ pub enum TransportEvent {
 
 /// Commands to the transport I/O loops.
 pub enum TransportCommand {
-    /// Write an Opus audio frame to the Publisher PC.
-    WriteAudio(Vec<u8>),
-    /// Write a VP8 video frame to the Publisher PC.
-    WriteVideo(Vec<u8>),
+    /// Write an encoded Opus audio frame to the Publisher PC. Carries
+    /// [`elementium_types::PlaintextMedia`] so it cannot reach the socket without
+    /// passing through encryption first.
+    WriteAudio(elementium_types::PlaintextMedia),
+    /// Write an encoded VP8 video frame to the Publisher PC. See
+    /// [`TransportCommand::WriteAudio`].
+    WriteVideo(elementium_types::PlaintextMedia),
     /// Shut down the transport.
     Shutdown,
 }
@@ -48,21 +54,11 @@ pub struct Transport {
     pub sub_socket: Arc<UdpSocket>,
     pub cmd_tx: mpsc::Sender<TransportCommand>,
     pub event_rx: Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
-    pub e2ee: Option<E2eeContext>,
+    pub e2ee: EncryptionPolicy,
 }
 
 impl Transport {
-    /// Create a new dual-PC transport. Binds two UDP sockets and starts I/O loops.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if either UDP socket fails to bind or its local address
-    /// cannot be determined.
-    pub fn new(room_id: &str) -> Result<Self, String> {
-        Self::new_with_e2ee(room_id, None, None)
-    }
-
-    /// Create a new dual-PC transport with optional E2EE and ICE servers.
+    /// Create a new dual-PC transport with an E2EE policy and optional ICE servers.
     ///
     /// # Errors
     ///
@@ -70,9 +66,9 @@ impl Transport {
     /// cannot be determined.
     pub fn new_with_e2ee(
         room_id: &str,
-        e2ee: Option<E2eeContext>,
+        e2ee: EncryptionPolicy,
         ice_servers: Option<&[IceServerConfig]>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::error::WebRtcError> {
         // Create Publisher PC
         let pub_id = format!("{room_id}-pub");
         let mut pub_inner = peer_connection::create_peer_connection(pub_id);
@@ -168,8 +164,11 @@ impl Transport {
     pub fn create_publisher_offer(
         &self,
         include_video: bool,
-    ) -> Result<SessionDescription, String> {
-        let mut pc = self.publisher.lock().map_err(|e| e.to_string())?;
+    ) -> Result<SessionDescription, crate::error::WebRtcError> {
+        let mut pc = self
+            .publisher
+            .lock()
+            .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
         let mut transceivers = vec![peer_connection::TransceiverInfo {
             kind: str0m::media::MediaKind::Audio,
             direction: str0m::media::Direction::SendRecv,
@@ -189,8 +188,14 @@ impl Transport {
     ///
     /// Returns `Err` if the Publisher PC lock is poisoned or applying the
     /// remote description fails.
-    pub fn set_publisher_answer(&self, answer: &SessionDescription) -> Result<(), String> {
-        let mut pc = self.publisher.lock().map_err(|e| e.to_string())?;
+    pub fn set_publisher_answer(
+        &self,
+        answer: &SessionDescription,
+    ) -> Result<(), crate::error::WebRtcError> {
+        let mut pc = self
+            .publisher
+            .lock()
+            .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
         peer_connection::set_remote_description(&mut pc, answer)?;
         Ok(())
     }
@@ -204,27 +209,16 @@ impl Transport {
     pub fn set_subscriber_offer(
         &self,
         offer: &SessionDescription,
-    ) -> Result<SessionDescription, String> {
-        let mut guard = self.subscriber.lock().map_err(|e| e.to_string())?;
+    ) -> Result<SessionDescription, crate::error::WebRtcError> {
+        let mut guard = self
+            .subscriber
+            .lock()
+            .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
         let answer = peer_connection::set_remote_description(&mut guard, offer)?;
         drop(guard);
-        answer.ok_or_else(|| "Expected answer from subscriber offer".into())
-    }
-
-    /// Add an ICE candidate to the correct PC based on target.
-    /// target=0 → Publisher, target=1 → Subscriber.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the target PC lock is poisoned or the candidate is invalid.
-    pub fn add_ice_candidate(&self, target: i32, candidate_sdp: &str) -> Result<(), String> {
-        let handle = if target == 0 {
-            &self.publisher
-        } else {
-            &self.subscriber
-        };
-        let mut pc = handle.lock().map_err(|e| e.to_string())?;
-        peer_connection::add_ice_candidate(&mut pc, candidate_sdp)
+        answer.ok_or_else(|| {
+            crate::error::WebRtcError::Sdp("expected answer from subscriber offer".to_string())
+        })
     }
 
     /// Send a command to write audio/video or shutdown.
@@ -232,11 +226,14 @@ impl Transport {
     /// # Errors
     ///
     /// Returns `Err` if the transport command channel has been closed.
-    pub async fn send_command(&self, cmd: TransportCommand) -> Result<(), String> {
+    pub async fn send_command(
+        &self,
+        cmd: TransportCommand,
+    ) -> Result<(), crate::error::WebRtcError> {
         self.cmd_tx
             .send(cmd)
             .await
-            .map_err(|_| "Transport command channel closed".to_string())
+            .map_err(|_| crate::error::WebRtcError::ChannelClosed("transport command"))
     }
 
     /// Shut down both `PeerConnections`.
@@ -247,8 +244,8 @@ impl Transport {
 
 /// Internal command for the Publisher I/O loop.
 enum PcCommand {
-    WriteAudio(Vec<u8>),
-    WriteVideo(Vec<u8>),
+    WriteAudio(elementium_types::PlaintextMedia),
+    WriteVideo(elementium_types::PlaintextMedia),
     Shutdown,
 }
 
@@ -262,15 +259,18 @@ fn pc_io_loop(
     socket: Arc<UdpSocket>,
     cmd_rx: Option<mpsc::Receiver<PcCommand>>,
     event_tx: mpsc::Sender<PcEvent>,
-    e2ee: Option<E2eeContext>,
+    e2ee: EncryptionPolicy,
 ) {
     let mut recv_buf = vec![0u8; 2000];
     let mut cmd_rx = cmd_rx;
     tracing::info!(
-        e2ee_active = e2ee.is_some(),
+        e2ee_active = e2ee.as_context().is_some(),
         "PC I/O loop starting"
     );
     let mut inbound_audio_count: u64 = 0;
+    // See `engine::io_loop`'s `dropped_events` -- same invisible-loss blind spot on the
+    // LiveKit subscriber path's own event channel to `room.rs`.
+    let mut dropped_events: u64 = 0;
 
     loop {
         // Process commands (only Publisher has commands)
@@ -280,7 +280,7 @@ fn pc_io_loop(
                     Ok(PcCommand::WriteAudio(data)) => {
                         write_encrypted_or_drop(
                             &handle,
-                            e2ee.as_ref(),
+                            e2ee.as_context(),
                             data,
                             E2eeMediaKind::Audio,
                         );
@@ -288,7 +288,7 @@ fn pc_io_loop(
                     Ok(PcCommand::WriteVideo(data)) => {
                         write_encrypted_or_drop(
                             &handle,
-                            e2ee.as_ref(),
+                            e2ee.as_context(),
                             data,
                             E2eeMediaKind::Video,
                         );
@@ -310,9 +310,11 @@ fn pc_io_loop(
                 Ok((events, deadline)) => {
                     for event in events {
                         if let Some(event) =
-                            log_and_decrypt_event(event, e2ee.as_ref(), &mut inbound_audio_count)
+                            log_and_decrypt_event(event, e2ee.as_context(), &mut inbound_audio_count)
+                            && event_tx.try_send(event).is_err()
                         {
-                            let _ = event_tx.try_send(event);
+                            dropped_events = dropped_events.saturating_add(1);
+                            tracing::warn!(dropped_events, "PcEvent dropped: event_tx to room.rs full");
                         }
                     }
                     deadline
@@ -335,22 +337,13 @@ fn pc_io_loop(
                 tracing::info!(pc_id = %pc.id, "Transport PC no longer alive");
                 return;
             }
-            if let Err(e) =
-                peer_connection::recv_and_feed(&mut pc, &socket, &mut recv_buf, wait)
-            {
-                tracing::debug!(reason = %e, "recv_and_feed failed");
+            match peer_connection::recv_and_feed(&mut pc, &socket, &mut recv_buf, wait) {
+                Ok(true) => peer_connection::drain_backlog(&mut pc, &socket, &mut recv_buf),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(reason = %e, "recv_and_feed failed");
+                }
             }
-        }
-    }
-}
-
-/// Lock a PC handle, recovering from a poisoned lock rather than propagating the panic.
-fn lock_pc(handle: &PeerConnectionHandle) -> std::sync::MutexGuard<'_, peer_connection::PeerConnectionInner> {
-    match handle.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::warn!("Transport PC lock was poisoned, recovering");
-            poisoned.into_inner()
         }
     }
 }
@@ -360,7 +353,7 @@ fn lock_pc(handle: &PeerConnectionHandle) -> std::sync::MutexGuard<'_, peer_conn
 fn write_encrypted_or_drop(
     handle: &PeerConnectionHandle,
     e2ee: Option<&E2eeContext>,
-    data: Vec<u8>,
+    data: elementium_types::PlaintextMedia,
     kind: E2eeMediaKind,
 ) {
     let label = match kind {
@@ -386,11 +379,11 @@ fn write_encrypted_or_drop(
 /// [`maybe_decrypt_event`]. Split out from `pc_io_loop` to keep that function under clippy's
 /// line-count limit.
 fn log_and_decrypt_event(
-    event: PcEvent,
+    event: crate::peer_connection::WirePcEvent,
     e2ee: Option<&E2eeContext>,
     inbound_audio_count: &mut u64,
 ) -> Option<PcEvent> {
-    if let PcEvent::AudioData(ref data) = event {
+    if let PcEvent::AudioData { ref data, .. } = event {
         *inbound_audio_count = inbound_audio_count.saturating_add(1);
         if inbound_audio_count.is_multiple_of(100) {
             tracing::info!(
@@ -402,7 +395,7 @@ fn log_and_decrypt_event(
         }
     }
     let decrypted = crate::e2ee_io::maybe_decrypt_event(event, e2ee);
-    if let Some(PcEvent::AudioData(ref data)) = decrypted
+    if let Some(PcEvent::AudioData { ref data, .. }) = decrypted
         && inbound_audio_count.is_multiple_of(100)
     {
         tracing::info!(
@@ -412,39 +405,6 @@ fn log_and_decrypt_event(
         );
     }
     decrypted
-}
-
-/// Perform STUN discovery using ICE servers and add srflx candidates.
-fn discover_and_add_srflx(
-    socket: &UdpSocket,
-    pc: &mut peer_connection::PeerConnectionInner,
-    local_addr: std::net::SocketAddr,
-    servers: &[IceServerConfig],
-) {
-    for server in servers {
-        for url in &server.urls {
-            if let Some(stun_addr) = stun::parse_stun_url(url) {
-                tracing::info!(
-                    pc_id = %pc.id,
-                    %url,
-                    %stun_addr,
-                    "Attempting STUN discovery (transport)"
-                );
-                if let Some(srflx_addr) = stun::discover_srflx(socket, stun_addr) {
-                    let base = if local_addr.ip().is_unspecified() {
-                        let real_ip = peer_connection::get_local_ip()
-                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-                        std::net::SocketAddr::new(real_ip, local_addr.port())
-                    } else {
-                        local_addr
-                    };
-                    peer_connection::add_srflx_candidate(pc, srflx_addr, base);
-                    return;
-                }
-            }
-        }
-    }
-    tracing::warn!(pc_id = %pc.id, "STUN discovery failed on all ICE servers (transport)");
 }
 
 /// Async dispatcher: routes `TransportCommands` to the Publisher and merges PC events.

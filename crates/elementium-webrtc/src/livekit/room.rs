@@ -18,6 +18,7 @@ use livekit_protocol::{
 
 use elementium_types::{CorrelationId, SdpType, SessionDescription};
 
+use crate::e2ee_io::EncryptionPolicy;
 use crate::engine::VideoFrameBuffer;
 use crate::livekit::signaling::{SignalClient, SignalSender};
 use crate::livekit::transport::{Transport, TransportCommand, TransportEvent};
@@ -113,7 +114,8 @@ impl LiveKitRoom {
         token: &str,
         video_frames: VideoFrameBuffer,
         correlation_id: CorrelationId,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<RoomEvent>), String> {
+        e2ee: EncryptionPolicy,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<RoomEvent>), crate::error::WebRtcError> {
         let room_id = generate_room_id();
 
         // Connect signaling
@@ -121,14 +123,18 @@ impl LiveKitRoom {
             Ok(client) => client,
             Err(e) => {
                 tracing::error!(reason = %e, "signaling connect failed");
-                return Err(format!("Signaling connect failed: {e}"));
+                return Err(crate::error::WebRtcError::Signaling(format!(
+                    "connect failed: {e}"
+                )));
             }
         };
 
         let signal_sender = signal_client.sender();
         let Some(mut signal_rx) = signal_client.take_receiver() else {
             tracing::error!(reason = "signal receiver already taken", "connect attempt failed");
-            return Err("Failed to take signal receiver".to_string());
+            return Err(crate::error::WebRtcError::ChannelClosed(
+                "signal receiver already taken",
+            ));
         };
 
         // Wait for JoinResponse
@@ -170,7 +176,7 @@ impl LiveKitRoom {
         }
 
         // Create transport (Publisher + Subscriber PeerConnections)
-        let transport = match Transport::new(&room_id) {
+        let transport = match Transport::new_with_e2ee(&room_id, e2ee, None) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(reason = %e, "connect attempt failed");
@@ -263,11 +269,11 @@ impl LiveKitRoom {
         &mut self,
         kind: &str,
         source: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::error::WebRtcError> {
         let track_type: i32 = match kind {
             "audio" => TrackType::Audio.into(),
             "video" => TrackType::Video.into(),
-            _ => return Err(format!("Unknown track kind: {kind}")),
+            _ => return Err(crate::error::WebRtcError::UnknownTrackKind(kind.to_string())),
         };
 
         let track_source: i32 = match source {
@@ -301,7 +307,9 @@ impl LiveKitRoom {
             }))
         {
             tracing::error!(reason = %e, "publish track failed");
-            return Err(format!("Failed to send AddTrack: {e}"));
+            return Err(crate::error::WebRtcError::Signaling(format!(
+                "failed to send AddTrack: {e}"
+            )));
         }
 
         // Trigger SDP renegotiation on Publisher
@@ -323,7 +331,9 @@ impl LiveKitRoom {
             }))
         {
             tracing::error!(reason = %e, "publish track failed");
-            return Err(format!("Failed to send publisher offer: {e}"));
+            return Err(crate::error::WebRtcError::Signaling(format!(
+                "failed to send publisher offer: {e}"
+            )));
         }
 
         Ok(())
@@ -340,7 +350,10 @@ impl LiveKitRoom {
     /// # Errors
     ///
     /// Returns `Err` if the command cannot be sent to the transport.
-    pub async fn write_audio(&self, data: Vec<u8>) -> Result<(), String> {
+    pub async fn write_audio(
+        &self,
+        data: elementium_types::PlaintextMedia,
+    ) -> Result<(), crate::error::WebRtcError> {
         self.transport
             .send_command(TransportCommand::WriteAudio(data))
             .await
@@ -349,7 +362,10 @@ impl LiveKitRoom {
     /// # Errors
     ///
     /// Returns `Err` if the command cannot be sent to the transport.
-    pub async fn write_video(&self, data: Vec<u8>) -> Result<(), String> {
+    pub async fn write_video(
+        &self,
+        data: elementium_types::PlaintextMedia,
+    ) -> Result<(), crate::error::WebRtcError> {
         self.transport
             .send_command(TransportCommand::WriteVideo(data))
             .await
@@ -441,7 +457,7 @@ fn send_room_event(tx: &mpsc::UnboundedSender<RoomEvent>, event: RoomEvent) {
 /// Wait for the `JoinResponse` from the signaling channel.
 async fn wait_for_join(
     rx: &mut mpsc::UnboundedReceiver<signal_response::Message>,
-) -> Result<JoinResponse, String> {
+) -> Result<JoinResponse, crate::error::WebRtcError> {
     let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(msg) = rx.recv().await {
             if let signal_response::Message::Join(join) = msg {
@@ -449,12 +465,14 @@ async fn wait_for_join(
             }
             tracing::debug!("Ignoring pre-join message");
         }
-        Err("Signal channel closed before JoinResponse".to_string())
+        Err(crate::error::WebRtcError::ChannelClosed(
+            "signaling (before JoinResponse)",
+        ))
     });
 
     timeout
         .await
-        .unwrap_or_else(|_| Err("Timeout waiting for JoinResponse".to_string()))
+        .unwrap_or(Err(crate::error::WebRtcError::Timeout("JoinResponse")))
 }
 
 /// Background loop: processes signaling messages and transport events.
@@ -643,18 +661,107 @@ async fn signal_processing_loop(
     tracing::info!(room_id = %room_id, "Signal processing loop ended");
 }
 
-/// Process transport events (audio/video data from subscriber PC).
+/// Decode one inbound subscriber Opus packet and play it. Returns the updated
+/// decoded-frame counter.
 ///
-/// Runs as a blocking task because `AudioPlayer` (cpal) is not `Send`.
+/// `contiguous` (str0m's gap signal) is intentionally not acted on here -- see the
+/// disabled-concealment comment in `audio_pipeline::start_playback` for why: a test
+/// (`interleaved_plc_calls_corrupt_subsequent_real_decodes`, elementium-codec/
+/// `opus_codec.rs`) proves `conceal()` corrupts the *next real packet's* decode, not just the
+/// concealment frame itself, and str0m's own docs say `contiguous` "most likely doesn't
+/// matter" for audio -- no confirmed-reliable trigger exists for this yet.
+fn decode_and_play_subscriber_audio(
+    mid: &str,
+    opus_data: &elementium_types::PlaintextMedia,
+    opus_decoders: &mut HashMap<String, elementium_codec::OpusDecoder>,
+    player: Option<&elementium_media::audio_playback::AudioSink>,
+    mut decoded_audio_count: u64,
+) -> u64 {
+    // Opus decoder creation with fixed, known-valid parameters (48kHz, stereo) cannot
+    // fail in practice; the entry API requires an infallible closure.
+    let decoder = match opus_decoders.entry(mid.to_string()) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            #[allow(clippy::unwrap_used)]
+            let d = elementium_codec::OpusDecoder::new(48000, 2).unwrap();
+            v.insert(d)
+        }
+    };
+
+    match decoder.decode(opus_data, 960) {
+        Ok(frame) => {
+            decoded_audio_count = decoded_audio_count.saturating_add(1);
+            // Per-frame, at TRACE so it costs nothing in production. The INFO line below
+            // is throttled to every 100th frame, which is fine for eyeballing a live log
+            // but makes it impossible to measure what fraction of a sender's frames
+            // actually arrived -- and "most of them vanished" is exactly the failure this
+            // pipeline has been unable to distinguish from "the audio sounds bad".
+            tracing::trace!(
+                mid,
+                count = decoded_audio_count,
+                opus_len = opus_data.len(),
+                decoded_samples = frame.data.len(),
+                decoded_channels = frame.channels,
+                peak = frame.data.iter().fold(0.0_f32, |a, s| a.max(s.abs())),
+                "Inbound audio frame decoded"
+            );
+            if decoded_audio_count.is_multiple_of(100) {
+                tracing::info!(
+                    mid,
+                    count = decoded_audio_count,
+                    opus_len = opus_data.len(),
+                    decoded_samples = frame.data.len(),
+                    decoded_sample_rate = frame.sample_rate,
+                    decoded_channels = frame.channels,
+                    player_available = player.is_some(),
+                    "Decoded inbound Opus audio frame"
+                );
+            }
+            if let Some(p) = player {
+                // Keyed by `mid` so the mixer plays this track's consecutive frames
+                // sequentially while summing it with other participants' tracks sharing
+                // the same output stream -- see `AudioSink::play`.
+                p.play(mid, frame);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                mid,
+                opus_len = opus_data.len(),
+                error = %e,
+                "Failed to decode inbound Opus frame, dropping"
+            );
+        }
+    }
+
+    decoded_audio_count
+}
+
 fn process_transport_events(
     event_rx: &Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
     video_frames: &VideoFrameBuffer,
     room_id: &str,
     event_tx: &mpsc::UnboundedSender<RoomEvent>,
 ) {
+    // One decoder per remote track (`mid`), not one shared decoder for the whole
+    // subscriber PC -- LiveKit multiplexes every subscribed remote participant's track
+    // onto this single subscriber PeerConnection, so a room with more than one other
+    // participant genuinely has multiple concurrent audio/video streams here. Opus/VP8
+    // decoding is stateful; interleaving two independent encoder streams through one
+    // shared decoder corrupts both (this was a real "digital screeching" bug on the
+    // native WebRTC path -- see `audio_pipeline.rs` -- and the same risk existed here
+    // under an earlier, incorrect "only ever one subscriber stream" assumption).
     let mut opus_decoders: HashMap<String, elementium_codec::OpusDecoder> = HashMap::new();
-    let mut vp8_decoder = elementium_codec::Vp8Decoder::new().ok();
-    let player = elementium_media::audio_playback::AudioPlayer::start().ok();
+    let mut vp8_decoders: HashMap<String, elementium_codec::Vp8Decoder> = HashMap::new();
+    // Process-wide shared output stream, not a stream of its own -- see
+    // `elementium_media::audio_playback::shared_sink` for why: this room's subscriber PC
+    // is exactly the kind of second concurrent audio source (alongside the native WebRTC
+    // path's PeerConnections) that caused a real, confirmed audio-glitching bug when each
+    // source opened its own independent cpal output stream.
+    let player = elementium_media::audio_playback::shared_sink();
+    // room_id never changes for this thread's lifetime, so the frame-buffer key is built
+    // once here instead of reallocating a String on every decoded video frame.
+    let video_track_key = format!("{room_id}-sub-video");
     tracing::info!(
         player_started = player.is_some(),
         "Subscriber audio playback pipeline initialized"
@@ -670,52 +777,35 @@ fn process_transport_events(
         };
 
         match event {
-            Some(TransportEvent::SubscriberEvent(PcEvent::AudioData(opus_data))) => {
-                // Opus decoder creation with fixed, known-valid parameters (48kHz, stereo)
-                // cannot fail in practice; entry() requires an infallible closure here.
-                #[allow(clippy::unwrap_used)]
-                let decoder = opus_decoders
-                    .entry("default".to_string())
-                    .or_insert_with(|| {
-                        elementium_codec::OpusDecoder::new(48000, 2).unwrap()
-                    });
-
-                match decoder.decode(&opus_data, 960) {
-                    Ok(frame) => {
-                        decoded_audio_count = decoded_audio_count.saturating_add(1);
-                        if decoded_audio_count.is_multiple_of(100) {
-                            tracing::info!(
-                                count = decoded_audio_count,
-                                opus_len = opus_data.len(),
-                                decoded_samples = frame.data.len(),
-                                decoded_sample_rate = frame.sample_rate,
-                                decoded_channels = frame.channels,
-                                player_available = player.is_some(),
-                                "Decoded inbound Opus audio frame"
-                            );
-                        }
-                        if let Some(ref p) = player {
-                            p.play(frame);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            opus_len = opus_data.len(),
-                            error = %e,
-                            "Failed to decode inbound Opus frame, dropping"
-                        );
-                    }
-                }
+            Some(TransportEvent::SubscriberEvent(PcEvent::AudioData { mid, data: opus_data, contiguous: _ })) => {
+                decoded_audio_count = decode_and_play_subscriber_audio(
+                    &mid,
+                    &opus_data,
+                    &mut opus_decoders,
+                    player.as_ref(),
+                    decoded_audio_count,
+                );
             }
-            Some(TransportEvent::SubscriberEvent(PcEvent::VideoData(vp8_data))) => {
-                if let Some(ref mut decoder) = vp8_decoder
+            Some(TransportEvent::SubscriberEvent(PcEvent::VideoData { mid, data: vp8_data })) => {
+                let decoder = match vp8_decoders.entry(mid.clone()) {
+                    std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        elementium_codec::Vp8Decoder::new().ok().map(|d| v.insert(d))
+                    }
+                };
+                if let Some(decoder) = decoder
                     && let Ok(frames) = decoder.decode(&vp8_data)
                 {
                     for i420_frame in frames {
                         let rgba = elementium_codec::i420_to_rgba(&i420_frame);
-                        let track_key = format!("{room_id}-sub-video");
+                        // Only the first frame's insert needs to clone `video_track_key`;
+                        // every later frame overwrites the existing entry in place.
                         if let Ok(mut buf) = video_frames.lock() {
-                            buf.insert(track_key, rgba);
+                            if let Some(existing) = buf.get_mut(&video_track_key) {
+                                *existing = rgba;
+                            } else {
+                                buf.insert(video_track_key.clone(), rgba);
+                            }
                         }
                     }
                 }
