@@ -358,4 +358,161 @@ mod tests {
             assert_eq!(addr.port(), 12345);
         }
     }
+
+    /// Build a synthetic STUN Binding Response containing a single attribute, for
+    /// testing `parse_binding_response`'s header validation and attribute walk without
+    /// a real STUN server.
+    fn build_binding_response(
+        transaction_id: &[u8; 12],
+        attr_type: u16,
+        attr_payload: &[u8],
+    ) -> Vec<u8> {
+        let padded_len = (attr_payload.len().checked_add(3).unwrap_or(0)) & !3usize;
+        let attr_total_len = 4usize.checked_add(padded_len).unwrap_or(4);
+        let mut msg = Vec::with_capacity(20usize.checked_add(attr_total_len).unwrap_or(20));
+        msg.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        msg.extend_from_slice(&u16::try_from(attr_total_len).unwrap_or(0).to_be_bytes());
+        msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        msg.extend_from_slice(transaction_id);
+        msg.extend_from_slice(&attr_type.to_be_bytes());
+        msg.extend_from_slice(&u16::try_from(attr_payload.len()).unwrap_or(0).to_be_bytes());
+        msg.extend_from_slice(attr_payload);
+        let padding = padded_len.saturating_sub(attr_payload.len());
+        msg.resize(msg.len().saturating_add(padding), 0);
+        msg
+    }
+
+    fn xor_mapped_address_attr(tid: &[u8; 12], ip: [u8; 4], port: u16) -> Vec<u8> {
+        #[allow(clippy::unwrap_used)]
+        let cookie_high = u16::try_from(MAGIC_COOKIE >> 16).unwrap();
+        let xor_port = (port ^ cookie_high).to_be_bytes();
+        let xor_ip = (u32::from_be_bytes(ip) ^ MAGIC_COOKIE).to_be_bytes();
+        let _ = tid; // XOR-MAPPED-ADDRESS IPv4 doesn't mix in the transaction id
+        vec![0x00, 0x01, xor_port[0], xor_port[1], xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]]
+    }
+
+    fn mapped_address_attr(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let port = port.to_be_bytes();
+        vec![0x00, 0x01, port[0], port[1], ip[0], ip[1], ip[2], ip[3]]
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn parse_binding_response_prefers_xor_mapped_address() {
+        let tid = [7u8; 12];
+        let msg = build_binding_response(
+            &tid,
+            ATTR_XOR_MAPPED_ADDRESS,
+            &xor_mapped_address_attr(&tid, [198, 51, 100, 9], 4242),
+        );
+        let addr = parse_binding_response(&msg, &tid).expect("should parse");
+        assert_eq!(addr.ip().to_string(), "198.51.100.9");
+        assert_eq!(addr.port(), 4242);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn parse_binding_response_falls_back_to_mapped_address() {
+        // Some older/simpler STUN servers only send MAPPED-ADDRESS, not
+        // XOR-MAPPED-ADDRESS; the fallback path must still produce a usable address.
+        let tid = [3u8; 12];
+        let msg = build_binding_response(
+            &tid,
+            ATTR_MAPPED_ADDRESS,
+            &mapped_address_attr([203, 0, 113, 77], 5555),
+        );
+        let addr = parse_binding_response(&msg, &tid).expect("should parse via fallback");
+        assert_eq!(addr.ip().to_string(), "203.0.113.77");
+        assert_eq!(addr.port(), 5555);
+    }
+
+    #[test]
+    fn parse_binding_response_rejects_wrong_transaction_id() {
+        let tid = [1u8; 12];
+        let other_tid = [2u8; 12];
+        let msg = build_binding_response(
+            &tid,
+            ATTR_XOR_MAPPED_ADDRESS,
+            &xor_mapped_address_attr(&tid, [1, 2, 3, 4], 1),
+        );
+        assert!(parse_binding_response(&msg, &other_tid).is_none());
+    }
+
+    #[test]
+    fn parse_binding_response_rejects_truncated_message() {
+        let tid = [1u8; 12];
+        assert!(parse_binding_response(&[0u8; 10], &tid).is_none());
+    }
+
+    #[test]
+    fn parse_binding_response_rejects_non_response_message_type() {
+        let tid = [1u8; 12];
+        let mut msg = build_binding_response(
+            &tid,
+            ATTR_XOR_MAPPED_ADDRESS,
+            &xor_mapped_address_attr(&tid, [1, 2, 3, 4], 1),
+        );
+        // Overwrite the message type with Binding Request instead of Response.
+        if let Some(header) = msg.get_mut(0..2) {
+            header.copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        }
+        assert!(parse_binding_response(&msg, &tid).is_none());
+    }
+
+    /// Regression test for `discover_srflx`'s retry loop against a real (loopback)
+    /// UDP responder -- confirms the full send/receive/parse round trip works, not
+    /// just the pure parsing functions in isolation.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn discover_srflx_succeeds_against_a_loopback_responder() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let Ok((len, client_addr)) = server_socket.recv_from(&mut buf) else {
+                return;
+            };
+            let Some(request) = buf.get(..len) else {
+                return;
+            };
+            // Echo back a Binding Response carrying the client's observed address,
+            // exactly like a real STUN server would.
+            let Some(tid) = request.get(8..20) else {
+                return;
+            };
+            let tid: [u8; 12] = tid.try_into().unwrap();
+            let std::net::IpAddr::V4(ip) = client_addr.ip() else {
+                return;
+            };
+            let response = build_binding_response(
+                &tid,
+                ATTR_XOR_MAPPED_ADDRESS,
+                &xor_mapped_address_attr(&tid, ip.octets(), client_addr.port()),
+            );
+            let _ = server_socket.send_to(&response, client_addr);
+        });
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = discover_srflx(&client_socket, server_addr);
+        responder.join().unwrap();
+
+        #[allow(clippy::expect_used)]
+        let addr = result.expect("discover_srflx should succeed against a real responder");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+    }
+
+    /// A server that never responds must not hang forever -- the retry loop has to
+    /// give up and return `None` after its bounded number of attempts/timeouts.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn discover_srflx_gives_up_when_server_never_responds() {
+        // Bind a socket but never read from it, so requests go unanswered.
+        let dead_server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_server.local_addr().unwrap();
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = discover_srflx(&client_socket, dead_addr);
+        assert!(result.is_none());
+    }
 }
