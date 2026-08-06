@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
-use elementium_types::VideoFrame;
+use elementium_media::audio_playback::AudioSink;
+use elementium_types::{PlaintextMedia, VideoFrame};
 
-use crate::e2ee_io::{encrypt_or_drop, maybe_decrypt_event};
-use crate::peer_connection::{self, PcEvent, PeerConnectionHandle};
-use crate::stun;
+use crate::e2ee_io::{EncryptionPolicy, encrypt_or_drop, maybe_decrypt_event};
+use crate::peer_connection::{
+    self, PcEvent, PeerConnectionHandle, discover_and_add_srflx, lock_pc,
+};
 
 /// ICE server configuration (STUN/TURN) passed from the signaling layer.
 #[derive(Debug, Clone)]
@@ -22,10 +24,11 @@ pub struct IceServerConfig {
 
 /// Command sent to the I/O loop task.
 pub enum IoCommand {
-    /// Write an Opus frame to the peer connection.
-    WriteAudio(Vec<u8>),
-    /// Write a VP8 frame to the peer connection.
-    WriteVideo(Vec<u8>),
+    /// Write an encoded Opus frame to the peer connection. Carries [`PlaintextMedia`]
+    /// so it cannot reach the socket without passing through encryption first.
+    WriteAudio(PlaintextMedia),
+    /// Write an encoded VP8 frame to the peer connection. See [`IoCommand::WriteAudio`].
+    WriteVideo(PlaintextMedia),
     /// Shut down the I/O loop.
     Shutdown,
 }
@@ -51,10 +54,10 @@ pub struct WebRtcEngine {
     connections: HashMap<String, ManagedPc>,
     /// Shared video frame buffer for all connections.
     pub video_frames: VideoFrameBuffer,
-    /// Shared E2EE context for frame encryption/decryption.
+    /// Shared E2EE policy for frame encryption/decryption.
     /// Uses `Arc<Mutex<>>` so it can be shared with Tauri's `E2eeState` and
     /// populated after I/O loops are already running.
-    pub e2ee: Arc<Mutex<Option<E2eeContext>>>,
+    pub e2ee: Arc<Mutex<EncryptionPolicy>>,
 }
 
 impl Default for WebRtcEngine {
@@ -69,8 +72,19 @@ impl WebRtcEngine {
         Self {
             connections: HashMap::new(),
             video_frames: Arc::new(Mutex::new(HashMap::new())),
-            e2ee: Arc::new(Mutex::new(None)),
+            e2ee: Arc::new(Mutex::new(EncryptionPolicy::default())),
         }
+    }
+
+    /// Get the process-wide shared audio output stream handle (starting it on first call
+    /// anywhere in the process). See [`elementium_media::audio_playback::shared_sink`] for
+    /// why this is a process-wide singleton, not per-engine: a single call can involve
+    /// more than one native `PeerConnection` (confirmed via a real session log), and each
+    /// connection used to open its own output stream, which is a real, confirmed source
+    /// of audio glitching independent of decode correctness.
+    #[must_use]
+    pub fn shared_audio_player(&self) -> Option<AudioSink> {
+        elementium_media::audio_playback::shared_sink()
     }
 
     /// Create a new peer connection. Binds a UDP socket and starts the I/O loop.
@@ -86,7 +100,7 @@ impl WebRtcEngine {
         &mut self,
         id: String,
         ice_servers: Option<&[IceServerConfig]>,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::error::WebRtcError> {
         // Captured here (rather than at `spawn_blocking` time) so it reflects whatever
         // span the caller was in when it asked for this connection to be created — in
         // practice the `peer_connection` span entered by the Tauri command, carrying
@@ -118,7 +132,7 @@ impl WebRtcEngine {
         // Spawn the I/O loop as a blocking task (it does synchronous UDP I/O)
         let loop_handle = handle.clone();
         let loop_socket = socket.clone();
-        let loop_e2ee = self.e2ee.clone(); // clones the Arc, shares the Option
+        let loop_e2ee = self.e2ee.clone(); // clones the Arc, shares the policy
         let loop_span = span.clone();
         tokio::task::spawn_blocking(move || {
             let _enter = loop_span.enter();
@@ -169,18 +183,53 @@ impl WebRtcEngine {
     }
 }
 
-/// Lock the PC handle, recovering from poisoned locks.
+/// How evenly audio frames actually reach str0m, which is when they reach the wire.
 ///
-/// A poisoned lock means a previous holder panicked — we recover the
-/// inner data and keep going rather than cascading the panic.
-fn lock_pc(
-    handle: &PeerConnectionHandle,
-) -> std::sync::MutexGuard<'_, peer_connection::PeerConnectionInner> {
-    match handle.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::warn!("PC lock was poisoned, recovering");
-            poisoned.into_inner()
+/// str0m runs with `PacerImpl::null()` (we do not enable BWE), so it transmits each packet
+/// the moment it is handed over. The capture thread already measures its *own* output
+/// cadence, and after fixing the input buffer that is a clean frame every 20ms -- but that
+/// is not the wire cadence. Between the two sits this I/O loop, which blocks in
+/// `recv_and_feed` for up to 20ms and then drains every queued command at once. If it does,
+/// smoothly-produced frames are handed to str0m in clumps and transmitted in clumps, and
+/// the far end's jitter buffer conceals the gaps -- robotic audio with, by construction,
+/// zero packet loss for RTCP to report.
+#[derive(Default)]
+struct WritePacing {
+    last_write: Option<Instant>,
+    writes: u64,
+    burst_writes: u64,
+    max_gap_ms: u64,
+}
+
+impl WritePacing {
+    /// Report every 250 writes: at a nominal 50 frames/sec that is roughly every 5s,
+    /// matching the capture side's reporting cadence so the two can be compared directly.
+    const REPORT_EVERY: u64 = 250;
+
+    fn record(&mut self, pc_id: &str) {
+        let now = Instant::now();
+        self.writes = self.writes.saturating_add(1);
+        if let Some(previous) = self.last_write {
+            let gap = now.saturating_duration_since(previous);
+            self.max_gap_ms = self
+                .max_gap_ms
+                .max(u64::try_from(gap.as_millis()).unwrap_or(u64::MAX));
+            if gap < Duration::from_millis(5) {
+                self.burst_writes = self.burst_writes.saturating_add(1);
+            }
+        }
+        self.last_write = Some(now);
+
+        if self.writes.is_multiple_of(Self::REPORT_EVERY) {
+            tracing::info!(
+                pc_id,
+                writes = self.writes,
+                burst_writes = self.burst_writes,
+                max_gap_ms = self.max_gap_ms,
+                "Outbound audio wire pacing"
+            );
+            self.burst_writes = 0;
+            self.max_gap_ms = 0;
         }
     }
 }
@@ -191,6 +240,7 @@ fn drain_io_commands(
     cmd_rx: &mut mpsc::Receiver<IoCommand>,
     handle: &PeerConnectionHandle,
     e2ee: Option<&E2eeContext>,
+    pacing: &mut WritePacing,
 ) -> bool {
     loop {
         match cmd_rx.try_recv() {
@@ -200,8 +250,26 @@ fn drain_io_commands(
                     continue;
                 };
                 let mut pc = lock_pc(handle);
+                pacing.record(&pc.id.clone());
                 if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
-                    tracing::debug!("write_audio: {e}");
+                    // Throttled warn, not debug: this is the last hop before the network,
+                    // so a persistent failure here means nobody hears us -- and at
+                    // `debug` it produced a completely clean log while doing so. The
+                    // usual causes (no audio mid negotiated, no Opus payload type) are
+                    // steady-state, not transient, hence the coarse throttle.
+                    static WRITE_FAILURES: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = WRITE_FAILURES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .saturating_add(1);
+                    if n == 1 || n.is_multiple_of(250) {
+                        tracing::warn!(
+                            pc_id = %pc.id,
+                            failures = n,
+                            error = %e,
+                            "Outbound audio frame not written to the peer connection"
+                        );
+                    }
                 }
             }
             Ok(IoCommand::WriteVideo(vp8_data)) => {
@@ -233,19 +301,27 @@ fn io_loop(
     socket: &Arc<UdpSocket>,
     mut cmd_rx: mpsc::Receiver<IoCommand>,
     event_tx: &mpsc::Sender<PcEvent>,
-    e2ee_ctx: &Arc<Mutex<Option<E2eeContext>>>,
+    e2ee_ctx: &Arc<Mutex<EncryptionPolicy>>,
 ) {
     let mut recv_buf = vec![0u8; 2000];
+    // Count of `PcEvent`s dropped because `event_tx` (io_loop -> `forward_events`, capacity
+    // 256) was full. This is a gap `str0m`'s own `MediaData::contiguous` flag cannot see --
+    // `contiguous` reflects RTP-level continuity as decoded by str0m, but a drop here
+    // happens strictly after str0m already emitted a complete, contiguous event. If this
+    // ever fires, audio/video frames are vanishing between str0m and the playback
+    // pipelines without str0m-side loss ever occurring, invisible to the Opus
+    // packet-loss-concealment path added for genuine network loss.
+    let mut dropped_events: u64 = 0;
+    let mut write_pacing = WritePacing::default();
 
     loop {
-        // Snapshot the E2EE context for this iteration.
-        // E2eeContext::clone() is cheap (Arc::clone inside), and this picks up
-        // contexts that were initialized after the I/O loop started.
-        let e2ee: Option<E2eeContext> =
-            e2ee_ctx.lock().ok().and_then(|g| g.clone());
+        // Snapshot the E2EE policy for this iteration.
+        // EncryptionPolicy::clone() is cheap (Arc::clone inside E2eeContext), and this
+        // picks up contexts that were initialized after the I/O loop started.
+        let e2ee: EncryptionPolicy = e2ee_ctx.lock().map(|g| g.clone()).unwrap_or_default();
 
         // Process any pending commands (non-blocking)
-        if drain_io_commands(&mut cmd_rx, handle, e2ee.as_ref()) {
+        if drain_io_commands(&mut cmd_rx, handle, e2ee.as_context(), &mut write_pacing) {
             return;
         }
 
@@ -255,8 +331,19 @@ fn io_loop(
             match peer_connection::poll_once(&mut pc, socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        if let Some(event) = maybe_decrypt_event(event, e2ee.as_ref()) {
-                            let _ = event_tx.try_send(event);
+                        if let Some(event) = maybe_decrypt_event(event, e2ee.as_context())
+                            && event_tx.try_send(event).is_err()
+                        {
+                            dropped_events = dropped_events.saturating_add(1);
+                            // Unthrottled: this is a real invisible-loss channel this
+                            // codebase has never had visibility into before, and
+                            // capacity-256 means it shouldn't fire under normal load at
+                            // all -- if it does, every occurrence matters.
+                            tracing::warn!(
+                                pc_id = %pc.id,
+                                dropped_events,
+                                "PcEvent dropped: event_tx to forward_events full"
+                            );
                         }
                     }
                     deadline
@@ -280,46 +367,15 @@ fn io_loop(
                 tracing::info!(pc_id = %pc.id, "Peer connection no longer alive");
                 return;
             }
-            if let Err(e) =
-                peer_connection::recv_and_feed(&mut pc, socket, &mut recv_buf, wait)
-            {
-                tracing::debug!("recv_and_feed: {e}");
+            match peer_connection::recv_and_feed(&mut pc, socket, &mut recv_buf, wait) {
+                Ok(true) => peer_connection::drain_backlog(&mut pc, socket, &mut recv_buf),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("recv_and_feed: {e}");
+                }
             }
         }
     }
 }
 
-/// Perform STUN discovery using ICE servers and add srflx candidates.
-fn discover_and_add_srflx(
-    socket: &UdpSocket,
-    pc: &mut peer_connection::PeerConnectionInner,
-    local_addr: std::net::SocketAddr,
-    servers: &[IceServerConfig],
-) {
-    for server in servers {
-        for url in &server.urls {
-            if let Some(stun_addr) = stun::parse_stun_url(url) {
-                tracing::info!(
-                    pc_id = %pc.id,
-                    %url,
-                    %stun_addr,
-                    "Attempting STUN discovery"
-                );
-                if let Some(srflx_addr) = stun::discover_srflx(socket, stun_addr) {
-                    // Use the real local IP as the base (not 0.0.0.0)
-                    let base = if local_addr.ip().is_unspecified() {
-                        let real_ip = peer_connection::get_local_ip()
-                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-                        std::net::SocketAddr::new(real_ip, local_addr.port())
-                    } else {
-                        local_addr
-                    };
-                    peer_connection::add_srflx_candidate(pc, srflx_addr, base);
-                    return; // One srflx candidate is enough
-                }
-            }
-        }
-    }
-    tracing::warn!(pc_id = %pc.id, "STUN discovery failed on all ICE servers");
-}
 

@@ -10,19 +10,53 @@
 
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 
-use crate::peer_connection::PcEvent;
+use elementium_types::{PlaintextMedia, WireMedia};
+
+use crate::peer_connection::{PcEvent, WirePcEvent};
+
+/// Whether a connection encrypts media with E2EE, or deliberately does not.
+///
+/// Replaces the previous `Option<E2eeContext>` used at connection-setup boundaries
+/// (`Transport::new_with_e2ee`, `LiveKitRoom::connect`, `WebRtcEngine::e2ee`). `None` let
+/// "unencrypted" happen by omission -- a caller that simply forgot to wire up E2EE (as
+/// `commands/livekit.rs` did until this was found) type-checked identically to one that
+/// deliberately chose no encryption. Naming the unencrypted state forces every call site to
+/// write `ExplicitlyUnencrypted` on purpose; a forgotten wire-up is a compile error instead
+/// of a silent security gap.
+#[derive(Clone, Default)]
+pub enum EncryptionPolicy {
+    /// No E2EE: media is sent/received as-is (still protected by DTLS-SRTP transport
+    /// encryption, but not by the app-layer E2EE key).
+    #[default]
+    ExplicitlyUnencrypted,
+    /// E2EE active with the given context.
+    Encrypted(E2eeContext),
+}
+
+impl EncryptionPolicy {
+    /// Borrow the active `E2eeContext`, or `None` if explicitly unencrypted.
+    #[must_use]
+    pub const fn as_context(&self) -> Option<&E2eeContext> {
+        match self {
+            Self::Encrypted(ctx) => Some(ctx),
+            Self::ExplicitlyUnencrypted => None,
+        }
+    }
+}
 
 /// Encrypt an outbound frame if E2EE is active, or drop it with a warning if encryption is
 /// configured but fails -- fail-closed, never sends plaintext when E2EE is supposed to be
 /// protecting the frame.
 pub(crate) fn encrypt_or_drop(
     e2ee: Option<&E2eeContext>,
-    data: Vec<u8>,
+    data: PlaintextMedia,
     kind: E2eeMediaKind,
     label: &str,
-) -> Option<Vec<u8>> {
+) -> Option<WireMedia> {
     let Some(ctx) = e2ee else {
-        return Some(data);
+        // Deliberate unencrypted send: named at the call into `WireMedia` so a forgotten
+        // key can never silently become "shipped plaintext" -- it has to be written down.
+        return Some(WireMedia::deliberately_unencrypted(data));
     };
     ctx.encrypt_frame(&data, kind).map_or_else(
         || {
@@ -46,29 +80,92 @@ pub(crate) fn encrypt_or_drop(
 /// through still-encrypted/undecryptable bytes as if they were valid media -- feeding
 /// ciphertext straight to the Opus/VP8 decoder produces garbage output (audible as noise),
 /// which is worse than silently dropping the frame.
-pub(crate) fn maybe_decrypt_event(event: PcEvent, e2ee: Option<&E2eeContext>) -> Option<PcEvent> {
+pub(crate) fn maybe_decrypt_event(
+    event: WirePcEvent,
+    e2ee: Option<&E2eeContext>,
+) -> Option<PcEvent> {
+    // Non-media variants carry no payload, so they cross the boundary unchanged. Written
+    // out explicitly rather than via a catch-all: the payload type differs on each side,
+    // so the compiler forces every variant to be considered whenever one is added.
+    let passthrough = |event: WirePcEvent| -> Option<PcEvent> {
+        match event {
+            PcEvent::IceConnectionStateChange(s) => Some(PcEvent::IceConnectionStateChange(s)),
+            PcEvent::ConnectionStateChange(s) => Some(PcEvent::ConnectionStateChange(s)),
+            PcEvent::IceCandidate(c) => Some(PcEvent::IceCandidate(c)),
+            PcEvent::IceGatheringComplete => Some(PcEvent::IceGatheringComplete),
+            PcEvent::Connected => Some(PcEvent::Connected),
+            PcEvent::RemoteTrackAdded { mid, kind } => Some(PcEvent::RemoteTrackAdded { mid, kind }),
+            PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks } => {
+                Some(PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks })
+            }
+            PcEvent::AudioData { .. } | PcEvent::VideoData { .. } => None,
+        }
+    };
+
     let Some(ctx) = e2ee else {
-        return Some(event);
+        // No E2EE context: media is passed through byte-for-byte. That is correct only if
+        // the *remote* is also sending unencrypted. If the remote is encrypting (as
+        // Element Call / MatrixRTC does by default), this hands raw ciphertext to the
+        // Opus/VP8 decoder -- and libopus turns that into noise rather than an error, so
+        // it surfaces as unexplained "digital screeching" with a clean-looking log.
+        // Warned once per process (not per frame) so the condition is impossible to miss
+        // without drowning the log at 50 frames/sec.
+        return match event {
+            PcEvent::AudioData { mid, data, contiguous } => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "Inbound audio is being passed through WITHOUT decryption (no E2EE key \
+                         configured). If the remote peer is encrypting, the decoder is being fed \
+                         ciphertext and will output noise."
+                    );
+                });
+                Some(PcEvent::AudioData {
+                    mid,
+                    data: PlaintextMedia::assume_peer_sends_unencrypted(data),
+                    contiguous,
+                })
+            }
+            PcEvent::VideoData { mid, data } => Some(PcEvent::VideoData {
+                mid,
+                data: PlaintextMedia::assume_peer_sends_unencrypted(data),
+            }),
+            other => passthrough(other),
+        };
     };
 
     match event {
-        PcEvent::AudioData(data) => match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
-            Ok(Some(decrypted)) => Some(PcEvent::AudioData(decrypted)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(reason = %e, "E2EE dropping inbound audio frame: decrypt failed");
-                None
+        PcEvent::AudioData { mid, data, contiguous } => {
+            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
+                Ok(Some(decrypted)) => {
+                    Some(PcEvent::AudioData { mid, data: decrypted, contiguous })
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        %mid,
+                        reason = %e,
+                        "E2EE dropping inbound audio frame: decrypt failed"
+                    );
+                    None
+                }
             }
-        },
-        PcEvent::VideoData(data) => match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
-            Ok(Some(decrypted)) => Some(PcEvent::VideoData(decrypted)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(reason = %e, "E2EE dropping inbound video frame: decrypt failed");
-                None
+        }
+        PcEvent::VideoData { mid, data } => {
+            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
+                Ok(Some(decrypted)) => Some(PcEvent::VideoData { mid, data: decrypted }),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        %mid,
+                        reason = %e,
+                        "E2EE dropping inbound video frame: decrypt failed"
+                    );
+                    None
+                }
             }
-        },
-        other => Some(other),
+        }
+        other => passthrough(other),
     }
 }
 
@@ -78,6 +175,27 @@ mod tests {
     use elementium_observability_test::LogCapture;
 
     use super::*;
+
+    /// The default `EncryptionPolicy` must be the explicit unencrypted variant, not a bare
+    /// absence -- this is the whole point of the type: a connection wired up without
+    /// deliberately choosing a policy gets a named, greppable "unencrypted" state instead
+    /// of silently defaulting through an `Option::None`.
+    #[test]
+    fn default_policy_is_explicitly_unencrypted() {
+        assert!(matches!(
+            EncryptionPolicy::default(),
+            EncryptionPolicy::ExplicitlyUnencrypted
+        ));
+        assert!(EncryptionPolicy::default().as_context().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn encrypted_policy_exposes_its_context() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        let policy = EncryptionPolicy::Encrypted(ctx);
+        assert!(policy.as_context().is_some());
+    }
 
     /// Regression test for the outbound fail-open E2EE bug: when a frame can't be encrypted
     /// (e.g. no key set for the local participant), `encrypt_or_drop` must drop it rather
@@ -92,7 +210,7 @@ mod tests {
         let capture = LogCapture::new();
 
         let result = capture.run(|| {
-            encrypt_or_drop(Some(&ctx), b"plaintext-frame".to_vec(), E2eeMediaKind::Audio, "audio")
+            encrypt_or_drop(Some(&ctx), PlaintextMedia::from_encoder(b"plaintext-frame".to_vec()), E2eeMediaKind::Audio, "audio")
         });
 
         // Fail closed: the frame must be dropped, never sent as plaintext.
@@ -112,9 +230,9 @@ mod tests {
     fn encrypt_or_drop_passes_through_when_no_e2ee_configured() {
         let capture = LogCapture::new();
         let result = capture.run(|| {
-            encrypt_or_drop(None, b"plaintext-frame".to_vec(), E2eeMediaKind::Audio, "audio")
+            encrypt_or_drop(None, PlaintextMedia::from_encoder(b"plaintext-frame".to_vec()), E2eeMediaKind::Audio, "audio")
         });
-        assert_eq!(result, Some(b"plaintext-frame".to_vec()));
+        assert_eq!(result.map(WireMedia::into_bytes), Some(b"plaintext-frame".to_vec()));
         assert!(capture.find_event("Dropping outbound frame").is_none());
     }
 
@@ -133,7 +251,10 @@ mod tests {
         let capture = LogCapture::new();
 
         let result = capture.run(|| {
-            maybe_decrypt_event(PcEvent::AudioData(b"ciphertext-looking-bytes".to_vec()), Some(&ctx))
+            maybe_decrypt_event(
+                PcEvent::AudioData { mid: "1".to_string(), data: WireMedia::from_network(b"ciphertext-looking-bytes".to_vec()), contiguous: true },
+                Some(&ctx),
+            )
         });
 
         // Fail closed: the event must be dropped, never forwarded as if it were decrypted.
@@ -150,28 +271,33 @@ mod tests {
         sender.set_key("alice", 0, b"test-key-material-1234567890abc");
         let plaintext = b"hello-from-alice";
         let encrypted = sender
-            .encrypt_frame(plaintext, elementium_e2ee::MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(plaintext.to_vec()), elementium_e2ee::MediaKind::Audio)
             .expect("encrypt should succeed with a key set");
 
         let receiver = E2eeContext::new(E2eeOptions::default());
         receiver.set_key("alice", 0, b"test-key-material-1234567890abc");
 
-        let result = maybe_decrypt_event(PcEvent::AudioData(encrypted), Some(&receiver));
-        let PcEvent::AudioData(decrypted) = result.expect("decrypt should succeed") else {
+        let result = maybe_decrypt_event(
+            PcEvent::AudioData { mid: "1".to_string(), data: encrypted, contiguous: true },
+            Some(&receiver),
+        );
+        let PcEvent::AudioData { data: decrypted, .. } = result.expect("decrypt should succeed")
+        else {
             panic!("expected AudioData variant");
         };
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(decrypted.as_bytes(), plaintext);
     }
 
     /// Sanity check: when no E2EE context is configured, events pass through unmodified.
     #[test]
     #[allow(clippy::expect_used, clippy::panic)]
     fn maybe_decrypt_event_passes_through_when_no_e2ee_configured() {
-        let event = PcEvent::AudioData(b"raw-unencrypted-opus".to_vec());
+        let event = PcEvent::AudioData { mid: "1".to_string(), data: WireMedia::from_network(b"raw-unencrypted-opus".to_vec()), contiguous: true };
         let result = maybe_decrypt_event(event, None);
-        let PcEvent::AudioData(data) = result.expect("no-op passthrough should return Some") else {
+        let PcEvent::AudioData { data, .. } = result.expect("no-op passthrough should return Some")
+        else {
             panic!("expected AudioData variant");
         };
-        assert_eq!(data, b"raw-unencrypted-opus");
+        assert_eq!(data.as_bytes(), b"raw-unencrypted-opus");
     }
 }
