@@ -141,6 +141,17 @@ impl LogCapture {
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
 
+    /// Discard everything captured so far, keeping the subscriber installed.
+    ///
+    /// For measurements with a warm-up phase: a test that counts events over a window
+    /// needs the window to start somewhere, and reinstalling a subscriber mid-test is not
+    /// possible (`set_global_default` takes effect once per process).
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.events.lock() {
+            guard.clear();
+        }
+    }
+
     /// All events captured so far, in emission order.
     #[must_use]
     pub fn events(&self) -> Vec<CapturedEvent> {
