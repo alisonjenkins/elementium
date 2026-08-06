@@ -28,19 +28,24 @@ pub struct CameraCapturer {
 /// to avoid spamming logs on every frame.
 static LOGGED_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Find the first available camera's real device index via nokhwa's enumeration.
+/// List the real device indices of every camera nokhwa's enumeration finds.
 ///
 /// `nokhwa`'s Linux backend opens `CameraIndex::Index(n)` as `/dev/video{n}` directly, so the
 /// index must come from actually querying which devices exist rather than assuming `0` --
 /// device nodes are not guaranteed to start at 0 (e.g. a system with only `/dev/video2` and up).
-fn first_camera_index() -> Result<u32, CameraError> {
+/// Enumeration can also include non-capture nodes (e.g. a UVC camera's separate metadata
+/// interface, which has zero supported formats) -- callers should try each in order and fall
+/// through to the next on failure rather than assuming the first entry is a working camera.
+fn candidate_camera_indices() -> Result<Vec<u32>, CameraError> {
     let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
         .map_err(|e| CameraError::Camera(e.to_string()))?;
-    let first = cameras.first().ok_or(CameraError::NoCameraFound)?;
-    first
-        .index()
-        .as_index()
-        .map_err(|e| CameraError::Camera(e.to_string()))
+    if cameras.is_empty() {
+        return Err(CameraError::NoCameraFound);
+    }
+    Ok(cameras
+        .iter()
+        .filter_map(|c| c.index().as_index().ok())
+        .collect())
 }
 
 /// Build the requested camera format for the given optional resolution.
@@ -198,8 +203,22 @@ impl CameraCapturer {
     /// Returns [`CameraError`] if no camera is found or the camera cannot be
     /// opened/started.
     pub fn start(width: Option<u32>, height: Option<u32>) -> Result<Self, CameraError> {
-        let index = first_camera_index()?;
-        Self::start_with_index(index, width, height)
+        let indices = candidate_camera_indices()?;
+        let mut last_err = CameraError::NoCameraFound;
+        for index in indices {
+            match Self::start_with_index(index, width, height) {
+                Ok(capturer) => return Ok(capturer),
+                Err(e) => {
+                    tracing::warn!(
+                        camera_index = index,
+                        error = %e,
+                        "Camera candidate failed to open, trying next"
+                    );
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// Start capturing from a specific camera index.
