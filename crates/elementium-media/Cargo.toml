@@ -12,6 +12,12 @@ nokhwa = { workspace = true }
 turbojpeg = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# SIMD-accelerated (AVX2/SSE/NEON, with scalar fallback) YUV<->RGB conversion.
+yuv = "0.8"
+
+[dev-dependencies]
+elementium-observability-test = { workspace = true }
+elementium-codec = { workspace = true }
 
 [lints]
 workspace = true
