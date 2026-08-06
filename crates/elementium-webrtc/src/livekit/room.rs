@@ -502,14 +502,26 @@ async fn signal_processing_loop(
                 }
             }
             signal_response::Message::Offer(offer) => {
-                // SFU offer for Subscriber PC
+                // SFU offer for Subscriber PC (initial join, or renegotiation when a new
+                // track is subscribed to mid-call).
+                tracing::info!(
+                    sdp_len = offer.sdp.len(),
+                    "subscriber offer received from SFU"
+                );
                 let desc = SessionDescription {
                     sdp_type: SdpType::Offer,
                     sdp: offer.sdp,
                 };
                 let answer = {
-                    let Ok(mut pc) = subscriber.lock() else {
-                        continue;
+                    let mut pc = match subscriber.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            tracing::error!(
+                                reason = "subscriber_lock_poisoned",
+                                "subscriber offer failed: recovering poisoned lock"
+                            );
+                            poisoned.into_inner()
+                        }
                     };
                     match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                         Ok(Some(ans)) => ans,
@@ -527,6 +539,7 @@ async fn signal_processing_loop(
                     }
                 };
 
+                tracing::info!(sdp_len = answer.sdp.len(), "sending subscriber answer");
                 if let Err(e) =
                     signal_sender.send(signal_request::Message::Answer(LkSessionDescription {
                         r#type: "answer".to_string(),

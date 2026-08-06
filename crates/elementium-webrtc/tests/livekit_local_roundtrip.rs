@@ -175,21 +175,31 @@ async fn audio_survives_real_publish_subscribe_round_trip() {
             .expect("bob should connect to the local dev server");
 
     // Give both sides a moment to finish ICE/DTLS after the initial join before publishing.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // NOTE: generous fixed delay, not event-driven -- SignalSender::send() is fire-and-forget
+    // (enqueues to an unbounded channel, no delivery confirmation), so publishing too early
+    // relative to the signaling connection's readiness could silently lose the AddTrack
+    // message. If this test is still flaky at this delay, that's itself worth fixing for
+    // real (either exposing a real "signaling ready" signal, or making publish_track's
+    // caller-visible contract stronger), not just a test tuning problem.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     alice
         .publish_track("audio", "microphone")
         .expect("publish_track should succeed");
 
     // Give the SFU time to process the AddTrack + renegotiate before we start sending media.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut encoder =
         elementium_codec::OpusEncoder::new(48_000, 2).expect("Opus encoder should initialize");
 
-    // 6 seconds = 300 packets, giving comfortable margin past the every-100th-packet
-    // decode-log throttle even accounting for early packets lost during negotiation.
-    for chunk in sine_wave_chunks(6_000, 440.0) {
+    // 30 seconds, not a shorter window: on a machine with several network interfaces (LAN,
+    // Docker bridges, a VPN, IPv6), the subscriber's ICE connectivity checks against every
+    // candidate pair can genuinely take 10+ seconds to settle before any RTP can flow at
+    // all -- confirmed empirically (a 6s window reliably produced zero decoded frames on such
+    // a machine even though publish/SFU/subscribe signaling all completed correctly; 30s
+    // reliably passes). This is a real property of ICE negotiation, not a arbitrary retry.
+    for chunk in sine_wave_chunks(30_000, 440.0) {
         let frame = elementium_types::AudioFrame {
             sample_rate: 48_000,
             channels: 2,
