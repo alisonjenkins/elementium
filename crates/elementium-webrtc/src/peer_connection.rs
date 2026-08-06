@@ -103,6 +103,15 @@ pub struct PeerConnectionInner {
     /// here so ordering is provable from logs instead of inferred.
     pub last_audio_seq: HashMap<Mid, u64>,
     pub alive: bool,
+    /// When ICE first reported `Disconnected` without having recovered since.
+    ///
+    /// str0m's `Disconnected` is explicitly *not* terminal -- its own docs say it "may
+    /// trigger intermittently and resolve just as spontaneously on less reliable networks",
+    /// and that str0m has no `failed`/`closed` state at all because "it's always possible
+    /// to come back". Treating it as fatal tore the connection down on the first transient
+    /// blip and never recovered. Media stops instantly; whether the user notices depends
+    /// only on how quickly something above rejoins.
+    pub ice_disconnected_since: Option<Instant>,
     /// Set to true after SDP negotiation triggers DTLS initialization inside str0m.
     /// Before this, calling `poll_output` would panic in dimpl because `handle_timeout`
     /// has not been propagated to the DTLS layer (str0m bug: `do_handle_timeout`
@@ -166,6 +175,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         video_frame_count: 0,
         last_audio_seq: HashMap::new(),
         alive: true,
+        ice_disconnected_since: None,
         dtls_initialized: false,
         cached_answer: None,
         audio_pt: None,
@@ -249,6 +259,14 @@ pub struct DataChannelInfo {
 pub struct TransceiverInfo {
     pub kind: MediaKind,
     pub direction: Direction,
+    /// Track id to advertise as `a=msid:<stream> <track_id>`.
+    ///
+    /// `LiveKit`'s SFU associates a published track with an m-line by matching the `cid`
+    /// from `AddTrackRequest` against the offer's msid track id -- livekit-client sets
+    /// `cid` to the `MediaStreamTrack.id`, which *is* that value, so they agree by
+    /// construction. Leaving this `None` lets str0m invent an id the SFU has never seen,
+    /// and the association then depends on the server's by-kind fallback.
+    pub track_id: Option<String>,
 }
 
 impl TransceiverInfo {
@@ -265,7 +283,7 @@ impl TransceiverInfo {
             Some("inactive") => Direction::Inactive,
             _ => Direction::SendRecv,
         };
-        Self { kind, direction }
+        Self { kind, direction, track_id: None }
     }
 }
 
@@ -305,9 +323,28 @@ pub fn create_offer(
         api.add_channel_with_config(config);
     }
 
-    // Add media transceivers (m=audio, m=video)
+    // Add media transceivers (m=audio, m=video).
+    //
+    // Skip a kind that already has an m-line: `add_media` unconditionally appends a new
+    // one, so re-offering (publishing video after audio, say) would otherwise emit a
+    // second audio m-line describing a track that already exists.
     for tc in transceivers {
-        let mid = api.add_media(tc.kind, tc.direction, None, None, None);
+        let existing = match tc.kind {
+            MediaKind::Audio => pc.audio_mid,
+            MediaKind::Video => pc.video_mid,
+        };
+        if let Some(mid) = existing {
+            tracing::debug!(pc_id = %pc.id, %mid, kind = ?tc.kind, "Transceiver already present, not re-adding");
+            continue;
+        }
+        let mid = api.add_media(tc.kind, tc.direction, None, tc.track_id.clone(), None);
+        tracing::info!(
+            pc_id = %pc.id,
+            %mid,
+            kind = ?tc.kind,
+            track_id = tc.track_id.as_deref().unwrap_or("<generated>"),
+            "Added transceiver"
+        );
         match tc.kind {
             MediaKind::Audio => pc.audio_mid = Some(mid),
             MediaKind::Video => pc.video_mid = Some(mid),
@@ -978,6 +1015,51 @@ const fn classify_packet(data: &[u8]) -> &'static str {
     }
 }
 
+/// How long ICE may stay disconnected before the connection is abandoned.
+///
+/// Matches the order of magnitude browsers allow before declaring a peer connection failed.
+/// Long enough to ride out a wifi roam or a brief route change; short enough that a
+/// genuinely dead connection does not linger.
+pub const ICE_DISCONNECT_GRACE: Duration = Duration::from_secs(30);
+
+/// Whether an ICE disconnection has gone on long enough to give up on.
+#[must_use]
+pub fn ice_disconnect_expired(since: Option<Instant>, now: Instant) -> bool {
+    since.is_some_and(|t| now.saturating_duration_since(t) >= ICE_DISCONNECT_GRACE)
+}
+
+/// Record an ICE state transition, starting or clearing the disconnection clock.
+fn note_ice_state(pc: &mut PeerConnectionInner, mapped: IceState) {
+    match mapped {
+        IceState::Disconnected => {
+            // Start the clock rather than tearing down. Recovery is normal.
+            let first = pc.ice_disconnected_since.is_none();
+            pc.ice_disconnected_since.get_or_insert_with(Instant::now);
+            if first {
+                tracing::warn!(
+                    pc_id = %pc.id,
+                    grace_secs = ICE_DISCONNECT_GRACE.as_secs(),
+                    reason = "ice_disconnected",
+                    "ICE disconnected; waiting for it to recover before giving up"
+                );
+            }
+        }
+        IceState::Connected | IceState::Completed => {
+            if let Some(since) = pc.ice_disconnected_since.take() {
+                tracing::info!(
+                    pc_id = %pc.id,
+                    down_ms = since.elapsed().as_millis(),
+                    "ICE recovered after a disconnection"
+                );
+            }
+            tracing::info!(pc_id = %pc.id, state = ?mapped, "ICE connection state changed");
+        }
+        IceState::New | IceState::Checking | IceState::Failed | IceState::Closed => {
+            tracing::info!(pc_id = %pc.id, state = ?mapped, "ICE connection state changed");
+        }
+    }
+}
+
 fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<WirePcEvent> {
     match event {
         Event::IceConnectionStateChange(state) => {
@@ -986,21 +1068,9 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
                 IceConnectionState::Checking => IceState::Checking,
                 IceConnectionState::Connected => IceState::Connected,
                 IceConnectionState::Completed => IceState::Completed,
-                IceConnectionState::Disconnected => {
-                    pc.alive = false;
-                    IceState::Disconnected
-                }
+                IceConnectionState::Disconnected => IceState::Disconnected,
             };
-            if mapped == IceState::Disconnected {
-                tracing::warn!(
-                    pc_id = %pc.id,
-                    state = ?mapped,
-                    reason = "ice_disconnected",
-                    "peer connection failed"
-                );
-            } else {
-                tracing::info!(pc_id = %pc.id, state = ?mapped, "ICE connection state changed");
-            }
+            note_ice_state(pc, mapped);
             Some(PcEvent::IceConnectionStateChange(mapped))
         }
         Event::Connected => {
@@ -1440,5 +1510,145 @@ mod audio_send_pacing_tests {
             .expect("a report after the second window");
         assert!(r.max_gap_ms >= 100, "max_gap_ms was {}", r.max_gap_ms);
         assert_eq!(r.late, 1);
+    }
+}
+
+#[cfg(test)]
+mod offer_track_id_tests {
+    use super::{TransceiverInfo, create_offer, create_peer_connection};
+    use str0m::media::{Direction, MediaKind};
+
+    /// `LiveKit`'s SFU pairs an `AddTrackRequest` with an m-line by matching the request's
+    /// `cid` against the offer's msid track id. livekit-client gets this for free because
+    /// its `cid` *is* the `MediaStreamTrack.id`; we have to pass the value through
+    /// explicitly. When it was left unset str0m invented an id the SFU had never seen, and
+    /// association fell through to the server's match-by-kind fallback -- which works until
+    /// ordering or track counts change, and then silently publishes a track nobody
+    /// subscribes to.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_offer_advertises_the_supplied_track_id_as_its_msid() {
+        let mut pc = create_peer_connection("test".to_owned());
+        let offer = create_offer(
+            &mut pc,
+            &[],
+            &[TransceiverInfo {
+                kind: MediaKind::Audio,
+                direction: Direction::SendRecv,
+                track_id: Some("PA_abc123-audio-microphone".to_owned()),
+            }],
+        )
+        .expect("offer");
+
+        let msid = offer
+            .sdp
+            .lines()
+            .find(|l| l.starts_with("a=msid:"))
+            .expect("the offer must carry an msid line");
+        assert!(
+            msid.ends_with(" PA_abc123-audio-microphone"),
+            "msid track id must be the supplied cid, got {msid:?}"
+        );
+    }
+
+    /// Re-offering must not allocate a second mid for a kind that already has one:
+    /// `add_media` appends unconditionally, so publishing video after audio would otherwise
+    /// describe the audio track twice and leave the first m-line orphaned.
+    ///
+    /// Asserts on the recorded mid rather than the SDP: a faithful SDP assertion would need
+    /// a completed offer/answer handshake, and the mid is the state the rest of the code
+    /// actually uses to route media.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn re_offering_keeps_the_existing_transceivers_mid() {
+        let mut pc = create_peer_connection("test".to_owned());
+        let audio = TransceiverInfo {
+            kind: MediaKind::Audio,
+            direction: Direction::SendRecv,
+            track_id: Some("cid-audio".to_owned()),
+        };
+        create_offer(&mut pc, &[], std::slice::from_ref(&audio)).expect("first offer");
+        let first_mid = pc.audio_mid.expect("audio mid recorded");
+
+        create_offer(
+            &mut pc,
+            &[],
+            &[
+                audio,
+                TransceiverInfo {
+                    kind: MediaKind::Video,
+                    direction: Direction::SendRecv,
+                    track_id: Some("cid-video".to_owned()),
+                },
+            ],
+        )
+        .expect("second offer");
+
+        assert_eq!(
+            pc.audio_mid,
+            Some(first_mid),
+            "the audio transceiver must keep its original mid across a renegotiation"
+        );
+        assert!(pc.video_mid.is_some(), "the new video transceiver must be added");
+        assert_ne!(pc.video_mid, pc.audio_mid);
+    }
+}
+
+#[cfg(test)]
+mod ice_disconnect_tests {
+    use super::{ICE_DISCONNECT_GRACE, IceState, create_peer_connection, ice_disconnect_expired, note_ice_state};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_connection_that_was_never_disconnected_never_expires() {
+        assert!(!ice_disconnect_expired(None, Instant::now()));
+    }
+
+    #[test]
+    fn a_brief_disconnection_does_not_expire() {
+        let since = Instant::now();
+        assert!(!ice_disconnect_expired(
+            Some(since),
+            since + ICE_DISCONNECT_GRACE - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn a_disconnection_past_the_grace_period_expires() {
+        let since = Instant::now();
+        assert!(ice_disconnect_expired(Some(since), since + ICE_DISCONNECT_GRACE));
+    }
+
+    /// The whole point: `Disconnected` must not kill the connection on its own.
+    ///
+    /// str0m documents this state as recoverable and has no terminal failure state at all
+    /// ("it's always possible to come back"). Treating it as fatal made every transient
+    /// blip permanent.
+    #[test]
+    fn disconnecting_does_not_kill_the_connection() {
+        let mut pc = create_peer_connection("test".to_owned());
+        note_ice_state(&mut pc, IceState::Disconnected);
+        assert!(pc.alive, "a disconnection must not mark the connection dead");
+        assert!(pc.ice_disconnected_since.is_some(), "the clock must start");
+    }
+
+    #[test]
+    fn recovering_clears_the_disconnection_clock() {
+        let mut pc = create_peer_connection("test".to_owned());
+        note_ice_state(&mut pc, IceState::Disconnected);
+        note_ice_state(&mut pc, IceState::Connected);
+        assert!(pc.ice_disconnected_since.is_none());
+        assert!(pc.alive);
+    }
+
+    /// Repeated `Disconnected` events must not keep resetting the clock, or a connection
+    /// flapping every few seconds would never exhaust the grace period.
+    #[test]
+    fn repeated_disconnections_do_not_restart_the_clock() {
+        let mut pc = create_peer_connection("test".to_owned());
+        note_ice_state(&mut pc, IceState::Disconnected);
+        let first = pc.ice_disconnected_since;
+        note_ice_state(&mut pc, IceState::Disconnected);
+        assert_eq!(pc.ice_disconnected_since, first);
     }
 }

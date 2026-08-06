@@ -193,6 +193,44 @@ impl WebRtcEngine {
 /// smoothly-produced frames are handed to str0m in clumps and transmitted in clumps, and
 /// the far end's jitter buffer conceals the gaps -- robotic audio with, by construction,
 /// zero packet loss for RTCP to report.
+/// Wait for inbound UDP and feed it to str0m. Returns `false` when the loop should exit.
+///
+/// Split out so the peer-connection lock is released as soon as the receive is done rather
+/// than being held for the rest of the iteration.
+fn recv_phase(
+    handle: &PeerConnectionHandle,
+    socket: &UdpSocket,
+    recv_buf: &mut [u8],
+    wait: Duration,
+) -> bool {
+    let mut pc = lock_pc(handle);
+    if !pc.alive {
+        tracing::info!(pc_id = %pc.id, "Peer connection no longer alive");
+        return false;
+    }
+    // A disconnected ICE agent is given time to recover before the loop exits; str0m keeps
+    // running connectivity checks throughout, so exiting early is what turns a transient
+    // blip into a permanent outage.
+    if peer_connection::ice_disconnect_expired(pc.ice_disconnected_since, Instant::now()) {
+        tracing::warn!(
+            pc_id = %pc.id,
+            grace_secs = peer_connection::ICE_DISCONNECT_GRACE.as_secs(),
+            "ICE stayed disconnected past the grace period; giving up"
+        );
+        pc.alive = false;
+        return false;
+    }
+    match peer_connection::recv_and_feed(&mut pc, socket, recv_buf, wait) {
+        Ok(true) => peer_connection::drain_backlog(&mut pc, socket, recv_buf),
+        Ok(false) => {}
+        Err(e) => tracing::debug!("recv_and_feed: {e}"),
+    }
+    // Released explicitly: the caller's next step is `poll_once`, which takes the same
+    // lock, and holding it until the end of scope would serialise the two needlessly.
+    drop(pc);
+    true
+}
+
 #[derive(Default)]
 struct WritePacing {
     last_write: Option<Instant>,
@@ -361,19 +399,8 @@ fn io_loop(
             .max(Duration::from_millis(1));
         let wait = wait.min(Duration::from_millis(20)); // Cap at 20ms for responsiveness
 
-        {
-            let mut pc = lock_pc(handle);
-            if !pc.alive {
-                tracing::info!(pc_id = %pc.id, "Peer connection no longer alive");
-                return;
-            }
-            match peer_connection::recv_and_feed(&mut pc, socket, &mut recv_buf, wait) {
-                Ok(true) => peer_connection::drain_backlog(&mut pc, socket, &mut recv_buf),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::debug!("recv_and_feed: {e}");
-                }
-            }
+        if !recv_phase(handle, socket, &mut recv_buf, wait) {
+            return;
         }
     }
 }
