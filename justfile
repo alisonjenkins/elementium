@@ -1,5 +1,9 @@
 # Elementium task runner
 
+# List justfile targets
+list:
+    @just --list
+
 # Development
 dev:
     cargo tauri dev
