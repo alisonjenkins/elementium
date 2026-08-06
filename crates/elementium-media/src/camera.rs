@@ -344,10 +344,10 @@ impl Drop for CameraCapturer {
 
 /// Convert YUYV (YUY2) packed data to RGBA.
 ///
-/// YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V].
-/// Each pair shares U and V chroma values.
+/// YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V]. Each pair shares U and V chroma
+/// values. Uses the `yuv` crate's SIMD-accelerated (AVX2/SSE/NEON, with scalar fallback)
+/// converter -- BT.601 full-range, matching this function's previous hand-rolled math.
 fn yuyv_to_rgba(width: u32, height: u32, yuyv: &[u8]) -> Vec<u8> {
-    // Pixel dimensions comfortably fit in usize on all supported platforms.
     let Some(pixel_count) = usize::try_from(width)
         .ok()
         .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
@@ -357,57 +357,25 @@ fn yuyv_to_rgba(width: u32, height: u32, yuyv: &[u8]) -> Vec<u8> {
     let Some(capacity) = pixel_count.checked_mul(4) else {
         return Vec::new();
     };
-    let mut rgba = Vec::with_capacity(capacity);
+    let mut rgba = vec![0u8; capacity];
 
-    // Process two pixels at a time (4 bytes of YUYV → 8 bytes of RGBA)
-    let pair_count = pixel_count / 2;
-    for i in 0..pair_count {
-        let Some(base) = i.checked_mul(4) else {
-            break;
-        };
-        let (Some(&y0_raw), Some(&u_raw), Some(&y1_raw), Some(&v_raw)) = (
-            yuyv.get(base),
-            base.checked_add(1).and_then(|idx| yuyv.get(idx)),
-            base.checked_add(2).and_then(|idx| yuyv.get(idx)),
-            base.checked_add(3).and_then(|idx| yuyv.get(idx)),
-        ) else {
-            break;
-        };
+    let packed = yuv::YuvPackedImage {
+        yuy: yuyv,
+        yuy_stride: width.saturating_mul(2),
+        width,
+        height,
+    };
+    let rgba_stride = width.saturating_mul(4);
 
-        let y0 = f32::from(y0_raw);
-        let u = f32::from(u_raw) - 128.0;
-        let y1 = f32::from(y1_raw);
-        let v = f32::from(v_raw) - 128.0;
-
-        // BT.601 YUV → RGB
-        // Intentional lossy conversion: clamped to [0, 255] before truncation to u8.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
-        let r0 = 1.402f32.mul_add(v, y0).clamp(0.0, 255.0) as u8;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
-        let g0 = 0.714f32
-            .mul_add(-v, 0.344f32.mul_add(-u, y0))
-            .clamp(0.0, 255.0) as u8;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
-        let b0 = 1.772f32.mul_add(u, y0).clamp(0.0, 255.0) as u8;
-
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
-        let r1 = 1.402f32.mul_add(v, y1).clamp(0.0, 255.0) as u8;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
-        let g1 = 0.714f32
-            .mul_add(-v, 0.344f32.mul_add(-u, y1))
-            .clamp(0.0, 255.0) as u8;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
-        let b1 = 1.772f32.mul_add(u, y1).clamp(0.0, 255.0) as u8;
-
-        rgba.push(r0);
-        rgba.push(g0);
-        rgba.push(b0);
-        rgba.push(255);
-
-        rgba.push(r1);
-        rgba.push(g1);
-        rgba.push(b1);
-        rgba.push(255);
+    if let Err(e) = yuv::yuyv422_to_rgba(
+        &packed,
+        &mut rgba,
+        rgba_stride,
+        yuv::YuvRange::Full,
+        yuv::YuvStandardMatrix::Bt601,
+    ) {
+        tracing::error!(width, height, error = %e, "SIMD YUYV->RGBA conversion failed, returning blank frame");
+        rgba.fill(0);
     }
 
     rgba
