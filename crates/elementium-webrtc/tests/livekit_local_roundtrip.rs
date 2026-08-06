@@ -131,7 +131,13 @@ fn sine_wave_chunks(duration_ms: u32, freq_hz: f32) -> Vec<Vec<f32>> {
     chunks
 }
 
-#[tokio::test]
+// Multi-threaded runtime, not the default single-threaded one: alice's signal-processing
+// loop, bob's signal-processing loop, and this test function's own audio-sending loop all
+// need to run with genuine parallelism. On a single cooperative thread, a long-running task
+// (or one slow to yield) can starve the others -- e.g. the SFU renegotiating a subscriber's
+// SDP mid-call needs that side's signal loop to be scheduled promptly to answer in time, or
+// the SFU gives up ("negotiation timed out") and tears down the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a local livekit-server (see module docs for the docker run command)"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn audio_survives_real_publish_subscribe_round_trip() {
