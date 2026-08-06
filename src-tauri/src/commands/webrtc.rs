@@ -15,7 +15,7 @@ use tracing::Instrument;
 use elementium_types::{CorrelationId, IceCandidate, SessionDescription};
 use elementium_webrtc::engine::{IceServerConfig, WebRtcEngine};
 use elementium_webrtc::peer_connection;
-use elementium_webrtc::{AudioPipeline, PcEvent, VideoPipeline};
+use elementium_webrtc::{PcEvent, VideoPipeline, start_audio_playback};
 
 use super::media_devices::MediaState;
 
@@ -315,7 +315,7 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
 
     // Start audio playback pipeline (receives Opus → decodes → cpal output)
     let audio_rx = Arc::new(Mutex::new(audio_rx));
-    if let Err(e) = AudioPipeline::start_playback(audio_rx) {
+    if let Err(e) = start_audio_playback(audio_rx) {
         tracing::error!(pc_id = pc_id, "Failed to start audio playback: {e}");
     }
 
