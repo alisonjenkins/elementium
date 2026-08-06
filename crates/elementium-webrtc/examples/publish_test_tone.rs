@@ -19,6 +19,12 @@
 //! `--key-hex` enables E2EE with that raw key material at index 0; without it the stream is
 //! published unencrypted. Both are needed: comparing them is what separates "the browser
 //! cannot decrypt our frames" from "the browser cannot play our audio".
+//!
+//! `--rotate-frames N` switches to the next key every N frames, cycling through keys derived
+//! from `--key-hex` by appending the index. Element Call rotates keys as participants come
+//! and go, and a rotation the two sides disagree about drops only the frames encrypted
+//! during the disagreement -- which sounds like part of a sentence going missing, not like
+//! silence. A static-key test cannot see it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -103,6 +109,16 @@ fn tone_frame(start_sample: u32) -> Vec<f32> {
     frame
 }
 
+/// Key material for rotation `index`, derived from the base key so both sides can compute
+/// the same sequence without exchanging anything beyond the base key and the index.
+fn rotated_key(base: &[u8], index: u8) -> Vec<u8> {
+    let mut key = base.to_vec();
+    if let Some(first) = key.first_mut() {
+        *first ^= index;
+    }
+    key
+}
+
 fn arg(name: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     args.iter()
@@ -138,13 +154,18 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    let policy = arg("--key-hex").map_or(EncryptionPolicy::ExplicitlyUnencrypted, |hex| {
-        let material = decode_hex(&hex).expect("--key-hex must be valid hex");
+    let rotate_frames: u64 = arg("--rotate-frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let base_key = arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
+    let ctx = base_key.as_ref().map(|material| {
         let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
         ctx.set_local_identity(&identity);
-        ctx.set_key(&identity, 0, &material);
-        EncryptionPolicy::Encrypted(ctx)
+        ctx.set_key(&identity, 0, &rotated_key(material, 0));
+        ctx
     });
+    let policy = ctx.clone().map_or(EncryptionPolicy::ExplicitlyUnencrypted, EncryptionPolicy::Encrypted);
 
     let video_frames: elementium_webrtc::engine::VideoFrameBuffer =
         Arc::new(Mutex::new(HashMap::new()));
@@ -189,8 +210,21 @@ async fn main() {
     let mut ticker = tokio::time::interval(Duration::from_millis(20));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
 
-    for _ in 0..frames {
+    let mut key_index: u8 = 0;
+    for i in 0..frames {
         ticker.tick().await;
+
+        // Rotate on schedule, exactly as a client would when the room membership changes.
+        if rotate_frames > 0
+            && i > 0
+            && i.is_multiple_of(rotate_frames)
+            && let (Some(ctx), Some(base)) = (ctx.as_ref(), base_key.as_ref())
+        {
+            key_index = key_index.wrapping_add(1);
+            ctx.set_key(&identity, key_index, &rotated_key(base, key_index));
+            println!("ROTATED {key_index}");
+        }
+
         let frame = tone_frame(sample_index);
         sample_index = sample_index.wrapping_add(
             u32::try_from(FRAME_SAMPLES).unwrap_or(960),

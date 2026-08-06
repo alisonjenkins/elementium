@@ -129,13 +129,19 @@ interface Publisher {
 }
 
 /** Spawn the Rust publisher and resolve once it reports that it is actually sending. */
-function startPublisher(room: string, seconds: number, keyHex?: string): Publisher {
+function startPublisher(
+  room: string,
+  seconds: number,
+  keyHex?: string,
+  rotateFrames = 0,
+): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
     "--room", room,
     "--identity", "rust-publisher",
     "--seconds", String(seconds),
     ...(keyHex ? ["--key-hex", keyHex] : []),
+    ...(rotateFrames > 0 ? ["--rotate-frames", String(rotateFrames)] : []),
   ];
   const proc = spawn(PUBLISHER, args, { stdio: "pipe" });
   let sent: number | null = null;
@@ -179,6 +185,8 @@ interface InboundStats {
 async function measure(
   page: import("@playwright/test").Page,
   keyHex?: string,
+  rotateFrames = 0,
+  keyDelayMs = 0,
 ): Promise<{ stats: InboundStats; sent: number | null; errors: string[] }> {
   const roomName = `elementium-recv-${Date.now()}`;
   const server = await startPageServer();
@@ -195,12 +203,18 @@ async function measure(
   const token = mintToken("browser-subscriber", roomName);
   const query = new URLSearchParams({ url: SFU_WS, token });
   if (keyHex) query.set("key", keyHex);
+  // 30s at 50fps, so the browser can pre-install every key the publisher will use.
+  if (rotateFrames > 0) {
+    query.set("rotations", String(Math.ceil(1500 / rotateFrames)));
+    query.set("rotatems", String(rotateFrames * 20));
+    if (keyDelayMs > 0) query.set("keydelay", String(keyDelayMs));
+  }
   await page.goto(`${server.origin}/?${query.toString()}`);
   await expect
     .poll(() => page.textContent("#state"), { timeout: 20_000 })
     .toBe("connected");
 
-  const publisher = startPublisher(roomName, 30, keyHex);
+  const publisher = startPublisher(roomName, 30, keyHex, rotateFrames);
 
   try {
     await publisher.live;
@@ -219,14 +233,22 @@ async function measure(
         throw e;
       });
 
+    // Retry rather than failing on the first miss: livekit creates the subscribing peer
+    // connection lazily, so stats can genuinely be unavailable for a moment after the track
+    // is reported subscribed. Failing immediately turned that race into a flake.
     const read = async (): Promise<InboundStats> => {
-      const s = await page.evaluate(() =>
-        (window as never as {
-          __stats: () => Promise<InboundStats | { error: string }>;
-        }).__stats(),
-      );
-      if ("error" in s) throw new Error(`could not read receiver stats: ${s.error}`);
-      return s;
+      let last = "not attempted";
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const s = await page.evaluate(() =>
+          (window as never as {
+            __stats: () => Promise<InboundStats | { error: string }>;
+          }).__stats(),
+        );
+        if (!("error" in s)) return s;
+        last = s.error;
+        await page.waitForTimeout(500);
+      }
+      throw new Error(`could not read receiver stats after 10s: ${last}`);
     };
 
     // Let the jitter buffer settle, take a baseline, then measure a steady-state window.
@@ -299,5 +321,37 @@ test.describe("browser receive path", () => {
     // the real assertion -- but worker errors are worth surfacing when they do occur.
     expect(errors, "no page errors").toEqual([]);
     assertHealthy(stats, "encrypted");
+  });
+
+  test("audio survives key rotation mid-call", async ({ page }) => {
+    // Rotate every 100 frames (2 seconds), so the 10-second measurement window spans about
+    // five rotations. Element Call rotates whenever room membership changes, and a rotation
+    // the two sides disagree about loses only the frames encrypted during the disagreement
+    // -- heard as part of a sentence going missing while the rest arrives normally, which
+    // is exactly the reported symptom and is what a static-key test cannot produce.
+    const { stats, errors } = await measure(page, KEY_HEX, 100);
+    expect(errors, "no page errors").toEqual([]);
+    assertHealthy(stats, "rotating");
+  });
+
+  // REPRODUCTION, expected to fail until the sender stops encrypting with a key before the
+  // far end can possibly have it. `test.fail()` means this passes while the defect exists
+  // and starts failing the moment it is fixed -- at which point delete the marker.
+  //
+  // Measured behaviour: 52 of ~500 packets usable, 426,630 of 480,480 samples concealed
+  // (89%), and `packetsLost` of 0 throughout. Zero reported loss is why every sender-side
+  // measurement of this bug came back clean.
+  test("audio survives a key rotation the far end learns about late", async ({ page }) => {
+    test.fail();
+    // The same rotation, but the receiver only learns each new key 500ms after the sender
+    // starts using it -- a realistic delay for a key published over Matrix and fanned out
+    // to a room. Any frame sent inside that window is undecryptable at the far end.
+    //
+    // 500ms of a 2s rotation period is a quarter of all audio. If this fails while the
+    // pre-installed variant passes, the defect is that we switch encryption keys the moment
+    // one is handed to us, without regard for whether anyone else can read them yet.
+    const { stats, errors } = await measure(page, KEY_HEX, 100, 500);
+    expect(errors, "no page errors").toEqual([]);
+    assertHealthy(stats, "rotating with late key delivery");
   });
 });

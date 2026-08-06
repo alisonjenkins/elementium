@@ -3,6 +3,24 @@
 <title>Elementium receive-path probe</title>
 <body>
   <p id="state">idle</p>
+  <script>
+    // Record every RTCPeerConnection the page creates, before livekit can make one.
+    //
+    // Stats are read from the connection itself rather than through livekit's track
+    // objects: with E2EE the track is wrapped for insertable streams and its `receiver` is
+    // not populated, so both `track.receiver.getStats()` and `getRTCStatsReport()` (which
+    // is only a wrapper around it) return nothing. Going to the source removes the
+    // dependency on livekit's internals entirely, and is the same trick the app's own shim
+    // uses to intercept this API.
+    window.__pcs = [];
+    const NativePC = window.RTCPeerConnection;
+    window.RTCPeerConnection = function (...args) {
+      const pc = new NativePC(...args);
+      window.__pcs.push(pc);
+      return pc;
+    };
+    window.RTCPeerConnection.prototype = NativePC.prototype;
+  </script>
   <script type="module">
     // Served by the Playwright fixture: /lk/ maps to livekit-client's dist directory, so
     // the page runs the same client library Element Call ships rather than a stand-in.
@@ -43,7 +61,44 @@
           worker: new Worker("/lk/livekit-client.e2ee.worker.mjs", { type: "module" }),
         },
       });
-      await keyProvider.setKey(hexToBytes(keyHex));
+
+      // `ExternalE2EEKeyProvider.setKey` only ever installs at index 0, but a rotating
+      // sender stamps a changing index into every frame trailer. Element Call installs keys
+      // at explicit indices through `onSetEncryptionKey`, so the probe does the same --
+      // importing the material exactly as livekit's own `createKeyMaterialFromBuffer` does.
+      const installKey = async (bytes, index) => {
+        const material = await crypto.subtle.importKey("raw", bytes, "HKDF", false, [
+          "deriveBits",
+          "deriveKey",
+        ]);
+        keyProvider.onSetEncryptionKey(material, undefined, index);
+      };
+
+      const base = hexToBytes(keyHex);
+      const rotations = Number(params.get("rotations") ?? 0);
+      // Same derivation as the publisher: base key with the index XORed into byte 0.
+      const keyFor = (i) => {
+        const key = Uint8Array.from(base);
+        key[0] ^= i;
+        return key;
+      };
+
+      // `keydelay` models the real key-distribution channel. Element Call publishes a new
+      // key over Matrix and peers receive it some time later; if the sender switches to it
+      // before they have it, every frame in that window is undecryptable -- which is heard
+      // as part of a sentence going missing while the rest arrives cleanly. With no delay
+      // the keys are pre-installed and the test measures only the wire handling of a
+      // changing index.
+      const keyDelayMs = Number(params.get("keydelay") ?? 0);
+      const rotateMs = Number(params.get("rotatems") ?? 0);
+      await installKey(keyFor(0), 0);
+      for (let i = 1; i <= rotations; i += 1) {
+        if (keyDelayMs > 0) {
+          setTimeout(() => installKey(keyFor(i), i), i * rotateMs + keyDelayMs);
+        } else {
+          await installKey(keyFor(i), i);
+        }
+      }
       await room.setE2EEEnabled(true);
     } else {
       room = new Room();
@@ -84,61 +139,44 @@
     });
 
     /**
-     * Inbound audio stats, read from the receiving RTCPeerConnection.
+     * Inbound audio stats, read from every peer connection the page created.
      *
-     * These are the numbers that separate the two remaining explanations for bad audio:
-     * `packetsLost` counts what never arrived, while `concealedSamples` and the
-     * accelerate/decelerate counters count what arrived and could not be played as sent --
-     * a decryption failure, a jitter-buffer stall or a sender whose clock runs off. All of
-     * those are invisible to RTCP, which is why the sending side kept reporting health.
-     *
-     * Reads off the track captured at subscription time rather than re-deriving it from the
-     * participant map: the wrapper livekit puts around an E2EE track does not always expose
-     * `receiver`, and silently finding nothing is indistinguishable from finding zeroes.
+     * The measurement is not packet loss. `packetsLost` counts what never arrived, while
+     * `concealedSamples` and the accelerate/decelerate counters count what arrived and
+     * could not be played as sent -- a decryption failure, a jitter-buffer stall, or a
+     * sender whose clock runs off. All of those stay invisible to RTCP, which is why the
+     * sending side kept reporting a healthy stream while listeners heard a robot.
      */
     window.__stats = async () => {
-      const track = window.__audioTrack;
-      if (!track) return { error: "no audio track was subscribed" };
+      if (!window.__subscribed) return { error: "no audio track was subscribed" };
 
-      let report = null;
-      if (track.receiver?.getStats) {
-        report = await track.receiver.getStats();
-      } else if (typeof track.getRTCStatsReport === "function") {
-        report = await track.getRTCStatsReport();
-      }
-      if (!report) {
+      for (const pc of window.__pcs) {
+        const report = await pc.getStats();
+        let inbound = null;
+        report.forEach((s) => {
+          if (s.type === "inbound-rtp" && s.kind === "audio") inbound = s;
+        });
+        if (!inbound) continue;
+
+        let codec = null;
+        report.forEach((s) => {
+          if (s.type === "codec" && s.id === inbound.codecId) codec = s;
+        });
         return {
-          error:
-            "no stats source on the subscribed track; track keys=" +
-            Object.keys(track).join("|") +
-            " proto=" +
-            Object.getOwnPropertyNames(Object.getPrototypeOf(track)).join("|") +
-            " engine=" + typeof room.engine +
-            " pcm=" + typeof room.engine?.pcManager,
+          mimeType: codec?.mimeType ?? null,
+          packetsReceived: inbound.packetsReceived ?? 0,
+          packetsLost: inbound.packetsLost ?? 0,
+          concealedSamples: inbound.concealedSamples ?? 0,
+          silentConcealedSamples: inbound.silentConcealedSamples ?? 0,
+          concealmentEvents: inbound.concealmentEvents ?? 0,
+          totalSamplesReceived: inbound.totalSamplesReceived ?? 0,
+          insertedSamplesForDeceleration: inbound.insertedSamplesForDeceleration ?? 0,
+          removedSamplesForAcceleration: inbound.removedSamplesForAcceleration ?? 0,
+          jitter: inbound.jitter ?? 0,
         };
       }
-
-      let inbound = null;
-      let codec = null;
-      report.forEach((s) => {
-        if (s.type === "inbound-rtp" && s.kind === "audio") inbound = s;
-      });
-      if (!inbound) return { error: "no inbound-rtp audio stats in the report" };
-      report.forEach((s) => {
-        if (s.type === "codec" && s.id === inbound.codecId) codec = s;
-      });
-
       return {
-        mimeType: codec?.mimeType ?? null,
-        packetsReceived: inbound.packetsReceived ?? 0,
-        packetsLost: inbound.packetsLost ?? 0,
-        concealedSamples: inbound.concealedSamples ?? 0,
-        silentConcealedSamples: inbound.silentConcealedSamples ?? 0,
-        concealmentEvents: inbound.concealmentEvents ?? 0,
-        totalSamplesReceived: inbound.totalSamplesReceived ?? 0,
-        insertedSamplesForDeceleration: inbound.insertedSamplesForDeceleration ?? 0,
-        removedSamplesForAcceleration: inbound.removedSamplesForAcceleration ?? 0,
-        jitter: inbound.jitter ?? 0,
+        error: `no inbound-rtp audio stats on any of ${window.__pcs.length} peer connections`,
       };
     };
 
