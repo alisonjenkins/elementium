@@ -12,12 +12,18 @@ use str0m::channel::{ChannelConfig, Reliability};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use elementium_types::{
-    IceConnectionState as IceState, PeerConnectionState, SdpType, SessionDescription,
+    IceConnectionState as IceState, PeerConnectionState, PlaintextMedia, SdpType,
+    SessionDescription, WireMedia,
 };
 
 /// Events emitted by a peer connection to the application layer.
+///
+/// Generic over the media payload so the encryption boundary is visible in the type:
+/// [`WirePcEvent`] (straight off the network, possibly ciphertext) is produced by
+/// `poll_once`, and only [`crate::e2ee_io::maybe_decrypt_event`] can turn it into a
+/// `PcEvent<PlaintextMedia>`, which is the only thing the decode pipelines accept.
 #[derive(Debug, Clone)]
-pub enum PcEvent {
+pub enum PcEvent<P = PlaintextMedia> {
     /// ICE connection state changed.
     IceConnectionStateChange(IceState),
     /// Peer connection state changed.
@@ -30,11 +36,47 @@ pub enum PcEvent {
     Connected,
     /// A new remote media track was added.
     RemoteTrackAdded { mid: String, kind: String },
-    /// Received audio data (Opus packet).
-    AudioData(Vec<u8>),
-    /// Received video data (VP8 packet).
-    VideoData(Vec<u8>),
+    /// Received audio data (Opus packet) on a specific remote track.
+    ///
+    /// `mid` identifies which media line this packet came from -- required because a
+    /// single `PeerConnection` can carry more than one remote audio track (e.g. two
+    /// participants' audio bundled onto one connection in a mesh call). Without it,
+    /// packets from independent Opus encoder streams would be indistinguishable and
+    /// have to be fed through one shared decoder, corrupting both streams (this was a
+    /// real bug: interleaving two encoders' packets into a single stateful Opus decoder
+    /// produces garbage audio, heard as "digital screeching").
+    ///
+    /// `contiguous` is str0m's own gap detector (`MediaData::contiguous`): `false` means
+    /// one or more RTP packets were lost between this frame and the last one emitted for
+    /// this track. Opus is stateful (LPC history) -- feeding it a real packet right after
+    /// an unconcealed gap, as if no time had passed, produces a phase discontinuity at
+    /// that boundary. Under sustained loss, repeated unconcealed discontinuities produce
+    /// harsh broadband noise bursts audible as "digital screeching", not just an
+    /// occasional click. Carried through so the playback pipeline can call Opus's
+    /// packet-loss concealment for the gap before decoding the real packet.
+    AudioData { mid: String, data: P, contiguous: bool },
+    /// Received video data (VP8 packet) on a specific remote track. See `AudioData` for
+    /// why `mid` is required.
+    VideoData { mid: String, data: P },
+    /// Aggregated outbound stats for one of our sending tracks, from RTCP receiver
+    /// reports sent back by the peers.
+    ///
+    /// `loss` is the fraction (`0.0..=1.0`) of our packets the peers report not
+    /// receiving, and is `None` when no report arrived in the interval. It is the only
+    /// direct measurement we have of how much of our audio is actually being lost, which
+    /// is what decides how much FEC redundancy the Opus encoder should emit.
+    EgressStats {
+        mid: String,
+        loss: Option<f32>,
+        rtt_ms: Option<u64>,
+        packets: u64,
+        nacks: u64,
+    },
 }
+
+/// A [`PcEvent`] whose media payload came straight off the network and may still be
+/// encrypted. Cannot reach a decoder: decoders only accept [`PlaintextMedia`].
+pub type WirePcEvent = PcEvent<WireMedia>;
 
 /// Shared state for a single peer connection.
 pub struct PeerConnectionInner {
@@ -45,7 +87,21 @@ pub struct PeerConnectionInner {
     pub pending_offer: Option<SdpPendingOffer>,
     pub remote_mids: HashMap<Mid, MediaKind>,
     pub audio_frame_count: u64,
+    /// Wall-clock instant corresponding to audio RTP timestamp 0 on this connection.
+    ///
+    /// Set on the first audio write; every later frame's wallclock is derived from it and
+    /// the frame counter, rather than read from the clock at write time. See
+    /// [`audio_wallclock`].
+    pub audio_epoch: Option<Instant>,
     pub video_frame_count: u64,
+    /// Last RTP sequence number emitted per audio `mid`, for out-of-order detection.
+    ///
+    /// Opus frames must reach the decoder in the order they were encoded. If str0m emits
+    /// them out of sequence, every individual packet still decodes cleanly (no errors,
+    /// plausible amplitudes) but the audio is scrambled in time -- which sounds like
+    /// harsh garbage and is invisible to every other check in this pipeline. Captured
+    /// here so ordering is provable from logs instead of inferred.
+    pub last_audio_seq: HashMap<Mid, u64>,
     pub alive: bool,
     /// Set to true after SDP negotiation triggers DTLS initialization inside str0m.
     /// Before this, calling `poll_output` would panic in dimpl because `handle_timeout`
@@ -56,6 +112,14 @@ pub struct PeerConnectionInner {
     /// str0m generates the answer during `accept_offer`, but the WebRTC API expects
     /// `createAnswer()` to return it separately. Cache it here for that call.
     pub cached_answer: Option<SessionDescription>,
+    /// Negotiated Opus payload type, recorded on each audio write.
+    ///
+    /// Needed to pick our own audio packets back out of the outgoing UDP stream at the
+    /// socket, where audio, video, RTCP and STUN are all interleaved on one port.
+    pub audio_pt: Option<u8>,
+    /// Cadence of audio RTP packets as they actually leave the socket. See
+    /// [`AudioSendPacing`].
+    pub audio_send_pacing: AudioSendPacing,
     /// Counter for UDP transmit logging (throttle after first 10).
     pub transmit_log_count: u64,
     /// Counter for UDP receive logging (throttle after first 10).
@@ -76,6 +140,14 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         .clear_codecs()
         .enable_opus(true)
         .enable_vp8(true)
+        // Off by default in str0m, which means `Event::MediaEgressStats` never fires and
+        // the RTCP receiver reports the peers are already sending us are parsed and then
+        // thrown away. Those reports carry the fraction of our packets each peer failed
+        // to receive -- the only real measurement of outbound loss available to us, and
+        // what the Opus encoder needs to size its FEC redundancy correctly instead of
+        // guessing. One second matches the RTCP reporting interval; polling faster would
+        // just re-report the same numbers.
+        .set_stats_interval(Some(Duration::from_secs(1)))
         .build(now);
 
     // str0m's DTLS layer (dimpl) requires handle_timeout before any poll_output.
@@ -90,10 +162,14 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         pending_offer: None,
         remote_mids: HashMap::new(),
         audio_frame_count: 0,
+        audio_epoch: None,
         video_frame_count: 0,
+        last_audio_seq: HashMap::new(),
         alive: true,
         dtls_initialized: false,
         cached_answer: None,
+        audio_pt: None,
+        audio_send_pacing: AudioSendPacing::default(),
         transmit_log_count: 0,
         recv_log_count: 0,
         remote_candidates: Vec::new(),
@@ -206,7 +282,7 @@ pub fn create_offer(
     pc: &mut PeerConnectionInner,
     data_channels: &[DataChannelInfo],
     transceivers: &[TransceiverInfo],
-) -> Result<SessionDescription, String> {
+) -> Result<SessionDescription, crate::error::WebRtcError> {
     let mut api = pc.rtc.sdp_api();
 
     // Add data channels (m=application)
@@ -259,7 +335,7 @@ pub fn create_offer(
 ///
 /// Returns an error if no answer has been cached, i.e. `set_remote_description`
 /// was not called with an offer first.
-pub fn create_answer(pc: &mut PeerConnectionInner) -> Result<SessionDescription, String> {
+pub fn create_answer(pc: &mut PeerConnectionInner) -> Result<SessionDescription, crate::error::WebRtcError> {
     pc.cached_answer
         .take()
         .ok_or_else(|| "No cached answer — call set_remote_description(offer) first".into())
@@ -274,7 +350,7 @@ pub fn create_answer(pc: &mut PeerConnectionInner) -> Result<SessionDescription,
 pub fn set_remote_description(
     pc: &mut PeerConnectionInner,
     desc: &SessionDescription,
-) -> Result<Option<SessionDescription>, String> {
+) -> Result<Option<SessionDescription>, crate::error::WebRtcError> {
     match desc.sdp_type {
         SdpType::Offer => {
             // Log the setup direction from the remote offer
@@ -354,7 +430,7 @@ pub fn set_remote_description(
 pub fn add_ice_candidate(
     pc: &mut PeerConnectionInner,
     candidate_sdp: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::error::WebRtcError> {
     if candidate_sdp.is_empty() {
         return Ok(());
     }
@@ -370,6 +446,39 @@ pub fn add_ice_candidate(
     Ok(())
 }
 
+/// The wall-clock instant that corresponds to a given audio RTP offset.
+///
+/// str0m documents `wallclock` as "the real world time that corresponds to the
+/// `MediaTime`", and uses it for exactly one thing: building the NTP<->RTP mapping in RTCP
+/// Sender Reports (`streams/send.rs::sender_info`). Receivers use that mapping to drive
+/// playout timing.
+///
+/// Passing `Instant::now()` at write time -- as this did -- makes that mapping reflect
+/// *when we got round to draining the frame*, not when its samples were captured. The
+/// draining loop blocks for up to 20ms waiting on the socket, so the reported mapping
+/// wobbled by that much every reporting interval while the RTP timestamps advanced
+/// perfectly evenly. A receiver tracking that mapping sees the sender's clock jitter and
+/// keeps re-adjusting its playout, which is audible as robotic, warbling speech -- and is
+/// invisible to packet-loss diagnostics, because nothing is lost.
+///
+/// Deriving it from the media timeline instead keeps wallclock and `MediaTime` exactly
+/// consistent, which is what str0m asks for.
+///
+/// Clamped to never exceed `now`: if the capture thread ever runs ahead of real time, a
+/// wallclock in the future makes str0m's `current_rtp_time` return `None` and emit a
+/// Sender Report with `rtp_time` of zero, which is worse than a slightly stale mapping.
+fn audio_wallclock(epoch: Instant, rtp_offset: u64, now: Instant) -> Instant {
+    // 48kHz: RTP offset in samples -> elapsed media time.
+    let elapsed = Duration::from_nanos(
+        rtp_offset
+            .saturating_mul(1_000_000_000)
+            .checked_div(48_000)
+            .unwrap_or(0),
+    );
+    let derived = epoch.checked_add(elapsed).unwrap_or(now);
+    derived.min(now)
+}
+
 /// Write an Opus-encoded audio frame to the peer connection.
 ///
 /// # Errors
@@ -382,11 +491,12 @@ pub fn add_ice_candidate(
 ///
 /// Never panics: `48_000` is a non-zero literal, so the internal `NonZeroU32`
 /// construction always succeeds.
-pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &[u8]) -> Result<(), String> {
+pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &WireMedia) -> Result<(), crate::error::WebRtcError> {
+    let opus_data = opus_data.as_bytes();
     let mid = pc.audio_mid.ok_or("No audio mid configured")?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
-        return Err("No writer for audio mid".into());
+        return Err(crate::error::WebRtcError::NoWriterForKind("audio"));
     };
 
     let pt = writer
@@ -394,6 +504,7 @@ pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &[u8]) -> Result<(),
         .find(|p| p.spec().codec == Codec::Opus)
         .map(str0m::format::PayloadParams::pt)
         .ok_or("No Opus payload type negotiated")?;
+    pc.audio_pt = Some(*pt);
 
     // Opus at 48kHz: each 20ms frame = 960 samples
     let samples_per_frame: u64 = 960;
@@ -405,8 +516,12 @@ pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &[u8]) -> Result<(),
     #[allow(clippy::unwrap_used)]
     let rtp_time = MediaTime::new(rtp_offset, NonZeroU32::new(48_000).unwrap().into());
 
+    let now = Instant::now();
+    let epoch = *pc.audio_epoch.get_or_insert(now);
+    let wallclock = audio_wallclock(epoch, rtp_offset, now);
+
     writer
-        .write(pt, Instant::now(), rtp_time, opus_data)
+        .write(pt, wallclock, rtp_time, opus_data)
         .map_err(|e| format!("Failed to write audio: {e}"))?;
 
     pc.audio_frame_count = pc
@@ -428,11 +543,12 @@ pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &[u8]) -> Result<(),
 ///
 /// Never panics: `90_000` is a non-zero literal, so the internal `NonZeroU32`
 /// construction always succeeds.
-pub fn write_video(pc: &mut PeerConnectionInner, vp8_data: &[u8]) -> Result<(), String> {
+pub fn write_video(pc: &mut PeerConnectionInner, vp8_data: &WireMedia) -> Result<(), crate::error::WebRtcError> {
+    let vp8_data = vp8_data.as_bytes();
     let mid = pc.video_mid.ok_or("No video mid configured")?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
-        return Err("No writer for video mid".into());
+        return Err(crate::error::WebRtcError::NoWriterForKind("video"));
     };
 
     let pt = writer
@@ -472,7 +588,7 @@ pub fn poll_once(
     pc: &mut PeerConnectionInner,
     socket: &UdpSocket,
     _recv_buf: &mut [u8],
-) -> Result<(Vec<PcEvent>, Instant), String> {
+) -> Result<(Vec<WirePcEvent>, Instant), crate::error::WebRtcError> {
     // str0m's do_poll_output calls dtls.poll_output() which requires dimpl's
     // handle_timeout to have been called. But str0m's do_handle_timeout does NOT
     // propagate to dtls.handle_timeout — only init_dtls does (called during SDP
@@ -501,10 +617,12 @@ pub fn poll_once(
                     .checked_add(1)
                     .ok_or("transmit log counter overflow")?;
                 let pkt_type = classify_packet(&transmit.contents);
-                if pc.transmit_log_count <= 20
-                    || pc.transmit_log_count.is_multiple_of(100)
-                    || pkt_type != "STUN"
-                {
+                // Throttled for *all* packet types, media included. Emitting a formatted
+                // log line per packet costs time inside the send loop, on the same thread
+                // that decides when audio leaves the socket -- exactly the timing this
+                // function is now instrumented to measure. Per-packet media logging would
+                // perturb the measurement it exists to support.
+                if pc.transmit_log_count <= 20 || pc.transmit_log_count.is_multiple_of(500) {
                     tracing::info!(
                         pc_id = %pc.id,
                         dest = %transmit.destination,
@@ -514,7 +632,11 @@ pub fn poll_once(
                         "Transmit → sending UDP"
                     );
                 }
-                match socket.send_to(&transmit.contents, transmit.destination) {
+                let send_result = socket.send_to(&transmit.contents, transmit.destination);
+                // Timestamped after the syscall returns, so the measured gap is between
+                // packets actually handed to the kernel.
+                record_audio_send(pc, &transmit.contents, Instant::now());
+                match send_result {
                     Ok(n) => {
                         if pc.transmit_log_count <= 10 {
                             tracing::info!(pc_id = %pc.id, bytes = n, "UDP sent");
@@ -534,7 +656,7 @@ pub fn poll_once(
             }
             Err(e) => {
                 pc.alive = false;
-                return Err(format!("str0m error: {e}"));
+                return Err(format!("str0m error: {e}").into());
             }
         }
     }
@@ -547,12 +669,22 @@ pub fn poll_once(
 /// Returns an error if setting the socket read timeout fails, if the receive
 /// log counter overflows, if the received length exceeds `recv_buf`, or if
 /// str0m fails to process the input.
+/// Receive and feed a single UDP datagram into str0m, or wait up to `timeout` for one.
+///
+/// Returns `Ok(true)` if a datagram was actually received (the caller should immediately
+/// try again with a near-zero timeout to drain any further backlog before going back to
+/// `poll_once` -- audio, video, RTCP, and STUN all share one socket, and a single video
+/// keyframe/motion burst can queue several datagrams in the kernel receive buffer within
+/// one 20ms audio period; only pulling one per caller iteration lets that backlog build up
+/// behind bursty video, and once the kernel buffer fills the OS drops silently before
+/// str0m ever sees the packet). Returns `Ok(false)` on a genuine timeout (no data was
+/// waiting).
 pub fn recv_and_feed(
     pc: &mut PeerConnectionInner,
     socket: &UdpSocket,
     recv_buf: &mut [u8],
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<bool, crate::error::WebRtcError> {
     socket
         .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
         .map_err(|e| e.to_string())?;
@@ -598,6 +730,7 @@ pub fn recv_and_feed(
             pc.rtc
                 .handle_input(input)
                 .map_err(|e| format!("handle_input error: {e}"))?;
+            return Ok(true);
         }
         Err(e)
             if e.kind() == std::io::ErrorKind::WouldBlock
@@ -608,13 +741,227 @@ pub fn recv_and_feed(
                 .map_err(|e| format!("timeout error: {e}"))?;
         }
         Err(e) => {
-            return Err(format!("recv error: {e}"));
+            return Err(format!("recv error: {e}").into());
         }
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Drain any further backlogged UDP datagrams beyond the one `recv_and_feed` already
+/// consumed, instead of going back to `poll_once` and waiting up to the caller's normal
+/// deadline again.
+///
+/// Audio, video, RTCP, and STUN all share one socket per connection; a burst on one (e.g.
+/// a video keyframe) can queue several datagrams in the kernel receive buffer within a
+/// single audio frame period. Only pulling one datagram per caller loop iteration lets
+/// that backlog build up behind the burst, and once the kernel buffer fills, the OS drops
+/// silently before str0m ever sees the packet. Bounded to 64 so a pathological flood can't
+/// starve the rest of the caller's loop (command draining, policy refresh) indefinitely.
+/// Logs (at debug) how many were drained beyond the first, when more than one -- direct
+/// observability into how often/how bad this bursting actually is in practice.
+pub fn drain_backlog(pc: &mut PeerConnectionInner, socket: &UdpSocket, recv_buf: &mut [u8]) {
+    let mut drained = 1u32;
+    while drained < 64 {
+        match recv_and_feed(pc, socket, recv_buf, Duration::from_millis(1)) {
+            Ok(true) => drained = drained.saturating_add(1),
+            Ok(false) => break,
+            Err(e) => {
+                tracing::debug!(pc_id = %pc.id, error = %e, "recv_and_feed (drain) failed");
+                break;
+            }
+        }
+    }
+    if drained > 1 {
+        tracing::debug!(
+            pc_id = %pc.id,
+            drained,
+            "Drained backlogged UDP datagrams in one io loop iteration"
+        );
+    }
 }
 
 /// Classify a UDP packet by its first byte (RFC 7983 demultiplexing).
+/// Extract the primary (most recent) encoding from an RFC 2198 "RED" redundant-audio
+/// packet, discarding the redundant (older) copies.
+///
+/// Our own SDP offers negotiate `a=rtpmap:63 red/48000/2` / `a=fmtp:63 111/111` (RED
+/// wrapping Opus) for loss resilience -- common browser behavior when redundancy is
+/// negotiated. str0m's `Codec::from(&str)` (str0m 0.16.2, `format/codec.rs`) has no `"red"`
+/// case, so any packet that actually arrives wrapped in RED is classified `Codec::Unknown`
+/// and, before this, was silently dropped -- not corrupted, just discarded, indistinguish-
+/// able from ordinary loss/gaps from the receiving end's perspective. If the remote side
+/// sends any meaningful fraction of its audio as RED, this alone could account for
+/// significant unexplained audio gaps.
+///
+/// RFC 2198 format: zero or more 4-byte redundant block headers (1 bit "more follows" flag,
+/// 7-bit block PT, 14-bit timestamp offset, 10-bit block length), terminated by one 1-byte
+/// primary block header (flag bit clear, 7-bit primary PT, implicitly extends to the end of
+/// the packet), followed by the block payloads themselves in the same order as their
+/// headers. Returns `None` if the packet is too short to be valid RED framing.
+fn unwrap_red_primary(payload: &[u8]) -> Option<&[u8]> {
+    let mut pos = 0usize;
+    let mut redundant_len_sum = 0usize;
+
+    loop {
+        let header = *payload.get(pos)?;
+        let more_follows = header & 0x80 != 0;
+        if !more_follows {
+            // 1-byte primary header; primary payload is everything after all headers and
+            // all redundant block payloads.
+            let headers_len = pos.checked_add(1)?;
+            let payload_start = headers_len.checked_add(redundant_len_sum)?;
+            return payload.get(payload_start..);
+        }
+        // 4-byte redundant block header. Byte layout: byte0 = F(1 bit) + block PT(7
+        // bits); byte1 = timestamp-offset bits 13..6; byte2 = timestamp-offset bits 5..0
+        // (top 6 bits, unused here) + block-length bits 9..8 (bottom 2 bits); byte3 =
+        // block-length bits 7..0. We only need the 10-bit block length to know how many
+        // payload bytes to skip.
+        let byte2 = *payload.get(pos.checked_add(2)?)?;
+        let byte3 = *payload.get(pos.checked_add(3)?)?;
+        let block_len = (usize::from(byte2 & 0x03) << 8) | usize::from(byte3);
+        redundant_len_sum = redundant_len_sum.checked_add(block_len)?;
+        pos = pos.checked_add(4)?;
+    }
+}
+
+/// Payload type of an outgoing RTP packet, or `None` if the datagram is not RTP.
+///
+/// SRTP leaves the RTP header in the clear, so the payload type is readable even on an
+/// encrypted packet. RTCP is demultiplexed off the same port (RFC 5761), which reserves
+/// payload types 64..=95 for it -- those are rejected here so RTCP reports are not counted
+/// as media.
+fn rtp_payload_type(data: &[u8]) -> Option<u8> {
+    // Shortest possible RTP packet is a 12-byte header with no payload.
+    if data.len() < 12 {
+        return None;
+    }
+    // Version must be 2 (top two bits of byte 0).
+    if data.first()? & 0xC0 != 0x80 {
+        return None;
+    }
+    // Byte 1 is [marker:1][payload type:7].
+    let pt = data.get(1)? & 0x7F;
+    if (64..=95).contains(&pt) {
+        return None;
+    }
+    Some(pt)
+}
+
+/// One window's worth of measured audio send cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSendReport {
+    pub packets: u64,
+    /// Sends less than 5ms after the previous one -- two frames leaving back to back.
+    pub clumped: u64,
+    /// Sends more than 30ms after the previous one -- a frame held back past its slot.
+    pub late: u64,
+    pub min_gap_ms: u64,
+    pub max_gap_ms: u64,
+    pub mean_gap_ms: u64,
+}
+
+/// Cadence of audio RTP packets measured at the socket, not at the point we hand them to
+/// str0m.
+///
+/// Opus frames are produced every 20ms and must arrive at the far end spaced the same way;
+/// a receiver's jitter buffer treats a late packet as a loss and conceals it, which sounds
+/// robotic while every loss counter stays at zero. Existing instrumentation measured the
+/// cadence of `write_audio` *calls*, which is upstream of the I/O loop's blocking socket
+/// wait and so cannot see clumping introduced by it. This measures the last point we
+/// control: immediately before `send_to`.
+///
+/// Healthy is a tight cluster at 20ms. Clumping shows up as pairs of `clumped`+`late`.
+#[derive(Debug, Default)]
+pub struct AudioSendPacing {
+    last_send: Option<Instant>,
+    packets: u64,
+    clumped: u64,
+    late: u64,
+    min_gap_us: u64,
+    max_gap_us: u64,
+    total_gap_us: u64,
+    gaps: u64,
+}
+
+impl AudioSendPacing {
+    /// Report every 250 packets: 5 seconds of audio at 20ms per frame.
+    const REPORT_EVERY: u64 = 250;
+    const CLUMPED_BELOW_US: u64 = 5_000;
+    const LATE_ABOVE_US: u64 = 30_000;
+
+    /// Record one audio packet leaving the socket at `now`.
+    ///
+    /// Returns a report once per window, resetting the window's counters.
+    pub fn record(&mut self, now: Instant) -> Option<AudioSendReport> {
+        self.packets = self.packets.saturating_add(1);
+
+        if let Some(last) = self.last_send {
+            let gap_us = u64::try_from(now.saturating_duration_since(last).as_micros())
+                .unwrap_or(u64::MAX);
+            self.gaps = self.gaps.saturating_add(1);
+            self.total_gap_us = self.total_gap_us.saturating_add(gap_us);
+            self.max_gap_us = self.max_gap_us.max(gap_us);
+            self.min_gap_us = if self.min_gap_us == 0 {
+                gap_us
+            } else {
+                self.min_gap_us.min(gap_us)
+            };
+            if gap_us < Self::CLUMPED_BELOW_US {
+                self.clumped = self.clumped.saturating_add(1);
+            } else if gap_us > Self::LATE_ABOVE_US {
+                self.late = self.late.saturating_add(1);
+            }
+        }
+        self.last_send = Some(now);
+
+        if !self.packets.is_multiple_of(Self::REPORT_EVERY) {
+            return None;
+        }
+        let report = AudioSendReport {
+            packets: self.packets,
+            clumped: self.clumped,
+            late: self.late,
+            min_gap_ms: self.min_gap_us.checked_div(1000).unwrap_or(0),
+            max_gap_ms: self.max_gap_us.checked_div(1000).unwrap_or(0),
+            mean_gap_ms: self
+                .total_gap_us
+                .checked_div(self.gaps.max(1))
+                .unwrap_or(0)
+                .checked_div(1000)
+                .unwrap_or(0),
+        };
+        // Reset the window but keep `last_send`, so the gap across the boundary is not lost.
+        self.clumped = 0;
+        self.late = 0;
+        self.min_gap_us = 0;
+        self.max_gap_us = 0;
+        self.total_gap_us = 0;
+        self.gaps = 0;
+        Some(report)
+    }
+}
+
+/// Measure the send cadence if this datagram is one of our own audio RTP packets.
+fn record_audio_send(pc: &mut PeerConnectionInner, contents: &[u8], now: Instant) {
+    let Some(audio_pt) = pc.audio_pt else { return };
+    if rtp_payload_type(contents) != Some(audio_pt) {
+        return;
+    }
+    if let Some(r) = pc.audio_send_pacing.record(now) {
+        tracing::info!(
+            pc_id = %pc.id,
+            packets = r.packets,
+            clumped = r.clumped,
+            late = r.late,
+            min_gap_ms = r.min_gap_ms,
+            mean_gap_ms = r.mean_gap_ms,
+            max_gap_ms = r.max_gap_ms,
+            "Outbound audio socket pacing"
+        );
+    }
+}
+
 const fn classify_packet(data: &[u8]) -> &'static str {
     match data.first() {
         Some(0..=3) => "STUN",       // STUN Binding Request/Response/Indication
@@ -631,7 +978,7 @@ const fn classify_packet(data: &[u8]) -> &'static str {
     }
 }
 
-fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<PcEvent> {
+fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<WirePcEvent> {
     match event {
         Event::IceConnectionStateChange(state) => {
             let mapped = match state {
@@ -681,17 +1028,417 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<PcEv
             })
         }
         Event::MediaData(data) => {
-            if data.params.spec().codec == Codec::Opus {
-                Some(PcEvent::AudioData(data.data))
-            } else if data.params.spec().codec == Codec::Vp8 {
-                Some(PcEvent::VideoData(data.data))
+            let mid = data.mid.to_string();
+            let contiguous = data.contiguous;
+            let codec = data.params.spec().codec;
+            if codec == Codec::Opus {
+                // Opus frames must reach the decoder in encode order. Out-of-order
+                // delivery still decodes cleanly packet-by-packet but scrambles the audio
+                // in time -- inaudible to every error/amplitude check, so detect it
+                // explicitly here rather than assuming str0m always emits in order.
+                let first_seq: u64 = **data.seq_range.start();
+                let last_seq: u64 = **data.seq_range.end();
+                if let Some(prev) = pc.last_audio_seq.insert(data.mid, last_seq)
+                    && first_seq <= prev
+                {
+                    tracing::warn!(
+                        pc_id = %pc.id,
+                        mid,
+                        prev_seq = prev,
+                        this_seq_start = first_seq,
+                        this_seq_end = last_seq,
+                        "Inbound audio frame arrived OUT OF ORDER: scrambles decoded audio in time"
+                    );
+                }
+                Some(PcEvent::AudioData { mid, data: WireMedia::from_network(data.data), contiguous })
+            } else if codec == Codec::Vp8 {
+                Some(PcEvent::VideoData { mid, data: WireMedia::from_network(data.data) })
+            } else if codec == Codec::Unknown
+                && pc.remote_mids.get(&data.mid) == Some(&MediaKind::Audio)
+            {
+                // Almost certainly RFC 2198 RED (str0m has no "red" Codec variant, so RED
+                // packets land here as Unknown) -- unwrap it instead of dropping it.
+                if let Some(primary) = unwrap_red_primary(&data.data) {
+                    Some(PcEvent::AudioData { mid, data: WireMedia::from_network(primary.to_vec()), contiguous })
+                } else {
+                    tracing::warn!(pc_id = %pc.id, mid, len = data.data.len(), "Unhandled audio codec on inbound media (not RED-decodable), dropping");
+                    None
+                }
+            } else if codec == Codec::Rtx {
+                // Expected under any packet loss (retransmission requests); not a bug,
+                // and warning on every one would drown out real signal.
+                None
             } else {
+                tracing::warn!(pc_id = %pc.id, mid, codec = %codec, "Unhandled codec on inbound media, dropping");
                 None
             }
         }
+        Event::MediaEgressStats(stats) => Some(egress_stats_event(&pc.id, &stats)),
         _ => {
             tracing::info!(pc_id = %pc.id, ?event, "Unhandled str0m event");
             None
         }
+    }
+}
+
+/// Convert str0m's aggregated egress stats into a [`PcEvent::EgressStats`].
+///
+/// `loss` is `None` when no RTCP receiver report arrived during the interval, which is
+/// normal on a track we are not currently sending on. That is deliberately *not* the same
+/// as "zero loss" and is passed through as `None`: flattening it to `0.0` would decay the
+/// downstream loss estimate toward "clean link" simply because reports stopped arriving.
+fn egress_stats_event(pc_id: &str, stats: &str0m::stats::MediaEgressStats) -> WirePcEvent {
+    tracing::debug!(
+        pc_id,
+        mid = %stats.mid,
+        loss = ?stats.loss,
+        rtt_ms = ?stats.rtt.map(|d| d.as_millis()),
+        packets = stats.packets,
+        nacks = stats.nacks,
+        "Outbound RTCP stats"
+    );
+    PcEvent::EgressStats {
+        mid: stats.mid.to_string(),
+        loss: stats.loss,
+        rtt_ms: stats.rtt.and_then(|d| u64::try_from(d.as_millis()).ok()),
+        packets: stats.packets,
+        nacks: stats.nacks,
+    }
+}
+
+/// Lock the PC handle, recovering from poisoned locks.
+///
+/// A poisoned lock means a previous holder panicked — we recover the
+/// inner data and keep going rather than cascading the panic.
+pub(crate) fn lock_pc(handle: &PeerConnectionHandle) -> std::sync::MutexGuard<'_, PeerConnectionInner> {
+    match handle.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("PC lock was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Perform STUN discovery using ICE servers and add srflx candidates.
+pub(crate) fn discover_and_add_srflx(
+    socket: &UdpSocket,
+    pc: &mut PeerConnectionInner,
+    local_addr: SocketAddr,
+    servers: &[crate::engine::IceServerConfig],
+) {
+    for server in servers {
+        for url in &server.urls {
+            if let Some(stun_addr) = crate::stun::parse_stun_url(url) {
+                tracing::info!(
+                    pc_id = %pc.id,
+                    %url,
+                    %stun_addr,
+                    "Attempting STUN discovery"
+                );
+                if let Some(srflx_addr) = crate::stun::discover_srflx(socket, stun_addr) {
+                    // Use the real local IP as the base (not 0.0.0.0)
+                    let base = if local_addr.ip().is_unspecified() {
+                        let real_ip =
+                            get_local_ip().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                        SocketAddr::new(real_ip, local_addr.port())
+                    } else {
+                        local_addr
+                    };
+                    add_srflx_candidate(pc, srflx_addr, base);
+                    return; // One srflx candidate is enough
+                }
+            }
+        }
+    }
+    tracing::warn!(pc_id = %pc.id, "STUN discovery failed on all ICE servers");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a real incident: a poisoned PC lock (a previous holder
+    /// panicked while holding it) must not cascade the panic to every subsequent
+    /// caller. `lock_pc` recovers the inner data instead, matching the actual behavior
+    /// str0m needs -- a connection whose I/O loop hit an unexpected panic once should
+    /// keep serving requests, not become permanently unusable.
+    #[test]
+    // Deliberately poisoning a lock to test recovery from it requires a real panic on
+    // another thread; unwrap() on the test's own assertions is idiomatic test-fail style.
+    // significant_drop_tightening false-positives on the assert! immediately after the
+    // guard's last use inside its own scope.
+    #[allow(clippy::unwrap_used, clippy::panic, clippy::significant_drop_tightening)]
+    fn lock_pc_recovers_from_a_poisoned_lock() {
+        let handle: PeerConnectionHandle =
+            std::sync::Arc::new(std::sync::Mutex::new(create_peer_connection("test-pc".to_string())));
+
+        // Poison the lock by panicking while holding it, on another thread.
+        let poison_handle = handle.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = poison_handle.lock().unwrap();
+            panic!("deliberate poison for lock_pc_recovers_from_a_poisoned_lock");
+        })
+        .join();
+        assert!(result.is_err(), "the poisoning thread should have panicked");
+        assert!(handle.is_poisoned(), "the lock should now be poisoned");
+
+        // lock_pc must recover rather than panic itself.
+        {
+            let guard = lock_pc(&handle);
+            assert_eq!(guard.id, "test-pc");
+        }
+    }
+
+    /// Regression test for the `recv_and_feed` return-value contract that `drain_backlog`
+    /// (and both call sites' loop pacing) now depend on: with nothing waiting on the
+    /// socket, it must return `Ok(false)` (a genuine timeout), not `Ok(true)` or hang past
+    /// the requested timeout. This is the steady-state case (no backlog) that both io
+    /// loops hit on every iteration when the network is quiet -- if this ever regressed to
+    /// `Ok(true)`, every caller would spin `drain_backlog` needlessly on every idle tick.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn recv_and_feed_returns_false_on_a_genuine_timeout() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        let mut pc = create_peer_connection("timeout-test-pc".to_string());
+        let mut recv_buf = vec![0u8; 2000];
+
+        let start = Instant::now();
+        let received = recv_and_feed(&mut pc, &socket, &mut recv_buf, Duration::from_millis(20))
+            .expect("timeout is not an error");
+        let elapsed = start.elapsed();
+
+        assert!(!received, "no datagram was sent; must report no data received");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must not hang well past the requested timeout, took {elapsed:?}"
+        );
+    }
+
+    /// `drain_backlog` must terminate promptly (not hang or spin unboundedly) when there is
+    /// no further backlog beyond the packet the caller already consumed -- the common case
+    /// on every loop iteration, since bursts are the exception not the rule.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn drain_backlog_returns_promptly_with_no_further_backlog() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        let mut pc = create_peer_connection("drain-test-pc".to_string());
+        let mut recv_buf = vec![0u8; 2000];
+
+        let start = Instant::now();
+        drain_backlog(&mut pc, &socket, &mut recv_buf);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must not hang or spin waiting for backlog that doesn't exist, took {elapsed:?}"
+        );
+    }
+
+    /// Regression test for a real, confirmed protocol-level gap: our own SDP negotiates
+    /// `a=rtpmap:63 red/48000/2` (RFC 2198 RED wrapping Opus), but str0m has no `"red"`
+    /// `Codec` variant -- RED packets classify as `Codec::Unknown` and, before this fix,
+    /// were silently dropped rather than corrupted. This proves `unwrap_red_primary`
+    /// correctly extracts the primary encoding for the two real shapes a RED packet can
+    /// take: no redundancy yet (stream start) and one redundant block (steady state).
+    #[test]
+    fn unwrap_red_primary_extracts_the_current_encoding() {
+        // Case 1: no redundant blocks yet (e.g. the very first packet of a stream). Just
+        // a 1-byte primary header (F=0, PT=111) followed by the primary payload.
+        let primary_only = [&[0x6F][..], &[0xAA, 0xBB, 0xCC]].concat();
+        assert_eq!(unwrap_red_primary(&primary_only), Some(&[0xAA, 0xBB, 0xCC][..]));
+
+        // Case 2: one redundant block (an older, already-decoded frame carried again for
+        // loss resilience) followed by the primary block -- the steady-state shape once a
+        // stream has been running for more than one packet.
+        //   Redundant header (4 bytes): F=1, PT=111 (0x80 | 0x6F = 0xEF), timestamp
+        //   offset=0 (unused by this function), block length=2 (redundant payload is 2
+        //   bytes): byte1=0x00, byte2=0x00 (top 2 length bits = 0), byte3=0x02.
+        //   Primary header (1 byte): F=0, PT=111 (0x6F).
+        let redundant_header = [0xEF, 0x00, 0x00, 0x02];
+        let redundant_payload = [0x11, 0x22]; // 2 bytes, matches block length above
+        let primary_header = [0x6F];
+        let primary_payload = [0xAA, 0xBB, 0xCC, 0xDD];
+        let with_redundancy = [
+            &redundant_header[..],
+            &primary_header[..],
+            &redundant_payload[..],
+            &primary_payload[..],
+        ]
+        .concat();
+        assert_eq!(unwrap_red_primary(&with_redundancy), Some(&primary_payload[..]));
+    }
+
+    /// Malformed/truncated RED framing must fail closed (`None`), never panic or return
+    /// out-of-bounds/garbage data -- this runs on untrusted network input.
+    #[test]
+    fn unwrap_red_primary_rejects_truncated_input() {
+        assert_eq!(unwrap_red_primary(&[]), None);
+        // A redundant block header (F=1) claiming a huge block length that exceeds the
+        // actual packet size.
+        assert_eq!(unwrap_red_primary(&[0xEF, 0x00, 0x03, 0xFF, 0x6F]), None);
+        // Truncated mid-header (only 2 of 4 redundant header bytes present).
+        assert_eq!(unwrap_red_primary(&[0xEF, 0x00]), None);
+    }
+}
+
+#[cfg(test)]
+mod audio_wallclock_tests {
+    use super::*;
+
+    /// The whole point: wallclock must track the media timeline, so that a receiver's
+    /// NTP<->RTP mapping is stable even when our draining loop is late.
+    #[test]
+    fn wallclock_follows_the_media_timeline_not_the_drain_time() {
+        let epoch = Instant::now();
+        // 50 frames of 20ms = 1s of media.
+        let one_second_of_media = 50 * 960;
+        // Pretend the drain happened 17ms late; the answer must not move.
+        let late_now = epoch + Duration::from_millis(1017);
+        let derived = audio_wallclock(epoch, one_second_of_media, late_now);
+        assert_eq!(derived, epoch + Duration::from_secs(1));
+    }
+
+    /// Evenly-spaced RTP offsets must produce evenly-spaced wallclocks. This is the
+    /// property that was broken: RTP advanced evenly while wallclock jittered.
+    #[test]
+    fn evenly_spaced_frames_produce_evenly_spaced_wallclocks() {
+        let epoch = Instant::now();
+        let far_future = epoch + Duration::from_mins(1);
+        let times: Vec<Instant> = (0..5)
+            .map(|frame| audio_wallclock(epoch, frame * 960, far_future))
+            .collect();
+        for pair in times.windows(2) {
+            let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            assert_eq!(b.saturating_duration_since(*a), Duration::from_millis(20));
+        }
+    }
+
+    /// A wallclock in the future makes str0m emit a Sender Report with `rtp_time` zero,
+    /// so running ahead of real time must clamp rather than report the future.
+    #[test]
+    fn never_reports_a_wallclock_in_the_future() {
+        let epoch = Instant::now();
+        // Media timeline claims 10s elapsed, but only 1s of real time has passed.
+        let now = epoch + Duration::from_secs(1);
+        let derived = audio_wallclock(epoch, 10 * 48_000, now);
+        assert_eq!(derived, now, "must clamp to now rather than lead it");
+    }
+
+    /// The first frame maps to the epoch exactly.
+    #[test]
+    fn the_first_frame_maps_to_the_epoch() {
+        let epoch = Instant::now();
+        let now = epoch + Duration::from_millis(5);
+        assert_eq!(audio_wallclock(epoch, 0, now), epoch);
+    }
+}
+
+#[cfg(test)]
+mod audio_send_pacing_tests {
+    use super::{rtp_payload_type, AudioSendPacing};
+    use std::time::{Duration, Instant};
+
+    /// Minimal 12-byte RTP header: version 2, the given `[marker:1][pt:7]` byte, rest zero.
+    fn rtp_raw(byte1: u8) -> Vec<u8> {
+        let mut p = vec![0x80u8, byte1];
+        p.resize(12, 0);
+        p
+    }
+
+    #[test]
+    fn parses_the_payload_type_of_an_rtp_packet() {
+        assert_eq!(rtp_payload_type(&rtp_raw(111)), Some(111));
+    }
+
+    #[test]
+    fn ignores_the_marker_bit_when_reading_the_payload_type() {
+        assert_eq!(rtp_payload_type(&rtp_raw(0x6F | 0x80)), Some(111));
+    }
+
+    #[test]
+    fn rejects_rtcp_multiplexed_on_the_same_port() {
+        // RFC 5761 reserves payload types 64..=95 so RTCP can be demultiplexed; a sender
+        // report (PT 200) lands at 200 & 0x7F == 72, inside that range.
+        assert_eq!(rtp_payload_type(&rtp_raw(200)), None);
+    }
+
+    #[test]
+    fn rejects_non_rtp_datagrams() {
+        // STUN binding request: version bits are not 2.
+        let stun = vec![0x00u8; 20];
+        assert_eq!(rtp_payload_type(&stun), None);
+        // Truncated packet, shorter than an RTP header.
+        assert_eq!(rtp_payload_type(&[0x80, 111]), None);
+    }
+
+    #[test]
+    fn reports_once_per_window_and_not_before() {
+        let mut p = AudioSendPacing::default();
+        let start = Instant::now();
+        for i in 0..249u64 {
+            assert!(p.record(start + Duration::from_millis(i * 20)).is_none());
+        }
+        assert!(p.record(start + Duration::from_millis(249 * 20)).is_some());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn an_evenly_paced_stream_reports_a_tight_twenty_millisecond_gap() {
+        let mut p = AudioSendPacing::default();
+        let start = Instant::now();
+        let mut report = None;
+        for i in 0..250u64 {
+            report = p.record(start + Duration::from_millis(i * 20)).or(report);
+        }
+        let r = report.expect("a report after 250 packets");
+        assert_eq!((r.min_gap_ms, r.mean_gap_ms, r.max_gap_ms), (20, 20, 20));
+        assert_eq!((r.clumped, r.late), (0, 0));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn clumped_sends_are_counted_as_a_back_to_back_pair_plus_a_late_packet() {
+        // The signature of the I/O loop holding frames back: two frames leave together,
+        // then nothing for 40ms. Average spacing is still a perfect 20ms, which is why
+        // a mean alone cannot detect this.
+        let mut p = AudioSendPacing::default();
+        let start = Instant::now();
+        let mut report = None;
+        for i in 0..125u64 {
+            let base = i * 40;
+            report = p.record(start + Duration::from_millis(base)).or(report);
+            report = p.record(start + Duration::from_millis(base + 1)).or(report);
+        }
+        let r = report.expect("a report after 250 packets");
+        // 125 pairs -> 125 back-to-back gaps, and 124 stalls between consecutive pairs.
+        assert_eq!(r.clumped, 125, "one back-to-back send per pair");
+        assert_eq!(r.late, 124, "one 39ms stall between pairs");
+        // Still ~20ms on average: the mean alone cannot see this at all.
+        assert_eq!(r.mean_gap_ms, 19, "the mean hides it entirely");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_gap_across_a_window_boundary_is_not_lost() {
+        let mut p = AudioSendPacing::default();
+        let start = Instant::now();
+        for i in 0..250u64 {
+            p.record(start + Duration::from_millis(i * 20));
+        }
+        // First packet of the second window arrives 100ms after the last of the first.
+        let second = 249 * 20 + 100;
+        p.record(start + Duration::from_millis(second));
+        for i in 1..249u64 {
+            p.record(start + Duration::from_millis(second + i * 20));
+        }
+        // The 100ms stall must appear in the second window, not be swallowed by the reset.
+        let r = p
+            .record(start + Duration::from_millis(second + 249 * 20))
+            .expect("a report after the second window");
+        assert!(r.max_gap_ms >= 100, "max_gap_ms was {}", r.max_gap_ms);
+        assert_eq!(r.late, 1);
     }
 }
