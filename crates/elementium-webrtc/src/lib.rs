@@ -1,12 +1,15 @@
 pub mod audio_pipeline;
 pub mod e2ee_io;
 pub mod engine;
+pub mod error;
 pub mod livekit;
 pub mod peer_connection;
 pub mod stun;
 pub mod video_pipeline;
 
 pub use audio_pipeline::start_playback as start_audio_playback;
+pub use e2ee_io::EncryptionPolicy;
+pub use error::WebRtcError;
 pub use engine::{IoCommand, VideoFrameBuffer, WebRtcEngine};
 pub use livekit::{LiveKitRoom, RoomEvent};
 pub use peer_connection::{PcEvent, PeerConnectionHandle};
