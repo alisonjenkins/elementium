@@ -24,6 +24,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 elementium-observability-test = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [lints]
 workspace = true

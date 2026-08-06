@@ -124,6 +124,23 @@ impl LogCapture {
         tracing::subscriber::with_default(subscriber, f)
     }
 
+    /// Install this fixture as the process-wide global default `tracing` subscriber.
+    ///
+    /// [`LogCapture::run`]'s `tracing::subscriber::with_default` is thread-local: it can't
+    /// see events emitted on other threads/tasks (e.g. a background `tokio::spawn`'d I/O
+    /// loop), which most single-function unit tests don't need but a full multi-task
+    /// integration test (like a real two-client network round trip) does. Call this once,
+    /// at the very start of such a test, instead of `run`. Idempotent: a second call within
+    /// the same process is a no-op rather than a panic, since `tracing` only allows setting
+    /// the global default once per process.
+    pub fn install_global(&self) {
+        let layer = CaptureLayer {
+            events: Arc::clone(&self.events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+
     /// All events captured so far, in emission order.
     #[must_use]
     pub fn events(&self) -> Vec<CapturedEvent> {

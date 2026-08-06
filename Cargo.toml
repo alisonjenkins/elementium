@@ -87,6 +87,9 @@ futures-util = "0.3"
 prost = "0.12"
 url = "2"
 
+# LiveKit access token minting (test-only, for the local-server integration test)
+jsonwebtoken = "9"
+
 # Tauri
 tauri = { version = "2", features = [] }
 tauri-build = "2"
