@@ -28,6 +28,21 @@ pub struct CameraCapturer {
 /// to avoid spamming logs on every frame.
 static LOGGED_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Find the first available camera's real device index via nokhwa's enumeration.
+///
+/// `nokhwa`'s Linux backend opens `CameraIndex::Index(n)` as `/dev/video{n}` directly, so the
+/// index must come from actually querying which devices exist rather than assuming `0` --
+/// device nodes are not guaranteed to start at 0 (e.g. a system with only `/dev/video2` and up).
+fn first_camera_index() -> Result<u32, CameraError> {
+    let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
+        .map_err(|e| CameraError::Camera(e.to_string()))?;
+    let first = cameras.first().ok_or(CameraError::NoCameraFound)?;
+    first
+        .index()
+        .as_index()
+        .map_err(|e| CameraError::Camera(e.to_string()))
+}
+
 /// Build the requested camera format for the given optional resolution.
 fn requested_format(
     width: Option<u32>,
@@ -183,7 +198,8 @@ impl CameraCapturer {
     /// Returns [`CameraError`] if no camera is found or the camera cannot be
     /// opened/started.
     pub fn start(width: Option<u32>, height: Option<u32>) -> Result<Self, CameraError> {
-        Self::start_with_index(0, width, height)
+        let index = first_camera_index()?;
+        Self::start_with_index(index, width, height)
     }
 
     /// Start capturing from a specific camera index.
