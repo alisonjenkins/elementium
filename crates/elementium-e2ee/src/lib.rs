@@ -5,20 +5,41 @@
 //!
 //! ## Frame format (after encryption)
 //!
+//! Transcribed from livekit-client's `e2ee.worker` (`FrameCryptor.encodeFunction`), which
+//! documents it as:
+//!
 //! ```text
-//! [unencrypted header (N bytes)] [encrypted payload] [IV (12 bytes)] [key_index (1 byte)]
+//! ---------+-------------------------+-+---------+----
+//! payload  |IV...(length = IV_LENGTH)|R|IV_LENGTH|KID |
+//! ---------+-------------------------+-+---------+----
 //! ```
 //!
-//! - Audio: N=0, entire Opus packet is encrypted
-//! - Video: N=1..3, VP8 header bytes left unencrypted so the SFU can identify keyframes
-//! - IV: 12-byte nonce derived from a frame counter
+//! i.e. the full frame is:
+//!
+//! ```text
+//! [unencrypted header (N bytes)] [encrypted payload] [IV (12 bytes)] [IV_LENGTH (1 byte)] [key_index (1 byte)]
+//! ```
+//!
+//! - The trailer is **two** bytes, not one: `IV_LENGTH` then `key_index`. Reading only the
+//!   final byte still yields the right key index, which makes a one-byte trailer look
+//!   plausible -- but it shifts the IV window by one byte and leaves a stray byte on the
+//!   front of the ciphertext, so every frame then fails to authenticate.
+//! - Audio: N=1. The Opus TOC byte is left in the clear (RFC 6716 §3.1) so the SFU can
+//!   read the packet's framing; it is *not* encrypted.
+//! - Video: N=10 for a keyframe, N=3 for a delta frame -- livekit's
+//!   `UNENCRYPTED_BYTES` constants, covering the VP8 uncompressed data chunk.
+//! - Those header bytes are additionally passed to AES-GCM as **associated data**, so they
+//!   are authenticated even though they are not encrypted. Omitting the AAD fails
+//!   authentication just as surely as using the wrong key.
+//! - IV: 12-byte nonce, transmitted in the clear alongside the frame.
 //! - Encryption: AES-128-GCM with 16-byte auth tag appended to ciphertext
-//! - Key derivation: HKDF-SHA256 with info `"LKFrameEncryptionKey"`
+//! - Key derivation: HKDF-SHA256, salt `"LKFrameEncryptionKey"`, info 128 zero bytes
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use aes_gcm::aead::{Aead, KeyInit};
+use elementium_types::{PlaintextMedia, WireMedia};
 use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -35,26 +56,96 @@ const MAX_KEYS_U8: u8 = 16;
 /// Size of AES-GCM initialization vector.
 const IV_SIZE: usize = 12;
 
+/// [`IV_SIZE`] as it appears on the wire, in the frame trailer's `IV_LENGTH` byte.
+///
+/// A separate constant rather than a cast, matching the [`MAX_KEYS`]/[`MAX_KEYS_U8`] pair.
+const IV_SIZE_U8: u8 = 12;
+
+/// Size of the frame trailer: `[IV_LENGTH][key_index]`.
+///
+/// Two bytes, matching livekit-client's `frameTrailer`. See the module docs for why a
+/// one-byte trailer silently "works" for the key index while breaking everything else.
+const TRAILER_SIZE: usize = 2;
+
 /// Size of AES-GCM authentication tag.
 const TAG_SIZE: usize = 16;
 
 /// HKDF info string matching livekit-client's E2EE Worker.
-const HKDF_INFO: &[u8] = b"LKFrameEncryptionKey";
+/// Default HKDF salt, matching livekit-client's `SALT` constant (`e2ee/constants.ts`).
+/// Overridable via `E2eeOptions::ratchet_salt`, which is the same knob livekit exposes as
+/// `KeyProviderOptions.ratchetSalt`.
+const DEFAULT_RATCHET_SALT: &[u8] = b"LKFrameEncryptionKey";
 
-/// Reduce a raw key index into the `0..MAX_KEYS` slot range.
+/// HKDF `info` parameter: 128 zero bytes.
 ///
-/// `MAX_KEYS` is a nonzero compile-time constant, so this modulo can never panic.
-#[allow(clippy::arithmetic_side_effects)]
-fn key_slot(index: u8) -> usize {
-    usize::from(index) % MAX_KEYS
+/// Matches livekit-client's `getAlgoOptions` (`e2ee/utils.ts`), which passes
+/// `info: new ArrayBuffer(128)` -- a zero-filled buffer, *not* a label string. Getting
+/// this wrong (or swapping it with the salt) still derives a perfectly valid-looking AES
+/// key, it just is not the *same* key the peer derived, so every frame fails to
+/// authenticate and all inbound media is silently dropped.
+const HKDF_INFO: [u8; 128] = [0u8; 128];
+
+/// The shared secret a key ring entry was built from (the key provider's raw key bytes).
+///
+/// Paired with [`HkdfSalt`] purely so the two byte-string inputs to HKDF cannot be passed
+/// in the wrong order. They were: this crate derived keys with the salt and info arguments
+/// swapped relative to livekit-client, which still produces a perfectly valid-looking
+/// AES key -- just not the same one the peer derived, so every inbound frame failed to
+/// authenticate and all remote media was dropped. Two distinct types make that class of
+/// mistake a compile error rather than silence on the call.
+#[derive(Clone, Copy)]
+struct KeyMaterial<'a>(&'a [u8]);
+
+/// The HKDF salt (livekit's `KeyProviderOptions.ratchetSalt`). See [`KeyMaterial`].
+#[derive(Clone, Copy)]
+struct HkdfSalt<'a>(&'a [u8]);
+
+/// A key ring slot index, always in `0..MAX_KEYS` by construction.
+///
+/// Replaces the raw `u8` index that used to be re-reduced (`key_slot`) or
+/// re-validated separately at every call site -- once a `KeyIndex` exists, every consumer
+/// can trust it indexes a real slot without re-checking.
+///
+/// A sender's key index is a *rotation counter*, and livekit does not reduce it before
+/// writing it to the frame trailer: a peer on its 25th key sends `25` while holding the
+/// material at slot `25 % 16 == 9`. So the same modulo must be applied to wire bytes as to
+/// locally-supplied indices -- hence one constructor, not two.
+///
+/// This previously rejected wire bytes >= `MAX_KEYS` on the reasoning that the trailing
+/// byte is attacker-controlled. That reasoning was wrong, and made every peer past its
+/// 16th rotation permanently inaudible. The index only chooses which of 16 slots to try;
+/// AES-GCM authentication is what rejects a wrong key. An attacker who steers the choice
+/// still cannot forge a tag, so rejecting rather than wrapping bought no security at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyIndex(u8);
+
+impl KeyIndex {
+    /// Reduce a rotation counter -- from a local caller or from a frame trailer -- into
+    /// `0..MAX_KEYS`.
+    ///
+    /// `MAX_KEYS_U8` is a nonzero compile-time constant, so this modulo can never panic.
+    #[must_use]
+    #[allow(clippy::arithmetic_side_effects)]
+    pub const fn new(raw: u8) -> Self {
+        Self(raw % MAX_KEYS_U8)
+    }
+
+    /// The validated slot index into `KeyRing::keys` (`0..MAX_KEYS`).
+    fn slot(self) -> usize {
+        usize::from(self.0)
+    }
+
+    /// The wire-format byte for this index (already `0..MAX_KEYS`, so this is exact).
+    #[must_use]
+    pub const fn as_wire_byte(self) -> u8 {
+        self.0
+    }
 }
 
-/// Reduce a raw key index into the `0..MAX_KEYS` range, as stored on the wire.
-///
-/// `MAX_KEYS_U8` is a nonzero compile-time constant, so this modulo can never panic.
-#[allow(clippy::arithmetic_side_effects)]
-const fn key_index_byte(index: u8) -> u8 {
-    index % MAX_KEYS_U8
+impl std::fmt::Display for KeyIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// Media kind for determining unencrypted header size.
@@ -87,6 +178,15 @@ const fn default_true() -> bool {
     true
 }
 
+impl E2eeOptions {
+    /// The HKDF salt to derive with: the configured `ratchet_salt` if set, otherwise
+    /// livekit's default. Encoded as UTF-8 bytes, matching livekit-client's
+    /// `getAlgoOptions`, which does `new TextEncoder().encode(salt)`.
+    fn salt(&self) -> HkdfSalt<'_> {
+        HkdfSalt(self.ratchet_salt.as_ref().map_or(DEFAULT_RATCHET_SALT, |s| s.as_bytes()))
+    }
+}
+
 impl Default for E2eeOptions {
     fn default() -> Self {
         Self {
@@ -106,8 +206,12 @@ pub enum E2eeError {
     FrameTooShort(usize),
     #[error("decryption failed: {0}")]
     DecryptionFailed(String),
-    #[error("invalid key index {0}")]
-    InvalidKeyIndex(u8),
+    /// The frame trailer's `IV_LENGTH` byte was not 12.
+    ///
+    /// livekit only ever emits 12, and this byte is attacker-controlled, so anything else
+    /// is rejected rather than trusted as a length.
+    #[error("unsupported IV length {0} in frame trailer (expected {IV_SIZE_U8})")]
+    UnsupportedIvLength(u8),
     #[error("internal E2EE lock was poisoned by a panic in another thread")]
     LockPoisoned,
 }
@@ -117,72 +221,109 @@ struct KeyRing {
     /// Keys indexed by `key_index` (`0..MAX_KEYS`). `None` means slot is unused.
     keys: [Option<DerivedKey>; MAX_KEYS],
     /// The currently active key index for encryption.
-    current_index: u8,
+    current_index: KeyIndex,
 }
 
 /// A derived encryption key ready for AES-GCM.
 struct DerivedKey {
-    /// The raw key material from the JS side.
-    raw_material: Vec<u8>,
+    /// The raw key material from the JS side. `Zeroizing` wipes it from memory when this
+    /// key is replaced (rotation/ratcheting) or dropped, rather than leaving copies of
+    /// past key material sitting in freed heap memory.
+    raw_material: zeroize::Zeroizing<Vec<u8>>,
     /// The AES-128-GCM cipher derived from the raw material via HKDF.
     cipher: Aes128Gcm,
+    /// Non-secret [`key_fingerprint`] of `raw_material`, for correlating logs.
+    fingerprint: [u8; 4],
 }
 
 impl KeyRing {
     fn new() -> Self {
         Self {
             keys: std::array::from_fn(|_| None),
-            current_index: 0,
+            current_index: KeyIndex::new(0),
         }
     }
 
-    fn set_key(&mut self, index: u8, material: &[u8]) {
-        let idx = key_slot(index);
-        let cipher = derive_cipher(material);
-        if let Some(slot) = self.keys.get_mut(idx) {
-            *slot = Some(DerivedKey {
-                raw_material: material.to_vec(),
-                cipher,
-            });
-        }
+    fn set_key(&mut self, index: KeyIndex, material: KeyMaterial<'_>, salt: HkdfSalt<'_>) {
+        self.replace_key(index, material, salt);
         self.current_index = index;
     }
 
-    fn get_cipher(&self, index: u8) -> Option<&Aes128Gcm> {
-        let idx = key_slot(index);
-        self.keys.get(idx).and_then(Option::as_ref).map(|k| &k.cipher)
+    /// Overwrite the key at `index` without changing which key is used for *encryption*.
+    ///
+    /// Used when committing a successful ratchet found while decrypting an inbound frame:
+    /// that says nothing about which key this ring should encrypt with.
+    fn replace_key(&mut self, index: KeyIndex, material: KeyMaterial<'_>, salt: HkdfSalt<'_>) {
+        let cipher = derive_cipher(material, salt);
+        if let Some(slot) = self.keys.get_mut(index.slot()) {
+            *slot = Some(DerivedKey {
+                raw_material: zeroize::Zeroizing::new(material.0.to_vec()),
+                cipher,
+                fingerprint: key_fingerprint(material),
+            });
+        }
     }
 
-    fn current_cipher(&self) -> Option<(&Aes128Gcm, u8)> {
+    /// `(index, fingerprint_hex)` for every occupied slot.
+    fn inventory(&self) -> Vec<(usize, String)> {
+        self.keys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|k| (i, fingerprint_hex(k.fingerprint))))
+            .collect()
+    }
+
+    /// The raw key material behind the key at `index`, for deriving a ratchet chain.
+    fn raw_material(&self, index: KeyIndex) -> Option<&[u8]> {
+        self.keys
+            .get(index.slot())
+            .and_then(Option::as_ref)
+            .map(|k| k.raw_material.as_slice())
+    }
+
+    fn get_cipher(&self, index: KeyIndex) -> Option<&Aes128Gcm> {
+        self.keys.get(index.slot()).and_then(Option::as_ref).map(|k| &k.cipher)
+    }
+
+    fn current_cipher(&self) -> Option<(&Aes128Gcm, KeyIndex)> {
         self.get_cipher(self.current_index)
             .map(|c| (c, self.current_index))
     }
 
-    /// Ratchet the key at `index`: derive a new key from the current material.
-    fn ratchet(&mut self, index: u8) -> bool {
-        let idx = key_slot(index);
-        let Some(slot) = self.keys.get_mut(idx) else {
-            return false;
-        };
-        let Some(key) = slot.as_ref() else {
-            return false;
-        };
-        let new_material = ratchet_key(&key.raw_material);
-        let cipher = derive_cipher(&new_material);
-        *slot = Some(DerivedKey {
-            raw_material: new_material,
-            cipher,
-        });
-        true
+}
+
+/// A participant identity, distinct from any other `String`/`&str` floating around the call
+/// stack (room ids, track ids, etc.).
+///
+/// Used as the `HashMap` key for per-participant key rings, so a caller can't accidentally
+/// hand this API a different kind of id string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParticipantId(String);
+
+impl ParticipantId {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ParticipantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
 /// Manages encryption keys for all participants in a call.
 struct KeyManager {
-    /// Per-participant key rings. Key is participant identity string.
-    participants: HashMap<String, KeyRing>,
+    /// Per-participant key rings.
+    participants: HashMap<ParticipantId, KeyRing>,
     /// The local participant's identity (for encryption).
-    local_identity: Option<String>,
+    local_identity: Option<ParticipantId>,
 }
 
 impl KeyManager {
@@ -193,27 +334,80 @@ impl KeyManager {
         }
     }
 
-    fn set_key(&mut self, participant: &str, key_index: u8, material: &[u8]) {
+    fn set_key(
+        &mut self,
+        participant: &ParticipantId,
+        key_index: KeyIndex,
+        material: &[u8],
+        salt: HkdfSalt<'_>,
+    ) {
         let ring = self
             .participants
-            .entry(participant.to_string())
+            .entry(participant.clone())
             .or_insert_with(KeyRing::new);
-        ring.set_key(key_index, material);
+        ring.set_key(key_index, KeyMaterial(material), salt);
         // Only the key length (a size, not secret material) and identifiers are
         // logged here. The key bytes/derived cipher material must never appear
         // in a log event.
         tracing::info!(
-            participant = participant,
-            key_index = key_index,
+            participant = %participant,
+            key_index = %key_index,
             key_len = material.len(),
+            // Non-secret hash prefix. Lets a log reader tell "we never received their
+            // key" apart from "we received a different/stale one than they are using",
+            // which are indistinguishable from the decrypt failure alone.
+            fingerprint = %fingerprint_hex(key_fingerprint(KeyMaterial(material))),
             "E2EE key set for participant"
         );
     }
 }
 
+/// A short, non-secret identifier for a key, for correlating logs across a call.
+///
+/// The first four bytes of `SHA-256(material)`. Four bytes of a hash of a 16-byte secret
+/// is not a practical route back to the key, but it is enough to see at a glance whether
+/// the key we hold for a participant is the same one we held a moment ago -- which is the
+/// difference between "we never got their key" and "we got a stale one".
+fn key_fingerprint(material: KeyMaterial<'_>) -> [u8; 4] {
+    use sha2::Digest as _;
+    let digest = Sha256::digest(material.0);
+    let mut out = [0u8; 4];
+    for (slot, byte) in out.iter_mut().zip(digest.iter()) {
+        *slot = *byte;
+    }
+    out
+}
+
+/// The key index a wire frame claims, without validating anything else about the frame.
+///
+/// Diagnostics only: the sender's index is what makes a decrypt failure interpretable.
+const fn peek_key_index(frame: &[u8]) -> Option<u8> {
+    if frame.len() < TRAILER_SIZE {
+        return None;
+    }
+    match frame.last() {
+        Some(b) => Some(*b),
+        None => None,
+    }
+}
+
+/// Render a [`key_fingerprint`] as hex for logging.
+fn fingerprint_hex(fp: [u8; 4]) -> String {
+    use std::fmt::Write as _;
+    fp.iter().fold(String::with_capacity(8), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
 /// Thread-safe E2EE context shared across the media pipeline.
 pub struct E2eeContext {
     inner: Arc<RwLock<E2eeContextInner>>,
+    /// Count of frames no key could decrypt, for throttling the failure log.
+    ///
+    /// Outside the `RwLock` so the failure path never has to take a lock just to decide
+    /// whether to log.
+    undecryptable_frames: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct E2eeContextInner {
@@ -227,6 +421,7 @@ impl Clone for E2eeContext {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            undecryptable_frames: Arc::clone(&self.undecryptable_frames),
         }
     }
 }
@@ -241,7 +436,29 @@ impl E2eeContext {
                 options,
                 frame_counter: 0,
             })),
+            undecryptable_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Every key currently held, as `participant@index:fingerprint`, for diagnostics.
+    ///
+    /// Never includes key material -- only the [`key_fingerprint`] hash prefix.
+    fn key_inventory(&self) -> String {
+        let Ok(inner) = self.lock_read() else {
+            return "<lock poisoned>".to_owned();
+        };
+        let mut entries: Vec<String> = inner
+            .key_manager
+            .participants
+            .iter()
+            .flat_map(|(participant, ring)| {
+                ring.inventory()
+                    .into_iter()
+                    .map(move |(index, fp)| format!("{participant}@{index}:{fp}"))
+            })
+            .collect();
+        entries.sort();
+        entries.join(" ")
     }
 
     /// Acquire the read lock, translating poisoning into a proper error
@@ -274,7 +491,7 @@ impl E2eeContext {
             );
             return;
         };
-        inner.key_manager.local_identity = Some(identity.to_string());
+        inner.key_manager.local_identity = Some(ParticipantId::new(identity));
         tracing::info!(participant = identity, "E2EE local identity set");
     }
 
@@ -291,7 +508,10 @@ impl E2eeContext {
             );
             return;
         };
-        inner.key_manager.set_key(participant, key_index, key_material);
+        let participant = ParticipantId::new(participant);
+        // Split the borrow: the salt comes from `options` while `key_manager` is mutated.
+        let E2eeContextInner { options, key_manager, .. } = &mut *inner;
+        key_manager.set_key(&participant, KeyIndex::new(key_index), key_material, options.salt());
     }
 
     /// Check if E2EE has keys available for encryption.
@@ -329,7 +549,8 @@ impl E2eeContext {
     /// Returns `None` if no encryption key is available (passthrough mode),
     /// if the internal lock is poisoned, or if the outbound frame counter
     /// has been exhausted (which would otherwise force IV/nonce reuse).
-    pub fn encrypt_frame(&self, frame: &[u8], kind: MediaKind) -> Option<Vec<u8>> {
+    pub fn encrypt_frame(&self, frame: &PlaintextMedia, kind: MediaKind) -> Option<WireMedia> {
+        let frame = frame.as_bytes();
         let Ok(mut inner) = self.inner.write() else {
             tracing::error!(
                 reason = "lock_poisoned",
@@ -398,7 +619,11 @@ impl E2eeContext {
 
         let iv = build_iv(counter);
         let nonce = Nonce::from(iv);
-        let ciphertext = match cipher.encrypt(&nonce, payload) {
+        // The unencrypted header travels in the clear but is authenticated as associated
+        // data, exactly as livekit does (`additionalData: frameHeader`). A receiver that
+        // omits the AAD gets an authentication failure indistinguishable from a wrong key.
+        let aead_payload = aes_gcm::aead::Payload { msg: payload, aad: header };
+        let ciphertext = match cipher.encrypt(&nonce, aead_payload) {
             Ok(ct) => ct,
             Err(e) => {
                 tracing::warn!(
@@ -413,18 +638,19 @@ impl E2eeContext {
         // Nothing further needs the lock; release it before allocating the output.
         drop(inner);
 
-        // Build output: [header] [ciphertext (includes GCM tag)] [IV] [key_index]
+        // Build output: [header] [ciphertext (includes GCM tag)] [IV] [IV_LENGTH] [key_index]
         let capacity = header_size
             .saturating_add(ciphertext.len())
             .saturating_add(IV_SIZE)
-            .saturating_add(1);
+            .saturating_add(TRAILER_SIZE);
         let mut output = Vec::with_capacity(capacity);
         output.extend_from_slice(header);
         output.extend_from_slice(&ciphertext);
         output.extend_from_slice(&iv);
-        output.push(key_index_byte(key_index));
+        output.push(IV_SIZE_U8);
+        output.push(key_index.as_wire_byte());
 
-        Some(output)
+        Some(WireMedia::from_encrypted(output))
     }
 
     /// Decrypt a media frame, trying all known participant keys.
@@ -439,10 +665,10 @@ impl E2eeContext {
     /// decrypt the frame.
     pub fn decrypt_frame_any(
         &self,
-        frame: &[u8],
+        frame: &WireMedia,
         kind: MediaKind,
-    ) -> Result<Option<Vec<u8>>, E2eeError> {
-        let participants: Vec<String> = {
+    ) -> Result<Option<PlaintextMedia>, E2eeError> {
+        let participants: Vec<ParticipantId> = {
             let inner = self.lock_read()?;
             inner.key_manager.participants.keys().cloned().collect()
         };
@@ -456,12 +682,35 @@ impl E2eeContext {
         }
 
         for participant in &participants {
-            if let Ok(Some(decrypted)) = self.decrypt_frame(frame, participant, kind) {
+            if let Ok(Some(decrypted)) = self.decrypt_frame(frame, participant.as_str(), kind) {
                 return Ok(Some(decrypted));
             }
         }
 
-        // All participants failed; return the last error for diagnostics
+        // This frame is genuinely lost: no key we hold authenticates it. Report the key
+        // index the *sender* used alongside every key we actually have, because the
+        // interesting cases are only distinguishable by comparing the two:
+        //
+        // - the sender's index is absent from the inventory -> their key never reached us
+        // - the index is present but still fails -> we hold the wrong/stale key for it
+        //
+        // Throttled: at ~50 frames/sec per stream a lost key would otherwise bury the log.
+        let lost = self
+            .undecryptable_frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if lost == 1 || lost.is_multiple_of(200) {
+            tracing::warn!(
+                reason = "no_key_decrypts_frame",
+                frame_key_index = peek_key_index(frame.as_bytes())
+                    .map_or_else(|| "?".to_owned(), |i| i.to_string()),
+                media_kind = ?kind,
+                undecryptable_frames = lost,
+                keys_held = %self.key_inventory(),
+                "E2EE dropping inbound frame: no key we hold decrypts it"
+            );
+        }
+
         Err(E2eeError::DecryptionFailed(format!(
             "tried {} participants, none could decrypt",
             participants.len()
@@ -476,45 +725,51 @@ impl E2eeContext {
     /// # Errors
     ///
     /// Returns [`E2eeError::FrameTooShort`] if the frame is too small to contain
-    /// the E2EE metadata, [`E2eeError::InvalidKeyIndex`] if the trailing key
-    /// index is out of range, [`E2eeError::LockPoisoned`] if the internal lock
+    /// the E2EE metadata, [`E2eeError::UnsupportedIvLength`] if the trailer's
+    /// `IV_LENGTH` byte is not 12, [`E2eeError::LockPoisoned`] if the internal lock
     /// was poisoned, or [`E2eeError::DecryptionFailed`] if AES-GCM decryption
     /// fails for every key tried (including the ratchet window, if enabled).
     pub fn decrypt_frame(
         &self,
-        frame: &[u8],
+        frame: &WireMedia,
         participant: &str,
         kind: MediaKind,
-    ) -> Result<Option<Vec<u8>>, E2eeError> {
-        // Minimum frame size: at least 1 byte payload + IV + key_index
-        let min_size = IV_SIZE + 1 + TAG_SIZE;
+    ) -> Result<Option<PlaintextMedia>, E2eeError> {
+        let frame = frame.as_bytes();
+        // Minimum frame size: header + at least a bare GCM tag + IV + 2-byte trailer.
+        let min_size = TAG_SIZE
+            .saturating_add(IV_SIZE)
+            .saturating_add(TRAILER_SIZE);
         if frame.len() < min_size {
             return Err(E2eeError::FrameTooShort(frame.len()));
         }
 
-        // Extract key_index (last byte)
-        let key_index = *frame
-            .last()
+        // Trailer is `[IV_LENGTH][key_index]`. The key index is the sender's unreduced
+        // rotation counter, so it wraps into the ring exactly as a local index does; see
+        // [`KeyIndex`]. `IV_LENGTH` is validated strictly, because it is a *length* and
+        // trusting an attacker-supplied one would move the IV window.
+        let trailer_start = frame
+            .len()
+            .checked_sub(TRAILER_SIZE)
             .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        if usize::from(key_index) >= MAX_KEYS {
-            return Err(E2eeError::InvalidKeyIndex(key_index));
+        let trailer = frame
+            .get(trailer_start..)
+            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        let raw_iv_len = *trailer.first().ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        if raw_iv_len != IV_SIZE_U8 {
+            return Err(E2eeError::UnsupportedIvLength(raw_iv_len));
         }
+        let raw_key_index = *trailer.get(1).ok_or(E2eeError::FrameTooShort(frame.len()))?;
+        let key_index = KeyIndex::new(raw_key_index);
 
-        // Extract IV (12 bytes before key_index). All offsets are re-derived with
+        // Extract IV (12 bytes before the trailer). All offsets are re-derived with
         // checked arithmetic rather than relying solely on the length check above,
         // so a future refactor of `min_size` can't silently reintroduce a panic.
-        let without_key_index = frame
-            .len()
-            .checked_sub(1)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let iv_start = without_key_index
+        let iv_start = trailer_start
             .checked_sub(IV_SIZE)
             .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let iv_end = iv_start
-            .checked_add(IV_SIZE)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
         let iv = frame
-            .get(iv_start..iv_end)
+            .get(iv_start..trailer_start)
             .ok_or(E2eeError::FrameTooShort(frame.len()))?;
 
         // The rest is [header][ciphertext]
@@ -533,8 +788,9 @@ impl E2eeContext {
 
         let inner = self.lock_read()?;
         let options = inner.options.clone();
+        let participant = ParticipantId::new(participant);
 
-        let Some(ring) = inner.key_manager.participants.get(participant) else {
+        let Some(ring) = inner.key_manager.participants.get(&participant) else {
             tracing::warn!(
                 reason = "no_key_for_participant",
                 participant = %participant,
@@ -548,45 +804,69 @@ impl E2eeContext {
             .try_into()
             .map_err(|_| E2eeError::FrameTooShort(frame.len()))?;
 
+        // The header travels in the clear but is authenticated: it must be supplied as
+        // associated data or GCM authentication fails, looking exactly like a wrong key.
+        let nonce = Nonce::from(iv_array);
+        let aead_payload = || aes_gcm::aead::Payload { msg: ciphertext, aad: header };
+
         // Try the indicated key index first
-        if let Some(cipher) = ring.get_cipher(key_index) {
-            let nonce = Nonce::from(iv_array);
-            if let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) {
-                let mut output =
-                    Vec::with_capacity(header_size.saturating_add(plaintext.len()));
-                output.extend_from_slice(header);
-                output.extend_from_slice(&plaintext);
-                return Ok(Some(output));
-            }
+        if let Some(cipher) = ring.get_cipher(key_index)
+            && let Ok(plaintext) = cipher.decrypt(&nonce, aead_payload())
+        {
+            return Ok(Some(PlaintextMedia::from_decrypted(prepend_header(header, &plaintext))));
         }
 
-        // If ratcheting is enabled, try ratcheted keys
-        if options.ratchet_window_size > 0 {
-            drop(inner);
-            let mut inner = self.lock_write()?;
-            if let Some(ring) = inner.key_manager.participants.get_mut(participant) {
-                for _ in 0..options.ratchet_window_size {
-                    ring.ratchet(key_index);
-                    if let Some(cipher) = ring.get_cipher(key_index) {
-                        let nonce = Nonce::from(iv_array);
-                        if let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) {
-                            let mut output =
-                                Vec::with_capacity(header_size.saturating_add(plaintext.len()));
-                            output.extend_from_slice(header);
-                            output.extend_from_slice(&plaintext);
-                            return Ok(Some(output));
-                        }
+        // If ratcheting is enabled, walk the ratchet chain forward looking for a key that
+        // authenticates this frame.
+        //
+        // Deliberately computed on a *copy* of the material rather than by mutating the
+        // ring in place: a failed search must leave the participant's key exactly as it
+        // was. Advancing the stored key on every failure -- as this once did -- burns
+        // through the whole window on the first undecryptable frame and permanently
+        // destroys the real key, so the participant can never be decrypted again even
+        // once a good frame arrives.
+        let ratchet_material = if options.ratchet_window_size > 0 {
+            ring.raw_material(key_index).map(<[u8]>::to_vec).map(zeroize::Zeroizing::new)
+        } else {
+            None
+        };
+        drop(inner);
+
+        if let Some(mut material) = ratchet_material {
+            let salt = options.salt();
+            for _ in 0..options.ratchet_window_size {
+                material = zeroize::Zeroizing::new(ratchet_key(KeyMaterial(&material), salt));
+                let cipher = derive_cipher(KeyMaterial(&material), salt);
+                if let Ok(plaintext) = cipher.decrypt(&nonce, aead_payload()) {
+                    // Commit the ratchet only now that it is known good, so subsequent
+                    // frames skip the search.
+                    let mut write = self.lock_write()?;
+                    if let Some(ring) = write.key_manager.participants.get_mut(&participant) {
+                        ring.replace_key(key_index, KeyMaterial(&material), salt);
                     }
+                    drop(write);
+                    return Ok(Some(PlaintextMedia::from_decrypted(prepend_header(
+                        header, &plaintext,
+                    ))));
                 }
             }
         }
 
-        tracing::warn!(
+        // Debug, not warn, and deliberately so.
+        //
+        // `decrypt_frame_any` calls this once per known participant until one succeeds, so
+        // on a healthy call every successfully decrypted frame still produces a failure
+        // here for each participant tried before the right one. Logging that at `warn`
+        // made a working call look catastrophic: one real problem showed up as ~11,000
+        // warnings, roughly four per frame, most of them describing normal operation.
+        // The single authoritative "this frame is lost" event is emitted by
+        // `decrypt_frame_any` instead.
+        tracing::debug!(
             reason = "decryption_failed",
             participant = %participant,
-            key_index = key_index,
+            key_index = %key_index,
             ratchet_window_size = options.ratchet_window_size,
-            "E2EE dropping inbound frame: AES-GCM decryption failed for all tried keys"
+            "E2EE key did not decrypt this frame"
         );
         Err(E2eeError::DecryptionFailed(format!(
             "participant={participant}, key_index={key_index}"
@@ -594,31 +874,41 @@ impl E2eeContext {
     }
 }
 
+/// Build a decrypted frame's output buffer: the unencrypted `header` followed by `plaintext`.
+fn prepend_header(header: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(header.len().saturating_add(plaintext.len()));
+    output.extend_from_slice(header);
+    output.extend_from_slice(plaintext);
+    output
+}
+
 /// Derive an AES-128-GCM cipher from raw key material using HKDF-SHA256.
-fn derive_cipher(material: &[u8]) -> Aes128Gcm {
-    let hk = Hkdf::<Sha256>::new(None, material);
-    let mut okm = [0u8; 16]; // AES-128 = 16 bytes
+fn derive_cipher(material: KeyMaterial<'_>, salt: HkdfSalt<'_>) -> Aes128Gcm {
+    let hk = Hkdf::<Sha256>::new(Some(salt.0), material.0);
+    // `Zeroizing` wipes the derived key output from the stack once the cipher is built,
+    // rather than leaving a copy of the AES key sitting in memory after this fn returns.
+    let mut okm = zeroize::Zeroizing::new([0u8; 16]); // AES-128 = 16 bytes
     // HKDF-Expand only fails when the requested output length exceeds
     // 255 * hash_len (RFC 5869 section 2.3); a fixed 16-byte request is always valid.
     #[allow(clippy::expect_used)]
-    hk.expand(HKDF_INFO, &mut okm)
+    hk.expand(&HKDF_INFO, okm.as_mut_slice())
         .expect("HKDF expand output length (16 bytes) is within RFC 5869 bounds");
     // `okm` is exactly 16 bytes, the required AES-128 key length, so this
     // conversion cannot fail.
     #[allow(clippy::expect_used)]
-    let cipher =
-        Aes128Gcm::new_from_slice(&okm).expect("16 bytes is valid AES-128 key length");
-    cipher
+    Aes128Gcm::new_from_slice(okm.as_slice()).expect("16 bytes is valid AES-128 key length")
 }
 
 /// Ratchet a key: derive new key material from existing material.
-fn ratchet_key(material: &[u8]) -> Vec<u8> {
-    let hk = Hkdf::<Sha256>::new(None, material);
-    let mut okm = vec![0u8; material.len().max(16)];
+fn ratchet_key(material: KeyMaterial<'_>, salt: HkdfSalt<'_>) -> Vec<u8> {
+    let hk = Hkdf::<Sha256>::new(Some(salt.0), material.0);
+    // 256 bits, matching livekit-client's `ratchet()` which calls
+    // `crypto.subtle.deriveBits(algorithmOptions, material, 256)`.
+    let mut okm = vec![0u8; 32];
     // HKDF-Expand only fails when the requested output length exceeds
     // 255 * hash_len (RFC 5869 section 2.3); `okm` is always well within that bound.
     #[allow(clippy::expect_used)]
-    hk.expand(b"LKFrameRatchet", &mut okm)
+    hk.expand(&HKDF_INFO, &mut okm)
         .expect("HKDF expand output length is within RFC 5869 bounds");
     okm
 }
@@ -637,32 +927,21 @@ fn build_iv(counter: u64) -> [u8; IV_SIZE] {
 /// - Video (VP8): 1 byte minimum (the first byte contains keyframe flag and version),
 ///   but we check the VP8 payload descriptor to preserve the right amount
 fn unencrypted_header_size(frame: &[u8], kind: MediaKind) -> usize {
-    match kind {
-        MediaKind::Audio => 0,
+    let wanted = match kind {
+        // RFC 6716 §3.1: the Opus TOC byte carries the packet's own framing, so livekit
+        // leaves it in the clear. It is still authenticated, as associated data.
+        MediaKind::Audio => 1,
         MediaKind::Video => {
-            if frame.is_empty() {
-                return 0;
-            }
-            // VP8 payload descriptor: first byte always present
-            // Bit 7 (X): extension bit
-            // If X=1, second byte is present with I, L, T, K flags
-            // If I=1, PictureID is present (1 or 2 more bytes)
-            let mut size = 1;
-            if frame.len() > 1 && frame.first().is_some_and(|b| b & 0x80 != 0) {
-                // Extension byte present
-                size = 2;
-                if frame.len() > 2 && frame.get(1).is_some_and(|b| b & 0x80 != 0) {
-                    // PictureID present
-                    size = 3;
-                    if frame.len() > 3 && frame.get(2).is_some_and(|b| b & 0x80 != 0) {
-                        // 2-byte PictureID (M bit set)
-                        size = 4;
-                    }
-                }
-            }
-            size.min(frame.len())
+            // livekit's `UNENCRYPTED_BYTES`: 10 bytes for a key frame, 3 for a delta
+            // frame -- the VP8 uncompressed data chunk (RFC 6386 §9.1), which is 3 bytes
+            // of frame tag plus, on a key frame, the 3-byte start code and 4 bytes of
+            // dimensions.
+            //
+            // Bit 0 of the frame tag is the frame type: 0 = key frame, 1 = interframe.
+            if frame.first().is_some_and(|b| b & 0x01 == 0) { 10 } else { 3 }
         }
-    }
+    };
+    wanted.min(frame.len())
 }
 
 #[cfg(test)]
@@ -680,13 +959,13 @@ mod tests {
 
         let original = b"opus-frame-data-here";
         let encrypted = ctx
-            .encrypt_frame(original, MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(original.to_vec()), MediaKind::Audio)
             .expect("encryption should succeed");
 
         // Encrypted frame should be larger (IV + tag + key_index)
         assert!(encrypted.len() > original.len());
         // Encrypted payload should differ from original
-        let prefix = encrypted.get(..original.len()).expect("frame has prefix");
+        let prefix = encrypted.as_bytes().get(..original.len()).expect("frame has prefix");
         assert_ne!(prefix, &original[..]);
 
         let decrypted = ctx
@@ -694,7 +973,7 @@ mod tests {
             .expect("decryption should not error")
             .expect("decryption should produce output");
 
-        assert_eq!(&decrypted, original);
+        assert_eq!(decrypted.as_bytes(), original);
     }
 
     #[test]
@@ -709,12 +988,12 @@ mod tests {
         original.extend_from_slice(b"video-payload-data-here");
 
         let encrypted = ctx
-            .encrypt_frame(&original, MediaKind::Video)
+            .encrypt_frame(&PlaintextMedia::from_encoder(original.clone()), MediaKind::Video)
             .expect("encryption should succeed");
 
         // First few bytes (VP8 header) should be unencrypted
         assert_eq!(
-            encrypted.get(..3).expect("frame has header"),
+            encrypted.as_bytes().get(..3).expect("frame has header"),
             original.get(..3).expect("original has header")
         );
 
@@ -723,7 +1002,7 @@ mod tests {
             .expect("decryption should not error")
             .expect("decryption should produce output");
 
-        assert_eq!(decrypted, original);
+        assert_eq!(decrypted.as_bytes(), original.as_slice());
     }
 
     #[test]
@@ -735,7 +1014,7 @@ mod tests {
 
         let original = b"opus-frame";
         let encrypted = ctx
-            .encrypt_frame(original, MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(original.to_vec()), MediaKind::Audio)
             .expect("encryption should succeed");
 
         // Bob has no key set
@@ -754,7 +1033,7 @@ mod tests {
 
         let original = b"secret-audio-data";
         let encrypted = ctx
-            .encrypt_frame(original, MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(original.to_vec()), MediaKind::Audio)
             .expect("encryption should succeed");
 
         // Set a different key for alice
@@ -773,13 +1052,13 @@ mod tests {
         // Set key at index 0, encrypt a frame
         ctx.set_key("alice", 0, b"key-zero-material-abcdefghijklm");
         let encrypted_0 = ctx
-            .encrypt_frame(b"frame-0", MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(b"frame-0".to_vec()), MediaKind::Audio)
             .expect("encrypt should succeed");
 
         // Set key at index 1 (now current), encrypt another frame
         ctx.set_key("alice", 1, b"key-one-material-nopqrstuvwxyz1");
         let encrypted_1 = ctx
-            .encrypt_frame(b"frame-1", MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(b"frame-1".to_vec()), MediaKind::Audio)
             .expect("encrypt should succeed");
 
         // Both should decrypt successfully (both keys still in ring)
@@ -787,13 +1066,13 @@ mod tests {
             .decrypt_frame(&encrypted_0, "alice", MediaKind::Audio)
             .expect("should not error")
             .expect("should decrypt");
-        assert_eq!(&dec_0, b"frame-0");
+        assert_eq!(dec_0.as_bytes(), b"frame-0");
 
         let dec_1 = ctx
             .decrypt_frame(&encrypted_1, "alice", MediaKind::Audio)
             .expect("should not error")
             .expect("should decrypt");
-        assert_eq!(&dec_1, b"frame-1");
+        assert_eq!(dec_1.as_bytes(), b"frame-1");
     }
 
     #[test]
@@ -801,7 +1080,7 @@ mod tests {
         let ctx = E2eeContext::new(E2eeOptions::default());
         ctx.set_key("alice", 0, b"some-key");
 
-        let result = ctx.decrypt_frame(&[0; 5], "alice", MediaKind::Audio);
+        let result = ctx.decrypt_frame(&WireMedia::from_network(vec![0; 5]), "alice", MediaKind::Audio);
         assert!(matches!(result, Err(E2eeError::FrameTooShort(_))));
     }
 
@@ -809,7 +1088,7 @@ mod tests {
     fn no_key_returns_none_on_encrypt() {
         let ctx = E2eeContext::new(E2eeOptions::default());
         // No local identity set
-        let result = ctx.encrypt_frame(b"data", MediaKind::Audio);
+        let result = ctx.encrypt_frame(&PlaintextMedia::from_encoder(b"data".to_vec()), MediaKind::Audio);
         assert!(result.is_none());
     }
 
@@ -834,13 +1113,19 @@ mod tests {
             inner
                 .key_manager
                 .participants
-                .get_mut("alice")
-                .map(|ring| ring.ratchet(0))
+                .get_mut(&ParticipantId::new("alice"))
+                .map(|ring| {
+                    let salt = HkdfSalt(DEFAULT_RATCHET_SALT);
+                    let current =
+                        ring.raw_material(KeyIndex::new(0)).expect("key was just set").to_vec();
+                    let next = ratchet_key(KeyMaterial(&current), salt);
+                    ring.replace_key(KeyIndex::new(0), KeyMaterial(&next), salt);
+                })
         };
-        assert_eq!(ratcheted, Some(true));
+        assert_eq!(ratcheted, Some(()));
 
         let encrypted = sender
-            .encrypt_frame(b"test-data", MediaKind::Audio)
+            .encrypt_frame(&PlaintextMedia::from_encoder(b"test-data".to_vec()), MediaKind::Audio)
             .expect("encrypt should succeed");
 
         // Receiver has the original (pre-ratchet) key
@@ -857,29 +1142,397 @@ mod tests {
             .decrypt_frame(&encrypted, "alice", MediaKind::Audio)
             .expect("should not error")
             .expect("ratchet window should find the key");
-        assert_eq!(&decrypted, b"test-data");
+        assert_eq!(decrypted.as_bytes(), b"test-data");
     }
 
     #[test]
-    fn unencrypted_header_audio() {
-        assert_eq!(unencrypted_header_size(b"anything", MediaKind::Audio), 0);
+    fn unencrypted_header_audio_is_the_opus_toc_byte() {
+        // livekit's `UNENCRYPTED_BYTES.audio`: the Opus TOC byte stays in the clear.
+        assert_eq!(unencrypted_header_size(b"anything", MediaKind::Audio), 1);
     }
 
     #[test]
-    fn unencrypted_header_video_simple() {
-        // No extension bit
+    fn unencrypted_header_never_exceeds_the_frame() {
+        // A frame shorter than the nominal header must clamp rather than slice out of
+        // bounds -- inbound frame lengths are attacker-controlled.
+        assert_eq!(unencrypted_header_size(b"", MediaKind::Audio), 0);
+        assert_eq!(unencrypted_header_size(&[0x10, 0x00], MediaKind::Video), 2);
+    }
+
+    #[test]
+    fn unencrypted_header_video_distinguishes_key_and_delta_frames() {
+        // VP8 frame tag bit 0: 0 = key frame (10 clear bytes), 1 = interframe (3).
+        let long = [0u8; 32];
+        let mut keyframe = long;
+        if let Some(b) = keyframe.first_mut() {
+            *b = 0x10;
+        }
+        assert_eq!(unencrypted_header_size(&keyframe, MediaKind::Video), 10);
+
+        let mut delta = long;
+        if let Some(b) = delta.first_mut() {
+            *b = 0x11;
+        }
+        assert_eq!(unencrypted_header_size(&delta, MediaKind::Video), 3);
+    }
+
+    #[test]
+    fn key_index_wraps_into_the_key_ring() {
+        // A sender's key index is a monotonically increasing rotation counter, but the ring
+        // has only MAX_KEYS slots -- so both locally-supplied and wire-read indices reduce
+        // modulo the ring size. Same rule on both sides, or the two disagree about which
+        // slot a frame belongs to.
+        assert_eq!(KeyIndex::new(16), KeyIndex::new(0));
+        assert_eq!(KeyIndex::new(20), KeyIndex::new(4));
+        assert_eq!(KeyIndex::new(15).as_wire_byte(), 15);
+        assert_eq!(KeyIndex::new(255), KeyIndex::new(15));
+    }
+
+}
+
+#[cfg(test)]
+mod hkdf_interop_tests {
+    use super::*;
+
+
+    /// Pins our HKDF parameters against livekit-client's, using vectors computed
+    /// independently (a plain HMAC-SHA256 HKDF implementation, outside this crate).
+    ///
+    /// This is the check that would have caught a real interop break: we derived with
+    /// `salt = None` and `info = b"LKFrameEncryptionKey"`, whereas livekit-client's
+    /// `getAlgoOptions` uses `salt = ratchetSalt` (`"LKFrameEncryptionKey"`) and
+    /// `info = new ArrayBuffer(128)` (128 zero bytes). Swapping them still yields a
+    /// valid-looking AES-128 key, so nothing errors -- every remote frame simply fails
+    /// authentication and is dropped, which is silent and near-impossible to attribute.
+    /// Round-tripping against ourselves cannot catch it; only a fixed vector can.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn derived_key_matches_livekit_hkdf_parameters() {
+        let material: Vec<u8> = (0..32u8).collect();
+        let opts = E2eeOptions::default();
+        let salt = opts.salt();
+        assert_eq!(salt.0, b"LKFrameEncryptionKey");
+
+        // HKDF-SHA256(salt = "LKFrameEncryptionKey", ikm = 0x00..0x1f, info = [0u8; 128])
+        // truncated to the AES-128 key length.
+        let expected_aes_key =
+            hex_to_bytes("6d0dd7b3d6f4efde47ab9a9e15abde76");
+
+        let hk = Hkdf::<Sha256>::new(Some(salt.0), &material);
+        let mut okm = [0u8; 16];
+        hk.expand(&HKDF_INFO, &mut okm).expect("expand");
         assert_eq!(
-            unencrypted_header_size(&[0x10, 0x00, 0x00], MediaKind::Video),
-            1
+            okm.as_slice(),
+            expected_aes_key.as_slice(),
+            "AES key derivation must match livekit-client exactly, or no peer can decrypt us"
         );
     }
 
+    /// The ratchet step must also match: livekit's `ratchet()` derives 256 bits with the
+    /// same algorithm options.
     #[test]
-    fn unencrypted_header_video_with_extension() {
-        // Extension bit set, I bit set, short PictureID
-        assert_eq!(
-            unencrypted_header_size(&[0x90, 0x80, 0x42, 0x00], MediaKind::Video),
-            3
+    fn ratchet_matches_livekit_derive_bits() {
+        let material: Vec<u8> = (0..32u8).collect();
+        let opts = E2eeOptions::default();
+        let salt = opts.salt();
+        let expected = hex_to_bytes(
+            "6d0dd7b3d6f4efde47ab9a9e15abde7635c45a13bddf5da15eed01f40178d328",
         );
+        let got = ratchet_key(KeyMaterial(&material), salt);
+        assert_eq!(got.len(), 32, "livekit ratchets to 256 bits");
+        assert_eq!(got, expected, "ratchet output must match livekit-client exactly");
+    }
+
+    /// A configured salt must actually be used, not silently ignored (it was: the salt
+    /// option existed but never reached the derivation).
+    #[test]
+    fn configured_salt_changes_the_derived_key() {
+        let material: Vec<u8> = (0..32u8).collect();
+        let custom = E2eeOptions {
+            ratchet_salt: Some("a-different-salt".to_string()),
+            ..E2eeOptions::default()
+        };
+        let defaults = E2eeOptions::default();
+        assert_ne!(
+            ratchet_key(KeyMaterial(&material), custom.salt()),
+            ratchet_key(KeyMaterial(&material), defaults.salt()),
+        );
+    }
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| hex.get(i..i.saturating_add(2)))
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect()
+    }
+}
+
+/// Interop tests for the *frame layout*, built independently of this crate's encryptor.
+///
+/// A round-trip test (encrypt with our code, decrypt with our code) cannot catch a layout
+/// mistake -- it agrees with itself. These tests instead assemble a frame byte-for-byte
+/// the way livekit-client's `e2ee.worker` does and require our decryptor to read it, which
+/// is what a browser or mobile Element Call peer actually sends.
+///
+/// The layout is transcribed from `FrameCryptor.encodeFunction` in
+/// `livekit-client/dist/livekit-client.e2ee.worker.mjs`:
+///
+/// ```text
+/// [header][ciphertext][IV (12)][IV_LENGTH][key_index]
+/// ```
+///
+/// with `additionalData` set to the header bytes.
+#[cfg(test)]
+mod wire_format_interop_tests {
+    use super::*;
+
+    const MATERIAL: &[u8] = b"interop-key-material-0123456789";
+
+    /// Build a frame exactly as livekit-client would, without using [`E2eeContext`].
+    #[allow(clippy::expect_used)]
+    fn livekit_style_frame(plaintext: &[u8], header_len: usize, key_index: u8) -> Vec<u8> {
+        let cipher = derive_cipher(KeyMaterial(MATERIAL), HkdfSalt(DEFAULT_RATCHET_SALT));
+        let iv = [7u8; IV_SIZE];
+        let header = plaintext.get(..header_len).expect("header within plaintext");
+        let body = plaintext.get(header_len..).expect("body within plaintext");
+
+        let ciphertext = cipher
+            .encrypt(
+                &Nonce::from(iv),
+                aes_gcm::aead::Payload { msg: body, aad: header },
+            )
+            .expect("encryption succeeds");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(header);
+        frame.extend_from_slice(&ciphertext);
+        frame.extend_from_slice(&iv);
+        frame.push(IV_SIZE_U8); // frameTrailer[0]
+        frame.push(key_index); // frameTrailer[1]
+        frame
+    }
+
+    /// The decisive test: a frame built to livekit's layout must decrypt.
+    ///
+    /// This failed before the trailer was corrected from one byte to two -- reading only
+    /// the final byte still yields the right key index, so the bug looked harmless while
+    /// shifting the IV window by one byte and prefixing the ciphertext with a stray byte.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn decrypts_an_audio_frame_laid_out_the_way_livekit_lays_it_out() {
+        // Byte 0 is the Opus TOC byte, which livekit leaves unencrypted.
+        let plaintext = b"\x78opus-payload-bytes".to_vec();
+        let frame = livekit_style_frame(&plaintext, 1, 3);
+
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_key("bob", 3, MATERIAL);
+
+        let decrypted = ctx
+            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Audio)
+            .expect("decryption should not error")
+            .expect("a key is configured");
+        assert_eq!(decrypted.as_bytes(), plaintext.as_slice());
+    }
+
+    /// A sender's key index is a rotation counter that is not reduced before it goes on
+    /// the wire.
+    ///
+    /// Regression: a peer that has rotated its key 25 times writes 25 into the frame
+    /// trailer while holding the material at slot `25 % 16 == 9`. Rejecting the
+    /// out-of-range byte rather than wrapping it made every frame from such a peer
+    /// undecryptable -- seen in the field as a participant who was completely inaudible
+    /// while their packets arrived normally and no key was actually missing.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn decrypts_a_frame_from_a_sender_that_rotated_past_the_ring_size() {
+        let plaintext = b"\x78opus-payload-bytes".to_vec();
+        // Wire index 25, key held at slot 9.
+        let frame = livekit_style_frame(&plaintext, 1, 25);
+
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_key("bob", 9, MATERIAL);
+
+        let decrypted = ctx
+            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Audio)
+            .expect("a wire index of 25 must resolve to slot 9")
+            .expect("a key is configured at slot 9");
+        assert_eq!(decrypted.as_bytes(), plaintext.as_slice());
+    }
+
+    /// Video keyframes leave 10 bytes in the clear, delta frames 3.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn decrypts_video_frames_with_livekits_header_sizes() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_key("bob", 0, MATERIAL);
+
+        // Frame tag bit 0 == 0 marks a key frame -> 10 unencrypted bytes.
+        let mut keyframe = vec![0x10u8];
+        keyframe.extend_from_slice(b"0123456789abcdef");
+        assert_eq!(unencrypted_header_size(&keyframe, MediaKind::Video), 10);
+        let frame = livekit_style_frame(&keyframe, 10, 0);
+        let decrypted = ctx
+            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Video)
+            .expect("decryption should not error")
+            .expect("a key is configured");
+        assert_eq!(decrypted.as_bytes(), keyframe.as_slice());
+
+        // Frame tag bit 0 == 1 marks an interframe -> 3 unencrypted bytes.
+        let mut delta = vec![0x11u8];
+        delta.extend_from_slice(b"0123456789abcdef");
+        assert_eq!(unencrypted_header_size(&delta, MediaKind::Video), 3);
+        let frame = livekit_style_frame(&delta, 3, 0);
+        let decrypted = ctx
+            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Video)
+            .expect("decryption should not error")
+            .expect("a key is configured");
+        assert_eq!(decrypted.as_bytes(), delta.as_slice());
+    }
+
+    /// Our encryptor must emit the same layout it can read, byte positions included.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn our_encryptor_emits_livekits_two_byte_trailer() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 5, MATERIAL);
+
+        let plaintext = b"\x78opus-payload-bytes".to_vec();
+        let encrypted = ctx
+            .encrypt_frame(&PlaintextMedia::from_encoder(plaintext.clone()), MediaKind::Audio)
+            .expect("encryption succeeds");
+        let bytes = encrypted.as_bytes();
+
+        let trailer_start = bytes.len().saturating_sub(TRAILER_SIZE);
+        assert_eq!(bytes.get(trailer_start), Some(&IV_SIZE_U8), "trailer[0] is IV_LENGTH");
+        assert_eq!(bytes.get(trailer_start + 1), Some(&5u8), "trailer[1] is the key index");
+
+        // Header is in the clear, exactly one Opus TOC byte for audio.
+        assert_eq!(bytes.first(), plaintext.first());
+
+        // Total length: header + payload + GCM tag + IV + trailer.
+        assert_eq!(bytes.len(), plaintext.len() + TAG_SIZE + IV_SIZE + TRAILER_SIZE);
+    }
+
+    /// The `IV_LENGTH` byte is attacker-controlled, so anything but 12 is rejected rather
+    /// than used as a length.
+    #[test]
+    fn rejects_a_frame_claiming_an_unsupported_iv_length() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_key("bob", 0, MATERIAL);
+
+        let mut frame = livekit_style_frame(b"\x78payload", 1, 0);
+        let trailer_start = frame.len().saturating_sub(TRAILER_SIZE);
+        if let Some(b) = frame.get_mut(trailer_start) {
+            *b = 16;
+        }
+        let result = ctx.decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Audio);
+        assert!(matches!(result, Err(E2eeError::UnsupportedIvLength(16))));
+    }
+
+    /// A failed ratchet search must leave the participant's key intact.
+    ///
+    /// Previously the search mutated the stored key on every step, so one undecryptable
+    /// frame burned the whole ratchet window and destroyed the real key permanently --
+    /// after which even a perfectly good frame could never be decrypted.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_failed_ratchet_search_does_not_destroy_the_key() {
+        let ctx = E2eeContext::new(E2eeOptions {
+            ratchet_window_size: 10,
+            ..Default::default()
+        });
+        ctx.set_key("bob", 0, MATERIAL);
+
+        // Garbage that no key in the window can authenticate.
+        let mut junk = livekit_style_frame(b"\x78payload", 1, 0);
+        if let Some(b) = junk.get_mut(3) {
+            *b ^= 0xff;
+        }
+        assert!(ctx.decrypt_frame(&WireMedia::from_network(junk), "bob", MediaKind::Audio).is_err());
+
+        // A genuine frame under the original key must still decrypt.
+        let plaintext = b"\x78opus-payload-bytes".to_vec();
+        let good = livekit_style_frame(&plaintext, 1, 0);
+        let decrypted = ctx
+            .decrypt_frame(&WireMedia::from_network(good), "bob", MediaKind::Audio)
+            .expect("decryption should not error")
+            .expect("the key must survive a failed ratchet search");
+        assert_eq!(decrypted.as_bytes(), plaintext.as_slice());
+    }
+}
+
+/// Tests for the diagnostics that make a decrypt failure interpretable.
+///
+/// These matter because the failure itself is silent to the user -- lost media sounds like
+/// a quiet participant, not an error -- so the log is the only way the cause is ever found.
+#[cfg(test)]
+mod key_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_distinguish_keys_without_revealing_them() {
+        use std::fmt::Write as _;
+        let a = b"key-material-aaaaaaaaaaaaaaaaaaa";
+        let b = b"key-material-bbbbbbbbbbbbbbbbbbb";
+        let fp_a = fingerprint_hex(key_fingerprint(KeyMaterial(a)));
+        let fp_b = fingerprint_hex(key_fingerprint(KeyMaterial(b)));
+
+        assert_ne!(fp_a, fp_b, "different keys must be distinguishable");
+        assert_eq!(fp_a, fingerprint_hex(key_fingerprint(KeyMaterial(a))), "stable");
+        assert_eq!(fp_a.len(), 8, "4 bytes rendered as hex");
+
+        // The fingerprint must not be, or contain, the key.
+        let material_hex = a.iter().fold(String::new(), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        });
+        assert!(!material_hex.contains(&fp_a), "fingerprint must not leak key bytes");
+    }
+
+    /// The inventory is what tells "their key never arrived" apart from "we have the
+    /// wrong key at that index" -- the two causes need opposite fixes.
+    #[test]
+    fn key_inventory_reports_every_held_key_by_participant_and_index() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_key("alice", 3, b"alice-key-material-00000000000");
+        ctx.set_key("bob", 4, b"bob-key-material-000000000000");
+        ctx.set_key("bob", 11, b"bob-second-key-material-00000");
+
+        let inventory = ctx.key_inventory();
+        assert!(inventory.contains("alice@3:"), "got {inventory}");
+        assert!(inventory.contains("bob@4:"), "got {inventory}");
+        assert!(inventory.contains("bob@11:"), "got {inventory}");
+        // An index nobody holds must be absent, which is exactly the diagnostic signal.
+        assert!(!inventory.contains("@5:"), "got {inventory}");
+    }
+
+    /// Replacing a participant's key must change its fingerprint, so a stale key is
+    /// visible in the log rather than looking identical to the correct one.
+    #[test]
+    fn rotating_a_key_changes_its_fingerprint() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_key("alice", 0, b"first-key-material-0000000000");
+        let before = ctx.key_inventory();
+        ctx.set_key("alice", 0, b"second-key-material-000000000");
+        let after = ctx.key_inventory();
+
+        assert_ne!(before, after, "a rotated key must be visibly different");
+    }
+
+    /// The frame's own key index is read for diagnostics even when nothing can decrypt it.
+    #[test]
+    fn peek_key_index_reads_the_senders_index_from_the_trailer() {
+        let mut frame = vec![0u8; 40];
+        let trailer_start = frame.len().saturating_sub(TRAILER_SIZE);
+        if let Some(b) = frame.get_mut(trailer_start) {
+            *b = IV_SIZE_U8;
+        }
+        if let Some(b) = frame.last_mut() {
+            *b = 5;
+        }
+        assert_eq!(peek_key_index(&frame), Some(5));
+        assert_eq!(peek_key_index(&[]), None, "a runt frame has no index to report");
     }
 }
