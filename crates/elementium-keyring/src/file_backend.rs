@@ -16,7 +16,9 @@ const KEY_LEN: usize = 32;
 
 pub struct FileBackend {
     path: PathBuf,
-    key: [u8; KEY_LEN],
+    /// `Zeroizing` wipes the derived AES key from memory on drop, rather than leaving it
+    /// sitting in freed heap memory -- matches `elementium-e2ee`'s handling of key material.
+    key: zeroize::Zeroizing<[u8; KEY_LEN]>,
 }
 
 impl FileBackend {
@@ -48,7 +50,7 @@ impl FileBackend {
             // New file — generate salt + write empty store
             let salt = random_bytes::<SALT_LEN>();
             let key = derive_key(password, &salt)?;
-            let backend = Self { path: path.clone(), key };
+            let backend = Self { path: path.clone(), key: key.clone() };
             backend.write_map(&HashMap::new())?;
             return Ok(Self { path, key });
         };
@@ -86,7 +88,7 @@ impl FileBackend {
             SecretStoreError::Decryption("secrets file too short".into())
         })?;
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_slice())
             .map_err(|e| SecretStoreError::Decryption(e.to_string()))?;
 
         let plaintext = cipher
@@ -114,7 +116,7 @@ impl FileBackend {
 
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_slice())
             .map_err(|e| SecretStoreError::Encryption(e.to_string()))?;
 
         let ciphertext = cipher
@@ -175,10 +177,10 @@ impl SecretStore for FileBackend {
     }
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
-    let mut key = [0u8; KEY_LEN];
+fn derive_key(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; KEY_LEN]>> {
+    let mut key = zeroize::Zeroizing::new([0u8; KEY_LEN]);
     Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt, key.as_mut_slice())
         .map_err(|e| SecretStoreError::KeyDerivation(e.to_string()))?;
     Ok(key)
 }

@@ -8,6 +8,12 @@ use crate::{SENSITIVE_KEYS, SecretStore, SERVICE_NAME};
 
 pub struct KeyringBackend;
 
+/// Build an OS-keyring `Entry` for `key`, mapping the (rare, environment-level)
+/// construction failure into our own error type.
+fn entry(key: &str) -> Result<Entry> {
+    Entry::new(SERVICE_NAME, key).map_err(|e| SecretStoreError::Keyring(e.to_string()))
+}
+
 impl KeyringBackend {
     /// Attempt to create a keyring backend by testing read/write/delete of a probe entry.
     /// Returns `Err` if the OS keyring is unavailable.
@@ -19,8 +25,7 @@ impl KeyringBackend {
         let test_key = "__elementium_test";
         let test_value = "probe";
 
-        let entry =
-            Entry::new(SERVICE_NAME, test_key).map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+        let entry = entry(test_key)?;
 
         entry
             .set_password(test_value)
@@ -47,8 +52,7 @@ impl KeyringBackend {
 
 impl SecretStore for KeyringBackend {
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let entry =
-            Entry::new(SERVICE_NAME, key).map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+        let entry = entry(key)?;
 
         match entry.get_password() {
             Ok(val) => Ok(Some(val)),
@@ -61,8 +65,7 @@ impl SecretStore for KeyringBackend {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
-        let entry =
-            Entry::new(SERVICE_NAME, key).map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+        let entry = entry(key)?;
 
         entry
             .set_password(value)
@@ -70,8 +73,7 @@ impl SecretStore for KeyringBackend {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        let entry =
-            Entry::new(SERVICE_NAME, key).map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+        let entry = entry(key)?;
 
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()), // already gone
