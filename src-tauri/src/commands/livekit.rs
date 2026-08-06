@@ -16,6 +16,9 @@ use elementium_types::CorrelationId;
 use elementium_webrtc::engine::VideoFrameBuffer;
 use elementium_webrtc::livekit::room::{LiveKitRoom, RoomEvent};
 
+use super::LockExt;
+use super::e2ee::E2eeState;
+
 /// Shared state holding active `LiveKit` rooms, managed by Tauri.
 #[derive(Clone)]
 pub struct LiveKitState {
@@ -35,6 +38,7 @@ pub struct ConnectResult {
 #[command]
 pub async fn livekit_connect(
     state: State<'_, LiveKitState>,
+    e2ee_state: State<'_, E2eeState>,
     app: AppHandle,
     sfu_url: String,
     token: String,
@@ -42,17 +46,24 @@ pub async fn livekit_connect(
     let correlation_id = CorrelationId::new();
     let span = tracing::info_span!("session", correlation_id = %correlation_id);
 
+    // Same shared E2EE policy the direct-WebRTC path uses (see main.rs's
+    // register_state doc comment): read the current policy at connect time.
+    // EncryptionPolicy clones cheaply (Arc-backed E2eeContext inside), so
+    // later e2ee_set_key calls remain visible through this clone.
+    let e2ee = e2ee_state.ctx.lock_str()?.clone();
+
     async move {
         tracing::info!(sfu_url = %sfu_url, "connect attempt started");
 
         let video_frames = state.video_frames.clone();
         let connect_result =
-            LiveKitRoom::connect(&sfu_url, &token, video_frames, correlation_id.clone()).await;
+            LiveKitRoom::connect(&sfu_url, &token, video_frames, correlation_id.clone(), e2ee)
+                .await;
         let (room, mut event_rx) = match connect_result {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(reason = %e, "connect attempt failed");
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -71,7 +82,7 @@ pub async fn livekit_connect(
 
         // Store in state
         {
-            let mut rooms = state.rooms.lock().map_err(|e| e.to_string())?;
+            let mut rooms = state.rooms.lock_str()?;
             rooms.insert(room_id.clone(), room);
         }
 
@@ -117,7 +128,7 @@ pub async fn livekit_publish_track(
 ) -> Result<(), String> {
     let room = get_room(&state, &room_id)?;
     let mut room = room.lock().await;
-    room.publish_track(&kind, &source)
+    Ok(room.publish_track(&kind, &source)?)
 }
 
 /// Disconnect from a `LiveKit` room.
@@ -127,7 +138,7 @@ pub async fn livekit_disconnect(
     room_id: String,
 ) -> Result<(), String> {
     let room = {
-        let mut rooms = state.rooms.lock().map_err(|e| e.to_string())?;
+        let mut rooms = state.rooms.lock_str()?;
         rooms.remove(&room_id)
     };
 
@@ -163,7 +174,7 @@ fn get_room(
     state: &LiveKitState,
     room_id: &str,
 ) -> Result<Arc<tokio::sync::Mutex<LiveKitRoom>>, String> {
-    let rooms = state.rooms.lock().map_err(|e| e.to_string())?;
+    let rooms = state.rooms.lock_str()?;
     rooms
         .get(room_id)
         .cloned()

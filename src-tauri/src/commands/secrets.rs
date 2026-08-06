@@ -10,12 +10,19 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{State, command};
 
-use elementium_keyring::{BackendType, SecretStore, file_backend::FileBackend};
+use elementium_keyring::{BackendType, SecretBackend, file_backend::FileBackend};
+
+use super::LockExt;
 
 /// Managed state for the secret store.
+///
+/// A single `Option<SecretBackend>` rather than a separate backend + `BackendType`
+/// pair: the backend enum variant already determines its `BackendType` (via
+/// `SecretBackend::kind`), so there is only one thing to keep locked and no way for
+/// "which backend is active" and "what type does the frontend think is active" to
+/// drift out of sync.
 pub struct SecretStoreState {
-    pub store: Arc<Mutex<Option<Box<dyn SecretStore>>>>,
-    pub backend_type: Arc<Mutex<BackendType>>,
+    pub backend: Arc<Mutex<Option<SecretBackend>>>,
 }
 
 #[command]
@@ -23,9 +30,9 @@ pub async fn secret_get(
     key: String,
     state: State<'_, SecretStoreState>,
 ) -> Result<Option<String>, String> {
-    let store = state.store.clone();
+    let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = store.lock().map_err(|e| e.to_string())?;
+        let guard = backend.lock_str()?;
         guard
             .as_ref()
             .map_or(Ok(None), |s| s.get(&key).map_err(|e| e.to_string()))
@@ -40,9 +47,9 @@ pub async fn secret_set(
     value: String,
     state: State<'_, SecretStoreState>,
 ) -> Result<(), String> {
-    let store = state.store.clone();
+    let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = store.lock().map_err(|e| e.to_string())?;
+        let guard = backend.lock_str()?;
         // no backend, silently ignore
         guard
             .as_ref()
@@ -54,9 +61,9 @@ pub async fn secret_set(
 
 #[command]
 pub async fn secret_delete(key: String, state: State<'_, SecretStoreState>) -> Result<(), String> {
-    let store = state.store.clone();
+    let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = store.lock().map_err(|e| e.to_string())?;
+        let guard = backend.lock_str()?;
         guard
             .as_ref()
             .map_or(Ok(()), |s| s.delete(&key).map_err(|e| e.to_string()))
@@ -69,9 +76,9 @@ pub async fn secret_delete(key: String, state: State<'_, SecretStoreState>) -> R
 pub async fn secret_get_all(
     state: State<'_, SecretStoreState>,
 ) -> Result<HashMap<String, String>, String> {
-    let store = state.store.clone();
+    let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = store.lock().map_err(|e| e.to_string())?;
+        let guard = backend.lock_str()?;
         guard.as_ref().map_or_else(
             || Ok(HashMap::new()),
             |s| s.get_all().map_err(|e| e.to_string()),
@@ -85,8 +92,8 @@ pub async fn secret_get_all(
 pub async fn secret_get_backend_status(
     state: State<'_, SecretStoreState>,
 ) -> Result<BackendType, String> {
-    let guard = state.backend_type.lock().map_err(|e| e.to_string())?;
-    Ok(*guard)
+    let guard = state.backend.lock_str()?;
+    Ok(guard.as_ref().map_or(BackendType::NeedsSetup, SecretBackend::kind))
 }
 
 #[command]
@@ -94,21 +101,14 @@ pub async fn secret_setup_file_backend(
     password: String,
     state: State<'_, SecretStoreState>,
 ) -> Result<(), String> {
-    let store_arc = state.store.clone();
-    let backend_type_arc = state.backend_type.clone();
+    let backend_arc = state.backend.clone();
 
     tokio::task::spawn_blocking(move || {
-        let backend = FileBackend::new(&password).map_err(|e| e.to_string())?;
-        let boxed: Box<dyn SecretStore> = Box::new(backend);
+        let file_backend = FileBackend::new(&password).map_err(|e| e.to_string())?;
 
         {
-            let mut store_guard = store_arc.lock().map_err(|e| e.to_string())?;
-            *store_guard = Some(boxed);
-        }
-
-        {
-            let mut bt_guard = backend_type_arc.lock().map_err(|e| e.to_string())?;
-            *bt_guard = BackendType::EncryptedFile;
+            let mut guard = backend_arc.lock_str()?;
+            *guard = Some(SecretBackend::File(file_backend));
         }
 
         Ok(())

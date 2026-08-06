@@ -16,7 +16,7 @@ use commands::livekit::LiveKitState;
 use commands::media_devices::MediaState;
 use commands::secrets::SecretStoreState;
 use commands::webrtc::WebRtcState;
-use elementium_keyring::{BackendType, create_backend};
+use elementium_keyring::{BackendType, SecretBackend, create_backend};
 use elementium_types::CorrelationId;
 use elementium_webrtc::WebRtcEngine;
 
@@ -95,7 +95,7 @@ const CONSOLE_BRIDGE_SCRIPT: &str = r"(function(){
 
 /// Load persisted secrets (if any backend is configured) for init-script injection.
 fn load_initial_secrets(
-    backend: Option<&dyn elementium_keyring::SecretStore>,
+    backend: Option<&SecretBackend>,
 ) -> std::collections::HashMap<String, String> {
     backend.map_or_else(std::collections::HashMap::new, |store| {
         store.get_all().unwrap_or_else(|e| {
@@ -108,14 +108,15 @@ fn load_initial_secrets(
 /// Register all app-managed state (`WebRtcEngine`, media, `LiveKit`, secrets, E2EE).
 fn register_state(
     builder: tauri::Builder<tauri::Wry>,
-    backend: Option<Box<dyn elementium_keyring::SecretStore>>,
-    backend_type: BackendType,
+    backend: Option<SecretBackend>,
 ) -> tauri::Builder<tauri::Wry> {
-    // The E2EE context is shared between the WebRTC engine (for I/O loop
+    // The E2EE policy is shared between the WebRTC engine (for I/O loop
     // encryption/decryption) and Tauri's E2eeState (for JS commands).
     // This ensures that when e2ee_init/e2ee_set_key are called from JS,
     // the running I/O loops immediately pick up the context and keys.
-    let shared_e2ee: Arc<Mutex<Option<elementium_e2ee::E2eeContext>>> = Arc::new(Mutex::new(None));
+    // Defaults to `ExplicitlyUnencrypted` until e2ee_init is called.
+    let shared_e2ee: Arc<Mutex<elementium_webrtc::EncryptionPolicy>> =
+        Arc::new(Mutex::new(elementium_webrtc::EncryptionPolicy::default()));
 
     let mut engine = WebRtcEngine::new();
     engine.e2ee = shared_e2ee.clone();
@@ -134,8 +135,7 @@ fn register_state(
             video_frames,
         })
         .manage(SecretStoreState {
-            store: Arc::new(Mutex::new(backend)),
-            backend_type: Arc::new(Mutex::new(backend_type)),
+            backend: Arc::new(Mutex::new(backend)),
         })
         .manage(E2eeState { ctx: shared_e2ee })
 }
@@ -216,13 +216,16 @@ fn main() -> tauri::Result<()> {
     let _app_span = tracing::info_span!("app_instance", correlation_id = %app_instance_id).entered();
 
     // Initialize secret storage backend
-    let (backend, backend_type) = create_backend();
-    let initial_secrets = load_initial_secrets(backend.as_deref());
+    let backend = create_backend();
+    let initial_secrets = load_initial_secrets(backend.as_ref());
+    let backend_type = backend
+        .as_ref()
+        .map_or(BackendType::NeedsSetup, SecretBackend::kind);
     let secrets_script = build_secrets_init_script(&initial_secrets, backend_type);
     let init_script = format!("{CONSOLE_BRIDGE_SCRIPT}\n{secrets_script}");
 
     let mut builder = tauri::Builder::default();
-    builder = register_state(builder, backend, backend_type);
+    builder = register_state(builder, backend);
     builder = builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())

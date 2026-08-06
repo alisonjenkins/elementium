@@ -17,6 +17,7 @@ use elementium_webrtc::engine::{IceServerConfig, WebRtcEngine};
 use elementium_webrtc::peer_connection;
 use elementium_webrtc::{PcEvent, VideoPipeline, start_audio_playback};
 
+use super::LockExt;
 use super::media_devices::MediaState;
 
 /// Shared WebRTC engine state, managed by Tauri.
@@ -103,7 +104,7 @@ pub async fn create_peer_connection(
     });
 
     {
-        let mut engine = state.0.lock().map_err(|e| e.to_string())?;
+        let mut engine = state.0.lock_str()?;
         engine.create_connection(id.clone(), ice_servers.as_deref())?;
     }
 
@@ -207,8 +208,21 @@ pub async fn create_offer(
         .map(|tc| peer_connection::TransceiverInfo::from_js(&tc.kind, tc.direction.as_deref()))
         .collect();
 
-    let mut pc = handle.lock().map_err(|e| e.to_string())?;
-    peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos)
+    let mut pc = handle.lock_str()?;
+    Ok(peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos)?)
+}
+
+/// Look up an active peer connection's handle by ID.
+fn get_pc_handle(
+    state: &WebRtcState,
+    pc_id: &str,
+) -> Result<peer_connection::PeerConnectionHandle, String> {
+    let engine = state.0.lock_str()?;
+    Ok(engine
+        .get(pc_id)
+        .ok_or("Peer connection not found")?
+        .handle
+        .clone())
 }
 
 #[command]
@@ -217,16 +231,9 @@ pub async fn create_answer(
     pc_id: String,
 ) -> Result<SessionDescription, String> {
     tracing::info!(pc_id = %pc_id, "Creating answer");
-    let handle = {
-        let engine = state.0.lock().map_err(|e| e.to_string())?;
-        engine
-            .get(&pc_id)
-            .ok_or("Peer connection not found")?
-            .handle
-            .clone()
-    };
-    let mut pc = handle.lock().map_err(|e| e.to_string())?;
-    peer_connection::create_answer(&mut pc)
+    let handle = get_pc_handle(&state, &pc_id)?;
+    let mut pc = handle.lock_str()?;
+    Ok(peer_connection::create_answer(&mut pc)?)
 }
 
 #[command]
@@ -246,16 +253,9 @@ pub async fn set_remote_description(
     description: SessionDescription,
 ) -> Result<Option<SessionDescription>, String> {
     tracing::info!(pc_id = %pc_id, sdp_type = ?description.sdp_type, "Setting remote description");
-    let handle = {
-        let engine = state.0.lock().map_err(|e| e.to_string())?;
-        engine
-            .get(&pc_id)
-            .ok_or("Peer connection not found")?
-            .handle
-            .clone()
-    };
-    let mut pc = handle.lock().map_err(|e| e.to_string())?;
-    peer_connection::set_remote_description(&mut pc, &description)
+    let handle = get_pc_handle(&state, &pc_id)?;
+    let mut pc = handle.lock_str()?;
+    Ok(peer_connection::set_remote_description(&mut pc, &description)?)
 }
 
 #[command]
@@ -265,16 +265,9 @@ pub async fn add_ice_candidate(
     candidate: IceCandidate,
 ) -> Result<(), String> {
     tracing::info!(pc_id = %pc_id, candidate = %candidate.candidate, "Adding ICE candidate");
-    let handle = {
-        let engine = state.0.lock().map_err(|e| e.to_string())?;
-        engine
-            .get(&pc_id)
-            .ok_or("Peer connection not found")?
-            .handle
-            .clone()
-    };
-    let mut pc = handle.lock().map_err(|e| e.to_string())?;
-    peer_connection::add_ice_candidate(&mut pc, &candidate.candidate)
+    let handle = get_pc_handle(&state, &pc_id)?;
+    let mut pc = handle.lock_str()?;
+    Ok(peer_connection::add_ice_candidate(&mut pc, &candidate.candidate)?)
 }
 
 #[command]
@@ -283,7 +276,7 @@ pub async fn close_peer_connection(
     pc_id: String,
 ) -> Result<(), String> {
     let span = {
-        let mut engine = state.0.lock().map_err(|e| e.to_string())?;
+        let mut engine = state.0.lock_str()?;
         let span = engine
             .get(&pc_id)
             .map_or_else(tracing::Span::current, |managed| managed.span.clone());
@@ -300,23 +293,142 @@ pub async fn close_peer_connection(
 /// Uses `eval()` instead of the Tauri event system (`emit`/`listen`) because
 /// Tauri's permission check blocks `listen()` from non-local URLs
 /// (e.g. <http://localhost:5173> in dev mode). `eval()` bypasses this entirely.
+/// Where a [`PcEvent`] can be routed to, besides the frontend.
+struct Routing<'a> {
+    app: &'a AppHandle,
+    pc_id: &'a str,
+    audio_tx: &'a tokio_mpsc::Sender<PcEvent>,
+    video_tx: &'a tokio_mpsc::Sender<PcEvent>,
+}
+
+/// Dispatch one peer-connection event.
+///
+/// Returns `Some` for events destined for the frontend, and `None` for those handled
+/// entirely in the backend: media payloads go to their decode pipelines, and RTCP egress
+/// stats feed the encoder's loss estimate. None of those are meaningful to JS.
+fn route_pc_event(
+    event: PcEvent,
+    routing: &Routing<'_>,
+    dropped_audio_events: &mut u64,
+) -> Option<WebRtcEvent> {
+    let pc_id = routing.pc_id;
+    match event {
+        PcEvent::IceConnectionStateChange(s) => Some(WebRtcEvent::IceConnectionStateChange {
+            pc_id: pc_id.to_string(),
+            state: format!("{s:?}").to_lowercase(),
+        }),
+        PcEvent::ConnectionStateChange(s) => Some(WebRtcEvent::ConnectionStateChange {
+            pc_id: pc_id.to_string(),
+            state: format!("{s:?}").to_lowercase(),
+        }),
+        PcEvent::IceCandidate(candidate) => Some(WebRtcEvent::IceCandidate {
+            pc_id: pc_id.to_string(),
+            candidate,
+        }),
+        PcEvent::IceGatheringComplete => Some(WebRtcEvent::IceGatheringComplete {
+            pc_id: pc_id.to_string(),
+        }),
+        PcEvent::Connected => Some(WebRtcEvent::Connected {
+            pc_id: pc_id.to_string(),
+        }),
+        PcEvent::RemoteTrackAdded { mid, kind } => Some(WebRtcEvent::RemoteTrackAdded {
+            pc_id: pc_id.to_string(),
+            mid,
+            kind,
+        }),
+        PcEvent::AudioData { mid, data, contiguous } => {
+            let ev = PcEvent::AudioData { mid: mid.clone(), data, contiguous };
+            if routing.audio_tx.try_send(ev).is_err() {
+                *dropped_audio_events = dropped_audio_events.saturating_add(1);
+                tracing::warn!(
+                    pc_id,
+                    mid,
+                    dropped_audio_events = *dropped_audio_events,
+                    "AudioData dropped: audio_tx full"
+                );
+            }
+            None
+        }
+        PcEvent::VideoData { mid, data } => {
+            let _ = routing.video_tx.try_send(PcEvent::VideoData { mid, data });
+            None
+        }
+        PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks } => {
+            record_outbound_loss(routing.app, pc_id, &mid, loss, rtt_ms, packets, nacks);
+            None
+        }
+    }
+}
+
+/// Feed loss measured by the peers back into the Opus encoder's FEC sizing.
+///
+/// Closes a loop that previously did not exist: the encoder protected against a hardcoded
+/// guess while the peers were telling us, once per second in their RTCP receiver reports,
+/// what the real loss was.
+///
+/// `loss` of `None` means no report arrived during the interval. That is deliberately not
+/// treated as zero: folding in 0.0 would decay the estimate toward "clean link" purely
+/// because reports stopped arriving, which is the opposite of the truth if the link just
+/// got bad enough to lose the reports too.
+#[allow(clippy::too_many_arguments)]
+fn record_outbound_loss(
+    app: &AppHandle,
+    pc_id: &str,
+    mid: &str,
+    loss: Option<f32>,
+    rtt_ms: Option<u64>,
+    packets: u64,
+    nacks: u64,
+) {
+    let Some(fraction) = loss else {
+        return;
+    };
+    let media_state = app.state::<MediaState>();
+    let Ok(guard) = media_state.audio_capture.lock() else {
+        return;
+    };
+    let Some(ref audio) = *guard else {
+        return;
+    };
+    audio.loss_estimate.observe(fraction);
+    tracing::debug!(
+        pc_id,
+        mid,
+        reported_loss = fraction,
+        smoothed_perc = audio.loss_estimate.percent(),
+        rtt_ms = ?rtt_ms,
+        packets,
+        nacks,
+        "Outbound loss measured from RTCP receiver report"
+    );
+}
+
 async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // Create relay channels for audio and video playback pipelines
     let (audio_tx, audio_rx) = tokio_mpsc::channel::<PcEvent>(256);
     let (video_tx, video_rx) = tokio_mpsc::channel::<PcEvent>(256);
 
-    // Get video frame buffer from engine
-    let video_frames = {
+    // Get video frame buffer and the shared audio output stream from the engine. The
+    // audio player is shared across every PeerConnection this engine manages (not one
+    // per connection) -- see `WebRtcEngine::shared_audio_player` for why.
+    let (video_frames, shared_player) = {
         let Ok(engine) = state.0.lock() else {
             return;
         };
-        engine.video_frames.clone()
+        (engine.video_frames.clone(), engine.shared_audio_player())
     };
 
     // Start audio playback pipeline (receives Opus → decodes → cpal output)
     let audio_rx = Arc::new(Mutex::new(audio_rx));
-    if let Err(e) = start_audio_playback(audio_rx) {
-        tracing::error!(pc_id = pc_id, "Failed to start audio playback: {e}");
+    match shared_player {
+        Some(player) => {
+            if let Err(e) = start_audio_playback(audio_rx, pc_id.to_string(), player) {
+                tracing::error!(pc_id = pc_id, "Failed to start audio playback: {e}");
+            }
+        }
+        None => {
+            tracing::error!(pc_id = pc_id, "No shared audio player available; inbound audio for this connection will not play");
+        }
     }
 
     // Start video playback pipeline (receives VP8 → decodes → frame buffer)
@@ -325,6 +437,12 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     if let Err(e) = video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string()) {
         tracing::error!(pc_id = pc_id, "Failed to start video playback: {e}");
     }
+
+    // Count of `PcEvent::AudioData` dropped because `audio_tx` (this loop -> the audio
+    // playback thread, capacity 256) was full -- another gap invisible to str0m's own
+    // `MediaData::contiguous` flag, since the drop happens after str0m already emitted a
+    // complete, contiguous event.
+    let mut dropped_audio_events: u64 = 0;
 
     loop {
         let event = {
@@ -342,40 +460,12 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
 
         match event {
             Some(pc_event) => {
-                let tauri_event = match pc_event {
-                    PcEvent::IceConnectionStateChange(s) => WebRtcEvent::IceConnectionStateChange {
-                        pc_id: pc_id.to_string(),
-                        state: format!("{s:?}").to_lowercase(),
-                    },
-                    PcEvent::ConnectionStateChange(s) => WebRtcEvent::ConnectionStateChange {
-                        pc_id: pc_id.to_string(),
-                        state: format!("{s:?}").to_lowercase(),
-                    },
-                    PcEvent::IceCandidate(candidate) => WebRtcEvent::IceCandidate {
-                        pc_id: pc_id.to_string(),
-                        candidate,
-                    },
-                    PcEvent::IceGatheringComplete => WebRtcEvent::IceGatheringComplete {
-                        pc_id: pc_id.to_string(),
-                    },
-                    PcEvent::Connected => WebRtcEvent::Connected {
-                        pc_id: pc_id.to_string(),
-                    },
-                    PcEvent::RemoteTrackAdded { mid, kind } => WebRtcEvent::RemoteTrackAdded {
-                        pc_id: pc_id.to_string(),
-                        mid,
-                        kind,
-                    },
-                    PcEvent::AudioData(data) => {
-                        // Relay to audio playback pipeline
-                        let _ = audio_tx.try_send(PcEvent::AudioData(data));
-                        continue;
-                    }
-                    PcEvent::VideoData(data) => {
-                        // Relay to video playback pipeline
-                        let _ = video_tx.try_send(PcEvent::VideoData(data));
-                        continue;
-                    }
+                let Some(tauri_event) = route_pc_event(
+                    pc_event,
+                    &Routing { app, pc_id, audio_tx: &audio_tx, video_tx: &video_tx },
+                    &mut dropped_audio_events,
+                ) else {
+                    continue;
                 };
 
                 // Push event to JS via eval() — calls the global handler registered

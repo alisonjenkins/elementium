@@ -10,14 +10,17 @@ use std::sync::{Arc, Mutex};
 use tauri::{State, command};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use elementium_codec::{OpusEncoder, Vp8Encoder};
+use elementium_codec::{OpusEncoder, OpusEncoderConfig, Vp8Encoder};
 use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::camera::CameraCapturer;
 use elementium_media::device_enumeration;
 use elementium_types::observability::CorrelationId;
-use elementium_types::{AudioFrame, MediaConstraints, MediaDevice, TrackId, VideoFrame};
+use elementium_types::{
+    AudioFrame, MediaConstraints, MediaDevice, NetworkLossEstimate, TrackId, VideoFrame,
+};
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
+use super::LockExt;
 use super::webrtc::WebRtcState;
 use crate::protocols::VideoFrameState;
 
@@ -37,6 +40,13 @@ pub struct AudioCaptureHandle {
     /// Set to enable Opus encoding and sending to a peer connection.
     /// When `None`, the pipeline captures but doesn't encode/send.
     pub encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    /// Measured outbound packet loss, fed from RTCP receiver reports.
+    ///
+    /// Written by whoever observes `PcEvent::EgressStats`, read by the capture thread to
+    /// size the Opus encoder's FEC redundancy. Shared rather than passed through the
+    /// command channel because it is a continuously-updated level, not an event: the
+    /// capture thread only cares about the latest value.
+    pub loss_estimate: Arc<NetworkLossEstimate>,
 }
 
 /// State for active media tracks (audio capture, video capture, etc.).
@@ -69,6 +79,69 @@ pub async fn enumerate_devices() -> Result<Vec<MediaDevice>, String> {
     Ok(devices)
 }
 
+/// A capture pipeline that can be stopped and whose peer connection can be handed on.
+///
+/// Implemented by both the audio and camera handles so the restart logic below is written
+/// once. They had this bug independently and identically; sharing the code is what stops
+/// them acquiring it again independently.
+trait CapturePipeline {
+    fn stop_sender(&self) -> &std::sync::mpsc::Sender<()>;
+    fn connection(&self) -> &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>;
+}
+
+impl CapturePipeline for AudioCaptureHandle {
+    fn stop_sender(&self) -> &std::sync::mpsc::Sender<()> {
+        &self.stop_tx
+    }
+    fn connection(&self) -> &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> {
+        &self.encode_tx
+    }
+}
+
+impl CapturePipeline for CameraPipelineHandle {
+    fn stop_sender(&self) -> &std::sync::mpsc::Sender<()> {
+        &self.stop_tx
+    }
+    fn connection(&self) -> &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> {
+        &self.encode_tx
+    }
+}
+
+/// What was found when replacing a capture pipeline.
+struct StoppedPipeline {
+    /// Whether a pipeline was actually running. Distinct from `connection.is_some()`: a
+    /// pipeline can exist while never having been attached to a peer connection, and the
+    /// camera needs this specifically to know whether to wait for the device to release.
+    existed: bool,
+    /// The peer connection the old pipeline was feeding, to hand to its replacement.
+    connection: Option<tokio_mpsc::Sender<IoCommand>>,
+}
+
+/// Stop the running capture pipeline, returning the peer connection it was feeding.
+///
+/// Carrying the connection over to the replacement is load-bearing, not tidiness.
+/// `getUserMedia` is re-called during a live call (mute/unmute, device change, track
+/// replacement -- five times in one short session in a real log), and the *only* place
+/// that ever attaches a capture pipeline to a peer connection is `create_offer`. A
+/// replacement that started disconnected therefore stayed disconnected until the next
+/// renegotiation happened to occur, which may be never: the log shows an audio restart
+/// after which `skipped_not_connected` simply climbed forever while `sent_frames` stayed
+/// at zero. The far end hears the speaker cut out, or the camera freeze, mid-call for no
+/// visible reason.
+fn stop_pipeline_inheriting_connection<H: CapturePipeline>(
+    slot: &Mutex<Option<H>>,
+) -> StoppedPipeline {
+    let Ok(mut guard) = slot.lock() else {
+        return StoppedPipeline { existed: false, connection: None };
+    };
+    let Some(old) = guard.take() else {
+        return StoppedPipeline { existed: false, connection: None };
+    };
+    let _ = old.stop_sender().send(());
+    let connection = old.connection().lock().ok().and_then(|c| c.clone());
+    StoppedPipeline { existed: true, connection }
+}
+
 #[command]
 pub async fn get_user_media(
     webrtc_state: State<'_, WebRtcState>,
@@ -91,16 +164,27 @@ pub async fn get_user_media(
         let track_id = TrackId(format!("audio-{}", generate_track_id()));
         tracing::info!(track_id = %track_id, "Starting audio capture");
 
-        // Stop any existing audio capture pipeline
-        if let Ok(mut audio) = media_state.audio_capture.lock()
-            && let Some(old) = audio.take()
-        {
-            let _ = old.stop_tx.send(());
+        // Stop any existing audio capture pipeline, inheriting whichever peer connection
+        // it was feeding -- see `stop_pipeline_inheriting_connection` for why that matters.
+        let previous = stop_pipeline_inheriting_connection(&media_state.audio_capture);
+        let inherited_connection = previous.connection;
+        if inherited_connection.is_some() {
+            tracing::info!(
+                track_id = %track_id,
+                "Audio capture restarted mid-call; inheriting the existing peer connection"
+            );
         }
 
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
-            Arc::new(Mutex::new(None));
+            Arc::new(Mutex::new(inherited_connection));
         let encode_tx_clone = encode_tx.clone();
+        // Seeded with the encoder's own starting assumption so behaviour before the
+        // first RTCP report matches the configured default, then converges on measured
+        // loss as reports arrive.
+        let loss_estimate = Arc::new(NetworkLossEstimate::new(
+            OpusEncoderConfig::default().expected_packet_loss_perc,
+        ));
+        let loss_estimate_clone = loss_estimate.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
         // Start audio capture pipeline on a background thread, inheriting the
@@ -109,7 +193,7 @@ pub async fn get_user_media(
         let audio_span = tracing::Span::current();
         std::thread::spawn(move || {
             let _guard = audio_span.enter();
-            audio_capture_loop(&encode_tx_clone, &stop_rx);
+            audio_capture_loop(&encode_tx_clone, &stop_rx, &loss_estimate_clone);
         });
 
         // Store the audio capture handle
@@ -118,6 +202,7 @@ pub async fn get_user_media(
                 track_id: track_id.0.clone(),
                 stop_tx,
                 encode_tx,
+                loss_estimate,
             });
         }
 
@@ -133,25 +218,31 @@ pub async fn get_user_media(
 
         // Get the shared video frame buffer from the WebRTC engine
         let video_frames = {
-            let engine = webrtc_state.0.lock().map_err(|e| e.to_string())?;
+            let engine = webrtc_state.0.lock_str()?;
             engine.video_frames.clone()
         };
 
-        // Stop any existing camera pipeline and wait for the device to release
-        let had_previous = if let Ok(mut cam) = media_state.camera.lock()
-            && let Some(old) = cam.take()
-        {
-            let _ = old.stop_tx.send(());
-            true
-        } else {
-            false
-        };
+        // Stop any existing camera pipeline, inheriting whichever peer connection it was
+        // feeding, and note whether we need to wait for the device to release.
+        //
+        // The inheritance matters for exactly the reason it does on the audio path: a
+        // camera restarted mid-call (device change, resolution change, track replacement)
+        // would otherwise sit disconnected until the next renegotiation, and the far end
+        // would see the video freeze with nothing in the log to explain it.
+        let previous = stop_pipeline_inheriting_connection(&media_state.camera);
+        let had_previous = previous.existed;
+        if previous.connection.is_some() {
+            tracing::info!(
+                track_id = %track_id,
+                "Camera restarted mid-call; inheriting the existing peer connection"
+            );
+        }
 
         let req_width = video_constraints.width;
         let req_height = video_constraints.height;
 
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
-            Arc::new(Mutex::new(None));
+            Arc::new(Mutex::new(previous.connection));
         let encode_tx_clone = encode_tx.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let tid = track_id.0.clone();
@@ -372,11 +463,321 @@ fn camera_pipeline_loop(
     }
 }
 
+/// Counters for one run of [`audio_capture_loop`], so a silent far end is diagnosable.
+#[derive(Default)]
+struct OutboundAudioStats {
+    captured: u64,
+    encoded: u64,
+    sent: u64,
+    skipped_not_connected: u64,
+    dropped_channel_full: u64,
+    encode_errors: u64,
+    /// Loudest raw sample seen since the last report; reset on each report so a quiet
+    /// period is visible as a quiet period rather than being masked by an earlier peak.
+    peak_since_report: f32,
+    last_encoded_len: usize,
+    /// Loss percentage currently configured on the encoder, so it is only reconfigured
+    /// when the measured estimate actually moves.
+    applied_packet_loss_perc: u8,
+    /// Total encoded bytes this window, for a real transmitted bitrate.
+    bytes_since_report: u64,
+    /// Frames this window that encoded down to a silence-sized packet.
+    silent_packets_since_report: u64,
+    /// Frames this window that were audibly loud on input yet still encoded to a
+    /// silence-sized packet.
+    ///
+    /// The direct test of a specific suspicion: reports repeatedly showed a 3-byte
+    /// `last_encoded_len` while `input_peak_amplitude` was 0.4-0.6, i.e. loud speech. If
+    /// this counter is anything but ~0, the encoder is discarding speech as silence and
+    /// the far end is being sent nothing to reconstruct -- which sounds exactly like a
+    /// robot. If it stays at 0, that pairing was just the window boundary landing in
+    /// pauses, and the encoder is behaving.
+    loud_but_silent_since_report: u64,
+    /// When the previous frame was handed to the transport, for pacing measurement.
+    last_frame_at: Option<std::time::Instant>,
+    /// Largest gap between consecutive frames this window, in milliseconds.
+    max_gap_ms: u64,
+    /// Frames emitted back-to-back (< 5ms after the previous one), i.e. in a burst.
+    ///
+    /// str0m runs with `PacerImpl::null()` because we do not enable BWE, so it transmits
+    /// each packet the instant we hand it over -- packets reach the wire exactly as
+    /// bursty as this thread produces them. If cpal delivers large input buffers, several
+    /// 20ms Opus frames are produced at once and then nothing for tens of milliseconds.
+    /// The receiver sees clumps rather than a steady 50/sec stream, and a jitter buffer
+    /// too small for the clump underruns and fills the gap with packet-loss concealment
+    /// -- which sounds robotic even though not a single packet was lost, and is exactly
+    /// consistent with RTCP reporting 0% loss.
+    burst_frames: u64,
+}
+
+/// Channels the outbound stream is encoded as, regardless of what the capture device
+/// offers.
+///
+/// Voice is mono everywhere in WebRTC. Encoding a microphone as stereo split the bitrate
+/// across two near-identical channels, halving the bits spent on the only content that
+/// matters -- audible as a thin, artifacty "robotic" quality that no pipeline counter can
+/// detect, because the encoder is faithfully producing what it was asked for.
+///
+/// It also made the SDP a lie: RFC 7587 defaults `sprop-stereo` to 0 and nothing in the
+/// offer/answer path ever set it, so a stereo stream was described to every receiver as
+/// mono. Encoding mono makes the declaration true rather than papering over it.
+const OUTBOUND_CHANNELS: u16 = 1;
+
+/// Opus packets at or below this size carry no meaningful audio (DTX/comfort noise is
+/// 1-3 bytes; a genuinely encoded frame is far larger).
+const SILENT_PACKET_BYTES: usize = 5;
+
+/// Input peak above which a frame is considered to contain real speech rather than room
+/// noise. -40 dBFS: comfortably above a noise floor, well below normal speech.
+const LOUD_INPUT_PEAK: f32 = 0.01;
+
+impl OutboundAudioStats {
+    /// How often to emit a summary: every 250 frames of 20ms, i.e. roughly every 5s.
+    const REPORT_EVERY: u64 = 250;
+
+    /// Record when a frame reached the transport, to measure how evenly they are paced.
+    ///
+    /// A healthy stream is one frame every 20ms. Clumps (gap ~0) followed by a long gap
+    /// mean the receiver is getting bursts, not a stream.
+    fn record_pacing(&mut self, now: std::time::Instant) {
+        if let Some(previous) = self.last_frame_at {
+            let gap = now.saturating_duration_since(previous);
+            let gap_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX);
+            self.max_gap_ms = self.max_gap_ms.max(gap_ms);
+            if gap < std::time::Duration::from_millis(5) {
+                self.burst_frames = self.burst_frames.saturating_add(1);
+            }
+        }
+        self.last_frame_at = Some(now);
+    }
+
+    /// Record one encoded packet against the window's size statistics.
+    fn record_packet(&mut self, len: usize, input_peak: f32) {
+        self.bytes_since_report = self.bytes_since_report.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        if len <= SILENT_PACKET_BYTES {
+            self.silent_packets_since_report = self.silent_packets_since_report.saturating_add(1);
+            if input_peak > LOUD_INPUT_PEAK {
+                self.loud_but_silent_since_report =
+                    self.loud_but_silent_since_report.saturating_add(1);
+            }
+        }
+    }
+
+    /// Actual transmitted bitrate over this window, in kbps.
+    const fn window_kbps(&self) -> u64 {
+        // REPORT_EVERY frames of 20ms = 5s of audio.
+        self.bytes_since_report.saturating_mul(8) / 1000 / 5
+    }
+
+    /// Emit a periodic summary, and reset the windowed peak.
+    fn maybe_report(&mut self, sample_rate: u32, opus_rate: u32) {
+        if self.captured == 1 || self.captured.is_multiple_of(Self::REPORT_EVERY) {
+            tracing::info!(
+                captured_frames = self.captured,
+                encoded_frames = self.encoded,
+                sent_frames = self.sent,
+                skipped_not_connected = self.skipped_not_connected,
+                dropped_channel_full = self.dropped_channel_full,
+                encode_errors = self.encode_errors,
+                input_peak_amplitude = self.peak_since_report,
+                last_encoded_len = self.last_encoded_len,
+                applied_packet_loss_perc = self.applied_packet_loss_perc,
+                kbps = self.window_kbps(),
+                silent_packets = self.silent_packets_since_report,
+                loud_but_silent = self.loud_but_silent_since_report,
+                max_gap_ms = self.max_gap_ms,
+                burst_frames = self.burst_frames,
+                capture_rate = sample_rate,
+                opus_rate,
+                "Outbound audio pipeline"
+            );
+            self.peak_since_report = 0.0;
+            self.bytes_since_report = 0;
+            self.silent_packets_since_report = 0;
+            self.loud_but_silent_since_report = 0;
+            self.max_gap_ms = 0;
+            self.burst_frames = 0;
+        }
+    }
+}
+
+/// Everything the per-frame encode step needs, bundled so it stays one argument.
+struct FrameEncodeCtx<'a> {
+    encoder: &'a mut OpusEncoder,
+    loopback_decoder: Option<&'a mut elementium_codec::OpusDecoder>,
+    opus_rate: u32,
+    channels: u16,
+    frame_samples: usize,
+}
+
+/// Encode one 20ms frame and hand it to the peer connection, updating counters.
+fn encode_and_send_frame(
+    ctx: &mut FrameEncodeCtx<'_>,
+    frame_data: Vec<f32>,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    stats: &mut OutboundAudioStats,
+) {
+    stats.captured = stats.captured.saturating_add(1);
+
+    // Peak of the raw captured samples, before encoding. This is the one measurement that
+    // separates "the pipeline is broken" from "the microphone is delivering silence" --
+    // everything downstream of a silent mic looks perfectly healthy while the far end
+    // hears nothing.
+    let peak = frame_data.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+    stats.peak_since_report = stats.peak_since_report.max(peak);
+
+    // Point 2: the exact 20ms frame about to be encoded, after any resampling and
+    // reframing. Dumped regardless of whether a peer connection is attached, so the
+    // microphone can be checked without needing to be in a call.
+    elementium_media::audio_debug_dump::maybe_dump(
+        "capture-encoder-in",
+        ctx.opus_rate,
+        ctx.channels,
+        &frame_data,
+    );
+
+    // Only encode and send if connected to a peer connection
+    if !encode_tx.lock().is_ok_and(|g| g.is_some()) {
+        stats.skipped_not_connected = stats.skipped_not_connected.saturating_add(1);
+        return;
+    }
+
+    let audio_frame = AudioFrame {
+        sample_rate: ctx.opus_rate,
+        channels: ctx.channels,
+        data: frame_data,
+        timestamp_us: 0,
+    };
+
+    match ctx.encoder.encode(&audio_frame) {
+        Ok(encoded_frame) => {
+            stats.encoded = stats.encoded.saturating_add(1);
+            stats.last_encoded_len = encoded_frame.len();
+            stats.record_packet(encoded_frame.len(), peak);
+            stats.record_pacing(std::time::Instant::now());
+            dump_loopback(
+                ctx.loopback_decoder.as_deref_mut(),
+                &encoded_frame,
+                ctx.frame_samples,
+            );
+            if let Ok(guard) = encode_tx.lock()
+                && let Some(ref tx) = *guard
+            {
+                if tx.try_send(IoCommand::WriteAudio(encoded_frame)).is_ok() {
+                    stats.sent = stats.sent.saturating_add(1);
+                } else {
+                    stats.dropped_channel_full = stats.dropped_channel_full.saturating_add(1);
+                }
+            }
+        }
+        Err(e) => {
+            stats.encode_errors = stats.encode_errors.saturating_add(1);
+            tracing::debug!("Opus encode error: {e}");
+        }
+    }
+}
+
+/// Build the decoder used to record what our own encoder produces, if dumping is on.
+///
+/// Bisection of the outbound path, mirroring what `ELEMENTIUM_AUDIO_DUMP` already does for
+/// inbound audio. Scalar telemetry cannot tell clean speech from garbage -- peak amplitude
+/// looks the same either way -- so the samples themselves are written to disk at three
+/// points, and comparing them localises any fault to one stage:
+///
+/// - `capture-raw`: what cpal handed us, untouched. Is the microphone healthy?
+/// - `capture-encoder-in`: after resampling and reframing. Did we damage it?
+/// - `capture-loopback`: encoded and decoded again. Is what we transmit intelligible?
+///
+/// The decoder exists only to produce that third file, so it is not built on a normal run.
+fn make_loopback_decoder(rate: u32, channels: u16) -> Option<elementium_codec::OpusDecoder> {
+    if !elementium_media::audio_debug_dump::is_enabled() {
+        return None;
+    }
+    match elementium_codec::OpusDecoder::new(rate, channels) {
+        Ok(d) => {
+            tracing::info!("ELEMENTIUM_AUDIO_DUMP: capturing outbound audio at 3 bisection points");
+            Some(d)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "ELEMENTIUM_AUDIO_DUMP: no loopback decoder; skipping the post-encode dump");
+            None
+        }
+    }
+}
+
+/// Decode a just-encoded packet and dump the result: what the far end should hear.
+///
+/// The decisive step of the outbound bisection. If `capture-encoder-in` sounds fine but
+/// this does not, the fault is ours (encoder settings, framing, channel count). If both
+/// sound fine, what we transmit is good and any remaining distortion happened after us --
+/// on the network or at the far end.
+fn dump_loopback(
+    decoder: Option<&mut elementium_codec::OpusDecoder>,
+    packet: &elementium_types::PlaintextMedia,
+    frame_samples: usize,
+) {
+    let Some(decoder) = decoder else {
+        return;
+    };
+    match decoder.decode(packet, frame_samples) {
+        Ok(pcm) => {
+            elementium_media::audio_debug_dump::maybe_dump(
+                "capture-loopback",
+                pcm.sample_rate,
+                pcm.channels,
+                &pcm.data,
+            );
+        }
+        Err(e) => {
+            // Our own encoder produced something our own decoder rejects -- that alone
+            // would explain unintelligible audio at the far end, so it is not silent.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::error!(error = %e, "Loopback decode of our own Opus packet failed");
+            });
+        }
+    }
+}
+
+/// Align the encoder's FEC sizing with the measured loss estimate.
+///
+/// Only acts when the whole-percent estimate actually moves. libopus reconfiguration is
+/// cheap but not free, and more importantly the estimate is deliberately smoothed so that
+/// this tracks real changes in link quality rather than per-report noise.
+fn retune_fec_if_needed(
+    encoder: &mut OpusEncoder,
+    loss_estimate: &Arc<NetworkLossEstimate>,
+    stats: &mut OutboundAudioStats,
+) {
+    let measured_loss = loss_estimate.percent();
+    if measured_loss == stats.applied_packet_loss_perc {
+        return;
+    }
+    match encoder.set_expected_packet_loss(measured_loss) {
+        Ok(()) => {
+            tracing::info!(
+                previous_perc = stats.applied_packet_loss_perc,
+                measured_perc = measured_loss,
+                "Retuned Opus FEC from measured packet loss"
+            );
+            stats.applied_packet_loss_perc = measured_loss;
+        }
+        Err(e) => {
+            tracing::warn!(
+                measured_perc = measured_loss,
+                error = %e,
+                "Failed to retune Opus FEC; keeping previous setting"
+            );
+        }
+    }
+}
+
 /// Background thread: captures mic audio, Opus-encodes, and sends to a peer
 /// connection when `encode_tx` is connected (deferred connection pattern).
 fn audio_capture_loop(
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
+    loss_estimate: &Arc<NetworkLossEstimate>,
 ) {
     let capturer = match AudioCapturer::start() {
         Ok(c) => c,
@@ -395,7 +796,8 @@ fn audio_capture_loop(
         _ => 48000,
     };
 
-    let mut encoder = match OpusEncoder::new(opus_rate, channels.min(2)) {
+    let encoder_config = OpusEncoderConfig::default();
+    let mut encoder = match OpusEncoder::with_config(opus_rate, OUTBOUND_CHANNELS, encoder_config) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Failed to create Opus encoder: {e}");
@@ -403,12 +805,18 @@ fn audio_capture_loop(
         }
     };
 
-    tracing::info!(sample_rate, channels, opus_rate, "Audio capture started");
+    tracing::info!(
+        sample_rate,
+        channels,
+        opus_rate,
+        encoded_channels = OUTBOUND_CHANNELS,
+        "Audio capture started"
+    );
 
     // Opus frame size: 20ms at the given sample rate. `opus_rate` is always one of the
     // small fixed constants above, so these conversions/multiplications cannot overflow
     // or lose precision in practice.
-    let channels_usize = usize::from(channels.min(2));
+    let channels_usize = usize::from(OUTBOUND_CHANNELS);
     let frame_samples = usize::try_from(opus_rate)
         .unwrap_or(48_000)
         .saturating_mul(20)
@@ -416,100 +824,77 @@ fn audio_capture_loop(
     let frame_total_samples = frame_samples.saturating_mul(channels_usize);
     let mut accumulator: Vec<f32> = Vec::with_capacity(frame_total_samples.saturating_mul(2));
 
+    // Outbound-path counters.
+    //
+    // Every failure in this loop used to be silent: frames dropped because no peer
+    // connection was attached, encode errors at `debug`, and a discarded `try_send`
+    // result. So "nobody can hear me" produced a completely clean log, and there was no
+    // way to tell a dead microphone from a broken encoder from a full channel.
+    let mut stats = OutboundAudioStats {
+        applied_packet_loss_perc: encoder_config.expected_packet_loss_perc,
+        ..OutboundAudioStats::default()
+    };
+
+    let mut loopback_decoder = make_loopback_decoder(opus_rate, OUTBOUND_CHANNELS);
+
     loop {
         if stop_rx.try_recv().is_ok() {
-            tracing::info!("Audio capture stopping");
+            tracing::info!(
+                captured_frames = stats.captured,
+                encoded_frames = stats.encoded,
+                sent_frames = stats.sent,
+                skipped_not_connected = stats.skipped_not_connected,
+                dropped_channel_full = stats.dropped_channel_full,
+                encode_errors = stats.encode_errors,
+                "Audio capture stopping"
+            );
             break;
         }
 
         if let Some(frame) = capturer.try_recv() {
             let mut data = frame.data;
 
+            // Point 1: exactly what the microphone produced, before we touch it.
+            elementium_media::audio_debug_dump::maybe_dump(
+                "capture-raw",
+                sample_rate,
+                channels,
+                &data,
+            );
+
             // Simple sample rate conversion for 44.1kHz → 48kHz
             if sample_rate == 44100 && opus_rate == 48000 {
-                data = resample_44100_to_48000(&data, usize::from(channels));
+                data = elementium_media::audio_playback::resample_interleaved(
+                    &data, channels, 44100, 48000,
+                );
             }
 
-            accumulator.extend_from_slice(&data);
+            // Fold to mono before framing: the encoder, the RTP timeline and the SDP all
+            // describe a single channel from here on. See `downmix_to_mono`.
+            let mono = elementium_media::audio_capture::downmix_to_mono(&data, channels);
+            accumulator.extend_from_slice(&mono);
 
             // Process complete Opus frames
             while accumulator.len() >= frame_total_samples {
                 let frame_data: Vec<f32> = accumulator.drain(..frame_total_samples).collect();
 
-                // Only encode and send if connected to a peer connection
-                let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
+                let mut ctx = FrameEncodeCtx {
+                    encoder: &mut encoder,
+                    loopback_decoder: loopback_decoder.as_mut(),
+                    opus_rate,
+                    channels: OUTBOUND_CHANNELS,
+                    frame_samples,
+                };
+                encode_and_send_frame(&mut ctx, frame_data, encode_tx, &mut stats);
 
-                if should_encode {
-                    let audio_frame = AudioFrame {
-                        sample_rate: opus_rate,
-                        channels: channels.min(2),
-                        data: frame_data,
-                        timestamp_us: 0,
-                    };
+                retune_fec_if_needed(&mut encoder, loss_estimate, &mut stats);
 
-                    match encoder.encode(&audio_frame) {
-                        Ok(encoded_frame) => {
-                            if let Ok(guard) = encode_tx.lock()
-                                && let Some(ref tx) = *guard
-                            {
-                                let _ = tx.try_send(IoCommand::WriteAudio(encoded_frame));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Opus encode error: {e}");
-                        }
-                    }
-                }
+                stats.maybe_report(sample_rate, opus_rate);
             }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
-}
-
-/// Simple linear interpolation resampling from 44100 to 48000 Hz.
-///
-/// Sample counts here are bounded by a single ~20ms audio frame (at most a few
-/// thousand samples), so the `usize`<->`f64`/`f32` conversions below never approach
-/// either type's precision limits; the casts are inherent to the interpolation math,
-/// not something `try_from` can meaningfully replace.
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects
-)]
-fn resample_44100_to_48000(samples: &[f32], channels: usize) -> Vec<f32> {
-    // Guard against a misbehaving capture device reporting zero channels.
-    if channels == 0 {
-        tracing::warn!(
-            requested_channels = 0,
-            "clamping anomalous zero-channel resample request"
-        );
-    }
-    let channels = channels.max(1);
-    let ratio = 48000.0 / 44100.0;
-    let input_frames = samples.len() / channels;
-    let output_frames = (input_frames as f64 * ratio) as usize;
-    let mut output = Vec::with_capacity(output_frames * channels);
-
-    for i in 0..output_frames {
-        let src_pos = i as f64 / ratio;
-        let src_idx = src_pos as usize;
-        let frac = (src_pos - src_idx as f64) as f32;
-
-        for ch in 0..channels {
-            let s0 = samples.get(src_idx * channels + ch).copied().unwrap_or(0.0);
-            let s1 = samples
-                .get((src_idx + 1) * channels + ch)
-                .copied()
-                .unwrap_or(s0);
-            output.push((s1 - s0).mul_add(frac, s0));
-        }
-    }
-
-    output
 }
 
 fn generate_track_id() -> String {
@@ -521,51 +906,3 @@ fn generate_track_id() -> String {
     format!("{t:x}")
 }
 
-#[cfg(test)]
-mod resample_tests {
-    use elementium_observability_test::LogCapture;
-
-    use super::resample_44100_to_48000;
-
-    /// Regression test: a misbehaving capture device reporting `channels =
-    /// 0` must not panic (the `channels.max(1)` guard holds), and the
-    /// anomaly must be visible in structured logs rather than silently
-    /// masked forever by the guard.
-    ///
-    /// Manually confirmed this test's second assertion fails if the
-    /// `tracing::warn!` call guarding the zero-channels clamp is removed:
-    /// `find_event` then returns `None`.
-    #[test]
-    // Test assertions are meant to panic on failure; expect() with a
-    // descriptive message is the idiomatic way to do that in test code.
-    #[allow(clippy::expect_used)]
-    fn zero_channels_is_clamped_without_panic_and_logged() {
-        let capture = LogCapture::new();
-        let samples = [0.1_f32, 0.2, 0.3, 0.4];
-
-        let output = capture.run(|| resample_44100_to_48000(&samples, 0));
-
-        // No panic occurred (we got here), and output is non-empty (treated as
-        // 1 channel, per the `.max(1)` guard).
-        assert!(!output.is_empty());
-
-        let event = capture
-            .find_event("clamping anomalous zero-channel resample request")
-            .expect("a structured warning should have been emitted for the zero-channels input");
-        assert_eq!(event.field("requested_channels"), Some("0"));
-    }
-
-    #[test]
-    fn nonzero_channels_does_not_log_the_clamp_warning() {
-        let capture = LogCapture::new();
-        let samples = [0.1_f32, 0.2, 0.3, 0.4];
-
-        capture.run(|| resample_44100_to_48000(&samples, 2));
-
-        assert!(
-            capture
-                .find_event("clamping anomalous zero-channel resample request")
-                .is_none()
-        );
-    }
-}

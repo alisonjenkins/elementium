@@ -10,12 +10,21 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use tauri::{State, command};
 
-use elementium_e2ee::{E2eeContext, E2eeOptions};
+use elementium_e2ee::E2eeOptions;
+use elementium_webrtc::EncryptionPolicy;
+use elementium_webrtc::E2eeContext;
+
+use super::LockExt;
 
 /// Shared E2EE state, managed by Tauri.
+///
+/// Also the connection-encryption policy consumed by the WebRTC engine and `LiveKit`
+/// transport (see `main.rs`'s `register_state`): "not yet initialized" and "this
+/// connection is deliberately unencrypted" are the same state here, both represented
+/// by [`EncryptionPolicy::ExplicitlyUnencrypted`] rather than by an absent `Option`.
 #[derive(Clone)]
 pub struct E2eeState {
-    pub ctx: Arc<Mutex<Option<E2eeContext>>>,
+    pub ctx: Arc<Mutex<EncryptionPolicy>>,
 }
 
 /// Options received from the JS E2EE Worker's init message.
@@ -46,8 +55,8 @@ pub async fn e2ee_init(
 
     let ctx = E2eeContext::new(opts);
     {
-        let mut guard = state.ctx.lock().map_err(|e| e.to_string())?;
-        *guard = Some(ctx);
+        let mut guard = state.ctx.lock_str()?;
+        *guard = EncryptionPolicy::Encrypted(ctx);
     }
 
     tracing::info!("E2EE context initialized");
@@ -70,9 +79,8 @@ pub async fn e2ee_set_key(
 
     state
         .ctx
-        .lock()
-        .map_err(|e| e.to_string())?
-        .as_ref()
+        .lock_str()?
+        .as_context()
         .ok_or("E2EE not initialized — call e2ee_init first")?
         .set_key(&participant, key_index, &key_material);
     Ok(())
@@ -87,9 +95,8 @@ pub async fn e2ee_set_local_identity(
 
     state
         .ctx
-        .lock()
-        .map_err(|e| e.to_string())?
-        .as_ref()
+        .lock_str()?
+        .as_context()
         .ok_or("E2EE not initialized — call e2ee_init first")?
         .set_local_identity(&identity);
     Ok(())
