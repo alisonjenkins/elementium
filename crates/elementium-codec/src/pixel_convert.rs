@@ -33,7 +33,7 @@ fn luma(r: f32, g: f32, b: f32) -> u8 {
 }
 
 /// BT.601 RGB -> chroma (U, V).
-fn chroma(r: f32, g: f32, b: f32) -> (u8, u8) {
+const fn chroma(r: f32, g: f32, b: f32) -> (u8, u8) {
     let chroma_u = quantize(b.mul_add(0.500, g.mul_add(-0.331, r.mul_add(-0.169, 128.0))));
     let chroma_v = quantize(b.mul_add(-0.081, g.mul_add(-0.419, r.mul_add(0.500, 128.0))));
     (chroma_u, chroma_v)

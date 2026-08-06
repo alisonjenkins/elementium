@@ -334,8 +334,8 @@ mod tests {
     #[test]
     fn test_parse_xor_mapped_address_ipv4() {
         let tid = [0u8; 12];
-        // Port 12345 XOR'd with 0x2112 = 12345 ^ 0x2112
-        let xor_port = (12345u16 ^ 0x2112u16).to_be_bytes();
+        // Port 12345 (0x3039) XOR'd with 0x2112 = 12345 ^ 0x2112
+        let xor_port = (0x3039u16 ^ 0x2112u16).to_be_bytes();
         // IP 203.0.113.5 XOR'd with magic cookie
         let ip = u32::from_be_bytes([203, 0, 113, 5]);
         let xor_ip = (ip ^ MAGIC_COOKIE).to_be_bytes();

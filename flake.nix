@@ -27,7 +27,7 @@
           gobject-introspection
           wrapGAppsHook3
           nodejs_22
-          nodePackages.pnpm
+          pnpm
           cargo-tauri
           just
           llvmPackages.clang
