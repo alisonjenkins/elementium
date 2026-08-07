@@ -116,6 +116,55 @@ pub fn rgb_to_i420(width: u32, height: u32, rgb: &[u8]) -> I420Frame {
     })
 }
 
+/// Halve an RGBA image's width and height, averaging each 2x2 block.
+///
+/// For the local self-view, which is displayed a few centimetres across and does not need
+/// the camera's full resolution. A 1280x720 RGBA frame is 3.7MB, and every one of them
+/// crosses the Rust-to-webview IPC boundary; at 30fps that is 110MB/s of copying to draw a
+/// thumbnail. Halving each axis cuts it fourfold.
+///
+/// Averaging rather than dropping pixels: nearest-neighbour on a downscale aliases badly
+/// on exactly the high-contrast detail a webcam view is full of (hair, text, edges), and
+/// the cost of the average is trivial next to the copy it saves.
+///
+/// Returns `None` for degenerate geometry or a buffer that does not match it, rather than
+/// producing a subtly wrong image from a wrong assumption.
+#[must_use]
+pub fn halve_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
+    if w < 2 || h < 2 || rgba.len() < w.checked_mul(h)?.checked_mul(4)? {
+        return None;
+    }
+
+    // Odd dimensions lose their last row/column, which is invisible at preview size and
+    // avoids a special case that would otherwise read past the edge.
+    let (out_w, out_h) = (w / 2, h / 2);
+    let mut out = Vec::with_capacity(out_w.saturating_mul(out_h).saturating_mul(4));
+
+    for y in 0..out_h {
+        let row0 = y.saturating_mul(2).saturating_mul(w).saturating_mul(4);
+        let row1 = row0.saturating_add(w.saturating_mul(4));
+        for x in 0..out_w {
+            let col = x.saturating_mul(8);
+            for channel in 0..4_usize {
+                let mut sum = 0_u16;
+                for base in [row0, row1] {
+                    for pixel in [0_usize, 4] {
+                        let at = base
+                            .saturating_add(col)
+                            .saturating_add(pixel)
+                            .saturating_add(channel);
+                        sum = sum.saturating_add(u16::from(*rgba.get(at)?));
+                    }
+                }
+                out.push(u8::try_from(sum / 4).unwrap_or(u8::MAX));
+            }
+        }
+    }
+
+    Some((out, u32::try_from(out_w).ok()?, u32::try_from(out_h).ok()?))
+}
+
 /// Convert I420 (YUV 4:2:0 planar) to RGBA pixel data.
 #[must_use]
 pub fn i420_to_rgba(frame: &I420Frame) -> VideoFrame {
@@ -195,5 +244,62 @@ mod tests {
         assert!(g < 50); // G
         assert!(b < 50); // B
         assert_eq!(a, 255); // A
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod halve_tests {
+    use super::halve_rgba;
+
+    /// A 2x2 block of one colour must halve to that same colour, not to something the
+    /// averaging arithmetic mangled.
+    #[test]
+    fn a_uniform_image_keeps_its_colour() {
+        let src: Vec<u8> = [10_u8, 20, 30, 255].repeat(4 * 4);
+        let (out, w, h) = halve_rgba(4, 4, &src).expect("halved");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert!(
+            out.chunks_exact(4).all(|px| px == [10, 20, 30, 255]),
+            "got {out:?}"
+        );
+    }
+
+    /// Each output pixel must be the mean of its 2x2 source block -- a dropped-pixel
+    /// downscale would return one corner's value instead.
+    #[test]
+    fn each_output_pixel_averages_its_source_block() {
+        // One 2x2 block: red channel 0, 100, 200, 255 -> mean 138 (integer division).
+        let src: Vec<u8> = vec![
+            0, 0, 0, 255, 100, 0, 0, 255, // top row: two pixels
+            200, 0, 0, 255, 252, 0, 0, 255, // bottom row
+        ];
+        let (out, _, _) = halve_rgba(2, 2, &src).expect("halved");
+        assert_eq!(out.first().copied(), Some(138), "mean of 0, 100, 200, 252");
+    }
+
+    /// The whole point is the byte count: a preview frame must be a quarter the size.
+    #[test]
+    fn the_output_is_a_quarter_of_the_input() {
+        let src = vec![0_u8; 1280 * 720 * 4];
+        let (out, w, h) = halve_rgba(1280, 720, &src).expect("halved");
+        assert_eq!((w, h), (640, 360));
+        assert_eq!(out.len(), src.len() / 4);
+        assert_eq!(out.len(), 640 * 360 * 4);
+    }
+
+    /// A buffer that does not match its claimed geometry is refused, not silently
+    /// half-processed -- the bug this whole area has had twice already.
+    #[test]
+    fn a_short_buffer_is_refused() {
+        assert!(halve_rgba(1280, 720, &[0_u8; 100]).is_none());
+    }
+
+    /// Nothing to halve.
+    #[test]
+    fn degenerate_geometry_is_refused() {
+        assert!(halve_rgba(1, 1, &[0_u8; 4]).is_none());
+        assert!(halve_rgba(0, 0, &[]).is_none());
     }
 }

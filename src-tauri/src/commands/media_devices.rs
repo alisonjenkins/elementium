@@ -500,14 +500,21 @@ fn camera_pipeline_loop(
                     "Camera frame received"
                 );
             }
-            // Write RGBA frame to VideoFrameBuffer for local preview
+            // Write RGBA to the VideoFrameBuffer for the local preview, halved.
+            //
+            // Every preview frame crosses the Rust-to-webview IPC boundary as raw RGBA:
+            // 3.7MB at 720p, 110MB/s at 30fps, to draw a thumbnail a few centimetres
+            // across. What gets encoded and sent to peers is still the full-resolution
+            // frame -- only the self-view is reduced.
+            let preview = elementium_codec::halve_rgba(frame.width, frame.height, &frame.data)
+                .unwrap_or_else(|| (frame.data.clone(), frame.width, frame.height));
             if let Ok(mut buf) = video_frames.lock() {
                 buf.insert(
                     track_id.to_string(),
                     VideoFrame {
-                        width: frame.width,
-                        height: frame.height,
-                        data: frame.data.clone(),
+                        width: preview.1,
+                        height: preview.2,
+                        data: preview.0,
                         timestamp_us: 0,
                     },
                 );
@@ -582,13 +589,9 @@ fn encode_and_send_video_frame(
         if ((asked && !recently) || last_keyframe.elapsed() >= KEYFRAME_INTERVAL)
             && let Some(enc) = encoder.as_mut()
         {
-            match enc.force_keyframe() {
-                Ok(()) => {
-                    *last_keyframe = std::time::Instant::now();
-                    tracing::info!(track_id, on_request = asked, "forced a VP8 keyframe");
-                }
-                Err(e) => tracing::warn!(track_id, reason = %e, "keyframe failed"),
-            }
+            enc.force_keyframe();
+            *last_keyframe = std::time::Instant::now();
+            tracing::info!(track_id, on_request = asked, "requested a VP8 keyframe");
         }
     }
 
