@@ -12,10 +12,18 @@ members = [
     "crates/elementium-observability-test",
 ]
 
+# Warnings that are only ever read once scroll past; these are the groups whose
+# findings we act on, so they fail the build instead.
+[workspace.lints.rust]
+unused = { level = "deny", priority = -1 }
+
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
 perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
