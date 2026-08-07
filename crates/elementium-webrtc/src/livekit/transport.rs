@@ -278,6 +278,8 @@ fn pc_io_loop(
         "PC I/O loop starting"
     );
     let mut inbound_audio_count: u64 = 0;
+    let mut audio_publish = PublishCounters::default();
+    let mut video_publish = PublishCounters::default();
     // See `engine::io_loop`'s `dropped_events` -- same invisible-loss blind spot on the
     // LiveKit subscriber path's own event channel to `room.rs`.
     let mut dropped_events: u64 = 0;
@@ -293,6 +295,7 @@ fn pc_io_loop(
                             e2ee.as_context(),
                             data,
                             E2eeMediaKind::Audio,
+                            &mut audio_publish,
                         );
                     }
                     Ok(PcCommand::WriteVideo(data)) => {
@@ -301,6 +304,7 @@ fn pc_io_loop(
                             e2ee.as_context(),
                             data,
                             E2eeMediaKind::Video,
+                            &mut video_publish,
                         );
                     }
                     Ok(PcCommand::Shutdown) => {
@@ -358,6 +362,51 @@ fn pc_io_loop(
     }
 }
 
+/// What happened to the frames we tried to publish, per media kind.
+///
+/// Every stage between "the encoder produced a frame" and "str0m accepted it" can fail
+/// silently and independently: encryption drops a frame when no key is set, and the write
+/// fails when no mid or payload type has been negotiated yet. Each was a `debug!` on the
+/// individual frame, which at 50 frames a second is unreadable when it fires and
+/// indistinguishable from success when it does not. Counting them makes "the far end
+/// hears nothing" a question with an answer.
+#[derive(Default)]
+struct PublishCounters {
+    offered: u64,
+    encrypt_dropped: u64,
+    written: u64,
+    write_failed: u64,
+    last_failure: Option<String>,
+}
+
+impl PublishCounters {
+    /// Report every this many offered frames -- one second of audio, ~2s of video.
+    const REPORT_EVERY: u64 = 50;
+
+    fn report(&self, kind: &str) {
+        if self.written == 0 {
+            tracing::warn!(
+                kind,
+                offered = self.offered,
+                encrypt_dropped = self.encrypt_dropped,
+                write_failed = self.write_failed,
+                last_failure = self.last_failure.as_deref().unwrap_or("none"),
+                "publishing produced no frames on the wire"
+            );
+        } else {
+            tracing::info!(
+                kind,
+                offered = self.offered,
+                written = self.written,
+                encrypt_dropped = self.encrypt_dropped,
+                write_failed = self.write_failed,
+                last_failure = self.last_failure.as_deref().unwrap_or("none"),
+                "publishing"
+            );
+        }
+    }
+}
+
 /// Encrypt an outbound audio/video frame (if E2EE is active, via the shared
 /// [`crate::e2ee_io::encrypt_or_drop`]) and write it to the peer connection.
 fn write_encrypted_or_drop(
@@ -365,14 +414,23 @@ fn write_encrypted_or_drop(
     e2ee: Option<&E2eeContext>,
     data: elementium_types::PlaintextMedia,
     kind: E2eeMediaKind,
+    counters: &mut PublishCounters,
 ) {
     let label = match kind {
         E2eeMediaKind::Audio => "audio",
         E2eeMediaKind::Video => "video",
     };
+    counters.offered = counters.offered.saturating_add(1);
+
     let Some(data) = crate::e2ee_io::encrypt_or_drop(e2ee, data, kind, label) else {
+        counters.encrypt_dropped = counters.encrypt_dropped.saturating_add(1);
+        counters.last_failure = Some("e2ee encryption failed".to_owned());
+        if counters.offered.is_multiple_of(PublishCounters::REPORT_EVERY) {
+            counters.report(label);
+        }
         return;
     };
+
     let result = {
         let mut pc = lock_pc(handle);
         match kind {
@@ -380,8 +438,16 @@ fn write_encrypted_or_drop(
             E2eeMediaKind::Video => peer_connection::write_video(&mut pc, &data),
         }
     };
-    if let Err(e) = result {
-        tracing::debug!(?kind, reason = %e, "write failed");
+    match result {
+        Ok(()) => counters.written = counters.written.saturating_add(1),
+        Err(e) => {
+            counters.write_failed = counters.write_failed.saturating_add(1);
+            counters.last_failure = Some(e.to_string());
+        }
+    }
+
+    if counters.offered.is_multiple_of(PublishCounters::REPORT_EVERY) {
+        counters.report(label);
     }
 }
 
