@@ -48,11 +48,22 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+/// Held for the length of a measurement.
+///
+/// The counter is global and the test harness runs these in parallel, so without this one
+/// test resets it while another is part-way through counting — and the second then observes
+/// fewer bytes than were really allocated. That failed intermittently and only in a full
+/// workspace run, which is the least useful moment to find out.
+static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Bytes allocated while running `f`.
 fn allocated_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let guard = MEASURING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     ALLOCATED.store(0, Ordering::Relaxed);
     let value = f();
-    (value, ALLOCATED.load(Ordering::Relaxed))
+    let count = ALLOCATED.load(Ordering::Relaxed);
+    drop(guard);
+    (value, count)
 }
 
 /// 720p, the resolution the camera negotiates.
