@@ -6,3 +6,4 @@ pub mod device_enumeration;
 pub mod pipewire_capture;
 pub mod pipewire_nodes;
 pub mod stream_config;
+pub mod video_source;

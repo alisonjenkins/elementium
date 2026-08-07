@@ -12,7 +12,6 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use elementium_codec::{OpusEncoder, OpusEncoderConfig, Vp8Encoder};
 use elementium_media::audio_capture::AudioCapturer;
-use elementium_media::camera::CameraCapturer;
 use elementium_media::device_enumeration;
 use elementium_types::observability::CorrelationId;
 use elementium_types::{
@@ -370,17 +369,24 @@ fn camera_pipeline_loop(
     req_width: Option<u32>,
     req_height: Option<u32>,
 ) {
-    let capturer = match CameraCapturer::start(req_width, req_height) {
+    // Prefers PipeWire, falls back to V4L2. On a desktop where PipeWire holds the camera,
+    // V4L2 cannot work at all -- see `VideoSource`.
+    let capturer = match elementium_media::video_source::VideoSource::start(req_width, req_height) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("Failed to start camera: {e}");
+            tracing::error!(reason = %e, track_id = %track_id, "Failed to start camera");
             return;
         }
     };
 
-    let width = capturer.width();
-    let height = capturer.height();
-    tracing::info!(width, height, track_id = %track_id, "Camera pipeline started");
+    let (width, height) = capturer.size();
+    tracing::info!(
+        width,
+        height,
+        backend = capturer.backend(),
+        track_id = %track_id,
+        "Camera pipeline started"
+    );
 
     let mut encoder: Option<Vp8Encoder> = None;
     let mut frame_count: u64 = 0;
