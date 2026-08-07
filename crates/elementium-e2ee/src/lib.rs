@@ -387,6 +387,32 @@ const fn peek_key_index(frame: &[u8]) -> Option<u8> {
     }
 }
 
+/// Whether a frame's trailer looks like one livekit wrote.
+///
+/// The second-to-last byte is `IV_LENGTH`, and livekit always writes 12. Anything else
+/// means the bytes being read are not a livekit frame tail, and therefore that the "key
+/// index" read beside it is not a key index either -- it is whatever happened to be at
+/// that offset.
+///
+/// This distinction is worth a whole diagnostic on its own. "No key decrypts this frame"
+/// has two completely different causes that look identical: a key we were never given, or
+/// a frame we are misreading. The first is someone else's problem to fix and the second is
+/// ours, and without this there is nothing to tell them apart -- a real session reported
+/// key indices 3 and 6 that no participant had ever announced, which is exactly what a
+/// misread produces.
+///
+/// Cases that produce a wrong tail here: an Opus payload still wrapped in RFC 2198 RED, a
+/// VP8 payload with its descriptor still attached, or a partially reassembled frame.
+const fn trailer_looks_like_livekit(frame: &[u8]) -> Option<bool> {
+    match frame.len().checked_sub(2) {
+        Some(at) => match frame.split_at(at).1.first() {
+            Some(iv_length) => Some(*iv_length == IV_SIZE_U8),
+            None => None,
+        },
+        None => None,
+    }
+}
+
 /// Render a [`key_fingerprint`] as hex for logging.
 fn fingerprint_hex(fp: [u8; 4]) -> String {
     use std::fmt::Write as _;
@@ -700,6 +726,12 @@ impl E2eeContext {
                 reason = "no_key_decrypts_frame",
                 frame_key_index = peek_key_index(frame.as_bytes())
                     .map_or_else(|| "?".to_owned(), |i| i.to_string()),
+                // False here means the frame is not shaped like one livekit wrote, so the
+                // index beside it is not a key index and no key could ever have worked.
+                // See `trailer_looks_like_livekit`.
+                trailer_is_livekit_shaped = trailer_looks_like_livekit(frame.as_bytes())
+                    .map_or_else(|| "?".to_owned(), |ok| ok.to_string()),
+                frame_len = frame.as_bytes().len(),
                 media_kind = ?kind,
                 undecryptable_frames = lost,
                 keys_held = %self.key_inventory(),
@@ -1170,6 +1202,29 @@ mod tests {
             *b = 0x11;
         }
         assert_eq!(unencrypted_header_size(&delta, MediaKind::Video), 3);
+    }
+
+    /// A livekit frame's trailer says how long its IV is, and livekit always says 12.
+    ///
+    /// This is the cheapest way to tell "we were never given the key" from "we are reading
+    /// the wrong bytes", which otherwise look identical: both drop every frame.
+    #[test]
+    fn a_trailer_is_recognised_by_its_iv_length() {
+        // A tail shaped the way livekit writes one: [..][IV_LENGTH=12][key_index].
+        let mut good = vec![0x11_u8; 40];
+        good.push(IV_SIZE_U8);
+        good.push(3);
+        assert_eq!(trailer_looks_like_livekit(&good), Some(true));
+
+        // A payload whose tail is something else entirely -- RED framing, a VP8
+        // descriptor, a partial frame. The last byte still reads as a plausible key index,
+        // which is exactly why the byte before it has to be checked.
+        let not_a_frame = vec![0x11_u8; 40];
+        assert_eq!(trailer_looks_like_livekit(&not_a_frame), Some(false));
+
+        // Too short to have a trailer at all.
+        assert_eq!(trailer_looks_like_livekit(&[0x01]), None);
+        assert_eq!(trailer_looks_like_livekit(&[]), None);
     }
 
     #[test]
