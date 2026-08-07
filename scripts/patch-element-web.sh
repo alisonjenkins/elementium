@@ -65,6 +65,64 @@ else
     echo "[patch] Injected shims script tag into $INDEX"
 fi
 
+# 4b. Autojoin driver, for testing only.
+#
+# Every remaining question about the call faults needs Elementium itself in a call, and
+# Playwright cannot drive it -- it is a Tauri app behind a WebKit webview. So the app drives
+# itself, from credentials in the test-env fixture. Injected only when asked for, and built
+# from its own entry point, so it cannot reach a release build by accident.
+if [[ "${ELEMENTIUM_AUTOJOIN:-}" == "1" ]]; then
+    FIXTURE="target/test-env-fixture.json"
+    if [[ ! -f "$FIXTURE" ]]; then
+        echo "[patch] ERROR: ELEMENTIUM_AUTOJOIN=1 but $FIXTURE is missing." >&2
+        echo "[patch]        Run test-env/provision.sh first." >&2
+        exit 1
+    fi
+    cp frontend/dist-shims/elementium-autojoin.js "$DIST_DIR/elementium-autojoin.js"
+    # Participant index 0 by default; `just call-peers` uses the rest, so the app takes
+    # tester1 and meets them.
+    AUTOJOIN_JSON=$(ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-0}" python3 - "$FIXTURE" <<'PYEOF'
+import json, os, sys
+env = json.load(open(sys.argv[1]))
+who = env["participants"][0]
+print(json.dumps({
+    "homeserver": env.get("homeserver", "http://localhost:8008"),
+    "userId": who["user_id"],
+    "accessToken": who["access_token"],
+    "deviceId": who["device_id"],
+    "roomId": env["room_id"],
+    "video": os.environ.get("ELEMENTIUM_AUTOJOIN_VIDEO") == "1",
+}))
+PYEOF
+)
+    for f in "$INDEX" "$DIST_DIR/widgets/element-call/index.html"; do
+        [[ -f "$f" ]] || continue
+        grep -qF "elementium-autojoin.js" "$f" && continue
+        awk -v cfg="$AUTOJOIN_JSON" '
+            !done && /<script/ {
+                print "    <script>window.__ELEMENTIUM_AUTOJOIN = " cfg ";</script>"
+                print "    <script src=\"/elementium-autojoin.js\"></script>"
+                done = 1
+            }
+            { print }
+        ' "$f" > "$f.tmp"
+        mv "$f.tmp" "$f"
+        echo "[patch] Injected autojoin driver into $f"
+    done
+else
+    # Symmetric removal. The injection carries a real access token and joins a call on
+    # startup, so leaving it behind would make an ordinary `just dev` log in as a test user
+    # and dial into a call by itself. Anything that can be turned on has to be turned off by
+    # the same script, or it is only off until someone forgets.
+    for f in "$INDEX" "$DIST_DIR/widgets/element-call/index.html"; do
+        [[ -f "$f" ]] || continue
+        grep -qF "elementium-autojoin" "$f" || continue
+        sed -i '/__ELEMENTIUM_AUTOJOIN/d; /elementium-autojoin\.js/d' "$f"
+        echo "[patch] Removed autojoin driver from $f"
+    done
+    rm -f "$DIST_DIR/elementium-autojoin.js"
+fi
+
 # 5. Patch Element Call widget (if present) to inject IPC bridge + shims
 EC_DIR="$DIST_DIR/widgets/element-call"
 EC_INDEX="$EC_DIR/index.html"

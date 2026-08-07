@@ -33,6 +33,24 @@ call-peers:
     cd frontend && ELEMENTIUM_HOLD_PEERS=1 pnpm exec playwright test \
         tests/matrixrtc/peers.spec.ts --reporter=list --timeout=0 --workers=1
 
+# Run Elementium headless and have it join the call, for testing.
+#
+# The other half of `just call-peers`: that puts real participants in a call, this puts
+# Elementium in the same one without anyone clicking. Runs on a virtual display, so no
+# window appears, and joins with the camera off -- the receive path does not need ours.
+# Set ELEMENTIUM_AUTOJOIN_VIDEO=1 to publish video too, which opens the camera.
+#
+# Logs land in /tmp/elementium.log as usual.
+app-join:
+    cd test-env && ./configure-synapse.sh
+    cd test-env && docker compose up -d
+    cd test-env && ./provision.sh > ../target/test-env-fixture.json
+    cd frontend && pnpm exec vite build -c vite.shims.config.ts
+    cd frontend && pnpm exec vite build -c vite.autojoin.config.ts
+    ELEMENTIUM_TEST_ENV=1 ELEMENTIUM_AUTOJOIN=1 ./scripts/patch-element-web.sh
+    nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
+        cargo tauri dev
+
 # Stop the local MatrixRTC stack.
 test-env-down:
     cd test-env && docker compose down
