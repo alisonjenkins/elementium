@@ -21,6 +21,18 @@ dev-test-env:
     cd test-env && ./provision.sh
     ELEMENTIUM_TEST_ENV=1 cargo tauri dev
 
+# Put other people in a call and leave them there, so Elementium can join them.
+#
+# Every Element Call scenario tested here passes, which leaves one configuration
+# uncovered: Elementium as a participant. Playwright cannot drive it -- it is a Tauri
+# app with a native WebRTC stack -- so this supplies the other side instead.
+#
+# Run this in one terminal and `just dev-test-env` in another, then log in as
+# tester1 (test-password-1) and join the call. Ctrl-C to stop.
+call-peers:
+    cd frontend && ELEMENTIUM_HOLD_PEERS=1 pnpm exec playwright test \
+        tests/matrixrtc/peers.spec.ts --reporter=list --timeout=0 --workers=1
+
 # Stop the local MatrixRTC stack.
 test-env-down:
     cd test-env && docker compose down
