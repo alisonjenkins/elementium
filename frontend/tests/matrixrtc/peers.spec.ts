@@ -53,14 +53,6 @@ test("hold a call open for Elementium to join", async ({ browser }) => {
 
   const server = await startElementWeb();
   const contexts = await Promise.all(peers.map(() => browser.newContext()));
-  contexts.forEach((c) =>
-    c.on("page", (pg) =>
-      pg.on("console", (m) => {
-        const t = m.text();
-        if (/error|fail|sync|Unable|crypto/i.test(t)) console.log(`    [page:${m.type()}] ${t.slice(0, 180)}`);
-      }),
-    ),
-  );
   const joined = [];
   for (const [i, who] of peers.entries()) {
     const p = await openRoom(contexts[i]!, server, who, env.room_id);
