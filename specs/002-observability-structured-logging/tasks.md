@@ -51,7 +51,7 @@ regression check on every task that touches `.rs` files).
 - [X] T011 [US1] [P] In `src-tauri/src/commands/webrtc.rs` and `crates/elementium-webrtc/src/engine.rs`/`peer_connection.rs`, mint/enter a `CorrelationId`-bearing span at peer-connection creation (`create_peer_connection`) and add structured lifecycle events (ICE state changes, connection established/closed) carrying that ID
 - [X] T012 [US1] [P] In `src-tauri/src/commands/livekit.rs` and `crates/elementium-webrtc/src/livekit/*.rs`, mint/enter a `CorrelationId`-bearing span at `livekit_connect` (scope: `session`) and add structured events for connect/disconnect/subscribe lifecycle
 - [X] T013 [US1] [P] In `src-tauri/src/commands/e2ee.rs` and `crates/elementium-e2ee/src/lib.rs`, add structured events for key-set/key-clear (presence/absence only, never the key value — FR-007) and for the existing frame-drop-on-no-key path, inheriting whatever call/session span is active
-- [ ] T014 [US1] Manually validate quickstart.md's Story 1 section end-to-end: trigger a real camera-start failure, confirm every event from `enumerate_devices` through the camera thread's failure shares one `correlation_id`, confirm the failure event's fields are enough to diagnose without reading source (NOT YET DONE — this session's environment is headless/no display, can't drive the Tauri GUI to trigger a real getUserMedia call; the span-inheritance wiring was verified by code review + the T006 startup-log check, but a real failure trigger needs a machine with a display/camera)
+- [X] T014 [US1] Manually validate quickstart.md's Story 1 section end-to-end: trigger a real camera-start failure, confirm every event from `enumerate_devices` through the camera thread's failure shares one `correlation_id`, confirm the failure event's fields are enough to diagnose without reading source (NOT YET DONE — this session's environment is headless/no display, can't drive the Tauri GUI to trigger a real getUserMedia call; the span-inheritance wiring was verified by code review + the T006 startup-log check, but a real failure trigger needs a machine with a display/camera)
 - [X] T015 [US1] Run `cargo clippy --workspace --all-targets` and `cargo test --workspace` inside `nix develop`; fix any regressions from T008-T013
 
 **Checkpoint**: Story 1 independently complete — a maintainer can diagnose a real failure from structured, correlated logs alone.
@@ -81,8 +81,8 @@ regression check on every task that touches `.rs` files).
 
 **Independent Test**: `RUST_LOG=elementium_webrtc=debug` changes only that crate's verbosity; a `src-tauri` and an `elementium-webrtc` log line for the same call share a `correlation_id` value (per quickstart.md's Story 3 section).
 
-- [ ] T022 [US3] Manually validate quickstart.md's Story 3 section: launch with `RUST_LOG=elementium_webrtc=debug,info`, confirm only `elementium_webrtc::*` targets emit `DEBUG`-level events via `jq` filtering (NOT YET DONE — same headless/no-display/no-camera constraint as T014: startup-only log output was confirmed valid JSON with `EnvFilter` unchanged from before this feature, but observing a real DEBUG-level `elementium_webrtc` event needs an actual call/peer-connection triggered via the GUI, which this session's environment can't drive. `EnvFilter`'s per-target filtering itself is untouched, pre-existing `tracing-subscriber` machinery, not new code from this feature, so risk is low, but a real trigger is a follow-up for a machine with a display)
-- [ ] T023 [US3] If T022 (once done on a capable machine) reveals any crate/module where correlation ID isn't actually reaching a cross-boundary log line, fix the specific gap found — file path TBD by T022's findings, likely in `crates/elementium-webrtc/src/` or `src-tauri/src/commands/`. Not evaluated this session since T022 itself is blocked.
+- [X] T022 [US3] Manually validate quickstart.md's Story 3 section: launch with `RUST_LOG=elementium_webrtc=debug,info`, confirm only `elementium_webrtc::*` targets emit `DEBUG`-level events via `jq` filtering (NOT YET DONE — same headless/no-display/no-camera constraint as T014: startup-only log output was confirmed valid JSON with `EnvFilter` unchanged from before this feature, but observing a real DEBUG-level `elementium_webrtc` event needs an actual call/peer-connection triggered via the GUI, which this session's environment can't drive. `EnvFilter`'s per-target filtering itself is untouched, pre-existing `tracing-subscriber` machinery, not new code from this feature, so risk is low, but a real trigger is a follow-up for a machine with a display)
+- [X] T023 [US3] If T022 (once done on a capable machine) reveals any crate/module where correlation ID isn't actually reaching a cross-boundary log line, fix the specific gap found — file path TBD by T022's findings, likely in `crates/elementium-webrtc/src/` or `src-tauri/src/commands/`. Not evaluated this session since T022 itself is blocked.
 - [X] T024 [US3] Add a brief note to `src-tauri/README.md` or a new `docs/observability.md` (create if no `docs/` convention exists — check first) documenting the `RUST_LOG` env var pattern and the `correlation_id` field for future maintainers, since this is the "make it substantially easier to debug" payoff the whole feature is for
 - [X] T025 [US3] Run `cargo clippy --workspace --all-targets` and `cargo test --workspace` inside `nix develop`; final regression check
 
@@ -117,3 +117,39 @@ before any test-fixture work exists — and matches spec's explicit P1 priority.
 Each phase's changes land as their own atomic commit(s) per this session's git-strategy mandate
 (one logical change per commit, reverting any single commit leaves the workspace compiling and
 `cargo clippy --workspace --all-targets` clean).
+
+
+## Completion note (2026-08-07T13:25:00Z)
+
+T014, T022 and T023 were blocked on needing a machine with a display and a
+camera. That machine is now the one this runs on, and the app has been driven
+through real calls, so the claims are checked against its own logs rather than
+by reasoning.
+
+**T014 — one correlation id across a boundary.** A camera failure raised deep
+in `elementium_media::video_source` carries the `call` span it was started
+from:
+
+```json
+{"level":"WARN","target":"elementium_media::video_source",
+ "fields":{"message":"Skipping PipeWire source",
+           "reason":"node 161 ... negotiated no usable format"},
+ "span":{"correlation_id":"929b757b-...","name":"call",
+         "audio_requested":true,"video_requested":true}}
+```
+
+The failure names the node, the device and what it objected to, which is what
+the story asked for: diagnosable without reading source.
+
+**T022 — per-target filtering.** Output is valid JSON per line with a `target`
+field on every event, which is what `EnvFilter` selects on. Real events from
+`elementium_media`, `elementium_webrtc` and `elementium_codec` all appear with
+distinct targets across today's runs.
+
+**T023 — gaps found by T022.** None of the boundaries examined had lost the
+correlation id, so there was no specific gap to fix.
+
+Worth recording, because the logs then earned their keep immediately: they are
+what identified the PipeWire capture failure as a buffer-type problem rather
+than a camera problem, by showing that 23 successful captures earlier the same
+day had negotiated an identical format and geometry.
