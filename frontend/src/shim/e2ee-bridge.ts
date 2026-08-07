@@ -92,12 +92,15 @@ function hookImportKey(): void {
       if (bytes) {
         // Copy: the caller's buffer may be reused or detached after this returns.
         const copy = new Uint8Array(bytes);
+        const call = isCallKeyImport(algorithm) ? noteKeyImported() : null;
         result
           .then((key) => {
             rawKeyMaterial.set(key, copy);
+            if (call !== null) importSerials.set(key, call);
           })
           .catch(() => {
             /* import failed; nothing to record */
+            if (call !== null) resolveImport(call);
           });
       }
     }
@@ -105,6 +108,77 @@ function hookImportKey(): void {
   };
 
   (subtle as unknown as Record<string, unknown>)["importKey"] = patched;
+}
+
+/**
+ * Whether an `importKey` call is Element Call deriving a frame-encryption key.
+ *
+ * Element Call imports its call keys as HKDF material
+ * (`importKey("raw", key, "HKDF", false, ["deriveBits", "deriveKey"])`). Element Web imports
+ * plenty of other raw keys for Matrix's own crypto, and counting those would make the
+ * arithmetic below meaningless.
+ */
+function isCallKeyImport(algorithm: unknown): boolean {
+  if (algorithm === "HKDF") return true;
+  return (
+    typeof algorithm === "object" &&
+    algorithm !== null &&
+    (algorithm as { name?: unknown }).name === "HKDF"
+  );
+}
+
+/**
+ * Call keys derived but not yet seen leaving for the worker, by serial.
+ *
+ * The question this answers was raised by a real call and never settled: inbound frames
+ * carried key indices 3 and 6 while every key this bridge saw was at index 0, 1 or 4, and no
+ * key ever failed to be recovered. Either livekit never told the worker about those keys, or
+ * it did so by a route this ignores -- and the two have different owners.
+ *
+ * Counting derivations against forwards separates them. A key that Element Call derives and
+ * never sends is upstream of us; a key that is sent and not forwarded is ours.
+ *
+ * Holds no `CryptoKey` and no material -- only a serial and a timestamp -- so nothing here
+ * keeps key material alive or puts it anywhere it could be logged.
+ */
+const pendingImports = new Map<number, { at: number }>();
+/** Serial for each imported call key, so `setKey` can resolve the import it came from. */
+const importSerials = new WeakMap<CryptoKey, number>();
+let importSerial = 0;
+let keysImported = 0;
+
+/**
+ * How long a derived key may go unforwarded before it is reported.
+ *
+ * Element Call delays *using* a new key by `useKeyDelay` (5s by default) after distributing
+ * it, so a key sits between derivation and `setKey` for several seconds as a matter of
+ * course. This has to be comfortably longer than that or every rotation reports itself.
+ */
+const UNFORWARDED_KEY_MS = 15_000;
+
+function noteKeyImported(): number {
+  importSerial += 1;
+  keysImported += 1;
+  const serial = importSerial;
+  pendingImports.set(serial, { at: Date.now() });
+  setTimeout(() => {
+    const entry = pendingImports.get(serial);
+    if (!entry) return;
+    pendingImports.delete(serial);
+    console.warn(
+      `[Elementium] E2EE call key #${serial} was derived ${Date.now() - entry.at}ms ago and ` +
+        `never reached the worker, so the native backend does not have it. ` +
+        `derived=${keysImported} forwarded=${keysForwarded} ` +
+        `still_waiting=${pendingImports.size}. This is upstream of the bridge: livekit was ` +
+        `never asked to install it.`,
+    );
+  }, UNFORWARDED_KEY_MS);
+  return serial;
+}
+
+/** Mark a derived key as accounted for, so its deadline passes without a report. */
+function resolveImport(serial: number): void {
+  pendingImports.delete(serial);
 }
 
 interface SetKeyMessage {
@@ -175,9 +249,15 @@ function handleSetKey(data: SetKeyMessage): void {
   const key = data.key;
 
   if (!(key instanceof CryptoKey)) {
-    console.warn("[Elementium] E2EE setKey without a CryptoKey; cannot forward to native backend");
+    console.warn(
+      `[Elementium] E2EE setKey for "${participant}" index ${keyIndex} carried no CryptoKey; ` +
+        `not forwarded, so the native backend has no key at that index`,
+    );
     return;
   }
+
+  const serial = importSerials.get(key);
+  if (serial !== undefined) resolveImport(serial);
 
   const material = rawKeyMaterial.get(key);
   if (!material) {
@@ -186,7 +266,9 @@ function handleSetKey(data: SetKeyMessage): void {
     // Rust keeps no key for this participant and drops all their media.
     console.error(
       `[Elementium] E2EE key for "${participant}" (index ${keyIndex}) has no recorded raw ` +
-        `material — native decryption for this participant will fail`,
+        `material — native decryption for this participant will fail. ` +
+        `derived=${keysImported} forwarded=${keysForwarded}. This one is ours: the key ` +
+        `reached the worker but not through an importKey("raw", ...) this bridge front-ran`,
     );
     return;
   }
@@ -205,7 +287,10 @@ function handleSetKey(data: SetKeyMessage): void {
   console.log(
     `[Elementium] E2EE key forwarded to native backend: participant="${participant}" ` +
       `index=${keyIndex} len=${material.length} ` +
-      `indexes_seen=[${[...keyIndexesSeen].sort((a, b) => a - b).join(",")}]`,
+      `indexes_seen=[${[...keyIndexesSeen].sort((a, b) => a - b).join(",")}] ` +
+      // derived > forwarded means Element Call made a key the worker was never told about,
+      // which is the difference between a key we lost and one we were never given.
+      `derived=${keysImported} forwarded=${keysForwarded}`,
   );
   invokeTauri("e2ee_set_key", {
     participant,
