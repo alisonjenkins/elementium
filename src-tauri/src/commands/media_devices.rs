@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use tauri::{State, command};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use elementium_codec::{OpusEncoder, OpusEncoderConfig, Vp8Encoder};
+use elementium_codec::{
+    EncoderConfig, OpusEncoder, OpusEncoderConfig, VideoCodec, VideoEncoder, make_encoder,
+};
 use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::device_enumeration;
 use elementium_types::observability::CorrelationId;
@@ -450,6 +452,14 @@ const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// one before the first has arrived. Roughly one round trip on a poor link.
 const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The codec used for outbound video.
+///
+/// A constant only until SDP negotiation is threaded through to here: the far end decides
+/// what it can decode, and the capture path is already written against the trait, so
+/// honouring that choice becomes a matter of passing the negotiated value rather than
+/// changing how frames are encoded.
+const NEGOTIATED_VIDEO_CODEC: VideoCodec = VideoCodec::Vp8;
+
 /// The fastest we encode, regardless of how fast the camera runs.
 ///
 /// The webcam delivers 60fps. Encoding all of it doubles the bitrate needed for the same
@@ -508,7 +518,9 @@ fn camera_pipeline_loop(
         "Camera pipeline started"
     );
 
-    let mut encoder: Option<Vp8Encoder> = None;
+    // Held behind the trait: which codec is in use comes from SDP negotiation, so the
+    // capture loop must not name one. See `elementium_codec::video`.
+    let mut encoder: Option<Box<dyn VideoEncoder>> = None;
     let mut frame_count: u64 = 0;
     let mut last_keyframe = std::time::Instant::now();
     let mut last_encode = std::time::Instant::now()
@@ -586,7 +598,7 @@ fn camera_pipeline_loop(
 fn encode_and_send_video_frame(
     track_id: &str,
     frame: &elementium_types::VideoFrame,
-    encoder: &mut Option<Vp8Encoder>,
+    encoder: &mut Option<Box<dyn VideoEncoder>>,
     last_keyframe: &mut std::time::Instant,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
@@ -600,19 +612,26 @@ fn encode_and_send_video_frame(
         .is_none_or(|e| e.size() != (frame.width, frame.height))
     {
         let bitrate = bitrate_for(frame.width, frame.height);
-        match Vp8Encoder::new(frame.width, frame.height, bitrate) {
+        let config = EncoderConfig {
+            width: frame.width,
+            height: frame.height,
+            bitrate_kbps: bitrate,
+            max_framerate: u32::try_from(MAX_ENCODE_FPS).unwrap_or(30),
+        };
+        match make_encoder(NEGOTIATED_VIDEO_CODEC, config) {
             Ok(enc) => {
                 tracing::info!(
                     width = frame.width,
                     height = frame.height,
                     bitrate_kbps = bitrate,
                     max_fps = MAX_ENCODE_FPS,
-                    "VP8 encoder created for camera"
+                    codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),
+                    "video encoder created for camera"
                 );
                 *encoder = Some(enc);
                 *last_keyframe = std::time::Instant::now();
             }
-            Err(e) => tracing::error!("Failed to create VP8 encoder: {e}"),
+            Err(e) => tracing::error!(codec = NEGOTIATED_VIDEO_CODEC.sdp_name(), "Failed to create video encoder: {e}"),
         }
     } else {
         // A receiver asking is the urgent case: until it gets a keyframe it displays a
@@ -627,9 +646,9 @@ fn encode_and_send_video_frame(
         if ((asked && !recently) || last_keyframe.elapsed() >= KEYFRAME_INTERVAL)
             && let Some(enc) = encoder.as_mut()
         {
-            enc.force_keyframe();
+            enc.request_keyframe();
             *last_keyframe = std::time::Instant::now();
-            tracing::info!(track_id, on_request = asked, "requested a VP8 keyframe");
+            tracing::info!(track_id, on_request = asked, "requested a video keyframe");
         }
     }
 
@@ -647,7 +666,7 @@ fn encode_and_send_video_frame(
                 }
             }
         }
-        Err(e) => tracing::debug!("VP8 encode error: {e}"),
+        Err(e) => tracing::debug!("video encode error: {e}"),
     }
 }
 

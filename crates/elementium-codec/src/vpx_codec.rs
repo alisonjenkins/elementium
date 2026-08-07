@@ -29,6 +29,9 @@ const KEYFRAME_MAX_DIST: u32 = 150;
 /// VP8 encoder over libvpx, configured for real-time use.
 pub struct Vp8Encoder {
     ctx: vpx_sys::vpx_codec_ctx_t,
+    /// Kept so the bitrate can be retargeted without rebuilding the encoder: congestion
+    /// control changes the target during a call, and libvpx needs the whole config back.
+    cfg: vpx_sys::vpx_codec_enc_cfg_t,
     width: u32,
     height: u32,
     bitrate_kbps: u32,
@@ -140,6 +143,7 @@ impl Vp8Encoder {
 
             Ok(Self {
                 ctx,
+                cfg,
                 width,
                 height,
                 bitrate_kbps,
@@ -175,6 +179,34 @@ impl Vp8Encoder {
     /// the encoder as an earlier version had to.
     pub const fn force_keyframe(&mut self) {
         self.force_keyframe = true;
+    }
+
+    /// Retarget the encoder's bitrate without rebuilding it.
+    ///
+    /// A call's available bandwidth is not fixed: congestion control lowers the target
+    /// when the link degrades and raises it when it recovers. Rebuilding the encoder to
+    /// change it would emit a keyframe every time, which is the opposite of what a
+    /// congested link needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if libvpx rejects the new configuration.
+    pub fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<(), String> {
+        if kbps == self.bitrate_kbps {
+            return Ok(());
+        }
+        self.cfg.rc_target_bitrate = kbps;
+        // SAFETY: `ctx` was initialised by `new` and `cfg` is the configuration it was
+        // created from, with one field changed.
+        let ret = unsafe {
+            vpx_sys::vpx_codec_enc_config_set(std::ptr::addr_of_mut!(self.ctx), &raw const self.cfg)
+        };
+        if ret != vpx_sys::VPX_CODEC_OK {
+            return Err(format!("VP8 set bitrate {kbps}kbps: {ret:?}"));
+        }
+        tracing::info!(from_kbps = self.bitrate_kbps, to_kbps = kbps, "VP8 bitrate retargeted");
+        self.bitrate_kbps = kbps;
+        Ok(())
     }
 
     /// Encode an I420 frame. Returns zero or more VP8 packets.
@@ -529,6 +561,49 @@ impl Drop for Vp8Decoder {
         unsafe {
             vpx_sys::vpx_codec_destroy(std::ptr::addr_of_mut!(self.ctx));
         }
+    }
+}
+
+
+impl crate::video::VideoEncoder for Vp8Encoder {
+    fn codec(&self) -> crate::video::VideoCodec {
+        crate::video::VideoCodec::Vp8
+    }
+
+    fn size(&self) -> (u32, u32) {
+        Self::size(self)
+    }
+
+    fn encode(
+        &mut self,
+        frame: &I420Frame,
+    ) -> Result<Vec<crate::video::EncodedFrame>, String> {
+        Ok(Self::encode(self, frame)?
+            .into_iter()
+            .map(|p| crate::video::EncodedFrame {
+                data: p.data,
+                is_keyframe: p.is_keyframe,
+                pts: p.pts,
+            })
+            .collect())
+    }
+
+    fn request_keyframe(&mut self) {
+        Self::force_keyframe(self);
+    }
+
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+        self.set_bitrate_kbps(kbps)
+    }
+}
+
+impl crate::video::VideoDecoder for Vp8Decoder {
+    fn codec(&self) -> crate::video::VideoCodec {
+        crate::video::VideoCodec::Vp8
+    }
+
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+        Self::decode(self, data)
     }
 }
 
