@@ -99,6 +99,31 @@ impl Config {
         profile: va::VAProfile,
         attributes: &mut [va::VAConfigAttrib],
     ) -> Result<Self, Status> {
+        Self::new(display, profile, va::VAEntrypoint_VAEntrypointEncSlice, attributes)
+    }
+
+    /// Create a configuration for decoding with `profile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the driver's status if it will not accept the profile or attributes -- most
+    /// often because the hardware has no decoder for it, which is normal and worth falling
+    /// back over rather than failing.
+    pub fn for_decoding(
+        display: &Arc<Display>,
+        profile: va::VAProfile,
+        attributes: &mut [va::VAConfigAttrib],
+    ) -> Result<Self, Status> {
+        Self::new(display, profile, va::VAEntrypoint_VAEntrypointVLD, attributes)
+    }
+
+    /// Create a configuration for a given entrypoint.
+    fn new(
+        display: &Arc<Display>,
+        profile: va::VAProfile,
+        entrypoint: va::VAEntrypoint,
+        attributes: &mut [va::VAConfigAttrib],
+    ) -> Result<Self, Status> {
         let mut id: va::VAConfigID = 0;
         // SAFETY: the display is initialised for as long as it is borrowed, and libva
         // writes only `id` plus the attribute values, whose count it is given.
@@ -106,7 +131,7 @@ impl Config {
             va::vaCreateConfig(
                 display.handle(),
                 profile,
-                va::VAEntrypoint_VAEntrypointEncSlice,
+                entrypoint,
                 attributes.as_mut_ptr(),
                 c_int::try_from(attributes.len()).unwrap_or(0),
                 std::ptr::addr_of_mut!(id),
@@ -165,6 +190,35 @@ impl SurfacePool {
         height: u32,
         count: usize,
     ) -> Result<Self, Status> {
+        Self::new_format(
+            display,
+            va::VA_RT_FORMAT_YUV420,
+            u32::from_le_bytes(*b"NV12"),
+            width,
+            height,
+            count,
+        )
+    }
+
+    /// Allocate `count` surfaces of a given format.
+    ///
+    /// The runtime format and the fourcc are separate because they say different things:
+    /// the first is the sampling the hardware plans for, the second the exact byte layout.
+    /// A JPEG decoder lands 4:2:2 output in YUY2 and 4:2:0 output in NV12, and only the
+    /// latter is what an encoder reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the driver's status if the surfaces cannot be allocated, which on a busy GPU
+    /// means exactly that and is worth falling back to software over.
+    pub fn new_format(
+        display: &Arc<Display>,
+        rt_format: u32,
+        fourcc: u32,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) -> Result<Self, Status> {
         let mut ids: Vec<va::VASurfaceID> = vec![0; count];
         let mut attribute = va::VASurfaceAttrib {
             type_: va::VASurfaceAttribType_VASurfaceAttribPixelFormat,
@@ -172,8 +226,7 @@ impl SurfacePool {
             value: va::VAGenericValue {
                 type_: va::VAGenericValueType_VAGenericValueTypeInteger,
                 value: va::_VAGenericValue__bindgen_ty_1 {
-                    // 'NV12' as a fourcc.
-                    i: i32::from_le_bytes(*b"NV12"),
+                    i: i32::from_ne_bytes(fourcc.to_ne_bytes()),
                 },
             },
         };
@@ -183,7 +236,7 @@ impl SurfacePool {
         let status = unsafe {
             va::vaCreateSurfaces(
                 display.handle(),
-                va::VA_RT_FORMAT_YUV420,
+                rt_format,
                 width,
                 height,
                 ids.as_mut_ptr(),
