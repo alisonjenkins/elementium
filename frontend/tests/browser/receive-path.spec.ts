@@ -20,8 +20,27 @@
  * subscribe to. It is retried once here because it is not what these tests measure, but it
  * is not understood, and it is worth understanding: "a participant already in the room never
  * learns about our published track" would match the reported symptom of a caller being
- * barely audible far better than any codec explanation. Our AddTrack also never populates
- * the `encryption` field, which is one candidate.
+ * barely audible far better than any codec explanation.
+ *
+ * The `encryption` candidate named here is settled, and settling it invalidated some of
+ * what this file used to measure. Our AddTrack did leave the field at NONE while the
+ * transport encrypted the frames; that is fixed. It was not the cause of the flake, but it
+ * was hiding something:
+ *
+ *   room.on(TrackPublished, pub =>
+ *     setParticipantCryptorEnabled(pub.trackInfo.encryption !== NONE, identity))
+ *   ...
+ *   if (!this.isEnabled() || byteLength === 0) return controller.enqueue(encodedFrame);
+ *
+ * Announced as NONE, the participant's cryptor is switched off and every frame is enqueued
+ * *undecrypted*. That did not show up as damage, because livekit's frame layout leaves the
+ * Opus TOC byte in the clear: each frame reached the decoder with a valid header and a
+ * ciphertext payload, so NetEq produced the right number of samples, on time, with nothing
+ * to conceal. Full marks for noise.
+ *
+ * So concealment alone cannot tell audio from noise, and every "healthy" verdict recorded
+ * here before that fix was worth less than it looked. With the declaration correct the
+ * frames are really decrypted, and the bad-start pair below tells a very different story.
  *
  * The SFU is started for you: see `tests/global-setup.ts`, which brings up the whole
  * MatrixRTC stack before any test runs and stops it afterwards unless it was already
@@ -412,23 +431,49 @@ test.describe("browser receive path", () => {
     assertHealthy(stats, "bad start, tolerant receiver");
   });
 
-  test("a receiver with livekit's default tolerance recovers from a bad start", async ({
+  test("a receiver with livekit's default tolerance never recovers from a bad start", async ({
     page,
   }) => {
-    // BaseKeyProvider's defaults are what Element Call's provider inherits, including
-    // `failureTolerance: 10`. 50 bad frames exhaust that in a fifth of a second, so if
-    // `hasInvalidKeyAtIndex` latched the way its source reads, every later frame at that
-    // index would be dropped without an attempt -- including the correct ones.
+    // THIS TEST ASSERTS A DEFECT. It passes because the damage happens, and it will fail
+    // when the damage stops -- at which point it is the fix that needs writing up, not
+    // this test that needs relaxing.
     //
-    // It does not latch in practice at these parameters: this passes. Kept as the guard
-    // that would catch it if it ever did, and as the control for the tolerant variant
-    // above -- the pair differs only in the receiver's failure tolerance.
+    // Element Call's key provider is `super({ratchetWindowSize: 10, keyringSize: 256})`
+    // on BaseKeyProvider. It never sets `failureTolerance`, so it gets the default of 10.
+    // Only `ExternalE2EEKeyProvider` sets -1, and Element Call does not use it.
+    //
+    // What that means, from livekit's worker source:
+    //
+    //   hasInvalidKeyAtIndex(i) -> failureTolerance >= 0 && failureCounts[i] > tolerance
+    //   decrypt: if (this.keys.hasInvalidKeyAtIndex(keyIndex)) return;   // dropped
+    //
+    // The drop happens *before* any decryption is attempted, and the only things that
+    // clear the count are a successful decryption at that index and installing a new key
+    // there. Since no decryption is attempted, success can never happen. The index is
+    // dead until the sender rotates away from it.
+    //
+    // Eleven undecryptable frames -- a fifth of a second of audio -- are enough. That is
+    // not a hypothetical: it is what a peer sees whenever we publish before our key has
+    // reached them, which is every call start and every rotation.
+    //
+    // The pair with the test above is the experiment. Identical streams; the only
+    // difference is the receiver's tolerance, and only the tolerant one recovers. So the
+    // damage is livekit latching the key as invalid, not anything about the frames.
     const { stats, errors } = await measure(page, KEY_HEX, 0, 0, {
       badFrames: 50,
       defaultTolerance: true,
     });
     expect(errors, "no page errors").toEqual([]);
-    assertHealthy(stats, "bad start, default tolerance");
+
+    console.log(`bad start, default tolerance: ${JSON.stringify(stats)}`);
+    expect(
+      stats.packetsReceived,
+      "packets must still arrive -- the loss is above the transport, not in it",
+    ).toBeGreaterThan(0);
+    expect(
+      stats.totalSamplesReceived,
+      "if this is non-zero the receiver recovered, and the latch described above is gone",
+    ).toBe(0);
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.
