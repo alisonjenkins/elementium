@@ -1,15 +1,45 @@
-//! VP8 video encoding and decoding via the `vpx-encode` crate and raw libvpx FFI.
+//! VP8 video encoding and decoding via raw libvpx FFI.
 
 use elementium_types::{I420Frame, PlaintextMedia};
 
-/// VP8 encoder wrapping `vpx_encode::Encoder`.
+/// How much encoding quality to trade for speed, 0 (best quality) to 16 (fastest).
+///
+/// libvpx defaults VP8 to 0, and the `vpx-encode` wrapper this code used to go through
+/// set it only for VP9 -- so every frame was encoded at maximum effort. At 1280x720 that
+/// costs far more CPU per frame than a video call can afford, and the encoder becomes the
+/// slowest stage in the pipeline. Real-time WebRTC stacks run VP8 in this range; the
+/// picture difference at conversational bitrates is not visible, and the CPU difference is
+/// several-fold.
+const CPU_USED: i32 = 8;
+
+/// Frames the encoder may buffer before emitting one.
+///
+/// Must be zero for a call. Any lag is added directly to the latency of every frame, and
+/// libvpx's default assumes offline encoding where that does not matter.
+const LAG_IN_FRAMES: u32 = 0;
+
+/// Longest run of frames without a keyframe, as a backstop.
+///
+/// A receiver that joins mid-call cannot decode anything until it sees one. Keyframe
+/// requests are the real mechanism (see [`Vp8Encoder::force_keyframe`]); this bounds the
+/// wait for a receiver that never asks. libvpx's own default is 9999 -- over five minutes
+/// at 30fps.
+const KEYFRAME_MAX_DIST: u32 = 150;
+
+/// VP8 encoder over libvpx, configured for real-time use.
 pub struct Vp8Encoder {
-    encoder: vpx_encode::Encoder,
+    ctx: vpx_sys::vpx_codec_ctx_t,
     width: u32,
     height: u32,
     bitrate_kbps: u32,
     pts: i64,
+    /// Set by [`Vp8Encoder::force_keyframe`], consumed by the next [`Vp8Encoder::encode`].
+    force_keyframe: bool,
 }
+
+// SAFETY: the encoder context is only ever touched through `&mut self` methods, so it is
+// never accessed concurrently. Matches `Vp8Decoder`'s reasoning.
+unsafe impl Send for Vp8Encoder {}
 
 /// A single encoded VP8 packet.
 #[derive(Debug, Clone)]
@@ -26,36 +56,97 @@ impl Vp8Encoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the underlying `vpx_encode` encoder fails
-    /// to initialize.
+    /// Returns an error string if the dimensions are not even (libvpx requires it for
+    /// 4:2:0 chroma) or if libvpx rejects the configuration.
+    #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
-        let config = vpx_encode::Config {
-            width,
-            height,
-            timebase: [1, 90_000], // WebRTC uses 90kHz clock
-            bitrate: bitrate_kbps,
-            codec: vpx_encode::VideoCodecId::VP8,
+        use std::mem::MaybeUninit;
+        use vpx_sys::{
+            vpx_codec_enc_config_default, vpx_codec_enc_init_ver, vpx_codec_vp8_cx,
+            vp8e_enc_control_id::VP8E_SET_CPUUSED, vpx_kf_mode::VPX_KF_AUTO,
+            vpx_rc_mode::VPX_CBR, VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION,
         };
 
-        let encoder = vpx_encode::Encoder::new(config).map_err(|e| {
-            tracing::error!(
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(format!(
+                "VP8 requires even dimensions, got {width}x{height}"
+            ));
+        }
+
+        // SAFETY: `cfg` and `ctx` are plain-old-data FFI structs that libvpx fully
+        // initializes on success. The interface pointer is a static returned by libvpx.
+        unsafe {
+            let iface = vpx_codec_vp8_cx();
+            let mut cfg = MaybeUninit::zeroed().assume_init();
+            let ret = vpx_codec_enc_config_default(iface, &raw mut cfg, 0);
+            if ret != VPX_CODEC_OK {
+                return Err(format!("VP8 encoder config failed: {ret:?}"));
+            }
+
+            cfg.g_w = width;
+            cfg.g_h = height;
+            // WebRTC's 90kHz clock, so `pts` is in the same units as the RTP timestamps.
+            cfg.g_timebase.num = 1;
+            cfg.g_timebase.den = 90_000;
+            cfg.rc_target_bitrate = bitrate_kbps;
+            // Constant bitrate: a call has a fixed budget every second, not on average
+            // over a file.
+            cfg.rc_end_usage = VPX_CBR;
+            cfg.g_lag_in_frames = LAG_IN_FRAMES;
+            cfg.kf_mode = VPX_KF_AUTO;
+            cfg.kf_max_dist = KEYFRAME_MAX_DIST;
+            // Let libvpx recover from packet loss without needing a fresh keyframe for
+            // every damaged frame.
+            cfg.g_error_resilient = vpx_sys::VPX_ERROR_RESILIENT_DEFAULT;
+            cfg.g_threads = std::thread::available_parallelism()
+                .map_or(4, |n| u32::try_from(n.get()).unwrap_or(4).clamp(1, 8));
+
+            let mut ctx = MaybeUninit::zeroed().assume_init();
+            let ret = vpx_codec_enc_init_ver(
+                &raw mut ctx,
+                iface,
+                &raw const cfg,
+                0,
+                VPX_ENCODER_ABI_VERSION as i32,
+            );
+            if ret != VPX_CODEC_OK {
+                tracing::error!(
+                    width,
+                    height,
+                    bitrate_kbps,
+                    error_kind = "encoder_init",
+                    vpx_error_code = ?ret,
+                    "Failed to initialize VP8 encoder"
+                );
+                return Err(format!("VP8 encoder init: {ret:?}"));
+            }
+
+            // The speed/quality control the previous wrapper never applied to VP8.
+            let ret = vpx_sys::vpx_codec_control_(&raw mut ctx, VP8E_SET_CPUUSED as i32, CPU_USED);
+            if ret != VPX_CODEC_OK {
+                // Not fatal: the encoder works, just slowly. Worth knowing about, because
+                // "the encoder is slow" is otherwise indistinguishable from a slow machine.
+                tracing::warn!(vpx_error_code = ?ret, "could not set VP8 cpu_used; encoding will be slower");
+            }
+
+            tracing::info!(
                 width,
                 height,
                 bitrate_kbps,
-                error_kind = "encoder_init",
-                error = %e,
-                "Failed to initialize VP8 encoder"
+                cpu_used = CPU_USED,
+                threads = cfg.g_threads,
+                "VP8 encoder initialized"
             );
-            format!("VP8 encoder init: {e}")
-        })?;
 
-        Ok(Self {
-            encoder,
-            width,
-            height,
-            bitrate_kbps,
-            pts: 0,
-        })
+            Ok(Self {
+                ctx,
+                width,
+                height,
+                bitrate_kbps,
+                pts: 0,
+                force_keyframe: false,
+            })
+        }
     }
 
     /// The geometry this encoder was configured for.
@@ -67,40 +158,40 @@ impl Vp8Encoder {
         (self.width, self.height)
     }
 
+    /// The bitrate this encoder was configured for, in kbps.
+    #[must_use]
+    pub const fn bitrate_kbps(&self) -> u32 {
+        self.bitrate_kbps
+    }
+
     /// Make the next encoded frame a keyframe.
     ///
     /// A receiver cannot decode anything until it has one: interframes reference frames it
-    /// never saw. libvpx's default maximum keyframe distance is 9999 frames -- over two
-    /// minutes at 60fps -- so a peer that subscribes after our first keyframe, or that
-    /// loses one, sees nothing at all until the encoder happens to emit another. Real
-    /// stacks solve this by responding to a receiver's keyframe request; this is the
-    /// mechanism that makes such a response possible.
+    /// never saw. This is how a receiver's RTCP keyframe request is honoured, and it is
+    /// the difference between recovering in one frame and displaying a broken picture
+    /// until the next scheduled keyframe.
     ///
-    /// Implemented by rebuilding the encoder, because `vpx_encode::Encoder` exposes no way
-    /// to set `VPX_EFLAG_FORCE_KF` on a single frame. The cost is the encoder's
-    /// rate-control state, which it rebuilds within a few frames; the alternative is
-    /// hand-rolling the FFI encoder, which is a great deal more code to get wrong for a
-    /// path that runs seconds apart.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error string if the replacement encoder fails to initialize. The old
-    /// encoder is kept in that case, so a failure degrades to "no keyframe yet" rather
-    /// than to no video at all.
-    pub fn force_keyframe(&mut self) -> Result<(), String> {
-        let replacement = Self::new(self.width, self.height, self.bitrate_kbps)?;
-        self.encoder = replacement.encoder;
-        Ok(())
+    /// Infallible: it sets a flag consumed by the next `encode`, rather than rebuilding
+    /// the encoder as an earlier version had to.
+    pub const fn force_keyframe(&mut self) {
+        self.force_keyframe = true;
     }
 
     /// Encode an I420 frame. Returns zero or more VP8 packets.
     ///
     /// # Errors
     ///
-    /// Returns an error string if `frame`'s dimensions don't match the
-    /// encoder's configured dimensions, or if the underlying `vpx_encode`
-    /// encoder fails.
+    /// Returns an error string if `frame`'s dimensions don't match the encoder's
+    /// configured dimensions, if the planes are too small for those dimensions, or if
+    /// libvpx fails to encode.
+    #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
     pub fn encode(&mut self, frame: &I420Frame) -> Result<Vec<Vp8Packet>, String> {
+        use vpx_sys::{
+            vpx_codec_cx_pkt_kind, vpx_codec_encode, vpx_codec_get_cx_data, vpx_codec_iter_t,
+            vpx_img_fmt, vpx_img_wrap, VPX_CODEC_OK, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF,
+            VPX_FRAME_IS_KEY,
+        };
+
         if frame.width != self.width || frame.height != self.height {
             tracing::error!(
                 encoder_width = self.width,
@@ -116,37 +207,105 @@ impl Vp8Encoder {
             ));
         }
 
-        // vpx-encode expects a contiguous I420 buffer: Y + U + V
-        let mut i420_buf =
-            Vec::with_capacity(frame.y.len().saturating_add(frame.u.len()).saturating_add(frame.v.len()));
-        i420_buf.extend_from_slice(&frame.y);
-        i420_buf.extend_from_slice(&frame.u);
-        i420_buf.extend_from_slice(&frame.v);
+        // libvpx reads the planes through raw pointers, so short planes are a buffer
+        // overrun, not a bad picture. Checked here rather than trusted.
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let luma = w.saturating_mul(h);
+        let chroma = w.div_ceil(2).saturating_mul(h.div_ceil(2));
+        if frame.y.len() < luma || frame.u.len() < chroma || frame.v.len() < chroma {
+            return Err(format!(
+                "I420 planes too small for {w}x{h}: y={} u={} v={}",
+                frame.y.len(),
+                frame.u.len(),
+                frame.v.len()
+            ));
+        }
 
-        let packets = self.encoder.encode(self.pts, &i420_buf).map_err(|e| {
-            tracing::error!(
-                width = self.width,
-                height = self.height,
-                buffer_len = i420_buf.len(),
-                pts = self.pts,
-                error_kind = "encode",
-                error = %e,
-                "VP8 encode failed"
+        // vpx-encode required a single contiguous Y+U+V buffer, so every frame was copied
+        // into one before encoding -- 1.4MB memcpy per frame at 720p, for nothing. The
+        // planes are pointed at directly instead.
+        let mut image = std::mem::MaybeUninit::<vpx_sys::vpx_image_t>::zeroed();
+
+        let flags = if self.force_keyframe {
+            self.force_keyframe = false;
+            u32::from(VPX_EFLAG_FORCE_KF)
+        } else {
+            0
+        };
+
+        let mut packets = Vec::new();
+
+        // SAFETY: `self.ctx` was initialized by `new`. The plane slices outlive this call
+        // and are at least as large as the geometry requires (checked above).
+        // `vpx_codec_get_cx_data` returns null or a pointer into libvpx-owned state that
+        // stays valid until the next encode call.
+        unsafe {
+            let img = vpx_img_wrap(
+                image.as_mut_ptr(),
+                vpx_img_fmt::VPX_IMG_FMT_I420,
+                frame.width,
+                frame.height,
+                1,
+                frame.y.as_ptr().cast_mut(),
             );
-            format!("VP8 encode: {e}")
-        })?;
+            if img.is_null() {
+                return Err("VP8 encode: could not wrap the I420 frame".to_owned());
+            }
 
-        let result = packets
-            .into_iter()
-            .map(|p| Vp8Packet {
-                data: PlaintextMedia::from_encoder(p.data.to_vec()),
-                is_keyframe: p.key,
-                pts: p.pts,
-            })
-            .collect();
+            let img = &mut *img;
+            img.planes[0] = frame.y.as_ptr().cast_mut();
+            img.planes[1] = frame.u.as_ptr().cast_mut();
+            img.planes[2] = frame.v.as_ptr().cast_mut();
+            img.stride[0] = frame.width as i32;
+            img.stride[1] = frame.width.div_ceil(2) as i32;
+            img.stride[2] = frame.width.div_ceil(2) as i32;
 
+            let ret = vpx_codec_encode(
+                std::ptr::addr_of_mut!(self.ctx),
+                img,
+                self.pts,
+                1,
+                i64::from(flags),
+                VPX_DL_REALTIME.into(),
+            );
+            if ret != VPX_CODEC_OK {
+                tracing::error!(
+                    width = self.width,
+                    height = self.height,
+                    pts = self.pts,
+                    error_kind = "encode",
+                    vpx_error_code = ?ret,
+                    "VP8 encode failed"
+                );
+                return Err(format!("VP8 encode: {ret:?}"));
+            }
+
+            let mut iter: vpx_codec_iter_t = std::ptr::null();
+            loop {
+                let pkt = vpx_codec_get_cx_data(std::ptr::addr_of_mut!(self.ctx), &raw mut iter);
+                if pkt.is_null() {
+                    break;
+                }
+                let pkt = &*pkt;
+                if pkt.kind != vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT {
+                    continue;
+                }
+                let frame_pkt = pkt.data.frame;
+                let bytes =
+                    std::slice::from_raw_parts(frame_pkt.buf.cast::<u8>(), frame_pkt.sz);
+                packets.push(Vp8Packet {
+                    data: PlaintextMedia::from_encoder(bytes.to_vec()),
+                    is_keyframe: (frame_pkt.flags & VPX_FRAME_IS_KEY) != 0,
+                    pts: frame_pkt.pts,
+                });
+            }
+        }
+
+        // One frame's worth of 90kHz ticks is added by the caller's cadence, not assumed
+        // here: `pts` only has to increase, and the RTP timestamps are derived separately
+        // from real elapsed time.
         self.pts = self.pts.saturating_add(1);
-        Ok(result)
+        Ok(packets)
     }
 
     #[must_use]
@@ -157,6 +316,15 @@ impl Vp8Encoder {
     #[must_use]
     pub const fn height(&self) -> u32 {
         self.height
+    }
+}
+
+impl Drop for Vp8Encoder {
+    fn drop(&mut self) {
+        // SAFETY: `ctx` was initialized in `new` and is destroyed exactly once.
+        unsafe {
+            vpx_sys::vpx_codec_destroy(std::ptr::addr_of_mut!(self.ctx));
+        }
     }
 }
 
@@ -483,7 +651,7 @@ mod tests {
              this test no longer proves that force_keyframe is what caused the next one"
         );
 
-        encoder.force_keyframe().expect("rebuild the encoder");
+        encoder.force_keyframe();
         let packets = encoder
             .encode(&solid_frame(width, height, 200))
             .expect("encode after forcing a keyframe");
@@ -508,7 +676,7 @@ mod tests {
     #[allow(clippy::expect_used)]
     fn force_keyframe_preserves_the_configured_size() {
         let mut encoder = Vp8Encoder::new(640, 480, 500).expect("encoder creation");
-        encoder.force_keyframe().expect("rebuild the encoder");
+        encoder.force_keyframe();
         assert_eq!(encoder.size(), (640, 480));
     }
 
