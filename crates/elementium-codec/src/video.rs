@@ -40,15 +40,56 @@ use elementium_types::{I420Frame, PlaintextMedia};
 /// than a display string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoCodec {
+    /// Universally supported, and the only one with no hardware encoder anywhere.
     Vp8,
+    /// What every GPU can encode, and what a hardware path realistically means.
+    H264,
+    /// Better compression than H.264 at the same quality; encoded in hardware by recent
+    /// AMD, Intel and Apple parts, and decoded by fewer peers.
+    Av1,
 }
 
 impl VideoCodec {
+    /// Every codec this application knows about.
+    ///
+    /// An array rather than a runtime list so adding one is a compile error everywhere it
+    /// has to be handled.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Vp8, Self::H264, Self::Av1]
+    }
+
+    /// The codecs there is a software encoder for.
+    ///
+    /// Distinct from [`VideoCodec::all`]: a codec can be negotiable and hardware-only, and
+    /// offering one with no fallback would produce a call that dies the moment the GPU
+    /// refuses.
+    #[must_use]
+    pub const fn software_supported() -> &'static [Self] {
+        &[Self::Vp8]
+    }
+
+    /// Preference between codecs when hardware support does not decide it.
+    ///
+    /// Lower is preferred. VP8 ranks last despite being the safest choice: it is the
+    /// fallback, and offering it first would have peers select it over codecs that cost
+    /// this machine far less to encode.
+    #[must_use]
+    pub const fn negotiation_rank(self) -> u8 {
+        match self {
+            Self::Av1 => 0,
+            Self::H264 => 1,
+            Self::Vp8 => 2,
+        }
+    }
+
     /// The codec's name as it appears in SDP.
     #[must_use]
     pub const fn sdp_name(self) -> &'static str {
         match self {
             Self::Vp8 => "VP8",
+            Self::H264 => "H264",
+            Self::Av1 => "AV1",
         }
     }
 
@@ -60,7 +101,7 @@ impl VideoCodec {
     #[must_use]
     pub const fn clock_rate(self) -> u32 {
         match self {
-            Self::Vp8 => 90_000,
+            Self::Vp8 | Self::H264 | Self::Av1 => 90_000,
         }
     }
 }
@@ -74,6 +115,12 @@ impl VideoCodec {
 pub enum PixelLayout {
     /// Planar YUV 4:2:0, three separate planes.
     I420,
+    /// Semi-planar YUV 4:2:0: a luma plane and one interleaved chroma plane.
+    ///
+    /// What hardware encoders want, on every platform. Stating it here rather than having
+    /// each backend convert internally means the conversion can happen once at the source
+    /// -- or not at all, when the capture path can be asked to produce it directly.
+    Nv12,
 }
 
 /// What an encoder is being asked to produce.
@@ -193,6 +240,14 @@ impl NegotiatedEncoder {
                 config.height,
                 config.bitrate_kbps,
             )?)),
+            // Negotiable but not yet encodable in software. Reported as an error rather
+            // than silently substituting VP8: a caller that asked for H.264 has told the
+            // far end it will send H.264, and sending something else produces a peer that
+            // receives undecodable video with nothing to explain it.
+            VideoCodec::H264 | VideoCodec::Av1 => Err(format!(
+                "no encoder available for {} on this build",
+                codec.sdp_name()
+            )),
         }
     }
 }
@@ -249,6 +304,10 @@ impl NegotiatedDecoder {
     pub fn new(codec: VideoCodec) -> Result<Self, String> {
         match codec {
             VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Decoder::new()?)),
+            VideoCodec::H264 | VideoCodec::Av1 => Err(format!(
+                "no decoder available for {} on this build",
+                codec.sdp_name()
+            )),
         }
     }
 }
