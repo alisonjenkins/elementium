@@ -49,10 +49,15 @@ export function createCanvasTrack(canvas: HTMLCanvasElement, fallbackFps = 30): 
     stream = canvas.captureStream(fallbackFps);
     track = stream.getVideoTracks()[0] ?? null;
     capture = null;
-    console.warn(
-      "[Elementium] canvas.requestFrame unavailable; falling back to timer capture, which can tear",
-    );
   }
+
+  // Logged unconditionally, and stating the mode rather than only complaining about the
+  // bad one. A line that appears only on failure cannot be told apart from a build that
+  // predates it — which is exactly the ambiguity that wasted a round trip here.
+  console.log(
+    `[Elementium] canvas capture mode: ${manual ? "manual (requestFrame)" : "timer (can tear)"} ` +
+      `${canvas.width}x${canvas.height}`,
+  );
 
   return {
     track,

@@ -332,7 +332,23 @@ function startLocalVideoFrameFetch(
         const height = view.getUint32(4, true);
 
         if (width > 1 && height > 1) {
-          const rgba = new Uint8ClampedArray(buf, 8);
+          // The header's geometry and the payload's length must agree exactly. If they do
+          // not, every row is read at the wrong stride and the picture shears into
+          // horizontal bands -- the symptom this whole area keeps producing. Checked
+          // rather than assumed, and refused rather than drawn, because a wrong picture
+          // is harder to diagnose than a missing one.
+          const payload = buf.byteLength - 8;
+          const expected = width * height * 4;
+          if (payload !== expected) {
+            if (frameCount % 60 === 1) {
+              debugLog(
+                `frame geometry mismatch: header says ${width}x${height} (${expected} bytes), ` +
+                  `payload is ${payload} bytes (${payload - expected >= 0 ? "+" : ""}${payload - expected})`,
+              );
+            }
+            return scheduleNext();
+          }
+          const rgba = new Uint8ClampedArray(buf.slice(8));
           const imageData = new ImageData(rgba, width, height);
           if (canvas.width === width && canvas.height === height) {
             ctx.putImageData(imageData, 0, 0);
@@ -386,15 +402,17 @@ function startLocalVideoFrameFetch(
       windowFetchMs = 0;
     }
 
-    if (running) {
-      // Schedule against the target period rather than sleeping a fixed amount *after* the
-      // work: the previous form made the real period "IPC time + 33ms", so a 30ms fetch
-      // halved the frame rate. A frame that took longer than the period is followed
-      // immediately by the next.
-      const delay = Math.max(0, TARGET_FRAME_MS - elapsed);
-      timerId = setTimeout(fetchLoop, delay);
-    }
+    scheduleNext(elapsed);
   };
+
+  // Schedule against the target period rather than sleeping a fixed amount *after* the
+  // work: the previous form made the real period "IPC time + 33ms", so a 30ms fetch halved
+  // the frame rate. A frame that took longer than the period is followed immediately by
+  // the next.
+  function scheduleNext(elapsed = 0): void {
+    if (!running) return;
+    timerId = setTimeout(fetchLoop, Math.max(0, TARGET_FRAME_MS - elapsed));
+  }
 
   debugLog(`fetchLoop: starting for ${trackId}`);
   timerId = setTimeout(fetchLoop, TARGET_FRAME_MS);
