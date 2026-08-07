@@ -7,7 +7,7 @@ anecdote cannot tell a fix from a coincidence.
 
 ## Phase 1: Make the faults observable
 
-- [ ] T001 [US1] Log the interval between a key being installed and the first frame it successfully decrypts, per participant, in `crates/elementium-e2ee/src/lib.rs` — the quantity US1 is about, and nothing currently reports it
+- [X] T001 [US1] Log the interval between a key being installed and the first frame it successfully decrypts, per participant, in `crates/elementium-e2ee/src/lib.rs` — the quantity US1 is about, and nothing currently reports it
 - [ ] T002 [US3] Log every key that reaches the bridge but is *not* installed, with the reason, in `frontend/src/shim/e2ee-bridge.ts` (already logs failures to recover material; add the parked and out-of-order cases visible from the JS side)
 - [ ] T003 [US2] Log membership changes alongside key rotations, so a silence can be attributed to a specific join or leave rather than to "something happened"
 
@@ -20,7 +20,7 @@ anecdote cannot tell a fix from a coincidence.
 
 ## Phase 3: Fix what the reproductions show
 
-- [ ] T008 [US1] Establish whether we honour livekit's `useKeyDelay` when adopting a newly distributed key for *encryption*. If we switch immediately while peers have not yet received it, every frame in that window is undecryptable to them
+- [ ] T008 [US1] **Now the highest-value task in either feature.** Establish whether we honour livekit's `useKeyDelay` when adopting a newly distributed key for *encryption*, and stop publishing frames encrypted with a key peers cannot yet hold. No longer speculative: eleven such frames — a fifth of a second — permanently kill that key index at every receiver running Element Call's default `failureTolerance` of 10, because the drop happens before decryption is attempted and only a successful decryption clears it. See the 2026-08-07 finding in `specs/003-call-media-faults/spec.md`
 - [ ] T009 [US2] Fix whatever T005/T006 show, file path unknown until then
 - [ ] T010 [US3] For any key that dies inside `RTCEncryptionManager`, decide whether it is ours to work around or upstream's to fix, and record which
 

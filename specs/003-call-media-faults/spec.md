@@ -72,6 +72,61 @@ A failed `try_send` is counted as `dropped_channel_full` whether the receiver is
 slow consumer, the other is a dead connection -- and reporting them as one number
 is why this looked like congestion.
 
+### 2026-08-07: a key index, once doubted, is never trusted again
+
+Two defects, one hiding the other. Both verified against livekit's own source and
+reproduced in `frontend/tests/browser/receive-path.spec.ts`.
+
+**We announced encrypted tracks as unencrypted.** `AddTrackRequest.encryption` was
+left at its default, `NONE`, while the transport encrypted every frame. Fixed.
+
+That is not a cosmetic mismatch, because subscribers act on it:
+
+```js
+room.on(TrackPublished, pub =>
+  setParticipantCryptorEnabled(pub.trackInfo.encryption !== NONE, identity))
+...
+if (!this.isEnabled() || byteLength === 0) return controller.enqueue(encodedFrame);
+```
+
+A participant announced as `NONE` has their cryptor switched off and every frame is
+passed through undecrypted. It produced no visible damage in our tests because
+livekit's frame layout leaves the Opus TOC byte in the clear: each frame reached
+NetEq with a valid header and a ciphertext payload, so the right number of samples
+arrived on time with nothing to conceal. The receiver reported a perfectly healthy
+stream of noise — which is the symptom, described from the other side.
+
+**And underneath it, the reason a bad moment does not pass.** With the declaration
+corrected the frames really are decrypted, and a test that used to pass now cannot:
+
+```js
+hasInvalidKeyAtIndex(i) -> failureTolerance >= 0 && failureCounts[i] > tolerance
+decrypt: if (this.keys.hasInvalidKeyAtIndex(keyIndex)) return;   // dropped
+```
+
+The drop happens *before* decryption is attempted. The count is cleared only by a
+successful decryption at that index or by installing a new key there — and since no
+attempt is made, success is unreachable. The index is dead until the sender rotates
+away from it.
+
+Eleven undecryptable frames reach that state. At 50 frames per second that is a
+fifth of a second, and it is exactly what a peer sees while our key is still in
+flight to them: at every call start, and at every rotation.
+
+Element Call is subject to it. Its provider is
+`super({ratchetWindowSize: 10, keyringSize: 256})` on `BaseKeyProvider`, which never
+sets `failureTolerance`, so it takes the default of 10. Only `ExternalE2EEKeyProvider`
+sets -1, and Element Call does not use it.
+
+This is a far better fit for the reported faults than any codec explanation: it is
+per-participant, it survives for the life of a key, it produces clean packet counts
+and no errors on either side, and it is triggered by exactly the events the user
+reports — joining, and someone else joining or leaving.
+
+What follows from it is that we must not publish frames encrypted with a key our
+peers cannot yet hold. See feature 004 T008 (`useKeyDelay`), which is now the
+highest-value open task in either feature.
+
 ## User Scenarios
 
 ### US1 (P1) — Participants can hear each other
