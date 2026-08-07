@@ -123,6 +123,15 @@ let localIdentitySent = false;
 let keysForwarded = 0;
 
 /**
+ * Every key index forwarded so far.
+ *
+ * Reported alongside each key because the interesting comparison is against the index the
+ * *sender* stamps on its frames, which Rust logs when a frame cannot be decrypted. A key
+ * set is only complete relative to what is arriving, and neither side can tell alone.
+ */
+const keyIndexesSeen = new Set<number>();
+
+/**
  * How long after E2EE setup to wait before declaring that no key ever arrived.
  *
  * Generous: livekit's key rollout is gated on a Matrix membership update plus a
@@ -192,9 +201,11 @@ function handleSetKey(data: SetKeyMessage): void {
   }
 
   keysForwarded += 1;
+  keyIndexesSeen.add(keyIndex);
   console.log(
     `[Elementium] E2EE key forwarded to native backend: participant="${participant}" ` +
-      `index=${keyIndex} len=${material.length}`,
+      `index=${keyIndex} len=${material.length} ` +
+      `indexes_seen=[${[...keyIndexesSeen].sort((a, b) => a - b).join(",")}]`,
   );
   invokeTauri("e2ee_set_key", {
     participant,
@@ -202,6 +213,20 @@ function handleSetKey(data: SetKeyMessage): void {
     keyMaterial: Array.from(material),
   });
 }
+
+/**
+ * Message kinds seen but not acted on, reported once each.
+ *
+ * Only `init` and `setKey` are handled. Whether that is sufficient is not something this
+ * file can assert on its own -- and a real call showed why it matters: inbound frames
+ * carried key indices 3 and 6 while every key this bridge ever saw was at index 0, 1 or 4,
+ * with no key ever failing to be recovered. Either livekit never told the worker about
+ * those keys, or it told it by a route this ignores.
+ *
+ * Kinds only. Never payloads: a `setKey` payload holds key material, and one careless log
+ * line puts a call's encryption key on disk.
+ */
+const unhandledKinds = new Set<string>();
 
 /** Inspect one message bound for a Web Worker, forwarding E2EE keys if it is one. */
 export function interceptE2eeWorkerMessage(message: unknown): void {
@@ -217,6 +242,13 @@ export function interceptE2eeWorkerMessage(message: unknown): void {
     handleInit(data);
   } else if (kind === "setKey") {
     handleSetKey(data as SetKeyMessage);
+  } else if (typeof kind === "string" && !unhandledKinds.has(kind)) {
+    // Once per kind, so a per-frame message cannot flood the log.
+    unhandledKinds.add(kind);
+    console.log(
+      `[Elementium] E2EE worker message kind "${kind}" is not forwarded to the native ` +
+        `backend. Harmless unless it carries key material.`,
+    );
   }
 }
 
