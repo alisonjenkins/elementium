@@ -45,14 +45,10 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 /// Maximum number of keys per participant in a key ring.
-const MAX_KEYS: usize = 16;
+const MAX_KEYS: usize = 256;
 
 /// Maximum number of keys per participant in a key ring, as a `u8`.
 ///
-/// Kept as a separate constant (mirroring `MAX_KEYS`) so the wire-format code
-/// never needs an `as` cast between the two.
-const MAX_KEYS_U8: u8 = 16;
-
 /// Size of AES-GCM initialization vector.
 const IV_SIZE: usize = 12;
 
@@ -100,34 +96,34 @@ struct KeyMaterial<'a>(&'a [u8]);
 #[derive(Clone, Copy)]
 struct HkdfSalt<'a>(&'a [u8]);
 
-/// A key ring slot index, always in `0..MAX_KEYS` by construction.
+/// A key ring slot index. Every `u8` is one, which is the whole design.
 ///
-/// Replaces the raw `u8` index that used to be re-reduced (`key_slot`) or
-/// re-validated separately at every call site -- once a `KeyIndex` exists, every consumer
-/// can trust it indexes a real slot without re-checking.
+/// The frame trailer carries a single byte, so a sender's index is `0..=255`. With 256
+/// slots that byte *is* the slot and nothing has to be reduced -- which matters, because
+/// both of the previous designs were wrong in ways that silenced calls.
 ///
-/// A sender's key index is a *rotation counter*, and livekit does not reduce it before
-/// writing it to the frame trailer: a peer on its 25th key sends `25` while holding the
-/// material at slot `25 % 16 == 9`. So the same modulo must be applied to wire bytes as to
-/// locally-supplied indices -- hence one constructor, not two.
+/// Rejecting wire bytes >= the ring size came first. That made every peer past its 16th
+/// rotation permanently inaudible, and bought no security: the index only chooses which
+/// key to try, and AES-GCM authentication is what rejects a wrong one, so an attacker who
+/// steers the choice still cannot forge a tag.
 ///
-/// This previously rejected wire bytes >= `MAX_KEYS` on the reasoning that the trailing
-/// byte is attacker-controlled. That reasoning was wrong, and made every peer past its
-/// 16th rotation permanently inaudible. The index only chooses which of 16 slots to try;
-/// AES-GCM authentication is what rejects a wrong key. An attacker who steers the choice
-/// still cannot forge a tag, so rejecting rather than wrapping bought no security at all.
+/// Reducing modulo 16 came next, and aliases. Element Call configures livekit with
+/// `keyringSize: 256`, so a peer can legitimately be at index 19 -- which landed in the
+/// same slot as index 3 and overwrote a key still in use. Two distinct keys sharing a slot
+/// means whichever arrived last wins and the other participant goes silent, intermittently
+/// and only on long calls.
+///
+/// 256 slots cost a few kilobytes per participant and make both faults unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyIndex(u8);
 
 impl KeyIndex {
-    /// Reduce a rotation counter -- from a local caller or from a frame trailer -- into
-    /// `0..MAX_KEYS`.
+    /// Take a rotation counter -- from a local caller or from a frame trailer -- as a slot.
     ///
-    /// `MAX_KEYS_U8` is a nonzero compile-time constant, so this modulo can never panic.
+    /// Total: every `u8` names a real slot, so this cannot fail and nothing is lost.
     #[must_use]
-    #[allow(clippy::arithmetic_side_effects)]
     pub const fn new(raw: u8) -> Self {
-        Self(raw % MAX_KEYS_U8)
+        Self(raw)
     }
 
     /// The validated slot index into `KeyRing::keys` (`0..MAX_KEYS`).
@@ -1177,15 +1173,20 @@ mod tests {
     }
 
     #[test]
-    fn key_index_wraps_into_the_key_ring() {
-        // A sender's key index is a monotonically increasing rotation counter, but the ring
-        // has only MAX_KEYS slots -- so both locally-supplied and wire-read indices reduce
-        // modulo the ring size. Same rule on both sides, or the two disagree about which
-        // slot a frame belongs to.
-        assert_eq!(KeyIndex::new(16), KeyIndex::new(0));
-        assert_eq!(KeyIndex::new(20), KeyIndex::new(4));
-        assert_eq!(KeyIndex::new(15).as_wire_byte(), 15);
-        assert_eq!(KeyIndex::new(255), KeyIndex::new(15));
+    fn every_index_has_its_own_slot() {
+        // The ring holds 256 keys because the trailer carries one byte, so the byte is the
+        // slot and nothing is reduced. This used to reduce modulo 16, which aliased: with
+        // Element Call's `keyringSize: 256` a peer can legitimately be at index 19, and
+        // that overwrote the key at index 3 while it was still in use -- one participant
+        // silencing another, intermittently and only on long calls.
+        assert_ne!(KeyIndex::new(16), KeyIndex::new(0));
+        assert_ne!(KeyIndex::new(19), KeyIndex::new(3));
+        assert_ne!(KeyIndex::new(255), KeyIndex::new(15));
+
+        // And the byte survives the round trip, which is what the far end reads back.
+        for raw in [0_u8, 1, 15, 16, 19, 200, 255] {
+            assert_eq!(KeyIndex::new(raw).as_wire_byte(), raw);
+        }
     }
 
 }
@@ -1335,28 +1336,34 @@ mod wire_format_interop_tests {
         assert_eq!(decrypted.as_bytes(), plaintext.as_slice());
     }
 
-    /// A sender's key index is a rotation counter that is not reduced before it goes on
-    /// the wire.
+    /// A sender's key index is a rotation counter carried whole, and every value it can
+    /// take names its own key.
     ///
-    /// Regression: a peer that has rotated its key 25 times writes 25 into the frame
-    /// trailer while holding the material at slot `25 % 16 == 9`. Rejecting the
-    /// out-of-range byte rather than wrapping it made every frame from such a peer
-    /// undecryptable -- seen in the field as a participant who was completely inaudible
-    /// while their packets arrived normally and no key was actually missing.
+    /// Regression, twice over. This first rejected trailer bytes at or above the ring
+    /// size, which made every peer past its 16th rotation permanently inaudible while
+    /// their packets arrived normally and no key was missing. The fix reduced modulo 16
+    /// instead, which aliased index 19 onto index 3 -- so a peer rotating past 16
+    /// overwrote a key another participant was still using. Element Call configures
+    /// `keyringSize: 256`, so both are reachable in a normal call.
     #[test]
     #[allow(clippy::expect_used)]
-    fn decrypts_a_frame_from_a_sender_that_rotated_past_the_ring_size() {
+    fn a_sender_past_the_sixteenth_rotation_decrypts_without_disturbing_others() {
         let plaintext = b"\x78opus-payload-bytes".to_vec();
-        // Wire index 25, key held at slot 9.
-        let frame = livekit_style_frame(&plaintext, 1, 25);
+        // Ratcheting off: it would eventually find a key by searching, and this is about
+        // the right key being in its own slot rather than being hunted for.
+        let options = E2eeOptions { ratchet_window_size: 0, ..E2eeOptions::default() };
+        let ctx = E2eeContext::new(options);
 
-        let ctx = E2eeContext::new(E2eeOptions::default());
-        ctx.set_key("bob", 9, MATERIAL);
+        // A live key, then a rotation past the old ring size. Under modulo 16 the second
+        // landed in the first's slot and destroyed it.
+        ctx.set_key("bob", 3, MATERIAL);
+        ctx.set_key("bob", 19, b"a-different-key-000000000000000");
 
+        let at_3 = livekit_style_frame(&plaintext, 1, 3);
         let decrypted = ctx
-            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Audio)
-            .expect("a wire index of 25 must resolve to slot 9")
-            .expect("a key is configured at slot 9");
+            .decrypt_frame(&WireMedia::from_network(at_3), "bob", MediaKind::Audio)
+            .expect("a key set at 19 must not disturb the one at 3")
+            .expect("a key is still configured at 3");
         assert_eq!(decrypted.as_bytes(), plaintext.as_slice());
     }
 
