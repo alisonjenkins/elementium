@@ -201,13 +201,60 @@ fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn main() -> tauri::Result<()> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+/// Send structured logs to a file as well as stderr, returning the guard that must be
+/// held for the process's lifetime.
+///
+/// Until now the only sink was stderr, which means a fault reported after the fact — the
+/// normal case, since the user is in a call when it happens — left nothing to read. Every
+/// diagnosis had to start by asking them to reproduce it under a terminal. The file is
+/// JSON, one event per line, so it can be filtered with `jq` rather than by eye.
+///
+/// Returns `None` if the log directory cannot be created, in which case stderr logging
+/// still works: no log file is a degraded state, not a reason to refuse to start.
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let dir = dirs::data_dir().map(|d| d.join("io.github.elementium").join("logs"));
+    let writer = dir.as_ref().and_then(|dir| {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| eprintln!("could not create log directory {}: {e}", dir.display()))
+            .ok()?;
+        Some(tracing_appender::non_blocking(
+            tracing_appender::rolling::daily(dir, "elementium.log"),
+        ))
+    });
+
+    let stderr = tracing_subscriber::fmt::layer().json();
+
+    let (file_layer, guard) = match writer {
+        Some((file_writer, guard)) => (
+            Some(tracing_subscriber::fmt::layer().json().with_writer(file_writer)),
+            Some(guard),
+        ),
+        None => (None, None),
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr)
+        .with(file_layer)
         .init();
+
+    if guard.is_some()
+        && let Some(dir) = dir
+    {
+        tracing::info!(log_dir = %dir.display(), "logging to file");
+    }
+
+    guard
+}
+
+fn main() -> tauri::Result<()> {
+    // Held for the whole of main: dropping it flushes and stops the writer thread.
+    let _log_guard = init_logging();
 
     // Root correlation ID for the whole process lifetime. Every event emitted before a
     // call/session-scoped span is entered (e.g. device enumeration, startup) inherits this
