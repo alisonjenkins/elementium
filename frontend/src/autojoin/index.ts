@@ -19,7 +19,7 @@ interface AutoJoinConfig {
   accessToken: string;
   deviceId: string;
   roomId: string;
-  /** Whether to publish video. Off by default: it opens the camera. */
+  /** Whether to publish video. Either way the microphone is used; video also opens the camera. */
   video?: boolean;
 }
 
@@ -103,22 +103,36 @@ async function driveElementWeb(cfg: AutoJoinConfig): Promise<void> {
 }
 
 /**
- * The Element Call widget: turn the camera off unless asked for, then join.
+ * Refuse video at the source, for a run that asked not to use the camera.
  *
- * Video is off by default because joining opens the camera, and a webcam light coming on
- * unannounced is not something a test should do. The receive path -- whether *other*
- * people's audio and video arrive -- does not need ours.
+ * Clicking "Stop video" in the lobby is too late: Element Call acquires the camera to show
+ * the preview *before* that control exists, so the webcam light is already on by the time
+ * anything could turn it off. The only point early enough is the request itself.
+ *
+ * Deferred by a tick because the media shim installs synchronously after this script, and
+ * whichever wraps `getUserMedia` last wins.
+ */
+function refuseVideo(): void {
+  setTimeout(() => {
+    const media = navigator.mediaDevices;
+    if (!media?.getUserMedia) return;
+    const original = media.getUserMedia.bind(media);
+    media.getUserMedia = (constraints?: MediaStreamConstraints) =>
+      original({ ...constraints, video: false });
+    log("video stripped from getUserMedia; the camera will not be opened");
+  }, 0);
+}
+
+/**
+ * The Element Call widget: join the call.
+ *
+ * Joining uses the camera and microphone. Element Call takes both in its lobby, before any
+ * control to decline them exists, so there is no version of this that quietly avoids the
+ * webcam -- only `video: false` in the config, which refuses it at the request.
  */
 async function driveElementCall(cfg: AutoJoinConfig): Promise<void> {
+  if (!cfg.video) refuseVideo();
   await waitFor("the lobby", byName(/^join call$/i));
-
-  if (!cfg.video) {
-    const stopVideo = byName(/stop video|turn off camera|video off/i)();
-    if (stopVideo) {
-      stopVideo.click();
-      log("camera turned off before joining");
-    }
-  }
 
   (await waitFor("the join button", byName(/^join call$/i))).click();
   log("join clicked");

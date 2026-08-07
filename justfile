@@ -37,8 +37,11 @@ call-peers:
 #
 # The other half of `just call-peers`: that puts real participants in a call, this puts
 # Elementium in the same one without anyone clicking. Runs on a virtual display, so no
-# window appears, and joins with the camera off -- the receive path does not need ours.
-# Set ELEMENTIUM_AUTOJOIN_VIDEO=1 to publish video too, which opens the camera.
+# window appears.
+#
+# THIS USES THE CAMERA AND MICROPHONE. Element Call acquires both in its lobby, before
+# any control can decline them, so joining at all opens the webcam -- the light comes on.
+# ELEMENTIUM_AUTOJOIN_VIDEO=0 strips video from the request instead.
 #
 # Logs land in /tmp/elementium.log as usual.
 app-join:
@@ -47,9 +50,15 @@ app-join:
     cd test-env && ./provision.sh > ../target/test-env-fixture.json
     cd frontend && pnpm exec vite build -c vite.shims.config.ts
     cd frontend && pnpm exec vite build -c vite.autojoin.config.ts
-    ELEMENTIUM_TEST_ENV=1 ELEMENTIUM_AUTOJOIN=1 ./scripts/patch-element-web.sh
-    nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
-        cargo tauri dev
+    # The env has to reach `cargo tauri dev`, not just the patch above: tauri runs
+    # `prepare-dev.sh` -- which calls the same patch script -- before starting. Without it
+    # that run sees no ELEMENTIUM_TEST_ENV and no ELEMENTIUM_AUTOJOIN, so it restores the
+    # production config and removes the autojoin driver, and the app comes up pointed at a
+    # real homeserver doing nothing. Which is exactly what happened the first time.
+    ELEMENTIUM_TEST_ENV=1 ELEMENTIUM_AUTOJOIN=1 \
+        ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-1}" \
+        nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
+            cargo tauri dev
 
 # Stop the local MatrixRTC stack.
 test-env-down:
