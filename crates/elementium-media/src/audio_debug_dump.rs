@@ -97,7 +97,10 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
     if state.samples_written >= MAX_SAMPLES_PER_STREAM {
         if !state.capped_logged {
             state.capped_logged = true;
-            tracing::info!(stream_key, "ELEMENTIUM_AUDIO_DUMP: capture cap reached, no longer writing this stream");
+            tracing::info!(
+                stream_key,
+                "ELEMENTIUM_AUDIO_DUMP: capture cap reached, no longer writing this stream"
+            );
         }
         return;
     }

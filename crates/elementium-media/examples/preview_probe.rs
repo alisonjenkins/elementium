@@ -26,7 +26,9 @@ use elementium_codec::Vp8Encoder;
 use elementium_media::video_source::VideoSource;
 
 fn main() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     let source = VideoSource::start(Some(1280), Some(720)).expect("camera");
     println!("backend: {}", source.backend());
@@ -77,10 +79,14 @@ fn main() {
         }
 
         if frames.is_multiple_of(60) {
-            let path =
-                format!("/tmp/elementium_preview_probe_{frames}_{width}x{height}.rgba");
+            let path = format!("/tmp/elementium_preview_probe_{frames}_{width}x{height}.rgba");
             std::fs::write(&path, &rgba).expect("write dump");
-            println!("wrote {path} ({} bytes, source {}x{})", rgba.len(), frame.width(), frame.height());
+            println!(
+                "wrote {path} ({} bytes, source {}x{})",
+                rgba.len(),
+                frame.width(),
+                frame.height()
+            );
             dumped += 1;
         }
     }

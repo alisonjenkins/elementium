@@ -73,7 +73,9 @@ fn requested_format(
 /// Returns `None` when the frame should be skipped (undecodable JPEG or an
 /// unrecognized buffer layout).
 fn decode_frame_to_rgba(w: u32, h: u32, raw: &[u8]) -> Option<Vec<u8>> {
-    let pixel_count = usize::try_from(w).ok()?.checked_mul(usize::try_from(h).ok()?)?;
+    let pixel_count = usize::try_from(w)
+        .ok()?
+        .checked_mul(usize::try_from(h).ok()?)?;
     let expected_rgba = pixel_count.checked_mul(4)?;
     let expected_rgb = pixel_count.checked_mul(3)?;
     let expected_yuyv = pixel_count.checked_mul(2)?;

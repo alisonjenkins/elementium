@@ -10,9 +10,7 @@ pub fn enumerate_audio_devices() -> Vec<MediaDevice> {
     // Input devices (microphones)
     if let Ok(inputs) = host.input_devices() {
         for (i, device) in inputs.enumerate() {
-            let label = device
-                .name()
-                .unwrap_or_else(|_| format!("Microphone {i}"));
+            let label = device.name().unwrap_or_else(|_| format!("Microphone {i}"));
             devices.push(MediaDevice {
                 id: format!("audio-input-{i}"),
                 label,

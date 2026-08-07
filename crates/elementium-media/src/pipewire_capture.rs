@@ -104,7 +104,9 @@ pub fn to_rgba(
     if stride < row_bytes {
         return None;
     }
-    let needed = stride.checked_mul(height.saturating_sub(1))?.checked_add(row_bytes)?;
+    let needed = stride
+        .checked_mul(height.saturating_sub(1))?
+        .checked_add(row_bytes)?;
     if src.len() < needed {
         return None;
     }
@@ -161,13 +163,19 @@ fn push_yuv_pixel(y: u8, u: u8, v: u8, out: &mut Vec<u8>) {
     let u = f32::from(u) - 128.0;
     let v = f32::from(v) - 128.0;
     let clamp = |x: f32| {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::as_conversions
+        )]
         {
             x.clamp(0.0, 255.0) as u8
         }
     };
     out.push(clamp(1.402_f32.mul_add(v, y)));
-    out.push(clamp((-0.714_136_f32).mul_add(v, (-0.344_136_f32).mul_add(u, y))));
+    out.push(clamp(
+        (-0.714_136_f32).mul_add(v, (-0.344_136_f32).mul_add(u, y)),
+    ));
     out.push(clamp(1.772_f32.mul_add(u, y)));
     out.push(255);
 }
@@ -253,13 +261,19 @@ pub fn decode_mjpeg_half_scale(jpeg: &[u8]) -> Option<I420Frame> {
     // 4:2:0 output regardless of the source's own subsampling, so the result needs no
     // resampling afterwards -- the same reason the full-size decode asks for planes.
     let mut image = turbojpeg::YuvImage {
-        pixels: vec![0_u8; turbojpeg::yuv_pixels_len(width, 4, height, turbojpeg::Subsamp::Sub2x2).ok()?],
+        pixels: vec![
+            0_u8;
+            turbojpeg::yuv_pixels_len(width, 4, height, turbojpeg::Subsamp::Sub2x2).ok()?
+        ],
         align: 4,
         width,
         height,
         subsamp: turbojpeg::Subsamp::Sub2x2,
     };
-    if decompressor.decompress_to_yuv(jpeg, image.as_deref_mut()).is_err() {
+    if decompressor
+        .decompress_to_yuv(jpeg, image.as_deref_mut())
+        .is_err()
+    {
         return full();
     }
     planes_from_yuv(&image)
@@ -318,7 +332,12 @@ pub fn decode_mjpeg_to_i420(jpeg: &[u8]) -> Option<I420Frame> {
     let h = usize::try_from(height).ok()?;
 
     let uv_keep = yuv.uv_width().min(uv_stride);
-    let u_src = tight_rows(yuv.pixels.get(u_start..v_start)?, uv_stride, uv_keep, uv_rows)?;
+    let u_src = tight_rows(
+        yuv.pixels.get(u_start..v_start)?,
+        uv_stride,
+        uv_keep,
+        uv_rows,
+    )?;
     let v_src = tight_rows(yuv.pixels.get(v_start..end)?, uv_stride, uv_keep, uv_rows)?;
 
     let (chroma_w, chroma_h) = (w.div_ceil(2), h.div_ceil(2));
@@ -374,10 +393,16 @@ fn resample_chroma(
 
     let mut out = Vec::with_capacity(dst_w.checked_mul(dst_h)?);
     for y in 0..dst_h {
-        let src_y = y.checked_mul(src_h)?.checked_div(dst_h)?.min(src_h.saturating_sub(1));
+        let src_y = y
+            .checked_mul(src_h)?
+            .checked_div(dst_h)?
+            .min(src_h.saturating_sub(1));
         let row_start = src_y.checked_mul(src_w)?;
         for x in 0..dst_w {
-            let src_x = x.checked_mul(src_w)?.checked_div(dst_w)?.min(src_w.saturating_sub(1));
+            let src_x = x
+                .checked_mul(src_w)?
+                .checked_div(dst_w)?
+                .min(src_w.saturating_sub(1));
             out.push(*src.get(row_start.checked_add(src_x)?)?);
         }
     }
@@ -434,9 +459,7 @@ pub fn planar_to_i420(
                 let plane_start = plane.checked_mul(uv_stride.checked_mul(chroma_height)?)?;
                 for row in 0..chroma_height {
                     let start = plane_start.checked_add(uv_stride.checked_mul(row)?)?;
-                    out.extend_from_slice(
-                        chroma.get(start..start.checked_add(chroma_width)?)?,
-                    );
+                    out.extend_from_slice(chroma.get(start..start.checked_add(chroma_width)?)?);
                 }
             }
         }
@@ -512,6 +535,20 @@ enum Encoding {
     Unsupported,
 }
 
+/// Why a conversion returned nothing, in terms of the path that was actually taken.
+///
+/// The conversions fail for unrelated reasons and only one of them is a short buffer. A
+/// single message describing every failure as one sends a reader to check geometry that was
+/// never in question -- for MJPEG the geometry is inside the JPEG, and a decode that failed
+/// says nothing about how many bytes arrived.
+const fn unusable_reason(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Mjpeg => "mjpeg_decode_failed",
+        Encoding::Planar(_) | Encoding::Raw(_) => "buffer_short_for_geometry",
+        Encoding::Unsupported => "format_not_supported",
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Negotiated {
     width: u32,
@@ -583,7 +620,9 @@ impl CaptureTiming {
         self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(0));
 
         if self.frames.is_multiple_of(Self::REPORT_EVERY) {
-            let mean = self.total.checked_div(u32::try_from(self.frames).unwrap_or(u32::MAX));
+            let mean = self
+                .total
+                .checked_div(u32::try_from(self.frames).unwrap_or(u32::MAX));
             tracing::info!(
                 frames = self.frames,
                 mean_ms = mean.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
@@ -691,7 +730,9 @@ impl PipewireCapturer {
                 failed,
             }),
             Ok(Err(e)) => Err(PipewireError::Connect(e)),
-            Err(e) => Err(PipewireError::Connect(format!("stream setup timed out: {e}"))),
+            Err(e) => Err(PipewireError::Connect(format!(
+                "stream setup timed out: {e}"
+            ))),
         }
     }
 
@@ -746,8 +787,7 @@ fn run_stream(
     pipewire::init();
 
     let setup = || -> Result<_, String> {
-        let mainloop =
-            pipewire::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
+        let mainloop = pipewire::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
         let context =
             pipewire::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
         let core = context.connect_rc(None).map_err(|e| e.to_string())?;
@@ -776,7 +816,9 @@ fn run_stream(
         }
     };
 
-    if let Err(e) = attach_and_connect(&stream, node_id, target_fps, target, negotiated, failed, frame_tx) {
+    if let Err(e) = attach_and_connect(
+        &stream, node_id, target_fps, target, negotiated, failed, frame_tx,
+    ) {
         let _ = ready_tx.send(Err(e));
         return;
     }
@@ -891,8 +933,12 @@ fn attach_and_connect(
             }
         })
         .process(move |stream, ()| {
-            let Some(mut buffer) = stream.dequeue_buffer() else { return };
-            let Ok(n) = frame_state.lock().map(|g| *g) else { return };
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let Ok(n) = frame_state.lock().map(|g| *g) else {
+                return;
+            };
             timing.offered();
             if n.encoding == Encoding::Unsupported {
                 timing.dropped(DropReason::Unusable);
@@ -907,7 +953,9 @@ fn attach_and_connect(
             last_decoded = Some(now);
 
             let datas = buffer.datas_mut();
-            let Some(data) = datas.first_mut() else { return };
+            let Some(data) = datas.first_mut() else {
+                return;
+            };
             let stride = usize::try_from(data.chunk().stride()).unwrap_or(0);
             let size = usize::try_from(data.chunk().size()).unwrap_or(0);
             let Some(mapped) = data.data() else { return };
@@ -931,7 +979,11 @@ fn attach_and_connect(
             // the result -- exactly what the snapshot does -- so taking a snapshot first
             // would copy a megabyte and a half in order to copy it again, for a race
             // window of precisely the same shape. They read the mapped buffer directly.
-            let copy_len = if size > 0 { size.min(mapped.len()) } else { mapped.len() };
+            let copy_len = if size > 0 {
+                size.min(mapped.len())
+            } else {
+                mapped.len()
+            };
             let source: &[u8] = if matches!(n.encoding, Encoding::Planar(_)) {
                 mapped.get(..copy_len).unwrap_or(mapped)
             } else {
@@ -1015,7 +1067,9 @@ fn attach_and_connect(
                 tracing::warn!(
                     len = bytes.len(),
                     width, height, stride,
-                    "PipeWire buffer too small for the negotiated geometry; frame dropped"
+                    encoding = ?n.encoding,
+                    reason = unusable_reason(n.encoding),
+                    "PipeWire frame could not be converted; frame dropped"
                 );
             }
         })
@@ -1039,8 +1093,7 @@ fn attach_and_connect(
         .connect(
             libspa::utils::Direction::Input,
             Some(node_id),
-            pipewire::stream::StreamFlags::AUTOCONNECT
-                | pipewire::stream::StreamFlags::MAP_BUFFERS,
+            pipewire::stream::StreamFlags::AUTOCONNECT | pipewire::stream::StreamFlags::MAP_BUFFERS,
             &mut param_refs,
         )
         .map_err(|e| e.to_string())?;
@@ -1115,8 +1168,11 @@ const fn spa_video_format(
 /// offers. That is worth doing and is not this.
 fn format_params(target_fps: u32, target: elementium_codec::EncodeTarget) -> Vec<Vec<u8>> {
     let preference = elementium_codec::capture_format::preference(target);
-    let raw: Vec<libspa::param::video::VideoFormat> =
-        preference.iter().copied().filter_map(spa_video_format).collect();
+    let raw: Vec<libspa::param::video::VideoFormat> = preference
+        .iter()
+        .copied()
+        .filter_map(spa_video_format)
+        .collect();
     // Where MJPEG sits relative to every raw layout is the whole decision: first when the
     // GPU decodes it, last when the CPU has to.
     let mjpeg_first = preference
@@ -1421,7 +1477,11 @@ mod tests {
         let src = planar_source(w, h, stride, PlanarFormat::Nv12);
         let correct = planar_to_i420(&src, w, h, stride, PlanarFormat::Nv12).expect("converts");
         let misread = planar_to_i420(&src, w, h, stride, PlanarFormat::I420).expect("converts");
-        assert_ne!(correct.u(), misread.u(), "the layouts must not be conflated");
+        assert_ne!(
+            correct.u(),
+            misread.u(),
+            "the layouts must not be conflated"
+        );
     }
 
     #[test]
@@ -1586,9 +1646,8 @@ mod tests {
             ("4:2:2", jpeg_encoder::SamplingFactor::F_2_1),
             ("4:2:0", jpeg_encoder::SamplingFactor::F_2_2),
         ] {
-            let frame =
-                super::decode_mjpeg_to_i420(&jpeg_fixture(64, 32, [200, 60, 60], sampling))
-                    .unwrap_or_else(|| panic!("{name} must decode"));
+            let frame = super::decode_mjpeg_to_i420(&jpeg_fixture(64, 32, [200, 60, 60], sampling))
+                .unwrap_or_else(|| panic!("{name} must decode"));
 
             assert_eq!(frame.y().len(), 64 * 32, "{name}: luma plane");
             assert_eq!(frame.u().len(), 32 * 16, "{name}: chroma must end up 4:2:0");

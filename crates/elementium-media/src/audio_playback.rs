@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use elementium_types::AudioFrame;
 use thiserror::Error;
 
@@ -109,7 +109,10 @@ impl AudioSink {
             }
         };
         if self.sender.try_send((track_id.to_string(), frame)).is_err() {
-            let dropped = self.dropped_frames.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let dropped = self
+                .dropped_frames
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             // Throttled: this can legitimately fire often under sustained backlog, and
             // logging every single drop would itself perturb timing.
             if dropped.is_multiple_of(50) {
@@ -213,11 +216,13 @@ impl AudioPlayer {
         let config = device
             .supported_output_configs()
             .ok()
-            .and_then(|configs| crate::stream_config::pick_preferred_config(configs, crate::stream_config::PREFERRED_RATE))
-            .map_or_else(
-                || device.default_output_config(),
-                Ok,
-            )
+            .and_then(|configs| {
+                crate::stream_config::pick_preferred_config(
+                    configs,
+                    crate::stream_config::PREFERRED_RATE,
+                )
+            })
+            .map_or_else(|| device.default_output_config(), Ok)
             .map_err(|e| PlaybackError::Config(e.to_string()))?;
 
         let sample_rate = config.sample_rate().0;
@@ -233,7 +238,9 @@ impl AudioPlayer {
             .map_err(|e| PlaybackError::Stream(e.to_string()))?;
 
         let id = NEXT_PLAYER_ID.fetch_add(1, Ordering::Relaxed);
-        let active_now = ACTIVE_PLAYER_COUNT.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let active_now = ACTIVE_PLAYER_COUNT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         tracing::info!(
             player_id = id,
             device = %device_name,
@@ -300,7 +307,9 @@ impl AudioPlayer {
 
 impl Drop for AudioPlayer {
     fn drop(&mut self) {
-        let active_now = ACTIVE_PLAYER_COUNT.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let active_now = ACTIVE_PLAYER_COUNT
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
         tracing::info!(
             player_id = self.id,
             active_player_count = active_now,
@@ -389,7 +398,11 @@ pub fn resample_interleaved(data: &[f32], channels: u16, from_rate: u32, to_rate
     for out_i in 0..out_frames {
         #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
         let src_pos = out_i as f64 / ratio;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::as_conversions)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::as_conversions
+        )]
         let src_index = src_pos.floor() as usize;
         #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
         let frac = (src_pos - src_pos.floor()) as f32;
@@ -691,7 +704,12 @@ mod resample_tests {
 #[allow(clippy::expect_used)]
 mod pick_preferred_config_tests {
 
-    fn range(channels: u16, min: u32, max: u32, format: cpal::SampleFormat) -> cpal::SupportedStreamConfigRange {
+    fn range(
+        channels: u16,
+        min: u32,
+        max: u32,
+        format: cpal::SampleFormat,
+    ) -> cpal::SupportedStreamConfigRange {
         cpal::SupportedStreamConfigRange::new(
             channels,
             cpal::SampleRate(min),
@@ -803,7 +821,8 @@ mod mix_tracks_tests {
         let mut first = [0.0f32; 2];
         mix(&mut first, &mut tracks);
         assert_eq!(
-            first, [0.1, 0.1],
+            first,
+            [0.1, 0.1],
             "first callback must play only the first frame, not the sum of both"
         );
 
@@ -811,7 +830,8 @@ mod mix_tracks_tests {
         let mut second = [0.0f32; 2];
         mix(&mut second, &mut tracks);
         assert_eq!(
-            second, [0.5, 0.5],
+            second,
+            [0.5, 0.5],
             "second frame must survive to play next, at its own amplitude"
         );
     }
@@ -826,7 +846,11 @@ mod mix_tracks_tests {
         mix(&mut output, &mut tracks);
 
         for (i, (got, (a, b))) in output.iter().zip(track_a.iter().zip(&track_b)).enumerate() {
-            assert!((got - (a + b)).abs() < 1e-6, "sample {i}: got {got}, want {}", a + b);
+            assert!(
+                (got - (a + b)).abs() < 1e-6,
+                "sample {i}: got {got}, want {}",
+                a + b
+            );
         }
     }
 
@@ -897,16 +921,30 @@ mod mix_tracks_tests {
 
         let mut encoder_a = OpusEncoder::new(sample_rate, channels).expect("encoder a");
         let mut encoder_b = OpusEncoder::new(sample_rate, channels).expect("encoder b");
-        let frame_a = AudioFrame { sample_rate, channels, data: make_sine(220.0), timestamp_us: 0 };
-        let frame_b = AudioFrame { sample_rate, channels, data: make_sine(440.0), timestamp_us: 0 };
+        let frame_a = AudioFrame {
+            sample_rate,
+            channels,
+            data: make_sine(220.0),
+            timestamp_us: 0,
+        };
+        let frame_b = AudioFrame {
+            sample_rate,
+            channels,
+            data: make_sine(440.0),
+            timestamp_us: 0,
+        };
         let packet_a = encoder_a.encode(&frame_a).expect("encode a");
         let packet_b = encoder_b.encode(&frame_b).expect("encode b");
 
         // Separate decoders per track, exactly as the playback pipelines key them by mid.
         let mut decoder_a = OpusDecoder::new(sample_rate, channels).expect("decoder a");
         let mut decoder_b = OpusDecoder::new(sample_rate, channels).expect("decoder b");
-        let decoded_a = decoder_a.decode(&packet_a, frame_samples).expect("decode a");
-        let decoded_b = decoder_b.decode(&packet_b, frame_samples).expect("decode b");
+        let decoded_a = decoder_a
+            .decode(&packet_a, frame_samples)
+            .expect("decode a");
+        let decoded_b = decoder_b
+            .decode(&packet_b, frame_samples)
+            .expect("decode b");
 
         let mut tracks = queues(&[("a", &decoded_a.data), ("b", &decoded_b.data)]);
         let mut output = vec![0.0f32; decoded_a.data.len()];
@@ -922,7 +960,10 @@ mod mix_tracks_tests {
             .zip(decoded_a.data.iter().zip(&decoded_b.data))
             .map(|(mixed, (a, b))| (mixed - (a + b)).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_diff < 0.05, "mixed output diverged from sum by {max_diff}");
+        assert!(
+            max_diff < 0.05,
+            "mixed output diverged from sum by {max_diff}"
+        );
     }
 }
 

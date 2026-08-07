@@ -188,29 +188,25 @@ fn start_pipewire(
     let mut last_error = String::new();
     for source in &sources {
         match PipewireCapturer::start_at(source.node_id, target_fps, target) {
-            Ok(capturer) => {
-                match wait_for_first_frame(&capturer) {
-                    Ok(()) => {
-                        let (width, height) = capturer.size();
-                        tracing::info!(
-                            node_id = source.node_id,
-                            name = %source.description,
-                            width,
-                            height,
-                            "Camera capture started via PipeWire"
-                        );
-                        return Ok(VideoSource::Pipewire(capturer));
-                    }
-                    Err(reason) => {
-                        capturer.stop();
-                        last_error = format!(
-                            "node {} ({}): {reason}",
-                            source.node_id, source.description
-                        );
-                        tracing::warn!(reason = %last_error, "Skipping PipeWire source");
-                    }
+            Ok(capturer) => match wait_for_first_frame(&capturer) {
+                Ok(()) => {
+                    let (width, height) = capturer.size();
+                    tracing::info!(
+                        node_id = source.node_id,
+                        name = %source.description,
+                        width,
+                        height,
+                        "Camera capture started via PipeWire"
+                    );
+                    return Ok(VideoSource::Pipewire(capturer));
                 }
-            }
+                Err(reason) => {
+                    capturer.stop();
+                    last_error =
+                        format!("node {} ({}): {reason}", source.node_id, source.description);
+                    tracing::warn!(reason = %last_error, "Skipping PipeWire source");
+                }
+            },
             Err(e) => {
                 last_error = format!("node {}: {e}", source.node_id);
                 tracing::warn!(reason = %last_error, "Skipping PipeWire source");

@@ -66,19 +66,24 @@ fn main() {
                                 let now = Instant::now();
                                 started.get_or_insert(now);
                                 latest = Some(now);
-                                sample = Some((f.width(), f.height(), f.mjpeg().map_or(0, <[u8]>::len)));
+                                sample =
+                                    Some((f.width(), f.height(), f.mjpeg().map_or(0, <[u8]>::len)));
                                 // Write one frame out so the pixels can be inspected
                                 // directly. A capture that is geometrically or
                                 // chromatically wrong looks identical to a healthy one in
                                 // every scalar we log.
-                                if frames == 30 && std::env::var_os("ELEMENTIUM_DUMP_FRAME").is_some() {
+                                if frames == 30
+                                    && std::env::var_os("ELEMENTIUM_DUMP_FRAME").is_some()
+                                {
                                     let path = format!("/tmp/elementium_frame_{}.rgba", s.node_id);
                                     if let Some(planar) = f.to_planar() {
                                         let rgba = elementium_codec::i420_to_rgba(&planar);
                                         match std::fs::write(&path, rgba.data) {
                                             Ok(()) => println!(
                                                 "    wrote {path} ({}x{}, {} luma bytes)",
-                                                planar.width(), planar.height(), planar.y().len()
+                                                planar.width(),
+                                                planar.height(),
+                                                planar.y().len()
                                             ),
                                             Err(e) => println!("    frame dump failed: {e}"),
                                         }
@@ -176,10 +181,16 @@ fn report_frames(cap: &elementium_media::camera::CameraCapturer, idx: u32) {
         (Some(first), Some(last)) if frames > 1 => {
             let span = last.saturating_duration_since(first).as_secs_f64();
             #[allow(clippy::cast_precision_loss)]
-            let fps = if span > 0.0 { f64::from(frames.saturating_sub(1)) / span } else { 0.0 };
+            let fps = if span > 0.0 {
+                f64::from(frames.saturating_sub(1)) / span
+            } else {
+                0.0
+            };
             println!(
                 "    /dev/video{idx}: {frames} frames in 3s ({fps:.1} fps), {} bytes/frame avg",
-                bytes.checked_div(usize::try_from(frames).unwrap_or(1)).unwrap_or(0)
+                bytes
+                    .checked_div(usize::try_from(frames).unwrap_or(1))
+                    .unwrap_or(0)
             );
         }
         _ => println!("    /dev/video{idx}: opened but delivered {frames} frames in 3s"),

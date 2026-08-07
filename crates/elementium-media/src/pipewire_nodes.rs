@@ -104,7 +104,9 @@ pub fn list_video_sources() -> Result<Vec<PipewireVideoSource>, PipewireError> {
 ///
 /// Split out and given its own properties type so the filtering rule is testable without a
 /// running `PipeWire` daemon.
-fn video_source_from_global(global: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>) -> Option<PipewireVideoSource> {
+fn video_source_from_global(
+    global: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+) -> Option<PipewireVideoSource> {
     let props = global.props?;
     let media_class = props.get("media.class")?;
     if !is_video_source_class(media_class) {

@@ -97,9 +97,15 @@ impl AudioCapturer {
         );
 
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, tx, sample_rate, channels),
-            SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, tx, sample_rate, channels),
-            SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, tx, sample_rate, channels),
+            SampleFormat::F32 => {
+                build_stream::<f32>(&device, &stream_config, tx, sample_rate, channels)
+            }
+            SampleFormat::I16 => {
+                build_stream::<i16>(&device, &stream_config, tx, sample_rate, channels)
+            }
+            SampleFormat::U16 => {
+                build_stream::<u16>(&device, &stream_config, tx, sample_rate, channels)
+            }
             _ => {
                 tracing::error!(
                     device_id = %device_id,
@@ -296,7 +302,10 @@ mod buffer_size_tests {
     /// -- a working stream on the device's own terms beats a failed one.
     #[test]
     fn falls_back_to_the_device_default_when_one_frame_is_out_of_range() {
-        let too_coarse = cpal::SupportedBufferSize::Range { min: 2048, max: 4096 };
+        let too_coarse = cpal::SupportedBufferSize::Range {
+            min: 2048,
+            max: 4096,
+        };
         assert_eq!(
             opus_frame_buffer_size(&too_coarse, 48_000),
             cpal::BufferSize::Default
@@ -322,11 +331,20 @@ mod buffer_size_tests {
     #[test]
     fn accepts_a_frame_size_exactly_at_the_range_boundary() {
         assert_eq!(
-            opus_frame_buffer_size(&cpal::SupportedBufferSize::Range { min: 960, max: 4096 }, 48_000),
+            opus_frame_buffer_size(
+                &cpal::SupportedBufferSize::Range {
+                    min: 960,
+                    max: 4096
+                },
+                48_000
+            ),
             cpal::BufferSize::Fixed(960)
         );
         assert_eq!(
-            opus_frame_buffer_size(&cpal::SupportedBufferSize::Range { min: 64, max: 960 }, 48_000),
+            opus_frame_buffer_size(
+                &cpal::SupportedBufferSize::Range { min: 64, max: 960 },
+                48_000
+            ),
             cpal::BufferSize::Fixed(960)
         );
     }
