@@ -1,0 +1,61 @@
+# A complete MatrixRTC stack on localhost, for reproducing call faults that only
+# appear with a real homeserver in the loop.
+#
+# The faults worth chasing here are protocol-level and involve more than one
+# participant: how long a key takes to arrive, and why someone joining or leaving
+# can silence everybody already in the call. Neither is reachable with a bare SFU,
+# because both are driven by Matrix -- room membership drives key rotation, and
+# to-device messages carry the keys.
+#
+# Everything binds to localhost. That is not only convenience: browsers require a
+# secure context for insertable streams, which back livekit's E2EE worker, and
+# `http://localhost` counts as secure while a LAN address does not.
+services:
+  # The homeserver. Registration is open and rate limiting is off, because the
+  # harness creates participants on demand and a rate limiter turns a test suite
+  # into a flaky one.
+  synapse:
+    image: matrixdotorg/synapse:latest
+    container_name: elementium-test-synapse
+    network_mode: host
+    environment:
+      SYNAPSE_SERVER_NAME: localhost
+      SYNAPSE_REPORT_STATS: "no"
+      # Run as the invoking user so the generated config and database stay
+      # editable from outside the container -- otherwise every change needs root.
+      UID: "1000"
+      GID: "100"
+    volumes:
+      - ./synapse:/data
+    command: run
+
+  # The SFU itself. `--dev` gives it the well-known devkey/secret pair, which
+  # lk-jwt-service is configured with below.
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: elementium-test-livekit-stack
+    network_mode: host
+    command: --dev --bind 0.0.0.0
+
+  # The bridge between the two: Element Call presents a Matrix OpenID token, this
+  # verifies it against the homeserver and mints a LiveKit JWT. Without it the
+  # call cannot authenticate to the SFU at all.
+  lk-jwt:
+    image: ghcr.io/element-hq/lk-jwt-service:latest
+    container_name: elementium-test-lk-jwt
+    network_mode: host
+    environment:
+      LIVEKIT_URL: ws://localhost:7880
+      LIVEKIT_KEY: devkey
+      LIVEKIT_SECRET: secret
+      # 8090, not the more usual 8080: that port is commonly taken by a dev server
+      # already, and a clash surfaces as the container exiting quietly while calls
+      # simply fail to authenticate.
+      LIVEKIT_JWT_BIND: ":8090"
+      # Local homeservers are http, and this refuses them unless told to allow it.
+      LIVEKIT_INSECURE_SKIP_VERIFY_TLS: "YES_I_KNOW_WHAT_I_AM_DOING"
+      # Which homeservers may publish, as opposed to only subscribe. Unset, every
+      # participant is refused an SFU token and no call connects at all.
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: "localhost"
+    depends_on:
+      - livekit
