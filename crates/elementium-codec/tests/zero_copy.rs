@@ -13,13 +13,20 @@
 #![allow(clippy::expect_used, clippy::as_conversions, clippy::arithmetic_side_effects)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use elementium_codec::Vp8Encoder;
 use elementium_types::I420Frame;
 
-/// Bytes allocated since the counter was last reset.
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+// Bytes allocated on *this thread* since its counter was last reset.
+//
+// Thread-local, and that is the whole point. A global counter attributes every thread's
+// allocations to whichever measurement happens to be running, so the harness printing a
+// result on one thread lands inside another's measurement -- which showed up as
+// `adopting_a_decoded_buffer_allocates_nothing` failing only in a full workspace run and
+// passing every time the file was run alone. Serialising the measurements did not fix it,
+// because the problem was never concurrent resets; it was concurrent allocation.
+thread_local! {
+    static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The system allocator, counting what it hands out.
 struct Counting;
@@ -28,7 +35,9 @@ struct Counting;
 // incidental and cannot affect the returned pointers.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+        // `try_with`, not `with`: a thread-local is unavailable during thread teardown, and
+        // allocating there must not panic inside the allocator.
+        let _ = ALLOCATED.try_with(|n| n.set(n.get().saturating_add(layout.size())));
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.alloc(layout) }
     }
@@ -39,7 +48,8 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATED.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
+        let grown = new_size.saturating_sub(layout.size());
+        let _ = ALLOCATED.try_with(|n| n.set(n.get().saturating_add(grown)));
         // SAFETY: forwarding the caller's own contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -48,22 +58,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Held for the length of a measurement.
-///
-/// The counter is global and the test harness runs these in parallel, so without this one
-/// test resets it while another is part-way through counting — and the second then observes
-/// fewer bytes than were really allocated. That failed intermittently and only in a full
-/// workspace run, which is the least useful moment to find out.
-static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Bytes allocated while running `f`.
+/// Bytes allocated on this thread while running `f`.
 fn allocated_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let guard = MEASURING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    ALLOCATED.store(0, Ordering::Relaxed);
+    ALLOCATED.with(|n| n.set(0));
     let value = f();
-    let count = ALLOCATED.load(Ordering::Relaxed);
-    drop(guard);
-    (value, count)
+    (value, ALLOCATED.with(std::cell::Cell::get))
 }
 
 /// 720p, the resolution the camera negotiates.
