@@ -23,6 +23,50 @@ pub struct AudioCapturer {
     channels: u16,
 }
 
+/// Choose the capture format for `device`, preferring Opus's own sample rate.
+///
+/// Prefer 48kHz explicitly rather than trusting `default_input_config()`, for the same
+/// reason the playback side does -- see [`crate::stream_config`]. cpal's synthesized default
+/// biases toward 44100Hz, and on this machine that is exactly what happened: capture ran at
+/// 44100 while Opus encodes at 48000, so every captured chunk went through a naive linear
+/// resample on the way to the encoder. Capturing at Opus's native rate removes that
+/// conversion entirely.
+fn input_config(
+    device: &cpal::Device,
+    device_id: &str,
+) -> Result<cpal::SupportedStreamConfig, CaptureError> {
+    device
+        .supported_input_configs()
+        .ok()
+        .and_then(|configs| {
+            crate::stream_config::pick_preferred_config(
+                configs,
+                crate::stream_config::PREFERRED_RATE,
+            )
+        })
+        .map_or_else(
+            || {
+                tracing::warn!(
+                    device_id = %device_id,
+                    preferred_rate = crate::stream_config::PREFERRED_RATE,
+                    "Input device does not advertise the preferred capture rate; \
+                     falling back to its default (captured audio will be resampled)"
+                );
+                device.default_input_config()
+            },
+            Ok,
+        )
+        .map_err(|e| {
+            tracing::error!(
+                device_id = %device_id,
+                error_kind = "config",
+                error = %e,
+                "Failed to get audio input device config"
+            );
+            CaptureError::Config(e.to_string())
+        })
+}
+
 impl AudioCapturer {
     /// Start capturing audio from the default input device.
     ///
@@ -39,42 +83,7 @@ impl AudioCapturer {
 
         let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
 
-        // Prefer 48kHz explicitly rather than trusting `default_input_config()`, for the
-        // same reason the playback side does -- see `crate::stream_config`. cpal's
-        // synthesized default biases toward 44100Hz, and on this machine that is exactly
-        // what happened: capture ran at 44100 while Opus encodes at 48000, so every single
-        // captured chunk went through a naive linear resample on the way to the encoder.
-        // Capturing at Opus's native rate removes that conversion entirely.
-        let config = device
-            .supported_input_configs()
-            .ok()
-            .and_then(|configs| {
-                crate::stream_config::pick_preferred_config(
-                    configs,
-                    crate::stream_config::PREFERRED_RATE,
-                )
-            })
-            .map_or_else(
-                || {
-                    tracing::warn!(
-                        device_id = %device_id,
-                        preferred_rate = crate::stream_config::PREFERRED_RATE,
-                        "Input device does not advertise the preferred capture rate; \
-                         falling back to its default (captured audio will be resampled)"
-                    );
-                    device.default_input_config()
-                },
-                Ok,
-            )
-            .map_err(|e| {
-                tracing::error!(
-                    device_id = %device_id,
-                    error_kind = "config",
-                    error = %e,
-                    "Failed to get audio input device config"
-                );
-                CaptureError::Config(e.to_string())
-            })?;
+        let config = input_config(&device, &device_id)?;
 
         let sample_rate = config.sample_rate().0;
         let channels = config.channels();
