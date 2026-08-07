@@ -1080,37 +1080,20 @@ fn encode_and_send_frame(
                 &encoded_frame,
                 ctx.frame_samples,
             );
-            let mut closed = false;
-            if let Ok(guard) = encode_tx.lock()
-                && let Some(ref tx) = *guard
-            {
-                match tx.try_send(IoCommand::WriteAudio(encoded_frame)) {
-                    Ok(()) => stats.sent = stats.sent.saturating_add(1),
-                    Err(tokio_mpsc::error::TrySendError::Full(_)) => {
-                        stats.dropped_channel_full =
-                            stats.dropped_channel_full.saturating_add(1);
-                    }
-                    Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
-                        stats.dropped_channel_closed =
-                            stats.dropped_channel_closed.saturating_add(1);
-                        closed = true;
-                    }
+            match deliver(encode_tx, IoCommand::WriteAudio(encoded_frame)) {
+                Delivery::Sent => stats.sent = stats.sent.saturating_add(1),
+                Delivery::Full => {
+                    stats.dropped_channel_full = stats.dropped_channel_full.saturating_add(1);
                 }
-            }
-            // Let go of a transport that has gone, rather than encoding into it for the
-            // rest of the call. A closed channel never reopens: the peer connection it
-            // belonged to was torn down, and the pipeline has to be attached to whatever
-            // replaced it. Detaching makes that state visible as `skipped_not_connected`
-            // -- honestly unattached -- instead of as a stream of drops that reads like
-            // congestion.
-            if closed {
-                if let Ok(mut guard) = encode_tx.lock() {
-                    *guard = None;
+                Delivery::Closed => {
+                    stats.dropped_channel_closed =
+                        stats.dropped_channel_closed.saturating_add(1);
+                    tracing::warn!(
+                        "the peer connection this microphone was feeding has closed; \
+                         audio is detached until a connection replaces it"
+                    );
                 }
-                tracing::warn!(
-                    "the peer connection this microphone was feeding has closed; \
-                     audio is detached until a connection replaces it"
-                );
+                Delivery::Unattached => {}
             }
         }
         Err(e) => {
@@ -1118,6 +1101,49 @@ fn encode_and_send_frame(
             tracing::debug!("Opus encode error: {e}");
         }
     }
+}
+
+/// What happened to a frame handed to a transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Sent,
+    /// The consumer is alive and behind. Back-pressure; the frame is dropped and the next
+    /// one may well succeed.
+    Full,
+    /// The consumer is gone. Nothing will succeed again on this channel.
+    Closed,
+    /// Nothing was attached to send to.
+    Unattached,
+}
+
+/// Hand one frame to the attached transport, letting go of it if it has gone.
+///
+/// The detach is the point. A closed channel never reopens -- the peer connection it
+/// belonged to was torn down -- so continuing to encode into it wastes the rest of the call
+/// and, while `Closed` and `Full` shared a counter, looked exactly like congestion.
+/// Clearing the slot makes the state honest: the pipeline reports itself unattached, and
+/// the next connection created can adopt it.
+fn deliver(
+    slot: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    command: IoCommand,
+) -> Delivery {
+    let outcome = {
+        let Ok(guard) = slot.lock() else {
+            return Delivery::Unattached;
+        };
+        let Some(ref tx) = *guard else {
+            return Delivery::Unattached;
+        };
+        match tx.try_send(command) {
+            Ok(()) => Delivery::Sent,
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => Delivery::Full,
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => Delivery::Closed,
+        }
+    };
+    if outcome == Delivery::Closed && let Ok(mut guard) = slot.lock() {
+        *guard = None;
+    }
+    outcome
 }
 
 /// Build the decoder used to record what our own encoder produces, if dumping is on.
@@ -1472,5 +1498,72 @@ mod active_codec_tests {
     fn the_default_is_the_universally_supported_codec() {
         assert_eq!(DEFAULT_VIDEO_CODEC, VideoCodec::Vp8);
         assert_eq!(ActiveCodec::new(DEFAULT_VIDEO_CODEC).get(), VideoCodec::Vp8);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod delivery_tests {
+    use super::{Delivery, deliver};
+    use elementium_webrtc::engine::IoCommand;
+    use elementium_types::PlaintextMedia;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc as tokio_mpsc;
+
+    fn frame() -> IoCommand {
+        IoCommand::WriteAudio(PlaintextMedia::from_encoder(vec![1, 2, 3]))
+    }
+
+    /// The ordinary case: a live consumer takes the frame.
+    #[test]
+    fn a_live_transport_takes_the_frame() {
+        let (tx, _rx) = tokio_mpsc::channel(4);
+        let slot = Arc::new(Mutex::new(Some(tx)));
+        assert_eq!(deliver(&slot, frame()), Delivery::Sent);
+        assert!(
+            slot.lock().expect("lock").is_some(),
+            "a working transport must stay attached"
+        );
+    }
+
+    /// Back-pressure is not disconnection. A full channel means the consumer is alive and
+    /// behind, so the attachment must survive -- dropping it here would end a call for a
+    /// moment of congestion.
+    #[test]
+    fn a_full_transport_is_kept() {
+        let (tx, _rx) = tokio_mpsc::channel(1);
+        let slot = Arc::new(Mutex::new(Some(tx)));
+        assert_eq!(deliver(&slot, frame()), Delivery::Sent);
+        assert_eq!(deliver(&slot, frame()), Delivery::Full);
+        assert!(
+            slot.lock().expect("lock").is_some(),
+            "congestion must not detach a live transport"
+        );
+    }
+
+    /// The case this exists for. A peer connection torn down mid-call leaves a sender
+    /// whose receiver is gone; every later frame is wasted, and while this was counted as
+    /// congestion it read as a busy call rather than a dead one.
+    #[test]
+    fn a_closed_transport_is_let_go_of() {
+        let (tx, rx) = tokio_mpsc::channel(4);
+        let slot = Arc::new(Mutex::new(Some(tx)));
+        drop(rx);
+
+        assert_eq!(deliver(&slot, frame()), Delivery::Closed);
+        assert!(
+            slot.lock().expect("lock").is_none(),
+            "a closed transport must be released, so the pipeline reports itself unattached \
+             and the next connection can adopt it"
+        );
+        // And having let go, it says so rather than reporting a closed channel forever.
+        assert_eq!(deliver(&slot, frame()), Delivery::Unattached);
+    }
+
+    /// Nothing attached is its own outcome, distinct from a failure to send.
+    #[test]
+    fn an_empty_slot_reports_itself() {
+        let slot: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> = Arc::new(Mutex::new(None));
+        assert_eq!(deliver(&slot, frame()), Delivery::Unattached);
     }
 }
