@@ -962,6 +962,9 @@ fn attach_and_connect(
         .register();
 
     let mut params = format_params(target_fps, target);
+    // Appended after the formats: the source reads both when the stream connects, and the
+    // buffer constraint applies whichever format it settles on.
+    params.push(buffers_param());
     let mut param_refs: Vec<&libspa::pod::Pod> = params
         .iter_mut()
         .filter_map(|p| libspa::pod::Pod::from_bytes(p))
@@ -1071,6 +1074,47 @@ fn format_params(target_fps: u32, target: elementium_codec::EncodeTarget) -> Vec
         params.push(mjpeg_format_param(target_fps));
     }
     params
+}
+
+/// The buffer types we can actually read.
+///
+/// Without this the source picks, and a source that picks DMA-BUF hands back a buffer whose
+/// memory is a GPU handle rather than something `MAP_BUFFERS` can map -- which the client
+/// then rejects with `error use input buffers: -22 (Invalid argument)` and delivers nothing
+/// at all. The camera works, the format negotiates, and every frame is silently absent.
+///
+/// So the two types this capture path can read are declared: a plain pointer, and a memfd
+/// the client maps. A source that can only offer DMA-BUF will now fail to negotiate rather
+/// than agreeing and then failing, which is the better of the two failures because it says
+/// so before a call starts.
+///
+/// Importing DMA-BUF directly is the real answer for the hardware path, since it would let
+/// the camera's buffer reach the GPU without the CPU touching it. That is a different piece
+/// of work; this is what makes the CPU path correct.
+fn buffers_param() -> Vec<u8> {
+    use libspa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    const MAPPABLE: i32 = (1 << libspa::sys::SPA_DATA_MemPtr) | (1 << libspa::sys::SPA_DATA_MemFd);
+
+    let obj = libspa::pod::Object {
+        type_: libspa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: libspa::param::ParamType::Buffers.as_raw(),
+        properties: vec![Property {
+            key: libspa::sys::SPA_PARAM_BUFFERS_dataType,
+            flags: PropertyFlags::empty(),
+            // A flags choice rather than a single value: this is a mask of what we accept,
+            // and the source picks one from it.
+            value: Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Flags {
+                    default: MAPPABLE,
+                    flags: vec![MAPPABLE],
+                },
+            ))),
+        }],
+    };
+    serialize(obj)
 }
 
 /// A `VideoFormat` property offering several layouts, the first being preferred.
