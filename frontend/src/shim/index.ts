@@ -11,6 +11,7 @@ import { setupWebRtcShim } from "./webrtc-shim";
 import { setupMediaDevicesShim } from "./media-devices";
 import { setupConsoleBridge } from "./console-bridge";
 import { setupE2eeBridge } from "./e2ee-bridge";
+import { setupMembershipLog } from "./membership-log";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 
 // Set up console bridge to forward JS console output to Rust (works in iframes too)
@@ -24,6 +25,10 @@ setupMediaDevicesShim();
 // Must be installed before Element Call imports its keys: the bridge captures raw key
 // material at `crypto.subtle.importKey`, which only works for imports it front-runs.
 setupE2eeBridge();
+
+// Puts joins and leaves in the same stream as key changes, so a silence that follows a
+// rotation can be attributed to the membership event that caused it.
+setupMembershipLog();
 
 // Expose LiveKit shim on window for Element Call widget integration
 (window as unknown as Record<string, unknown>)["__elementium_livekit"] = {

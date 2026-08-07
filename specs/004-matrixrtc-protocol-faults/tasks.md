@@ -8,8 +8,8 @@ anecdote cannot tell a fix from a coincidence.
 ## Phase 1: Make the faults observable
 
 - [X] T001 [US1] Log the interval between a key being installed and the first frame it successfully decrypts, per participant, in `crates/elementium-e2ee/src/lib.rs` — the quantity US1 is about, and nothing currently reports it
-- [ ] T002 [US3] Log every key that reaches the bridge but is *not* installed, with the reason, in `frontend/src/shim/e2ee-bridge.ts` (already logs failures to recover material; add the parked and out-of-order cases visible from the JS side)
-- [ ] T003 [US2] Log membership changes alongside key rotations, so a silence can be attributed to a specific join or leave rather than to "something happened"
+- [X] T002 [US3] Log every key that reaches the bridge but is *not* installed, with the reason, in `frontend/src/shim/e2ee-bridge.ts` (already logs failures to recover material; add the parked and out-of-order cases visible from the JS side)
+- [X] T003 [US2] Log membership changes alongside key rotations, so a silence can be attributed to a specific join or leave rather than to "something happened"
 
 ## Phase 2: Reproduce, in the environment that now exists
 
