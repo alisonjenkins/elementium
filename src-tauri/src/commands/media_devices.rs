@@ -124,17 +124,6 @@ struct StoppedPipeline {
     connection: Option<tokio_mpsc::Sender<IoCommand>>,
 }
 
-/// Stop the running capture pipeline, returning the peer connection it was feeding.
-///
-/// Carrying the connection over to the replacement is load-bearing, not tidiness.
-/// `getUserMedia` is re-called during a live call (mute/unmute, device change, track
-/// replacement -- five times in one short session in a real log), and the *only* place
-/// that ever attaches a capture pipeline to a peer connection is `create_offer`. A
-/// replacement that started disconnected therefore stayed disconnected until the next
-/// renegotiation happened to occur, which may be never: the log shows an audio restart
-/// after which `skipped_not_connected` simply climbed forever while `sent_frames` stayed
-/// at zero. The far end hears the speaker cut out, or the camera freeze, mid-call for no
-/// visible reason.
 /// The connection a freshly-started pipeline should feed.
 ///
 /// Prefers whatever the pipeline it replaces was feeding, falling back to the connected
@@ -207,6 +196,16 @@ fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
     track_id
 }
 
+/// Stop the running capture pipeline, returning the peer connection it was feeding.
+///
+/// Carrying the connection over to the replacement is load-bearing, not tidiness.
+/// `getUserMedia` is re-called during a live call (mute/unmute, device change, track
+/// replacement -- five times in one short session in a real log), and a replacement that
+/// started disconnected stayed disconnected until the next renegotiation happened to
+/// occur, which may be never: the log shows an audio restart after which
+/// `skipped_not_connected` simply climbed forever while `sent_frames` stayed at zero. The
+/// far end hears the speaker cut out, or the camera freeze, mid-call for no visible
+/// reason.
 fn stop_pipeline_inheriting_connection<H: CapturePipeline>(
     slot: &Mutex<Option<H>>,
 ) -> StoppedPipeline {
@@ -392,6 +391,12 @@ pub fn get_video_frame(
     }
 }
 
+/// How long a newly-subscribed peer may wait before it can decode anything.
+///
+/// Short enough that joining a call feels immediate, long enough that the cost of
+/// rebuilding the encoder's rate control is negligible.
+const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Background thread: reads camera frames, writes RGBA to `VideoFrameBuffer` for
 /// preview, and optionally VP8-encodes + sends to a peer connection.
 fn camera_pipeline_loop(
@@ -423,6 +428,7 @@ fn camera_pipeline_loop(
 
     let mut encoder: Option<Vp8Encoder> = None;
     let mut frame_count: u64 = 0;
+    let mut last_keyframe = std::time::Instant::now();
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -463,42 +469,81 @@ fn camera_pipeline_loop(
             let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
 
             if should_encode {
-                // Lazily create the encoder
-                if encoder.is_none() {
-                    match Vp8Encoder::new(width, height, 500) {
-                        Ok(enc) => {
-                            tracing::info!(width, height, "VP8 encoder created for camera");
-                            encoder = Some(enc);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create VP8 encoder: {e}");
-                        }
-                    }
-                }
-
-                if let Some(ref mut enc) = encoder {
-                    let i420 =
-                        elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
-
-                    match enc.encode(&i420) {
-                        Ok(packets) => {
-                            if let Ok(guard) = encode_tx.lock()
-                                && let Some(ref tx) = *guard
-                            {
-                                for packet in packets {
-                                    let _ = tx.try_send(IoCommand::WriteVideo(packet.data));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("VP8 encode error: {e}");
-                        }
-                    }
-                }
+                encode_and_send_video_frame(
+                    track_id,
+                    &frame,
+                    &mut encoder,
+                    &mut last_keyframe,
+                    encode_tx,
+                );
             }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+/// VP8-encode one captured frame and hand the packets to the connection.
+///
+/// Owns the encoder's lifecycle because two things can invalidate it: the source
+/// renegotiating its geometry, and the need for a periodic keyframe.
+fn encode_and_send_video_frame(
+    track_id: &str,
+    frame: &elementium_types::VideoFrame,
+    encoder: &mut Option<Vp8Encoder>,
+    last_keyframe: &mut std::time::Instant,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+) {
+    // Created lazily, and rebuilt if the source renegotiates its geometry:
+    // `Vp8Encoder::encode` rejects a frame whose size does not match its configuration, so
+    // a mid-stream resolution change would otherwise fail every frame from then on and
+    // stop the video permanently.
+    if encoder
+        .as_ref()
+        .is_none_or(|e| e.size() != (frame.width, frame.height))
+    {
+        match Vp8Encoder::new(frame.width, frame.height, 500) {
+            Ok(enc) => {
+                tracing::info!(
+                    width = frame.width,
+                    height = frame.height,
+                    "VP8 encoder created for camera"
+                );
+                *encoder = Some(enc);
+                *last_keyframe = std::time::Instant::now();
+            }
+            Err(e) => tracing::error!("Failed to create VP8 encoder: {e}"),
+        }
+    } else if last_keyframe.elapsed() >= KEYFRAME_INTERVAL
+        && let Some(enc) = encoder.as_mut()
+    {
+        // Nothing routes a receiver's keyframe request back to this thread yet, so a peer
+        // that subscribes mid-call would otherwise wait out libvpx's default keyframe
+        // distance -- minutes -- before it could decode anything.
+        match enc.force_keyframe() {
+            Ok(()) => {
+                *last_keyframe = std::time::Instant::now();
+                tracing::debug!(track_id, "forced a VP8 keyframe");
+            }
+            Err(e) => tracing::warn!(track_id, reason = %e, "keyframe failed"),
+        }
+    }
+
+    let Some(enc) = encoder.as_mut() else {
+        return;
+    };
+    let i420 = elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
+    match enc.encode(&i420) {
+        Ok(packets) => {
+            if let Ok(guard) = encode_tx.lock()
+                && let Some(tx) = guard.as_ref()
+            {
+                for packet in packets {
+                    let _ = tx.try_send(IoCommand::WriteVideo(packet.data));
+                }
+            }
+        }
+        Err(e) => tracing::debug!("VP8 encode error: {e}"),
     }
 }
 
