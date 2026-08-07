@@ -117,6 +117,26 @@ impl Config {
         Self::new(display, profile, va::VAEntrypoint_VAEntrypointVLD, attributes)
     }
 
+    /// Create a configuration for post-processing.
+    ///
+    /// Post-processing hangs off `VAProfileNone` rather than a codec, since it is not tied
+    /// to one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the driver's status if the device has no post-processor.
+    pub fn for_video_processing(
+        display: &Arc<Display>,
+        attributes: &mut [va::VAConfigAttrib],
+    ) -> Result<Self, Status> {
+        Self::new(
+            display,
+            va::VAProfile_VAProfileNone,
+            va::VAEntrypoint_VAEntrypointVideoProc,
+            attributes,
+        )
+    }
+
     /// Create a configuration for a given entrypoint.
     fn new(
         display: &Arc<Display>,

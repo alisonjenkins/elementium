@@ -19,6 +19,7 @@ pub mod jpeg;
 pub mod jpeg_headers;
 pub mod resource;
 pub mod status;
+pub mod vpp;
 
 pub use display::Display;
 pub use h264::H264Encoder;
