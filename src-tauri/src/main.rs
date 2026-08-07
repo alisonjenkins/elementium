@@ -128,6 +128,7 @@ fn register_state(
             active_tracks: Mutex::new(Vec::new()),
             camera: Mutex::new(None),
             audio_capture: Mutex::new(None),
+            sfu_media_tx: Mutex::new(None),
         })
         .manage(protocols::VideoFrameState(video_frames.clone()))
         .manage(LiveKitState {

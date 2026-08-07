@@ -55,6 +55,14 @@ pub struct MediaState {
     pub camera: Mutex<Option<CameraPipelineHandle>>,
     /// Active audio capture pipeline (at most one mic at a time).
     pub audio_capture: Mutex<Option<AudioCaptureHandle>>,
+    /// Where captured media goes for the currently-connected SFU room, if any.
+    ///
+    /// Publishing a track attaches whatever pipeline is running at that moment, but the
+    /// two events have no fixed order: joining a call muted and unmuting later starts the
+    /// microphone long after its track was published, and that pipeline has no earlier
+    /// handle to inherit a connection from. Remembering the room's sender here means a
+    /// pipeline that starts at any point in a call is attached on startup.
+    pub sfu_media_tx: Mutex<Option<tokio_mpsc::Sender<IoCommand>>>,
 }
 
 #[command]
@@ -127,6 +135,78 @@ struct StoppedPipeline {
 /// after which `skipped_not_connected` simply climbed forever while `sent_frames` stayed
 /// at zero. The far end hears the speaker cut out, or the camera freeze, mid-call for no
 /// visible reason.
+/// The connection a freshly-started pipeline should feed.
+///
+/// Prefers whatever the pipeline it replaces was feeding, falling back to the connected
+/// SFU room. Both are needed: the inherited connection covers a restart mid-call on the
+/// direct-`WebRTC` path, and the room covers a pipeline that starts for the first time
+/// after its track was already published (joining muted, then unmuting).
+fn connection_for_new_pipeline(
+    inherited: Option<tokio_mpsc::Sender<IoCommand>>,
+    media_state: &MediaState,
+) -> Option<tokio_mpsc::Sender<IoCommand>> {
+    inherited.or_else(|| {
+        media_state
+            .sfu_media_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    })
+}
+
+/// Start (or restart) the microphone pipeline, returning the new track's id.
+///
+/// Replaces whatever was running and takes over its connection, so a mid-call restart
+/// keeps sending -- see [`stop_pipeline_inheriting_connection`].
+fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
+    let track_id = TrackId(format!("audio-{}", generate_track_id()));
+    tracing::info!(track_id = %track_id, "Starting audio capture");
+
+    let previous = stop_pipeline_inheriting_connection(&media_state.audio_capture);
+    let connection = connection_for_new_pipeline(previous.connection, media_state);
+    if connection.is_some() {
+        tracing::info!(
+            track_id = %track_id,
+            "Audio capture attached to a live call on startup"
+        );
+    }
+
+    let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
+        Arc::new(Mutex::new(connection));
+    let encode_tx_clone = encode_tx.clone();
+    // Seeded with the encoder's own starting assumption so behaviour before the
+    // first RTCP report matches the configured default, then converges on measured
+    // loss as reports arrive.
+    let loss_estimate = Arc::new(NetworkLossEstimate::new(
+        OpusEncoderConfig::default().expected_packet_loss_perc,
+    ));
+    let loss_estimate_clone = loss_estimate.clone();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+    // Inherits the call's correlation span so every event the thread emits carries the
+    // same correlation_id.
+    let audio_span = tracing::Span::current();
+    std::thread::spawn(move || {
+        let _guard = audio_span.enter();
+        audio_capture_loop(&encode_tx_clone, &stop_rx, &loss_estimate_clone);
+    });
+
+    if let Ok(mut audio) = media_state.audio_capture.lock() {
+        *audio = Some(AudioCaptureHandle {
+            track_id: track_id.0.clone(),
+            stop_tx,
+            encode_tx,
+            loss_estimate,
+        });
+    }
+
+    if let Ok(mut tracks) = media_state.active_tracks.lock() {
+        tracks.push(track_id.clone());
+    }
+
+    track_id
+}
+
 fn stop_pipeline_inheriting_connection<H: CapturePipeline>(
     slot: &Mutex<Option<H>>,
 ) -> StoppedPipeline {
@@ -160,55 +240,7 @@ pub async fn get_user_media(
     let mut track_ids = Vec::new();
 
     if constraints.audio.is_some() {
-        let track_id = TrackId(format!("audio-{}", generate_track_id()));
-        tracing::info!(track_id = %track_id, "Starting audio capture");
-
-        // Stop any existing audio capture pipeline, inheriting whichever peer connection
-        // it was feeding -- see `stop_pipeline_inheriting_connection` for why that matters.
-        let previous = stop_pipeline_inheriting_connection(&media_state.audio_capture);
-        let inherited_connection = previous.connection;
-        if inherited_connection.is_some() {
-            tracing::info!(
-                track_id = %track_id,
-                "Audio capture restarted mid-call; inheriting the existing peer connection"
-            );
-        }
-
-        let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
-            Arc::new(Mutex::new(inherited_connection));
-        let encode_tx_clone = encode_tx.clone();
-        // Seeded with the encoder's own starting assumption so behaviour before the
-        // first RTCP report matches the configured default, then converges on measured
-        // loss as reports arrive.
-        let loss_estimate = Arc::new(NetworkLossEstimate::new(
-            OpusEncoderConfig::default().expected_packet_loss_perc,
-        ));
-        let loss_estimate_clone = loss_estimate.clone();
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-
-        // Start audio capture pipeline on a background thread, inheriting the
-        // call's correlation span so every event it emits carries the same
-        // correlation_id.
-        let audio_span = tracing::Span::current();
-        std::thread::spawn(move || {
-            let _guard = audio_span.enter();
-            audio_capture_loop(&encode_tx_clone, &stop_rx, &loss_estimate_clone);
-        });
-
-        // Store the audio capture handle
-        if let Ok(mut audio) = media_state.audio_capture.lock() {
-            *audio = Some(AudioCaptureHandle {
-                track_id: track_id.0.clone(),
-                stop_tx,
-                encode_tx,
-                loss_estimate,
-            });
-        }
-
-        if let Ok(mut tracks) = media_state.active_tracks.lock() {
-            tracks.push(track_id.clone());
-        }
-        track_ids.push(track_id);
+        track_ids.push(start_audio_pipeline(&media_state));
     }
 
     if let Some(ref video_constraints) = constraints.video {
@@ -230,7 +262,8 @@ pub async fn get_user_media(
         // would see the video freeze with nothing in the log to explain it.
         let previous = stop_pipeline_inheriting_connection(&media_state.camera);
         let had_previous = previous.existed;
-        if previous.connection.is_some() {
+        let inherited_connection = connection_for_new_pipeline(previous.connection, &media_state);
+        if inherited_connection.is_some() {
             tracing::info!(
                 track_id = %track_id,
                 "Camera restarted mid-call; inheriting the existing peer connection"
@@ -241,7 +274,7 @@ pub async fn get_user_media(
         let req_height = video_constraints.height;
 
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
-            Arc::new(Mutex::new(previous.connection));
+            Arc::new(Mutex::new(inherited_connection));
         let encode_tx_clone = encode_tx.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let tid = track_id.0.clone();

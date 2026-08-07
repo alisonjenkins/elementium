@@ -165,6 +165,12 @@ fn attach_capture_pipeline(
         _ => None,
     };
 
+    // Remembered for pipelines that have not started yet: joining a call muted publishes
+    // the microphone track long before `getUserMedia` opens the device.
+    if let Ok(mut guard) = media_state.sfu_media_tx.lock() {
+        *guard = Some(media_tx.clone());
+    }
+
     let Some(connection) = connection else {
         tracing::warn!(
             kind,
@@ -184,8 +190,14 @@ fn attach_capture_pipeline(
 #[command]
 pub async fn livekit_disconnect(
     state: State<'_, LiveKitState>,
+    media_state: State<'_, MediaState>,
     room_id: String,
 ) -> Result<(), String> {
+    // Detach the capture pipelines first: a pipeline left pointing at a torn-down room
+    // keeps encoding into a dead channel, and a pipeline that outlives the call would
+    // otherwise be handed to the *next* room by inheritance.
+    detach_capture_pipelines(&media_state);
+
     let room = {
         let mut rooms = state.rooms.lock_str()?;
         rooms.remove(&room_id)
@@ -217,6 +229,33 @@ pub async fn livekit_set_subscriber_volume(
     // TODO: Per-participant volume control requires mixing with per-source gains
     tracing::info!("livekit_set_subscriber_volume not yet implemented");
     Ok(())
+}
+
+/// Forget the room the capture pipelines were feeding, leaving them capturing but
+/// unpublished.
+fn detach_capture_pipelines(media_state: &MediaState) {
+    if let Ok(mut guard) = media_state.sfu_media_tx.lock() {
+        *guard = None;
+    }
+    for slot in [
+        media_state
+            .audio_capture
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|a| a.encode_tx.clone())),
+        media_state
+            .camera
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.encode_tx.clone())),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = None;
+        }
+    }
 }
 
 fn get_room(
