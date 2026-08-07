@@ -23,10 +23,9 @@
  * barely audible far better than any codec explanation. Our AddTrack also never populates
  * the `encryption` field, which is one candidate.
  *
- * Requires a local SFU:
- *
- *   docker run -d --name elementium-test-livekit --network host \
- *       livekit/livekit-server --dev --bind 0.0.0.0
+ * The SFU is started for you: see `tests/global-setup.ts`, which brings up the whole
+ * MatrixRTC stack before any test runs and stops it afterwards unless it was already
+ * running.
  */
 import { test, expect } from "@playwright/test";
 import { createServer } from "node:http";

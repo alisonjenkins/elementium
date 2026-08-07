@@ -14,8 +14,14 @@ const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
 const chromiumPath = process.env.ELEMENTIUM_CHROMIUM;
 
 export default defineConfig({
-  testDir: "./tests/browser",
-  // Serial by default: these tests share one local SFU and spawn a publisher process each.
+  testDir: "./tests",
+  // The stack these tests need -- an SFU, a homeserver, and the service that lets a
+  // Matrix identity authenticate to the SFU -- is brought up here rather than being
+  // a step in a comment that everyone forgets exactly once. See tests/global-setup.ts.
+  globalSetup: "./tests/global-setup.ts",
+  globalTeardown: "./tests/global-teardown.ts",
+  // Serial by default: these tests share one SFU and homeserver, and spawn a
+  // publisher process each.
   workers: 1,
   fullyParallel: false,
   reporter: [["list"]],

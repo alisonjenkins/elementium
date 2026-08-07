@@ -35,6 +35,12 @@ secure context for insertable streams, which back livekit's E2EE worker, and
 
 ## Running it
 
+For tests, nothing: `pnpm exec playwright test` (or `just test-browser`) brings the
+stack up and takes it down again. If it was already running it is left alone, so a
+test run cannot destroy an environment someone was using.
+
+By hand:
+
 ```sh
 cd test-env
 docker compose up -d
@@ -80,6 +86,5 @@ why, so they are written down rather than rediscovered.
 
 ## What is not here yet
 
-The Elementium app itself still points at whatever homeserver its config names.
-Pointing it here — and driving further participants with Playwright — is the next
-step, and is what makes the two faults above reproducible on demand.
+The Elementium app still points at whatever homeserver its own config names, so it
+cannot yet meet these participants in a room. That is the next step.
