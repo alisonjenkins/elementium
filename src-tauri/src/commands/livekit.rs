@@ -18,6 +18,7 @@ use elementium_webrtc::livekit::room::{LiveKitRoom, RoomEvent};
 
 use super::LockExt;
 use super::e2ee::E2eeState;
+use super::media_devices::MediaState;
 
 /// Shared state holding active `LiveKit` rooms, managed by Tauri.
 #[derive(Clone)]
@@ -122,13 +123,61 @@ pub async fn livekit_connect(
 #[command]
 pub async fn livekit_publish_track(
     state: State<'_, LiveKitState>,
+    media_state: State<'_, MediaState>,
     room_id: String,
     kind: String,
     source: String,
 ) -> Result<(), String> {
     let room = get_room(&state, &room_id)?;
-    let mut room = room.lock().await;
-    Ok(room.publish_track(&kind, &source)?)
+    let media_tx = {
+        let mut room = room.lock().await;
+        room.publish_track(&kind, &source)?;
+        room.media_sender()
+    };
+    attach_capture_pipeline(&media_state, media_tx, &kind);
+    Ok(())
+}
+
+/// Point the running capture pipeline for `kind` at this room, so its encoded frames
+/// actually leave the machine.
+///
+/// A pipeline that is capturing but unattached is silent in exactly the way that is
+/// hardest to notice: the camera light is on, the local preview updates, the encoder logs
+/// frames, and the far end sees nothing. Logging both outcomes -- attached, and "no
+/// pipeline running" -- is deliberate, because "publish succeeded" alone cannot
+/// distinguish them.
+fn attach_capture_pipeline(
+    media_state: &MediaState,
+    media_tx: tokio::sync::mpsc::Sender<elementium_webrtc::engine::IoCommand>,
+    kind: &str,
+) {
+    let connection = match kind {
+        "audio" => media_state
+            .audio_capture
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|a| a.encode_tx.clone())),
+        "video" => media_state
+            .camera
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|c| c.encode_tx.clone())),
+        _ => None,
+    };
+
+    let Some(connection) = connection else {
+        tracing::warn!(
+            kind,
+            "published a track with no capture pipeline running; nothing will be sent \
+             until the pipeline starts and is attached"
+        );
+        return;
+    };
+
+    if let Ok(mut guard) = connection.lock() {
+        *guard = Some(media_tx);
+        tracing::info!(kind, "capture pipeline attached to the SFU room");
+    }
 }
 
 /// Disconnect from a `LiveKit` room.

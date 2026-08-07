@@ -19,7 +19,7 @@ use livekit_protocol::{
 use elementium_types::{CorrelationId, SdpType, SessionDescription};
 
 use crate::e2ee_io::EncryptionPolicy;
-use crate::engine::VideoFrameBuffer;
+use crate::engine::{IoCommand, VideoFrameBuffer};
 use crate::livekit::signaling::{SignalClient, SignalSender};
 use crate::livekit::transport::{Transport, TransportCommand, TransportEvent};
 use crate::peer_connection::PcEvent;
@@ -83,6 +83,15 @@ pub struct LiveKitRoom {
     video_cid: Option<String>,
     room_event_tx: mpsc::UnboundedSender<RoomEvent>,
     video_frames: VideoFrameBuffer,
+    /// Where the capture pipelines write encoded media for this room.
+    ///
+    /// The mic and camera threads speak [`IoCommand`], because they were written against
+    /// the direct-`WebRTC` engine; the SFU transport speaks [`TransportCommand`]. Without
+    /// something joining the two, a capture pipeline can run perfectly -- encoding,
+    /// logging frame counts, showing a local preview -- while nothing it produces ever
+    /// reaches the socket, which is exactly the shape of "the camera light is on but
+    /// nobody sees me".
+    media_tx: mpsc::Sender<IoCommand>,
     shutdown: bool,
     correlation_id: CorrelationId,
 }
@@ -212,6 +221,8 @@ impl LiveKitRoom {
             },
         );
 
+        let media_tx = spawn_media_forwarder(transport.cmd_tx.clone());
+
         let room = Self {
             room_id: room_id.clone(),
             room_name,
@@ -226,6 +237,7 @@ impl LiveKitRoom {
             video_cid: None,
             room_event_tx: room_event_tx.clone(),
             video_frames,
+            media_tx,
             shutdown: false,
             correlation_id,
         };
@@ -361,6 +373,16 @@ impl LiveKitRoom {
         Ok(())
     }
 
+    /// The channel a capture pipeline should write encoded media into to publish it.
+    ///
+    /// Handing out a sender rather than requiring callers to hold the room lock matters:
+    /// the mic produces a frame every 20ms and the camera one every ~16ms, and both run on
+    /// blocking threads that must not contend with signaling for the room's mutex.
+    #[must_use]
+    pub fn media_sender(&self) -> mpsc::Sender<IoCommand> {
+        self.media_tx.clone()
+    }
+
     /// Check if we already have a published video track.
     fn has_video_track(&self) -> bool {
         let video_type: i32 = TrackType::Video.into();
@@ -417,6 +439,69 @@ impl LiveKitRoom {
         self.transport.shutdown().await;
         self.signal_client.disconnect().await;
     }
+}
+
+/// Bridge the capture pipelines' [`IoCommand`] channel onto the transport's command
+/// channel, returning the sender to hand to those pipelines.
+///
+/// Both halves already existed and neither reached the other: the pipelines were written
+/// for the direct-`WebRTC` engine and are attached to it when a shim `PeerConnection`
+/// creates an offer, but an SFU call never goes through that code path. Encoded audio and
+/// video were therefore produced and dropped for the whole of every `LiveKit` call.
+///
+/// The counters are what makes the absence of this bridge visible next time: a publish
+/// that never sends logs nothing at all, whereas a stalled forwarder logs a rising
+/// `dropped` count.
+fn spawn_media_forwarder(cmd_tx: mpsc::Sender<TransportCommand>) -> mpsc::Sender<IoCommand> {
+    // Deep enough to absorb a scheduling hiccup in the transport loop (~5s of audio or
+    // ~4s of video), shallow enough that a genuinely stuck transport drops fresh media
+    // rather than playing out minutes of stale frames once it recovers.
+    let (media_tx, mut media_rx) = mpsc::channel::<IoCommand>(256);
+    let span = tracing::Span::current();
+
+    tokio::spawn(
+        async move {
+            let mut forwarded: u64 = 0;
+            let mut dropped: u64 = 0;
+
+            while let Some(cmd) = media_rx.recv().await {
+                let transport_cmd = match cmd {
+                    IoCommand::WriteAudio(data) => TransportCommand::WriteAudio(data),
+                    IoCommand::WriteVideo(data) => TransportCommand::WriteVideo(data),
+                    IoCommand::Shutdown => break,
+                };
+
+                // `try_send` rather than `send`: blocking here would apply backpressure all
+                // the way to the capture thread, which cannot pause a live microphone. If
+                // the transport is not keeping up, the honest outcome is a dropped frame
+                // and a counter that says so.
+                match cmd_tx.try_send(transport_cmd) {
+                    Ok(()) => {
+                        forwarded = forwarded.saturating_add(1);
+                        if forwarded == 1 || forwarded.is_multiple_of(500) {
+                            tracing::info!(forwarded, dropped, "capture media forwarded to SFU");
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped = dropped.saturating_add(1);
+                        if dropped.is_multiple_of(50) {
+                            tracing::warn!(
+                                forwarded,
+                                dropped,
+                                "transport command channel full, dropping captured media"
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+
+            tracing::info!(forwarded, dropped, "capture media forwarder ended");
+        }
+        .instrument(span),
+    );
+
+    media_tx
 }
 
 /// Send a room event to the Tauri layer, logging a structured tracing event
@@ -876,4 +961,74 @@ fn generate_room_id() -> String {
         .unwrap()
         .as_nanos();
     format!("lk-{t:x}")
+}
+
+#[cfg(test)]
+mod media_forwarder_tests {
+    use super::{IoCommand, TransportCommand, spawn_media_forwarder};
+    use elementium_types::PlaintextMedia;
+    use tokio::sync::mpsc;
+
+    /// Encoded media handed to the room must reach the transport unchanged, and as the
+    /// matching command variant.
+    ///
+    /// The bug this guards against was not a corrupted frame but an absent one: the
+    /// capture pipelines wrote into a channel nobody was reading, for the whole of every
+    /// SFU call. Nothing failed, so nothing was logged.
+    #[tokio::test]
+    async fn audio_and_video_reach_the_transport_as_matching_commands() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<TransportCommand>(8);
+        let media_tx = spawn_media_forwarder(cmd_tx);
+
+        media_tx
+            .send(IoCommand::WriteAudio(PlaintextMedia::from_encoder(vec![
+                1, 2, 3,
+            ])))
+            .await
+            .expect("forwarder is running");
+        media_tx
+            .send(IoCommand::WriteVideo(PlaintextMedia::from_encoder(vec![
+                4, 5,
+            ])))
+            .await
+            .expect("forwarder is running");
+
+        match cmd_rx.recv().await {
+            Some(TransportCommand::WriteAudio(data)) => assert_eq!(data.as_bytes(), &[1, 2, 3]),
+            other => panic!("expected WriteAudio, got {}", describe(other.as_ref())),
+        }
+        match cmd_rx.recv().await {
+            Some(TransportCommand::WriteVideo(data)) => assert_eq!(data.as_bytes(), &[4, 5]),
+            other => panic!("expected WriteVideo, got {}", describe(other.as_ref())),
+        }
+    }
+
+    /// A full transport channel must not block the capture thread: the frame is dropped
+    /// and the forwarder stays live for the next one. A microphone cannot be paused.
+    #[tokio::test]
+    async fn a_full_transport_channel_drops_frames_rather_than_stalling() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<TransportCommand>(1);
+        let media_tx = spawn_media_forwarder(cmd_tx);
+
+        for _ in 0..8_u8 {
+            media_tx
+                .send(IoCommand::WriteAudio(PlaintextMedia::from_encoder(vec![7])))
+                .await
+                .expect("forwarder stays live while the transport is congested");
+        }
+
+        assert!(
+            matches!(cmd_rx.recv().await, Some(TransportCommand::WriteAudio(_))),
+            "the frames that did fit must still arrive"
+        );
+    }
+
+    fn describe(cmd: Option<&TransportCommand>) -> &'static str {
+        match cmd {
+            Some(TransportCommand::WriteAudio(_)) => "WriteAudio",
+            Some(TransportCommand::WriteVideo(_)) => "WriteVideo",
+            Some(TransportCommand::Shutdown) => "Shutdown",
+            None => "channel closed",
+        }
+    }
 }
