@@ -401,6 +401,27 @@ pub fn get_video_frame(
     }
 }
 
+/// Write a preview frame to disk when `ELEMENTIUM_DUMP_PREVIEW` is set.
+///
+/// Settles a question that cannot be answered from either end alone: whether a corrupt
+/// self-view is corrupt in the pixels Rust produces, or only after they have crossed into
+/// the webview and been drawn to a canvas. The camera probe already shows the capture path
+/// clean, and the preview shows torn output; exactly one of the steps between them is
+/// responsible, and reasoning about which has not converged.
+///
+/// Raw RGBA with the geometry in the filename, because writing a PNG encoder here to
+/// inspect one frame is not worth it -- `ffmpeg -f rawvideo -pix_fmt rgba -s WxH` reads it.
+fn maybe_dump_preview(frame_count: u64, rgba: &[u8], width: u32, height: u32) {
+    if !frame_count.is_multiple_of(60) || std::env::var_os("ELEMENTIUM_DUMP_PREVIEW").is_none() {
+        return;
+    }
+    let path = format!("/tmp/elementium_preview_{frame_count}_{width}x{height}.rgba");
+    match std::fs::write(&path, rgba) {
+        Ok(()) => tracing::info!(path, width, height, bytes = rgba.len(), "preview frame dumped"),
+        Err(e) => tracing::warn!(path, reason = %e, "could not dump preview frame"),
+    }
+}
+
 /// How long a newly-subscribed peer may wait before it can decode anything.
 ///
 /// Short enough that joining a call feels immediate, long enough that the cost of
@@ -508,6 +529,7 @@ fn camera_pipeline_loop(
             // frame -- only the self-view is reduced.
             let preview = elementium_codec::halve_rgba(frame.width, frame.height, &frame.data)
                 .unwrap_or_else(|| (frame.data.clone(), frame.width, frame.height));
+            maybe_dump_preview(frame_count, &preview.0, preview.1, preview.2);
             if let Ok(mut buf) = video_frames.lock() {
                 buf.insert(
                     track_id.to_string(),

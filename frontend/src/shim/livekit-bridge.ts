@@ -12,6 +12,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { fetchFrame } from "../renderer/frame-fetcher";
 
+/**
+ * Fixed geometry for canvas-backed remote video.
+ *
+ * `captureStream` binds a track's frame size when it is called, so this cannot follow the
+ * incoming frames; frames of other sizes are letterboxed into it instead.
+ */
+const RENDER_WIDTH = 1280;
+const RENDER_HEIGHT = 720;
+
 // ─── Event types matching livekit-client ───
 
 export enum RoomEvent {
@@ -62,6 +71,7 @@ export class Track {
 
 export class RemoteTrack extends Track {
   private _canvas: HTMLCanvasElement | null = null;
+  private _scratch: HTMLCanvasElement | null = null;
   private _rendering = false;
   private _timerId: ReturnType<typeof setTimeout> | null = null;
 
@@ -70,10 +80,17 @@ export class RemoteTrack extends Track {
     const el = element || document.createElement("video");
 
     if (this.kind === TrackKind.Video) {
-      // Use canvas-backed rendering via elementium:// protocol
+      // Canvas-backed rendering, fed by the native decoder.
+      //
+      // The geometry is fixed here and never changed afterwards: `captureStream` binds
+      // the track's frame size at the moment it is called, and resizing the canvas after
+      // that leaves the track describing one size while the backing store holds another.
+      // Frames are then read at the wrong stride, which tears the picture into horizontal
+      // bands with rotated colour channels. Incoming frames of a different size are
+      // scaled into this one instead -- see `_renderLoop`.
       this._canvas = document.createElement("canvas");
-      this._canvas.width = 640;
-      this._canvas.height = 480;
+      this._canvas.width = RENDER_WIDTH;
+      this._canvas.height = RENDER_HEIGHT;
       this._rendering = true;
       this._renderLoop();
 
@@ -102,16 +119,45 @@ export class RemoteTrack extends Track {
 
     const frame = await fetchFrame(this.sid);
     if (frame && this._canvas) {
-      if (this._canvas.width !== frame.width || this._canvas.height !== frame.height) {
-        this._canvas.width = frame.width;
-        this._canvas.height = frame.height;
-      }
       const ctx = this._canvas.getContext("2d");
       if (ctx) {
+        // Copied out of the IPC buffer rather than viewed in place: the view starts at a
+        // byte offset, and ImageData is specified over the whole of the array it is
+        // given.
         const buf = new ArrayBuffer(frame.rgba.byteLength);
         new Uint8Array(buf).set(new Uint8Array(frame.rgba.buffer, frame.rgba.byteOffset, frame.rgba.byteLength));
         const imageData = new ImageData(new Uint8ClampedArray(buf), frame.width, frame.height);
-        ctx.putImageData(imageData, 0, 0);
+
+        if (frame.width === this._canvas.width && frame.height === this._canvas.height) {
+          ctx.putImageData(imageData, 0, 0);
+        } else {
+          // Scale through a scratch canvas, preserving aspect. Resizing this canvas is
+          // not an option -- see `attach`.
+          if (!this._scratch) this._scratch = document.createElement("canvas");
+          if (this._scratch.width !== frame.width || this._scratch.height !== frame.height) {
+            this._scratch.width = frame.width;
+            this._scratch.height = frame.height;
+          }
+          const sctx = this._scratch.getContext("2d");
+          if (sctx) {
+            sctx.putImageData(imageData, 0, 0);
+            const scale = Math.min(
+              this._canvas.width / frame.width,
+              this._canvas.height / frame.height,
+            );
+            const drawW = Math.round(frame.width * scale);
+            const drawH = Math.round(frame.height * scale);
+            ctx.fillStyle = "#000";
+            ctx.fillRect(0, 0, this._canvas.width, this._canvas.height);
+            ctx.drawImage(
+              this._scratch,
+              Math.round((this._canvas.width - drawW) / 2),
+              Math.round((this._canvas.height - drawH) / 2),
+              drawW,
+              drawH,
+            );
+          }
+        }
       }
     }
 
