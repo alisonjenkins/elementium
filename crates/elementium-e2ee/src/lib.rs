@@ -909,60 +909,13 @@ impl E2eeContext {
         participant: &str,
         kind: MediaKind,
     ) -> Result<Option<PlaintextMedia>, E2eeError> {
+        let FrameParts {
+            header,
+            ciphertext,
+            iv,
+            key_index,
+        } = split_frame(frame.as_bytes(), kind)?;
         let frame = frame.as_bytes();
-        // Minimum frame size: header + at least a bare GCM tag + IV + 2-byte trailer.
-        let min_size = TAG_SIZE
-            .saturating_add(IV_SIZE)
-            .saturating_add(TRAILER_SIZE);
-        if frame.len() < min_size {
-            return Err(E2eeError::FrameTooShort(frame.len()));
-        }
-
-        // Trailer is `[IV_LENGTH][key_index]`. The key index is the sender's unreduced
-        // rotation counter, so it wraps into the ring exactly as a local index does; see
-        // [`KeyIndex`]. `IV_LENGTH` is validated strictly, because it is a *length* and
-        // trusting an attacker-supplied one would move the IV window.
-        let trailer_start = frame
-            .len()
-            .checked_sub(TRAILER_SIZE)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let trailer = frame
-            .get(trailer_start..)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let raw_iv_len = *trailer
-            .first()
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        if raw_iv_len != IV_SIZE_U8 {
-            return Err(E2eeError::UnsupportedIvLength(raw_iv_len));
-        }
-        let raw_key_index = *trailer
-            .get(1)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let key_index = KeyIndex::new(raw_key_index);
-
-        // Extract IV (12 bytes before the trailer). All offsets are re-derived with
-        // checked arithmetic rather than relying solely on the length check above,
-        // so a future refactor of `min_size` can't silently reintroduce a panic.
-        let iv_start = trailer_start
-            .checked_sub(IV_SIZE)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let iv = frame
-            .get(iv_start..trailer_start)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-
-        // The rest is [header][ciphertext]
-        let header_and_ciphertext = frame
-            .get(..iv_start)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-
-        // Determine unencrypted header size from the frame beginning
-        let header_size = unencrypted_header_size(header_and_ciphertext, kind);
-        let header = header_and_ciphertext
-            .get(..header_size)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
-        let ciphertext = header_and_ciphertext
-            .get(header_size..)
-            .ok_or(E2eeError::FrameTooShort(frame.len()))?;
 
         let inner = self.lock_read()?;
         let options = inner.options.clone();
@@ -1059,6 +1012,65 @@ impl E2eeContext {
             "participant={participant}, key_index={key_index}"
         )))
     }
+}
+
+/// An inbound frame taken apart into the four pieces decryption needs.
+struct FrameParts<'a> {
+    /// Travels in the clear, but is authenticated as associated data.
+    header: &'a [u8],
+    ciphertext: &'a [u8],
+    iv: &'a [u8],
+    key_index: KeyIndex,
+}
+
+/// Split an inbound frame into `[header][ciphertext][IV][IV_LENGTH][key_index]`.
+///
+/// Every offset is re-derived with checked arithmetic rather than relying on the length
+/// check alone, so a later change to `min_size` cannot silently reintroduce a panic.
+fn split_frame(frame: &[u8], kind: MediaKind) -> Result<FrameParts<'_>, E2eeError> {
+    let too_short = || E2eeError::FrameTooShort(frame.len());
+
+    // Minimum frame size: header + at least a bare GCM tag + IV + 2-byte trailer.
+    let min_size = TAG_SIZE
+        .saturating_add(IV_SIZE)
+        .saturating_add(TRAILER_SIZE);
+    if frame.len() < min_size {
+        return Err(too_short());
+    }
+
+    // Trailer is `[IV_LENGTH][key_index]`. The key index is the sender's unreduced rotation
+    // counter, so it wraps into the ring exactly as a local index does; see [`KeyIndex`].
+    // `IV_LENGTH` is validated strictly, because it is a *length* and trusting an
+    // attacker-supplied one would move the IV window.
+    let trailer_start = frame
+        .len()
+        .checked_sub(TRAILER_SIZE)
+        .ok_or_else(too_short)?;
+    let trailer = frame.get(trailer_start..).ok_or_else(too_short)?;
+    let raw_iv_len = *trailer.first().ok_or_else(too_short)?;
+    if raw_iv_len != IV_SIZE_U8 {
+        return Err(E2eeError::UnsupportedIvLength(raw_iv_len));
+    }
+    let key_index = KeyIndex::new(*trailer.get(1).ok_or_else(too_short)?);
+
+    let iv_start = trailer_start.checked_sub(IV_SIZE).ok_or_else(too_short)?;
+    let iv = frame.get(iv_start..trailer_start).ok_or_else(too_short)?;
+
+    let header_and_ciphertext = frame.get(..iv_start).ok_or_else(too_short)?;
+    let header_size = unencrypted_header_size(header_and_ciphertext, kind);
+    let header = header_and_ciphertext
+        .get(..header_size)
+        .ok_or_else(too_short)?;
+    let ciphertext = header_and_ciphertext
+        .get(header_size..)
+        .ok_or_else(too_short)?;
+
+    Ok(FrameParts {
+        header,
+        ciphertext,
+        iv,
+        key_index,
+    })
 }
 
 /// Build a decrypted frame's output buffer: the unencrypted `header` followed by `plaintext`.
