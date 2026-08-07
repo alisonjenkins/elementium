@@ -88,6 +88,12 @@ export default async function globalSetup(): Promise<void> {
     console.log("[test-env] stack up");
   }
 
+  // Rooms accumulate otherwise: every provision creates one and every call test creates
+  // another, so a few runs leave a client showing dozens of identically named rooms. That
+  // costs nothing on the server and makes anything observed by looking at the client much
+  // harder to read.
+  await run("./cleanup-rooms.sh", [], { cwd: TEST_ENV });
+
   // Participants and a room, regenerated every run. Cheap, and it keeps one test's
   // membership changes from leaking into the next -- which matters here more than
   // usual, since the faults being chased are *about* membership changes.

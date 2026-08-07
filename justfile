@@ -37,7 +37,9 @@ call-peers:
 #
 # The other half of `just call-peers`: that puts real participants in a call, this puts
 # Elementium in the same one without anyone clicking. Runs on a virtual display, so no
-# window appears.
+# window appears -- GDK_BACKEND=x11 and an empty WAYLAND_DISPLAY are what make that true:
+# GTK prefers Wayland when WAYLAND_DISPLAY is set and ignores the Xvfb display entirely, so
+# without them the window opens on the real desktop.
 #
 # THIS USES THE CAMERA AND MICROPHONE. Element Call acquires both in its lobby, before
 # any control can decline them, so joining at all opens the webcam -- the light comes on.
@@ -73,8 +75,16 @@ app-join:
         XDG_DATA_HOME="$PWD/target/app-join-profile/data" \
         XDG_CONFIG_HOME="$PWD/target/app-join-profile/config" \
         XDG_CACHE_HOME="$PWD/target/app-join-profile/cache" \
+        GDK_BACKEND=x11 WAYLAND_DISPLAY= \
         nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
             cargo tauri dev
+
+# Leave and forget every room the test participants are in.
+#
+# Each provision creates a room and each call test creates another, so they pile up. The
+# Playwright suite does this for itself before each run; this is for clearing up by hand.
+test-env-clean:
+    cd test-env && ./cleanup-rooms.sh
 
 # Stop the local MatrixRTC stack.
 test-env-down:
