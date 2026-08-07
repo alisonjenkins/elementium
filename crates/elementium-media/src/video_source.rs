@@ -19,10 +19,16 @@ use crate::pipewire_capture::PipewireCapturer;
 
 /// How long a source has to produce its first frame.
 ///
-/// Covers a round trip with the daemon, the device settling, and a cold USB camera starting
-/// its sensor. Short enough that falling back to `V4L2` still feels like starting rather
-/// than hanging.
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+/// Generous on purpose. A camera does not start when the format is agreed: an OBSBOT Tiny 2
+/// on this machine negotiates in 170ms and then takes a further 1.9 seconds to deliver
+/// anything, because the sensor has to wake, expose and settle. A tighter bound would give
+/// up on a working camera and fall back for no reason, and the fallback is the worse path
+/// -- it cannot be told which format to produce.
+///
+/// The cost of being generous is bounded: a stream that has actually failed reports an
+/// error and is abandoned immediately, so this timeout is only ever waited out by a source
+/// that is silent without saying why.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A running video capture, from whichever backend worked.
 pub enum VideoSource {
