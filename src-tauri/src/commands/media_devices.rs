@@ -614,10 +614,21 @@ fn camera_pipeline_loop(
 ) {
     // Prefers PipeWire, falls back to V4L2. On a desktop where PipeWire holds the camera,
     // V4L2 cannot work at all -- see `VideoSource`.
+    // Which format is worth asking the camera for depends on where the frames will be
+    // encoded, and the answer is not a small difference: MJPEG is the most expensive
+    // format on offer when the CPU decodes it and the cheapest when the GPU does. The
+    // requested geometry is used because negotiation has to happen before the camera has
+    // reported its own -- it decides only whether a hardware encoder is size-capable.
+    let target = elementium_codec::EncodeTarget::negotiated(
+        active_codec.get(),
+        req_width.unwrap_or(1280),
+        req_height.unwrap_or(720),
+    );
     let capturer = match elementium_media::video_source::VideoSource::start_at(
         req_width,
         req_height,
         req_fps,
+        target,
     ) {
         Ok(c) => c,
         Err(e) => {

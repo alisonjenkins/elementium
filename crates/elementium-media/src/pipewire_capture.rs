@@ -324,11 +324,124 @@ fn resample_chroma(
     Some(out)
 }
 
+/// Turn a planar 4:2:0 buffer into a frame, without converting any colour.
+///
+/// One copy, out of the driver's buffer and into a frame that adopts it — the same single
+/// copy every format pays to escape the race on mapped memory (see the process callback),
+/// and nothing on top of it. No colour conversion happens because none is needed: these
+/// layouts already carry the 4:2:0 subsampling an encoder wants, which is the entire reason
+/// they are worth asking a camera for.
+///
+/// The output is tightly packed rather than carrying the source's row padding. Since a copy
+/// is unavoidable, dropping the padding costs nothing and gives every consumer one less
+/// thing to get right.
+///
+/// Trailing padding on the final row is not required. Drivers size buffers exactly as often
+/// as they pad them, and demanding bytes that carry no samples would reject perfectly good
+/// frames.
+///
+/// Returns `None` if the buffer is too small for the claimed geometry, rather than
+/// producing a frame that is partly whatever was in memory.
+#[must_use]
+pub fn planar_to_i420(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    format: PlanarFormat,
+) -> Option<I420Frame> {
+    if width == 0 || height == 0 || stride < width {
+        return None;
+    }
+    let (chroma_width, chroma_height) = (width.checked_div(2)?, height.checked_div(2)?);
+    let luma_bytes = width.checked_mul(height)?;
+    let chroma_bytes = chroma_width.checked_mul(chroma_height)?;
+    let mut out = Vec::with_capacity(luma_bytes.checked_add(chroma_bytes.checked_mul(2)?)?);
+
+    // Luma is identical in both layouts.
+    for row in 0..height {
+        let start = stride.checked_mul(row)?;
+        out.extend_from_slice(src.get(start..start.checked_add(width)?)?);
+    }
+
+    // Past the luma plane, including whatever padding followed its last row.
+    let chroma = src.get(stride.checked_mul(height)?..)?;
+    match format {
+        PlanarFormat::I420 => {
+            // U then V, each a half-width plane at half the luma stride.
+            let uv_stride = stride.checked_div(2)?;
+            for plane in 0..2_usize {
+                let plane_start = plane.checked_mul(uv_stride.checked_mul(chroma_height)?)?;
+                for row in 0..chroma_height {
+                    let start = plane_start.checked_add(uv_stride.checked_mul(row)?)?;
+                    out.extend_from_slice(
+                        chroma.get(start..start.checked_add(chroma_width)?)?,
+                    );
+                }
+            }
+        }
+        PlanarFormat::Nv12 => {
+            // One interleaved plane, `U V U V ...`, at the luma stride. The V samples are
+            // gathered separately and appended, since I420 wants them as a whole plane.
+            let mut v_plane = Vec::with_capacity(chroma_bytes);
+            for row in 0..chroma_height {
+                let start = stride.checked_mul(row)?;
+                let pairs = chroma
+                    .get(start..start.checked_add(chroma_width.checked_mul(2)?)?)?
+                    .chunks_exact(2);
+                for pair in pairs {
+                    out.push(*pair.first()?);
+                    v_plane.push(*pair.get(1)?);
+                }
+            }
+            out.append(&mut v_plane);
+        }
+    }
+
+    I420Frame::from_padded(
+        u32::try_from(width).ok()?,
+        u32::try_from(height).ok()?,
+        out,
+        width,
+        chroma_width,
+        0,
+    )
+}
+
+/// A planar YUV 4:2:0 layout: already the subsampling every encoder wants.
+///
+/// Kept apart from [`SourceFormat`] because the difference is not cosmetic. Those layouts
+/// need a colour conversion touching every pixel; these need at most a chroma
+/// de-interleave, and I420 needs nothing at all. Sharing one enum would put the two on the
+/// same footing and lose exactly the distinction that makes them worth asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanarFormat {
+    /// Three separate planes: Y, then U, then V.
+    I420,
+    /// A luma plane, then one plane of interleaved U and V.
+    Nv12,
+}
+
+impl PlanarFormat {
+    /// Map a `libspa` video format onto a planar layout, or `None` if it is not one.
+    #[must_use]
+    pub const fn from_spa(format: libspa::param::video::VideoFormat) -> Option<Self> {
+        use libspa::param::video::VideoFormat as F;
+        match format {
+            F::I420 => Some(Self::I420),
+            F::NV12 => Some(Self::Nv12),
+            _ => None,
+        }
+    }
+}
+
 /// Negotiated geometry, shared between the format callback and the frame callback.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Encoding {
     /// Uncompressed pixels in a layout `SourceFormat` describes.
     Raw(SourceFormat),
+    /// Planar YUV 4:2:0, which reaches the encoder without a colour conversion.
+    Planar(PlanarFormat),
     /// Motion JPEG: each buffer is a complete JPEG image.
     ///
     /// What a UVC webcam offers at higher resolutions and frame rates -- often the *only*
@@ -404,10 +517,15 @@ impl PipewireCapturer {
     /// unreachable. A node that exists but never produces frames is *not* an error here —
     /// it surfaces as no frames arriving, which the caller can time out on.
     pub fn start(node_id: u32) -> Result<Self, PipewireError> {
-        Self::start_at(node_id, DEFAULT_CAPTURE_FPS)
+        Self::start_at(
+            node_id,
+            DEFAULT_CAPTURE_FPS,
+            elementium_codec::EncodeTarget::software(),
+        )
     }
 
-    /// Connect to `node_id`, asking for `target_fps` frames per second.
+    /// Connect to `node_id`, asking for `target_fps` frames per second in whichever format
+    /// suits `target` best.
     ///
     /// The rate is requested, not enforced: a source may offer only a fixed rate, and one
     /// that offers more will be asked for this and may still deliver more. Frames arriving
@@ -415,10 +533,21 @@ impl PipewireCapturer {
     /// largest cost on this path, and decoding a frame nothing will consume is the most
     /// expensive way to do nothing.
     ///
+    /// `target` decides the format preference, and it genuinely changes the answer rather
+    /// than nudging it. Encoding in software, MJPEG is the most expensive format the camera
+    /// offers, because every frame costs a full JPEG decode on the CPU; encoding on a GPU
+    /// that decodes JPEG itself, it is the cheapest, because the compressed bytes go
+    /// straight to the hardware and the CPU never sees a pixel. Capture cannot make that
+    /// choice without knowing where the frames are going.
+    ///
     /// # Errors
     ///
     /// As [`PipewireCapturer::start`].
-    pub fn start_at(node_id: u32, target_fps: u32) -> Result<Self, PipewireError> {
+    pub fn start_at(
+        node_id: u32,
+        target_fps: u32,
+        target: elementium_codec::EncodeTarget,
+    ) -> Result<Self, PipewireError> {
         let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let negotiated = Arc::new(Mutex::new(Negotiated::default()));
@@ -431,6 +560,7 @@ impl PipewireCapturer {
                 run_stream(
                     node_id,
                     target_fps,
+                    target,
                     &frame_tx,
                     stop_rx,
                     &thread_negotiated,
@@ -478,6 +608,7 @@ impl Drop for PipewireCapturer {
 fn run_stream(
     node_id: u32,
     target_fps: u32,
+    target: elementium_codec::EncodeTarget,
     frame_tx: &mpsc::SyncSender<I420Frame>,
     stop_rx: mpsc::Receiver<()>,
     negotiated: &Arc<Mutex<Negotiated>>,
@@ -516,7 +647,7 @@ fn run_stream(
         }
     };
 
-    if let Err(e) = attach_and_connect(&stream, node_id, target_fps, negotiated, frame_tx) {
+    if let Err(e) = attach_and_connect(&stream, node_id, target_fps, target, negotiated, frame_tx) {
         let _ = ready_tx.send(Err(e));
         return;
     }
@@ -533,6 +664,7 @@ fn attach_and_connect(
     stream: &pipewire::stream::StreamRc,
     node_id: u32,
     target_fps: u32,
+    target: elementium_codec::EncodeTarget,
     negotiated: &Arc<Mutex<Negotiated>>,
     frame_tx: &mpsc::SyncSender<I420Frame>,
 ) -> Result<(), String> {
@@ -580,7 +712,15 @@ fn attach_and_connect(
             let encoding = if subtype == Some(libspa::param::format::MediaSubtype::Mjpg.as_raw()) {
                 Encoding::Mjpeg
             } else {
-                SourceFormat::from_spa(info.format()).map_or(Encoding::Unsupported, Encoding::Raw)
+                // Planar first: I420 and NV12 also parse as raw layouts, and treating them
+                // as such would route frames through an RGBA conversion they do not need.
+                PlanarFormat::from_spa(info.format()).map_or_else(
+                    || {
+                        SourceFormat::from_spa(info.format())
+                            .map_or(Encoding::Unsupported, Encoding::Raw)
+                    },
+                    Encoding::Planar,
+                )
             };
             if encoding == Encoding::Unsupported {
                 tracing::error!(
@@ -620,7 +760,7 @@ fn attach_and_connect(
             let size = usize::try_from(data.chunk().size()).unwrap_or(0);
             let Some(mapped) = data.data() else { return };
 
-            // Snapshot the buffer before decoding it.
+            // Snapshot the buffer before *decoding* it.
             //
             // `data.data()` is memory the camera's driver writes into. Decoding straight
             // out of it means reading, over several milliseconds, from a region another
@@ -633,10 +773,21 @@ fn attach_and_connect(
             // establish; reading a buffer another writer owns is a race whether or not it
             // has been observed to lose. The copy is a few hundred KB for MJPEG against a
             // multi-millisecond decode, so it costs nothing worth measuring.
+            //
+            // The planar layouts are the exception, and deliberately so. Their conversion
+            // is itself a single sequential pass that reads each byte once and then owns
+            // the result -- exactly what the snapshot does -- so taking a snapshot first
+            // would copy a megabyte and a half in order to copy it again, for a race
+            // window of precisely the same shape. They read the mapped buffer directly.
             let copy_len = if size > 0 { size.min(mapped.len()) } else { mapped.len() };
-            snapshot.clear();
-            snapshot.extend_from_slice(mapped.get(..copy_len).unwrap_or(mapped));
-            let bytes: &[u8] = &snapshot;
+            let source: &[u8] = if matches!(n.encoding, Encoding::Planar(_)) {
+                mapped.get(..copy_len).unwrap_or(mapped)
+            } else {
+                snapshot.clear();
+                snapshot.extend_from_slice(mapped.get(..copy_len).unwrap_or(mapped));
+                &snapshot
+            };
+            let bytes: &[u8] = source;
 
             let width = usize::try_from(n.width).unwrap_or(0);
             let height = usize::try_from(n.height).unwrap_or(0);
@@ -648,6 +799,10 @@ fn attach_and_connect(
             let decode_started = std::time::Instant::now();
             let converted = match n.encoding {
                 Encoding::Mjpeg => decode_mjpeg_to_i420(bytes),
+                Encoding::Planar(format) => {
+                    let stride = if stride == 0 { width } else { stride };
+                    planar_to_i420(bytes, width, height, stride, format)
+                }
                 Encoding::Raw(format) => {
                     let stride = if stride == 0 {
                         width.saturating_mul(format.bytes_per_pixel())
@@ -694,7 +849,7 @@ fn attach_and_connect(
         })
         .register();
 
-    let mut params = [format_param(target_fps)];
+    let mut params = format_params(target_fps, target);
     let mut param_refs: Vec<&libspa::pod::Pod> = params
         .iter_mut()
         .filter_map(|p| libspa::pod::Pod::from_bytes(p))
@@ -702,7 +857,7 @@ fn attach_and_connect(
     if param_refs.is_empty() {
         // Connecting with no constraint lets the source pick anything at all, and there
         // would be no way to tell that had happened from the frames alone.
-        return Err("could not build the video format parameter".to_owned());
+        return Err("could not build the video format parameters".to_owned());
     }
 
     stream
@@ -746,13 +901,53 @@ fn run_until_stopped(
     tracing::info!(node_id, "PipeWire capture loop stopped");
 }
 
-/// The format we ask for: raw video in any layout we can convert.
+/// The `libspa` video format a capture format is offered as, if it is a raw layout.
 ///
-/// Offering several and letting `PipeWire` choose is deliberate — a source that cannot
-/// produce our first choice would otherwise fail to negotiate at all, and conversion is
-/// cheap next to not having a camera.
-fn format_param(target_fps: u32) -> Vec<u8> {
-    use libspa::pod::{object, property, Value};
+/// `None` for MJPEG, which is not a raw layout at all — it is a different media subtype,
+/// and offering it means building a different kind of parameter.
+const fn spa_video_format(
+    format: elementium_codec::CaptureFormat,
+) -> Option<libspa::param::video::VideoFormat> {
+    use elementium_codec::CaptureFormat as C;
+    use libspa::param::video::VideoFormat as F;
+    match format {
+        C::Mjpeg => None,
+        C::I420 => Some(F::I420),
+        C::Nv12 => Some(F::NV12),
+        C::Yuy2 => Some(F::YUY2),
+        C::Rgb => Some(F::RGB),
+        C::Bgr => Some(F::BGR),
+        C::Rgbx => Some(F::RGBx),
+        C::Bgrx => Some(F::BGRx),
+    }
+}
+
+/// Every format we will accept, best first for the encoder the frames are headed to.
+///
+/// One parameter per format rather than one parameter listing them all. `PipeWire` takes
+/// the first that the source can satisfy, so separate parameters are what make the
+/// preference order actually mean something — a single parameter with an enumerated list
+/// lets the source pick from it on its own terms, which is how a camera offering both
+/// MJPEG and YUY2 can hand back whichever it prefers regardless of which costs us more.
+///
+/// Every format is still offered. A camera that cannot produce the first choice at the
+/// requested size and rate must be able to fall through to something, and a working call
+/// in a worse format beats no camera at all.
+fn format_params(target_fps: u32, target: elementium_codec::EncodeTarget) -> Vec<Vec<u8>> {
+    elementium_codec::capture_format::preference(target)
+        .into_iter()
+        .map(|format| {
+            spa_video_format(format).map_or_else(
+                || mjpeg_format_param(target_fps),
+                |raw| raw_format_param(target_fps, raw),
+            )
+        })
+        .collect()
+}
+
+/// Ask for one raw pixel layout.
+fn raw_format_param(target_fps: u32, format: libspa::param::video::VideoFormat) -> Vec<u8> {
+    use libspa::pod::{object, property};
     let obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
         libspa::param::ParamType::EnumFormat,
@@ -768,21 +963,18 @@ fn format_param(target_fps: u32) -> Vec<u8> {
         ),
         property!(
             libspa::param::format::FormatProperties::VideoFormat,
-            Choice,
-            Enum,
             Id,
-            libspa::param::video::VideoFormat::RGBx,
-            libspa::param::video::VideoFormat::BGRx,
-            libspa::param::video::VideoFormat::RGBA,
-            libspa::param::video::VideoFormat::BGRA,
-            libspa::param::video::VideoFormat::RGB,
-            libspa::param::video::VideoFormat::BGR,
-            libspa::param::video::VideoFormat::YUY2
+            format
         ),
         // Size and framerate are not optional in practice: without them the source
         // fixates a format whose pixel layout comes back as `Unknown`, and every frame is
         // then dropped for want of a conversion. Offered as wide ranges so the source
         // picks whatever it natively supports.
+        //
+        // They also do the work of ruling out formats the link cannot carry. An
+        // uncompressed 720p60 stream is 110 MB/s and will not fit down USB 2.0; a camera
+        // advertises each format only at the rates it can sustain, so an infeasible one
+        // simply fails to match here rather than needing to be predicted.
         property!(
             libspa::param::format::FormatProperties::VideoSize,
             Choice,
@@ -802,9 +994,55 @@ fn format_param(target_fps: u32) -> Vec<u8> {
             libspa::utils::Fraction { num: target_fps, denom: 1 }
         ),
     };
+    serialize(obj)
+}
+
+/// Ask for MJPEG, which is a media subtype rather than a pixel layout.
+///
+/// No `VideoFormat` property: there is no pixel layout to state, and including one makes
+/// the parameter fail to match a camera that would otherwise have satisfied it.
+fn mjpeg_format_param(target_fps: u32) -> Vec<u8> {
+    use libspa::pod::{object, property};
+    let obj = object! {
+        libspa::utils::SpaTypes::ObjectParamFormat,
+        libspa::param::ParamType::EnumFormat,
+        property!(
+            libspa::param::format::FormatProperties::MediaType,
+            Id,
+            libspa::param::format::MediaType::Video
+        ),
+        property!(
+            libspa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            libspa::param::format::MediaSubtype::Mjpg
+        ),
+        property!(
+            libspa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            libspa::utils::Rectangle { width: 1280, height: 720 },
+            libspa::utils::Rectangle { width: 160, height: 120 },
+            libspa::utils::Rectangle { width: 4096, height: 4096 }
+        ),
+        property!(
+            libspa::param::format::FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            libspa::utils::Fraction { num: target_fps, denom: 1 },
+            libspa::utils::Fraction { num: 1, denom: 1 },
+            libspa::utils::Fraction { num: target_fps, denom: 1 }
+        ),
+    };
+    serialize(obj)
+}
+
+/// Serialise a format object into the bytes `PipeWire` takes, empty if it cannot be built.
+fn serialize(obj: libspa::pod::Object) -> Vec<u8> {
     libspa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
-        &Value::Object(obj),
+        &libspa::pod::Value::Object(obj),
     )
     .map(|(cursor, _)| cursor.into_inner())
     .unwrap_or_default()
@@ -818,7 +1056,116 @@ fn format_param(target_fps: u32) -> Vec<u8> {
     clippy::panic
 )]
 mod tests {
-    use super::{to_rgba, SourceFormat};
+    use super::{PlanarFormat, SourceFormat, planar_to_i420, to_rgba};
+
+    /// Build a padded planar buffer whose every sample is identifiable, so a plane landing
+    /// in the wrong place is visible rather than merely plausible.
+    ///
+    /// Luma counts up from 0, U is 200-something and V is 100-something. Swapping the
+    /// chroma planes -- the classic fault here, and one that survives every size check --
+    /// changes the picture's colour and nothing else, so the values have to distinguish
+    /// them.
+    fn planar_source(width: usize, height: usize, stride: usize, format: PlanarFormat) -> Vec<u8> {
+        let mut buffer = vec![0_u8; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                buffer[y * stride + x] = u8::try_from((y * width + x) % 100).unwrap_or(0);
+            }
+        }
+        let (cw, ch) = (width / 2, height / 2);
+        match format {
+            PlanarFormat::I420 => {
+                let uv_stride = stride / 2;
+                let mut u = vec![0_u8; uv_stride * ch];
+                let mut v = vec![0_u8; uv_stride * ch];
+                for y in 0..ch {
+                    for x in 0..cw {
+                        u[y * uv_stride + x] = u8::try_from(200 + (y * cw + x) % 50).unwrap_or(0);
+                        v[y * uv_stride + x] = u8::try_from(100 + (y * cw + x) % 50).unwrap_or(0);
+                    }
+                }
+                buffer.extend_from_slice(&u);
+                buffer.extend_from_slice(&v);
+            }
+            PlanarFormat::Nv12 => {
+                let mut uv = vec![0_u8; stride * ch];
+                for y in 0..ch {
+                    for x in 0..cw {
+                        uv[y * stride + x * 2] = u8::try_from(200 + (y * cw + x) % 50).unwrap_or(0);
+                        uv[y * stride + x * 2 + 1] =
+                            u8::try_from(100 + (y * cw + x) % 50).unwrap_or(0);
+                    }
+                }
+                buffer.extend_from_slice(&uv);
+            }
+        }
+        buffer
+    }
+
+    /// I420 from the camera is already what the encoder reads, so the only work is getting
+    /// it out of the driver's buffer -- no colour conversion, and one copy.
+    ///
+    /// The source is padded (stride 16 for 8 pixels) and the result is not, which is the
+    /// case a converter assuming a tight source gets wrong: it reads across row boundaries
+    /// and shears the picture progressively down the frame.
+    #[test]
+    fn i420_arrives_without_conversion() {
+        let (w, h, stride) = (8_usize, 4_usize, 16_usize);
+        let src = planar_source(w, h, stride, PlanarFormat::I420);
+        let frame = planar_to_i420(&src, w, h, stride, PlanarFormat::I420).expect("converts");
+
+        assert_eq!((frame.width(), frame.height()), (8, 4));
+        assert_eq!(frame.y_stride(), w, "the output is tightly packed");
+        assert_eq!(frame.uv_stride(), w / 2);
+        assert_eq!(frame.y()[w], 8, "second luma row misplaced");
+        assert_eq!(frame.u()[0], 200);
+        assert_eq!(frame.v()[0], 100, "chroma planes are the wrong way round");
+    }
+
+    /// NV12 needs its interleaved chroma split, and nothing else: the luma plane is
+    /// identical in both layouts and must not be touched.
+    #[test]
+    fn nv12_chroma_is_separated_and_luma_is_left_alone() {
+        let (w, h, stride) = (8_usize, 4_usize, 16_usize);
+        let src = planar_source(w, h, stride, PlanarFormat::Nv12);
+        let frame = planar_to_i420(&src, w, h, stride, PlanarFormat::Nv12).expect("converts");
+
+        assert_eq!(frame.y()[..w], src[..w], "luma must pass through untouched");
+        assert_eq!(frame.y()[w], 8, "second luma row misplaced");
+        for x in 0..w / 2 {
+            assert_eq!(frame.u()[x], u8::try_from(200 + x).unwrap_or(0));
+            assert_eq!(frame.v()[x], u8::try_from(100 + x).unwrap_or(0));
+        }
+    }
+
+    /// A buffer too small for its claimed geometry must be refused. Accepting it would
+    /// produce a frame whose lower rows are whatever happened to be in memory.
+    #[test]
+    fn a_short_planar_buffer_is_refused() {
+        let (w, h, stride) = (8_usize, 4_usize, 16_usize);
+        for format in [PlanarFormat::I420, PlanarFormat::Nv12] {
+            let src = planar_source(w, h, stride, format);
+            // A whole row short, so real samples are missing rather than only the padding
+            // that follows the last one -- which a driver is free not to send.
+            let truncated = &src[..src.len() - stride];
+            assert!(
+                planar_to_i420(truncated, w, h, stride, format).is_none(),
+                "{format:?}: a short buffer produced a frame"
+            );
+        }
+    }
+
+    /// The layouts are distinguished by what they mean, not only by their names: reading
+    /// NV12 as I420 finds interleaved chroma where a whole U plane is expected, which
+    /// tints the picture and passes every size check.
+    #[test]
+    fn the_two_planar_layouts_are_not_interchangeable() {
+        let (w, h, stride) = (8_usize, 4_usize, 16_usize);
+        let src = planar_source(w, h, stride, PlanarFormat::Nv12);
+        let correct = planar_to_i420(&src, w, h, stride, PlanarFormat::Nv12).expect("converts");
+        let misread = planar_to_i420(&src, w, h, stride, PlanarFormat::I420).expect("converts");
+        assert_ne!(correct.u(), misread.u(), "the layouts must not be conflated");
+    }
 
     #[test]
     fn bytes_per_pixel_matches_the_layout() {

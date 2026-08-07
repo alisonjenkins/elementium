@@ -42,7 +42,12 @@ impl VideoSource {
     /// camera did not start" without saying what each path objected to is the exact
     /// unhelpfulness this module exists to remove.
     pub fn start(width: Option<u32>, height: Option<u32>) -> Result<Self, String> {
-        Self::start_at(width, height, crate::pipewire_capture::DEFAULT_CAPTURE_FPS)
+        Self::start_at(
+            width,
+            height,
+            crate::pipewire_capture::DEFAULT_CAPTURE_FPS,
+            elementium_codec::EncodeTarget::software(),
+        )
     }
 
     /// Start capturing at a requested frame rate.
@@ -54,6 +59,10 @@ impl VideoSource {
     /// 30 suits a video call. Streaming and screen capture want 60 or more, which is why
     /// this exists rather than a constant.
     ///
+    /// `target` says which encoder the frames are destined for, which decides the capture
+    /// format worth asking for -- see [`crate::pipewire_capture::PipewireCapturer::start_at`].
+    /// It reaches only the `PipeWire` path; the `V4L2` fallback takes what the device gives.
+    ///
     /// # Errors
     ///
     /// As [`VideoSource::start`].
@@ -61,8 +70,9 @@ impl VideoSource {
         width: Option<u32>,
         height: Option<u32>,
         target_fps: u32,
+        target: elementium_codec::EncodeTarget,
     ) -> Result<Self, String> {
-        let pipewire_err = match start_pipewire(target_fps) {
+        let pipewire_err = match start_pipewire(target_fps, target) {
             Ok(source) => return Ok(source),
             Err(e) => e,
         };
@@ -125,7 +135,10 @@ impl VideoSource {
 /// layouts we cannot decode does exactly that -- so "connected" is not enough to call it
 /// working. Each candidate is given until [`NEGOTIATION_TIMEOUT`] to report a size, and the
 /// next is tried otherwise.
-fn start_pipewire(target_fps: u32) -> Result<VideoSource, String> {
+fn start_pipewire(
+    target_fps: u32,
+    target: elementium_codec::EncodeTarget,
+) -> Result<VideoSource, String> {
     let sources = crate::pipewire_nodes::list_video_sources().map_err(|e| e.to_string())?;
     if sources.is_empty() {
         return Err("PipeWire offered no video sources".to_owned());
@@ -133,7 +146,7 @@ fn start_pipewire(target_fps: u32) -> Result<VideoSource, String> {
 
     let mut last_error = String::new();
     for source in &sources {
-        match PipewireCapturer::start_at(source.node_id, target_fps) {
+        match PipewireCapturer::start_at(source.node_id, target_fps, target) {
             Ok(capturer) => {
                 let deadline = Instant::now().checked_add(NEGOTIATION_TIMEOUT);
                 while deadline.is_some_and(|d| Instant::now() < d) {
