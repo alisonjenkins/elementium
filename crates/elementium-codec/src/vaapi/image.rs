@@ -354,6 +354,99 @@ impl ImageView {
 
 }
 
+/// Reading a surface back into ordinary memory.
+///
+/// Separate from [`SurfaceUpload`] because it is not part of the capture path: nothing in a
+/// call reads a surface back, since doing so would undo the point of putting the frame on
+/// the GPU. It exists so a decode or an upload can be checked against what it was supposed
+/// to produce, which is otherwise unobservable.
+pub struct SurfaceDownload {
+    display: Arc<Display>,
+    image: va::VAImage,
+}
+
+// SAFETY: as `SurfaceUpload`.
+unsafe impl Send for SurfaceDownload {}
+
+impl SurfaceDownload {
+    /// Create an NV12 image to read surfaces into.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Status`] if the driver will not create an image of this size.
+    pub fn new(display: &Arc<Display>, width: u32, height: u32) -> Result<Self, Status> {
+        let upload = SurfaceUpload::new(display, width, height)?;
+        let image = upload.image;
+        // The image is now owned here, so the upload must not destroy it too.
+        std::mem::forget(upload);
+        Ok(Self {
+            display: Arc::clone(display),
+            image,
+        })
+    }
+
+    /// Read `surface` into ordinary memory, as NV12.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Status`] if the driver will not read the surface or map the result.
+    pub fn read(&mut self, surface: SurfaceId) -> Result<Vec<u8>, Status> {
+        // SAFETY: image and surface belong to this display; the rectangle is the whole
+        // image, whose geometry libva reported.
+        check(
+            unsafe {
+                va::vaGetImage(
+                    self.display.handle(),
+                    surface.raw(),
+                    0,
+                    0,
+                    u32::from(self.image.width),
+                    u32::from(self.image.height),
+                    self.image.image_id,
+                )
+            },
+            "vaGetImage",
+        )?;
+
+        let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `image.buf` belongs to an image created on this display.
+        check(
+            unsafe {
+                va::vaMapBuffer(self.display.handle(), self.image.buf, std::ptr::addr_of_mut!(data))
+            },
+            "vaMapBuffer",
+        )?;
+        let len = usize::try_from(self.image.data_size).unwrap_or(0);
+        let copied = if data.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the driver's mapping of `data_size` bytes, valid until unmapped below.
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }.to_vec()
+        };
+        // SAFETY: mapped immediately above, unmapped exactly once.
+        check(
+            unsafe { va::vaUnmapBuffer(self.display.handle(), self.image.buf) },
+            "vaUnmapBuffer",
+        )?;
+        Ok(copied)
+    }
+
+    /// Where each plane sits in what [`SurfaceDownload::read`] returns.
+    #[must_use]
+    pub fn layout(&self) -> Option<PlaneLayout> {
+        PlaneLayout::of(&self.image)
+    }
+}
+
+impl Drop for SurfaceDownload {
+    fn drop(&mut self) {
+        // SAFETY: created in `new` and destroyed exactly once.
+        unsafe {
+            va::vaDestroyImage(self.display.handle(), self.image.image_id);
+        }
+    }
+}
+
 /// Where NV12's two planes sit inside an image.
 ///
 /// The driver chooses both the offsets and the pitches, and they are routinely not what the
