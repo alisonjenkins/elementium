@@ -131,8 +131,17 @@ export function setupMediaDevicesShim(): void {
             debugLog(`video track ${id}: creating canvas...`);
             // Create a canvas-based video track fed by native camera frames
             const canvas = document.createElement("canvas");
-            canvas.width = 640;
-            canvas.height = 480;
+            // Size the canvas to the real capture geometry *before* captureStream, which
+            // fixes the resulting track's frame size at the moment it is called. Resizing
+            // afterwards leaves the track describing one geometry while the backing store
+            // holds another: rows are then read at the wrong stride, so the picture shears
+            // into horizontal bands whose colours rotate as the byte offset drifts through
+            // the RGBA quad. That is a rendering fault, not a camera fault -- the captured
+            // frames are pixel-perfect.
+            const geometry = await firstFrameGeometry(id);
+            canvas.width = geometry?.width ?? 640;
+            canvas.height = geometry?.height ?? 480;
+            debugLog(`video track: canvas sized ${canvas.width}x${canvas.height}`);
             // Attach to DOM (hidden) so captureStream works reliably in WebKitGTK
             canvas.style.position = "fixed";
             canvas.style.top = "-9999px";
@@ -144,7 +153,7 @@ export function setupMediaDevicesShim(): void {
             const initCtx = canvas.getContext("2d");
             if (initCtx) {
               initCtx.fillStyle = "#000";
-              initCtx.fillRect(0, 0, 640, 480);
+              initCtx.fillRect(0, 0, canvas.width, canvas.height);
             }
             debugLog(`video track: captureStream available? ${typeof canvas.captureStream}`);
             const canvasStream = canvas.captureStream(30);
@@ -249,6 +258,40 @@ function extractConstraintValue(value: unknown): number | undefined {
  * Uses setTimeout instead of requestAnimationFrame because rAF does not
  * fire reliably for detached (off-DOM) canvases, especially inside iframes.
  */
+/**
+ * Read the capture geometry from the first frame the backend produces.
+ *
+ * The size is not known until the device has negotiated a format, and the canvas has to be
+ * the right size before `captureStream` is called. Bounded so a camera that never produces
+ * a frame cannot hang `getUserMedia` -- the caller falls back to a default size, which
+ * gives a wrongly-scaled preview rather than no call at all.
+ */
+/// Target preview period: 30fps is plenty for a self-view and halves the IPC volume of 60.
+const TARGET_FRAME_MS = 33;
+
+async function firstFrameGeometry(
+  trackId: string,
+  timeoutMs = 3000,
+): Promise<{ width: number; height: number } | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
+      if (buf && buf.byteLength > 8) {
+        const view = new DataView(buf);
+        const width = view.getUint32(0, true);
+        const height = view.getUint32(4, true);
+        if (width > 1 && height > 1) return { width, height };
+      }
+    } catch {
+      // Backend not ready yet; keep waiting until the deadline.
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  debugLog(`firstFrameGeometry: no frame within ${timeoutMs}ms for ${trackId}`);
+  return null;
+}
+
 function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -257,8 +300,16 @@ function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): 
   let timerId: ReturnType<typeof setTimeout> | null = null;
 
   let frameCount = 0;
+  let scratch: HTMLCanvasElement | null = null;
+  // Rolling stats: a preview that is merely slow and one that is broken look the same to a
+  // user, and neither is visible in any existing log.
+  let windowStart = Date.now();
+  let windowFrames = 0;
+  let windowFetchMs = 0;
+
   const fetchLoop = async () => {
     if (!running) return;
+    const started = Date.now();
 
     try {
       // invoke returns ArrayBuffer when Rust returns tauri::ipc::Response
@@ -270,26 +321,59 @@ function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): 
         const height = view.getUint32(4, true);
 
         if (width > 1 && height > 1) {
-          if (canvas.width !== width || canvas.height !== height) {
-            canvas.width = width;
-            canvas.height = height;
-          }
           const rgba = new Uint8ClampedArray(buf, 8);
           const imageData = new ImageData(rgba, width, height);
-          ctx.putImageData(imageData, 0, 0);
+          if (canvas.width === width && canvas.height === height) {
+            ctx.putImageData(imageData, 0, 0);
+          } else {
+            // Geometry changed after the track was created (device switch, or a camera
+            // that renegotiates). Resizing the canvas now would silently corrupt the
+            // track, so scale through a scratch canvas instead and keep the track's
+            // geometry stable.
+            if (!scratch) scratch = document.createElement("canvas");
+            if (scratch.width !== width || scratch.height !== height) {
+              scratch.width = width;
+              scratch.height = height;
+            }
+            const sctx = scratch.getContext("2d");
+            if (sctx) {
+              sctx.putImageData(imageData, 0, 0);
+              ctx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
+            }
+          }
         }
       }
     } catch (err) {
       debugLog(`fetchLoop error: ${err}`);
     }
 
+    const elapsed = Date.now() - started;
+    windowFrames += 1;
+    windowFetchMs += elapsed;
+    if (Date.now() - windowStart >= 5000) {
+      const secs = (Date.now() - windowStart) / 1000;
+      debugLog(
+        `preview ${trackId}: ${(windowFrames / secs).toFixed(1)} fps, ` +
+          `${(windowFetchMs / windowFrames).toFixed(1)}ms avg per frame ` +
+          `(${canvas.width}x${canvas.height})`,
+      );
+      windowStart = Date.now();
+      windowFrames = 0;
+      windowFetchMs = 0;
+    }
+
     if (running) {
-      timerId = setTimeout(fetchLoop, 33);
+      // Schedule against the target period rather than sleeping a fixed amount *after* the
+      // work: the previous form made the real period "IPC time + 33ms", so a 30ms fetch
+      // halved the frame rate. A frame that took longer than the period is followed
+      // immediately by the next.
+      const delay = Math.max(0, TARGET_FRAME_MS - elapsed);
+      timerId = setTimeout(fetchLoop, delay);
     }
   };
 
   debugLog(`fetchLoop: starting for ${trackId}`);
-  timerId = setTimeout(fetchLoop, 33);
+  timerId = setTimeout(fetchLoop, TARGET_FRAME_MS);
 
   // Store cleanup reference on the canvas for stop_track
   (canvas as unknown as Record<string, unknown>).__stopFetch = () => {

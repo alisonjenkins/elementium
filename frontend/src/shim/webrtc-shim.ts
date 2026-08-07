@@ -171,8 +171,14 @@ class ElementiumRTCPeerConnection extends EventTarget {
     if (kind === "video" && this.pcId) {
       const trackId = `${this.pcId}-video`;
       const canvas = document.createElement("canvas");
-      canvas.width = 640;
-      canvas.height = 480;
+      // Fixed at 720p and never resized afterwards. `captureStream` fixes the resulting
+      // track's frame size when it is called; resizing the canvas later leaves the track
+      // describing one geometry while the backing store holds another, and rows are then
+      // read at the wrong stride -- the picture shears into horizontal bands whose colours
+      // rotate as the byte offset drifts through the RGBA quad. Incoming frames of any
+      // other size are scaled into this one instead.
+      canvas.width = 1280;
+      canvas.height = 720;
 
       // Use captureStream to get a real MediaStreamTrack from the canvas
       const canvasStream = canvas.captureStream(30);
@@ -210,9 +216,11 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
     let running = true;
     let timerId: ReturnType<typeof setTimeout> | null = null;
+    let scratch: HTMLCanvasElement | null = null;
 
     const fetchLoop = async () => {
       if (!running) return;
+      const started = Date.now();
 
       try {
         const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
@@ -222,13 +230,32 @@ class ElementiumRTCPeerConnection extends EventTarget {
           const height = view.getUint32(4, true);
 
           if (width > 1 && height > 1) {
-            if (canvas.width !== width || canvas.height !== height) {
-              canvas.width = width;
-              canvas.height = height;
-            }
             const rgba = new Uint8ClampedArray(buf, 8);
             const imageData = new ImageData(rgba, width, height);
-            ctx.putImageData(imageData, 0, 0);
+            if (canvas.width === width && canvas.height === height) {
+              ctx.putImageData(imageData, 0, 0);
+            } else {
+              // Scale into the track's fixed geometry rather than resizing it. Aspect ratio
+              // is preserved and the remainder left black, so a 4:3 sender is letterboxed
+              // rather than stretched.
+              if (!scratch) scratch = document.createElement("canvas");
+              if (scratch.width !== width || scratch.height !== height) {
+                scratch.width = width;
+                scratch.height = height;
+              }
+              const sctx = scratch.getContext("2d");
+              if (sctx) {
+                sctx.putImageData(imageData, 0, 0);
+                const scale = Math.min(canvas.width / width, canvas.height / height);
+                const dw = Math.round(width * scale);
+                const dh = Math.round(height * scale);
+                const dx = Math.round((canvas.width - dw) / 2);
+                const dy = Math.round((canvas.height - dh) / 2);
+                ctx.fillStyle = "#000";
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(scratch, dx, dy, dw, dh);
+              }
+            }
           }
         }
       } catch {
@@ -236,7 +263,10 @@ class ElementiumRTCPeerConnection extends EventTarget {
       }
 
       if (running) {
-        timerId = setTimeout(fetchLoop, 33);
+        // Scheduled against the target period, not slept for a fixed amount after the work:
+        // the previous form made the real period "IPC time + 33ms", so a 30ms fetch halved
+        // the frame rate.
+        timerId = setTimeout(fetchLoop, Math.max(0, 33 - (Date.now() - started)));
       }
     };
 
