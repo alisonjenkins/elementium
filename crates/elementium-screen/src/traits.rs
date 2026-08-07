@@ -1,4 +1,4 @@
-use elementium_types::{CaptureSource, VideoFrame};
+use elementium_types::{CaptureSource, I420Frame};
 
 /// Platform-agnostic screen capture trait.
 pub trait ScreenCapturer: Send {
@@ -17,7 +17,7 @@ pub trait ScreenCapturer: Send {
     fn start(
         &mut self,
         source_id: &str,
-        callback: Box<dyn Fn(VideoFrame) + Send>,
+        callback: Box<dyn Fn(I420Frame) + Send>,
     ) -> Result<(), elementium_types::ElementiumError>;
 
     /// Stop the current capture session.

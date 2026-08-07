@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use elementium_types::VideoFrame;
+use elementium_types::I420Frame;
 
 use crate::camera::CameraCapturer;
 use crate::pipewire_capture::PipewireCapturer;
@@ -65,7 +65,7 @@ impl VideoSource {
 
     /// The next frame, if one is waiting.
     #[must_use]
-    pub fn try_recv(&self) -> Option<VideoFrame> {
+    pub fn try_recv(&self) -> Option<I420Frame> {
         match self {
             Self::Pipewire(c) => c.try_recv(),
             Self::V4l2(c) => c.try_recv(),

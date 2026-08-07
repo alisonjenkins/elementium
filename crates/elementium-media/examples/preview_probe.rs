@@ -48,16 +48,20 @@ fn main() {
         };
         frames += 1;
 
-        // Exactly what the app does before the frame crosses into the webview.
-        let (rgba, width, height) = elementium_codec::halve_rgba(frame.width, frame.height, &frame.data)
-            .unwrap_or_else(|| (frame.data.clone(), frame.width, frame.height));
+        // Exactly what the app does before the frame crosses into the webview: halve in
+        // I420, then convert the smaller frame to RGBA.
+        let preview = elementium_codec::halve_i420(&frame)
+            .as_ref()
+            .map_or_else(
+                || elementium_codec::i420_to_rgba(&frame),
+                elementium_codec::i420_to_rgba,
+            );
+        let (rgba, width, height) = (preview.data, preview.width, preview.height);
 
         let expected = (width as usize) * (height as usize) * 4;
         if rgba.len() != expected {
             println!(
-                "MISMATCH at frame {frames}: {}x{} claims {expected} bytes, buffer has {}",
-                width,
-                height,
+                "MISMATCH at frame {frames}: {width}x{height} claims {expected} bytes, buffer has {}",
                 rgba.len()
             );
         }
@@ -69,8 +73,8 @@ fn main() {
             encoder = Vp8Encoder::new(frame.width, frame.height, 2764).ok();
         }
         if let Some(enc) = encoder.as_mut() {
-            let i420 = elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
-            let _ = enc.encode(&i420);
+            // No conversion: capture already produces the encoder's input format.
+            let _ = enc.encode(&frame);
         }
 
         if frames % 60 == 0 {

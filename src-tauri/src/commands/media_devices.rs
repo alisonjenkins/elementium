@@ -546,29 +546,29 @@ fn camera_pipeline_loop(
                     frame_count,
                     w = frame.width,
                     h = frame.height,
-                    data_len = frame.data.len(),
+                    luma_len = frame.y.len(),
                     "Camera frame received"
                 );
             }
-            // Write RGBA to the VideoFrameBuffer for the local preview, halved.
+            // The self-view: halved, then converted to RGBA for the canvas.
             //
-            // Every preview frame crosses the Rust-to-webview IPC boundary as raw RGBA:
-            // 3.7MB at 720p, 110MB/s at 30fps, to draw a thumbnail a few centimetres
-            // across. What gets encoded and sent to peers is still the full-resolution
-            // frame -- only the self-view is reduced.
-            let preview = elementium_codec::halve_rgba(frame.width, frame.height, &frame.data)
-                .unwrap_or_else(|| (frame.data.clone(), frame.width, frame.height));
-            maybe_dump_preview(frame_count, &preview.0, preview.1, preview.2);
-            if let Ok(mut buf) = video_frames.lock() {
-                buf.insert(
-                    track_id.to_string(),
-                    VideoFrame {
-                        width: preview.1,
-                        height: preview.2,
-                        data: preview.0,
-                        timestamp_us: 0,
-                    },
+            // Halving first is the cheap order. I420 is 1.5 bytes per pixel against RGBA's
+            // 4, so the downscale touches under 40% of the memory, and the conversion that
+            // follows then runs on a quarter of the pixels. Doing it the other way round
+            // converts the full frame and throws three quarters of it away.
+            //
+            // Every preview frame crosses the Rust-to-webview boundary as raw RGBA, so
+            // halving also cuts that traffic fourfold. What peers receive is still the
+            // full-resolution frame -- only the self-view is reduced.
+            let preview = elementium_codec::halve_i420(&frame)
+                .as_ref()
+                .map_or_else(
+                    || elementium_codec::i420_to_rgba(&frame),
+                    elementium_codec::i420_to_rgba,
                 );
+            maybe_dump_preview(frame_count, &preview.data, preview.width, preview.height);
+            if let Ok(mut buf) = video_frames.lock() {
+                buf.insert(track_id.to_string(), preview);
             }
 
             // VP8 encode and send if encoding is active
@@ -599,7 +599,7 @@ fn camera_pipeline_loop(
 /// named, and it has no business being on the per-frame path.
 fn ensure_encoder(
     encoder: &mut Option<NegotiatedEncoder>,
-    frame: &elementium_types::VideoFrame,
+    frame: &elementium_types::I420Frame,
     last_keyframe: &mut std::time::Instant,
 ) {
     // Rebuilt if the source renegotiates its geometry: an encoder rejects a frame whose
@@ -672,11 +672,13 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 /// inlinable, and the bound documents that the body depends on nothing but the interface.
 fn encode_and_send<E: VideoEncoder>(
     encoder: &mut E,
-    frame: &elementium_types::VideoFrame,
+    frame: &elementium_types::I420Frame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
-    let i420 = elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
-    match encoder.encode(&i420) {
+    // No conversion: capture already produces the encoder's input format. MJPEG is stored
+    // as YCbCr 4:2:0, which is what this is, so nothing on this path converts colour in
+    // either direction.
+    match encoder.encode(frame) {
         Ok(packets) => {
             if let Ok(guard) = encode_tx.lock()
                 && let Some(tx) = guard.as_ref()
@@ -693,7 +695,7 @@ fn encode_and_send<E: VideoEncoder>(
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
 fn encode_and_send_video_frame(
     track_id: &str,
-    frame: &elementium_types::VideoFrame,
+    frame: &elementium_types::I420Frame,
     encoder: &mut Option<NegotiatedEncoder>,
     last_keyframe: &mut std::time::Instant,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,

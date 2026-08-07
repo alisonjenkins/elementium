@@ -8,6 +8,8 @@ description = "Screen capture (Wayland via ashpd+pipewire, X11/macOS/Windows via
 [dependencies]
 elementium-media = { version = "0.1.0", path = "../elementium-media" }
 elementium-types = { workspace = true }
+# Pixel-layout conversion: capture hands out planar YUV, xcap produces packed BGRA.
+elementium-codec = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 tracing = { workspace = true }

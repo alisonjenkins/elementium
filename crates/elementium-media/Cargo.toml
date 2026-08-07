@@ -7,6 +7,10 @@ description = "Audio/video capture and playback (cpal, nokhwa)"
 
 [dependencies]
 elementium-types = { workspace = true }
+# Pixel-layout conversion for the raw-capture paths. Capture's output contract is planar
+# YUV, so a source handing over RGB has to be converted somewhere, and doing it here keeps
+# every consumer of a captured frame dealing with one format.
+elementium-codec = { workspace = true }
 cpal = { workspace = true }
 nokhwa = { workspace = true }
 turbojpeg = { workspace = true }
@@ -22,7 +26,7 @@ zune-core = "0.5.1"
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 elementium-observability-test = { workspace = true }
-elementium-codec = { workspace = true }
+jpeg-encoder = "0.7.1"
 
 [lints]
 workspace = true

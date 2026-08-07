@@ -14,7 +14,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use elementium_types::{CaptureSource, ElementiumError, VideoFrame};
+use elementium_types::{CaptureSource, ElementiumError, I420Frame};
 
 use crate::traits::ScreenCapturer;
 
@@ -87,7 +87,7 @@ impl ScreenCapturer for WaylandCapturer {
     fn start(
         &mut self,
         _source_id: &str,
-        callback: Box<dyn Fn(VideoFrame) + Send>,
+        callback: Box<dyn Fn(I420Frame) + Send>,
     ) -> Result<(), ElementiumError> {
         tracing::info!("Requesting a screencast session from the XDG desktop portal");
 

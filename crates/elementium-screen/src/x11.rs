@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use elementium_types::{CaptureSource, CaptureSourceKind, ElementiumError, VideoFrame};
+use elementium_types::{CaptureSource, CaptureSourceKind, ElementiumError, I420Frame};
 
 use crate::traits::ScreenCapturer;
 
@@ -78,7 +78,7 @@ impl ScreenCapturer for X11Capturer {
     fn start(
         &mut self,
         source_id: &str,
-        callback: Box<dyn Fn(VideoFrame) + Send>,
+        callback: Box<dyn Fn(I420Frame) + Send>,
     ) -> Result<(), ElementiumError> {
         tracing::info!(source_id = %source_id, "Starting X11 capture");
         self.active.store(true, Ordering::Relaxed);
@@ -145,19 +145,20 @@ impl ScreenCapturer for X11Capturer {
     }
 }
 
-/// Build a `VideoFrame` from an xcap-captured image (xcap returns BGRA data).
-fn frame_from_capture(image: xcap::image::RgbaImage) -> VideoFrame {
-    VideoFrame {
-        width: image.width(),
-        height: image.height(),
-        data: image.into_raw(),
-        timestamp_us: 0,
-    }
+/// Build a frame from an xcap-captured image (xcap returns BGRA data).
+///
+/// Converted to planar YUV here because that is capture's output contract: every video
+/// encoder takes it, and a source that hands over packed RGB has to be converted
+/// somewhere. Doing it at the source means nothing downstream has to ask what layout a
+/// captured frame is in.
+fn frame_from_capture(image: xcap::image::RgbaImage) -> I420Frame {
+    let (width, height) = (image.width(), image.height());
+    elementium_codec::bgra_to_i420(width, height, &image.into_raw())
 }
 
 /// Capture a single frame from a monitor by ID. Monitors whose id lookup fails are
 /// skipped rather than matched via a `0` fallback (see `sources()`'s id-0-collision note).
-fn capture_monitor(target_id: u32) -> Option<VideoFrame> {
+fn capture_monitor(target_id: u32) -> Option<I420Frame> {
     let monitors = xcap::Monitor::all().ok()?;
     let monitor = monitors
         .into_iter()
@@ -167,7 +168,7 @@ fn capture_monitor(target_id: u32) -> Option<VideoFrame> {
 
 /// Capture a single frame from a window by ID. Same id-0-collision reasoning as
 /// `capture_monitor`.
-fn capture_window(target_id: u32) -> Option<VideoFrame> {
+fn capture_window(target_id: u32) -> Option<I420Frame> {
     let windows = xcap::Window::all().ok()?;
     let window = windows
         .into_iter()

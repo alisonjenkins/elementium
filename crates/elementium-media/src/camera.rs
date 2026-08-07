@@ -2,7 +2,7 @@
 
 use std::sync::mpsc;
 
-use elementium_types::VideoFrame;
+use elementium_types::I420Frame;
 
 /// Error type for camera operations.
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +18,7 @@ pub enum CameraError {
 /// The camera is opened and polled on a background thread.
 /// Frames are sent to the main thread via a bounded channel.
 pub struct CameraCapturer {
-    frame_rx: mpsc::Receiver<VideoFrame>,
+    frame_rx: mpsc::Receiver<I420Frame>,
     stop_tx: mpsc::Sender<()>,
     width: u32,
     height: u32,
@@ -150,7 +150,7 @@ fn decode_rgb(pixel_count: usize, raw: &[u8]) -> Option<Vec<u8>> {
 fn run_capture_loop(
     device_id: &str,
     mut camera: nokhwa::Camera,
-    frame_tx: &mpsc::SyncSender<VideoFrame>,
+    frame_tx: &mpsc::SyncSender<I420Frame>,
     stop_rx: &mpsc::Receiver<()>,
 ) {
     loop {
@@ -172,12 +172,10 @@ fn run_capture_loop(
                     continue;
                 };
 
-                let frame = VideoFrame {
-                    width: w,
-                    height: h,
-                    data: rgba,
-                    timestamp_us: 0,
-                };
+                // Converted here rather than downstream: capture's contract is planar
+                // YUV, which is what every video encoder takes and what the MJPEG path
+                // produces without any conversion at all.
+                let frame = elementium_codec::rgba_to_i420(w, h, &rgba);
 
                 // Non-blocking send; drop frame if buffer full
                 let _ = frame_tx.try_send(frame);
@@ -234,7 +232,7 @@ impl CameraCapturer {
         width: Option<u32>,
         height: Option<u32>,
     ) -> Result<Self, CameraError> {
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<VideoFrame>(4);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<I420Frame>(4);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         // Channel to report initial resolution (or error) back to caller
         let (init_tx, init_rx) = mpsc::channel::<Result<(u32, u32), CameraError>>();
@@ -310,13 +308,13 @@ impl CameraCapturer {
 
     /// Try to get the next frame (non-blocking).
     #[must_use]
-    pub fn try_recv(&self) -> Option<VideoFrame> {
+    pub fn try_recv(&self) -> Option<I420Frame> {
         self.frame_rx.try_recv().ok()
     }
 
     /// Get the next frame (blocking).
     #[must_use]
-    pub fn recv(&self) -> Option<VideoFrame> {
+    pub fn recv(&self) -> Option<I420Frame> {
         self.frame_rx.recv().ok()
     }
 

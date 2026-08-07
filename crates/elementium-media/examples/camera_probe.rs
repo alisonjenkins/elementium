@@ -66,17 +66,17 @@ fn main() {
                                 let now = Instant::now();
                                 started.get_or_insert(now);
                                 latest = Some(now);
-                                sample = Some((f.width, f.height, f.data.len()));
+                                sample = Some((f.width, f.height, f.y.len()));
                                 // Write one frame out so the pixels can be inspected
                                 // directly. A capture that is geometrically or
                                 // chromatically wrong looks identical to a healthy one in
                                 // every scalar we log.
                                 if frames == 30 && std::env::var_os("ELEMENTIUM_DUMP_FRAME").is_some() {
                                     let path = format!("/tmp/elementium_frame_{}.rgba", s.node_id);
-                                    match std::fs::write(&path, &f.data) {
+                                    match std::fs::write(&path, elementium_codec::i420_to_rgba(&f).data) {
                                         Ok(()) => println!(
                                             "    wrote {path} ({}x{}, {} bytes)",
-                                            f.width, f.height, f.data.len()
+                                            f.width, f.height, f.y.len()
                                         ),
                                         Err(e) => println!("    frame dump failed: {e}"),
                                     }
@@ -160,7 +160,7 @@ fn report_frames(cap: &elementium_media::camera::CameraCapturer, idx: u32) {
     while Instant::now() < deadline {
         if let Some(frame) = cap.try_recv() {
             frames = frames.saturating_add(1);
-            bytes = bytes.saturating_add(frame.data.len());
+            bytes = bytes.saturating_add(frame.y.len());
             let now = Instant::now();
             first_at.get_or_insert(now);
             last_at = Some(now);

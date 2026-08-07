@@ -30,7 +30,7 @@
 )]
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use elementium_codec::{Vp8Encoder, halve_rgba, i420_to_rgba, rgba_to_i420};
+use elementium_codec::{Vp8Encoder, halve_i420, halve_rgba, i420_to_rgba, rgba_to_i420};
 use elementium_types::I420Frame;
 
 /// 720p: what the camera negotiates here, and the common video-call resolution.
@@ -196,9 +196,23 @@ fn stages(c: &mut Criterion) {
         b.iter(|| i420_to_rgba(&i420));
     });
 
-    // The self-view downscale, once per captured frame.
+    // The self-view downscale, once per captured frame. Both orders are measured because
+    // the choice between them is the whole saving: I420 is 1.5 bytes per pixel against
+    // RGBA's 4, so halving first touches far less memory and leaves the conversion running
+    // on a quarter of the pixels.
     group.bench_function("halve_rgba", |b| {
         b.iter(|| halve_rgba(W, H, &rgba));
+    });
+
+    group.bench_function("preview_via_rgba_then_halve", |b| {
+        b.iter(|| {
+            let full = i420_to_rgba(&i420);
+            halve_rgba(full.width, full.height, &full.data)
+        });
+    });
+
+    group.bench_function("preview_via_halve_then_rgba", |b| {
+        b.iter(|| halve_i420(&i420).as_ref().map(i420_to_rgba));
     });
 
     // VP8 keyframe: a fresh encoder always emits one. Measured separately because it is
@@ -246,7 +260,9 @@ fn whole_frame(c: &mut Criterion) {
 
     // A primed encoder, so this is the steady-state per-frame cost of a call rather than
     // the cost of starting one.
-    group.bench_function("capture_to_encoded_frame", |b| {
+    // What the pipeline used to do: decode to RGBA, downscale in RGBA for the preview,
+    // then convert back to YUV for the encoder.
+    group.bench_function("capture_to_encoded_frame_via_rgba", |b| {
         let mut enc = Vp8Encoder::new(W, H, 2764).expect("encoder");
         for f in &moving_sequence(4) {
             let _ = enc.encode(f);
@@ -255,6 +271,21 @@ fn whole_frame(c: &mut Criterion) {
             let (rgba, w, h) = elementium_media_decode(&jpeg).expect("decode");
             let _preview = halve_rgba(w, h, &rgba);
             let i420 = rgba_to_i420(w, h, &rgba);
+            enc.encode(&i420)
+        });
+    });
+
+    // What it does now: decode straight to the encoder's input format, and derive the
+    // preview from that. No colour conversion happens in either direction.
+    group.bench_function("capture_to_encoded_frame_via_i420", |b| {
+        let mut enc = Vp8Encoder::new(W, H, 2764).expect("encoder");
+        for f in &moving_sequence(4) {
+            let _ = enc.encode(f);
+        }
+        b.iter(|| {
+            let frame = turbojpeg::decompress_to_yuv(&jpeg).expect("decode");
+            let i420 = yuv_to_i420(&frame);
+            let _preview = halve_i420(&i420).as_ref().map(i420_to_rgba);
             enc.encode(&i420)
         });
     });
@@ -291,6 +322,39 @@ fn decode_jpeg_as(
         u32::try_from(width).ok()?,
         u32::try_from(height).ok()?,
     ))
+}
+
+/// Split a turbojpeg YUV buffer into I420 planes, as the capture path does.
+///
+/// Duplicated rather than depended on for the same reason as the decode below.
+fn yuv_to_i420(yuv: &turbojpeg::YuvImage<Vec<u8>>) -> I420Frame {
+    let (y_stride, y_rows) = yuv.y_size();
+    let (uv_stride, uv_rows) = yuv.uv_size();
+    let y_bytes = y_stride * y_rows;
+    let uv_bytes = uv_stride * uv_rows;
+    let tight = |src: &[u8], stride: usize, keep: usize, rows: usize| -> Vec<u8> {
+        (0..rows)
+            .flat_map(|r| src[r * stride..r * stride + keep].iter().copied())
+            .collect()
+    };
+    I420Frame {
+        width: yuv.width as u32,
+        height: yuv.height as u32,
+        y: tight(&yuv.pixels[..y_bytes], y_stride, yuv.width, y_rows),
+        u: tight(
+            &yuv.pixels[y_bytes..y_bytes + uv_bytes],
+            uv_stride,
+            yuv.uv_width().min(uv_stride),
+            uv_rows,
+        ),
+        v: tight(
+            &yuv.pixels[y_bytes + uv_bytes..y_bytes + 2 * uv_bytes],
+            uv_stride,
+            yuv.uv_width().min(uv_stride),
+            uv_rows,
+        ),
+        timestamp_us: 0,
+    }
 }
 
 /// Decode a JPEG the way the capture path does.

@@ -14,7 +14,7 @@
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use elementium_types::VideoFrame;
+use elementium_types::I420Frame;
 
 use crate::pipewire_nodes::PipewireError;
 
@@ -185,43 +185,134 @@ fn negotiated_subtype(pod: &libspa::pod::Pod) -> Option<u32> {
         })
 }
 
-/// Decode one MJPEG buffer to tightly packed RGBA, with the dimensions it really had.
+/// Decode one MJPEG buffer straight to I420 planes.
+///
+/// JPEG stores YCbCr, which is what a video encoder wants, so decoding to RGB and
+/// converting back to YUV is the same work done twice to arrive where the data started.
+/// Going direct removes both conversions.
+///
+/// Two things this must not assume, both of which produced a visibly wrong picture when
+/// they were assumed:
+///
+/// **Rows are padded.** libjpeg-turbo aligns every plane's rows, so a plane's stride is
+/// not its width. Splitting the buffer by width alone shears the image.
+///
+/// **The chroma subsampling is the JPEG's choice, not ours.** UVC cameras commonly emit
+/// 4:2:2 MJPEG, and some emit 4:4:4. Reading either as though it were 4:2:0 puts chroma
+/// samples where luma is expected: the first version of this function did exactly that,
+/// and decoded a solid red image to a murky green. Chroma is resampled to 4:2:0 when the
+/// source is not already there.
 ///
 /// Returns `None` on a malformed frame rather than a partial image: a camera occasionally
 /// emits a truncated JPEG, and half a frame followed by stale pixels looks like a decoder
 /// bug rather than a dropped frame.
 ///
-/// The dimensions are returned rather than assumed because **each JPEG carries its own**,
-/// and they are not guaranteed to match what the stream negotiated. A buffer labelled with
-/// the wrong geometry is read at the wrong stride by everything downstream: rows step by
-/// the wrong number of bytes, so the picture breaks into horizontal bands that slide
-/// sideways, and because a row offset that is not a multiple of four rotates the RGBA
-/// components, the bands take on colour casts. It looks like a corrupt encoder and is
-/// nothing of the kind -- the pixels are perfect and the label is wrong.
-///
-/// A decode whose output does not match its own stated size is refused outright; there is
-/// no geometry that would describe such a buffer correctly.
+/// The geometry comes from the JPEG itself rather than from what the stream negotiated,
+/// because each image carries its own and they are not guaranteed to agree. A frame
+/// labelled with the wrong size is read at the wrong stride by everything downstream --
+/// the picture breaks into sliding horizontal bands with rotated colour channels, which
+/// looks like a corrupt encoder and is nothing of the kind.
 #[must_use]
-pub fn decode_mjpeg_to_rgba(jpeg: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let options = zune_core::options::DecoderOptions::default()
-        .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGBA);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(jpeg), options);
-    let pixels = decoder.decode().ok()?;
-    let (width, height) = decoder.dimensions()?;
+pub fn decode_mjpeg_to_i420(jpeg: &[u8]) -> Option<I420Frame> {
+    let yuv = turbojpeg::decompress_to_yuv(jpeg).ok()?;
+    let width = u32::try_from(yuv.width).ok()?;
+    let height = u32::try_from(yuv.height).ok()?;
 
-    let expected = width.checked_mul(height)?.checked_mul(4)?;
-    if pixels.len() != expected {
+    let (y_stride, y_rows) = yuv.y_size();
+    let (uv_stride, uv_rows) = yuv.uv_size();
+    let y_bytes = y_stride.checked_mul(y_rows)?;
+    let uv_bytes = uv_stride.checked_mul(uv_rows)?;
+
+    let u_start = y_bytes;
+    let v_start = u_start.checked_add(uv_bytes)?;
+    let end = v_start.checked_add(uv_bytes)?;
+    if yuv.pixels.len() < end {
         tracing::warn!(
-            decoded_len = pixels.len(),
+            len = yuv.pixels.len(),
+            needed = end,
             width,
             height,
-            expected,
-            "MJPEG decode produced a buffer that does not match its own dimensions; frame dropped"
+            "MJPEG decode produced fewer bytes than its own geometry needs; frame dropped"
         );
         return None;
     }
 
-    Some((pixels, u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+    // Strip the row padding: I420 planes are tightly packed.
+    let y = tight_rows(yuv.pixels.get(..y_bytes)?, y_stride, yuv.width, y_rows)?;
+    let u_src = tight_rows(
+        yuv.pixels.get(u_start..v_start)?,
+        uv_stride,
+        yuv.uv_width().min(uv_stride),
+        uv_rows,
+    )?;
+    let v_src = tight_rows(
+        yuv.pixels.get(v_start..end)?,
+        uv_stride,
+        yuv.uv_width().min(uv_stride),
+        uv_rows,
+    )?;
+
+    // I420 wants chroma at half width and half height. Resample whatever the JPEG used.
+    let (chroma_w, chroma_h) = (
+        usize::try_from(width).ok()?.div_ceil(2),
+        usize::try_from(height).ok()?.div_ceil(2),
+    );
+    let src_w = usize::try_from(width).ok()?.div_ceil(yuv.subsamp.width());
+    let src_h = usize::try_from(height).ok()?.div_ceil(yuv.subsamp.height());
+
+    Some(I420Frame {
+        width,
+        height,
+        y,
+        u: resample_chroma(&u_src, src_w, src_h, chroma_w, chroma_h)?,
+        v: resample_chroma(&v_src, src_w, src_h, chroma_w, chroma_h)?,
+        timestamp_us: 0,
+    })
+}
+
+/// Copy `rows` rows of `keep` bytes each out of a padded plane.
+fn tight_rows(src: &[u8], stride: usize, keep: usize, rows: usize) -> Option<Vec<u8>> {
+    if stride == keep {
+        return Some(src.get(..stride.checked_mul(rows)?)?.to_vec());
+    }
+    let mut out = Vec::with_capacity(keep.checked_mul(rows)?);
+    for row in 0..rows {
+        let start = row.checked_mul(stride)?;
+        out.extend_from_slice(src.get(start..start.checked_add(keep)?)?);
+    }
+    Some(out)
+}
+
+/// Resample a chroma plane to the dimensions I420 requires.
+///
+/// Nearest-neighbour: chroma is already half-resolution and is about to be halved again
+/// for the preview or handed to an encoder that subsamples it further, so the difference
+/// between this and a filtered resample is not visible, while the cost difference is paid
+/// on every frame. A source already at the target size is returned untouched.
+fn resample_chroma(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Option<Vec<u8>> {
+    if src_w == dst_w && src_h == dst_h {
+        return Some(src.to_vec());
+    }
+    if src_w == 0 || src_h == 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(dst_w.checked_mul(dst_h)?);
+    for y in 0..dst_h {
+        let src_y = y.checked_mul(src_h)?.checked_div(dst_h)?.min(src_h.saturating_sub(1));
+        let row_start = src_y.checked_mul(src_w)?;
+        for x in 0..dst_w {
+            let src_x = x.checked_mul(src_w)?.checked_div(dst_w)?.min(src_w.saturating_sub(1));
+            out.push(*src.get(row_start.checked_add(src_x)?)?);
+        }
+    }
+    Some(out)
 }
 
 /// Negotiated geometry, shared between the format callback and the frame callback.
@@ -290,7 +381,7 @@ impl CaptureTiming {
 
 /// A running `PipeWire` video capture.
 pub struct PipewireCapturer {
-    frame_rx: mpsc::Receiver<VideoFrame>,
+    frame_rx: mpsc::Receiver<I420Frame>,
     stop_tx: mpsc::Sender<()>,
     negotiated: Arc<Mutex<Negotiated>>,
 }
@@ -327,7 +418,7 @@ impl PipewireCapturer {
 
     /// The most recent frame, if one is waiting.
     #[must_use]
-    pub fn try_recv(&self) -> Option<VideoFrame> {
+    pub fn try_recv(&self) -> Option<I420Frame> {
         self.frame_rx.try_recv().ok()
     }
 
@@ -355,7 +446,7 @@ impl Drop for PipewireCapturer {
 #[allow(clippy::needless_pass_by_value)]
 fn run_stream(
     node_id: u32,
-    frame_tx: &mpsc::SyncSender<VideoFrame>,
+    frame_tx: &mpsc::SyncSender<I420Frame>,
     stop_rx: mpsc::Receiver<()>,
     negotiated: &Arc<Mutex<Negotiated>>,
     ready_tx: &mpsc::Sender<Result<(), String>>,
@@ -410,7 +501,7 @@ fn attach_and_connect(
     stream: &pipewire::stream::StreamRc,
     node_id: u32,
     negotiated: &Arc<Mutex<Negotiated>>,
-    frame_tx: &mpsc::SyncSender<VideoFrame>,
+    frame_tx: &mpsc::SyncSender<I420Frame>,
 ) -> Result<(), String> {
     let fmt_state = Arc::clone(negotiated);
     let frame_state = Arc::clone(negotiated);
@@ -505,22 +596,28 @@ fn attach_and_connect(
             // negotiated size regardless of what came out of the decoder.
             let decode_started = std::time::Instant::now();
             let converted = match n.encoding {
-                Encoding::Mjpeg => decode_mjpeg_to_rgba(bytes),
+                Encoding::Mjpeg => decode_mjpeg_to_i420(bytes),
                 Encoding::Raw(format) => {
                     let stride = if stride == 0 {
                         width.saturating_mul(format.bytes_per_pixel())
                     } else {
                         stride
                     };
-                    to_rgba(bytes, width, height, stride, format)
-                        .map(|rgba| (rgba, n.width, n.height))
+                    // Raw sources are the minority path (a camera offering uncompressed
+                    // frames, and the screen-capture portal). They convert via RGBA
+                    // because that is what the layout converters produce; the cost is
+                    // paid only where MJPEG is not on offer.
+                    to_rgba(bytes, width, height, stride, format).map(|rgba| {
+                        elementium_codec::rgba_to_i420(n.width, n.height, rgba.as_slice())
+                    })
                 }
                 Encoding::Unsupported => None,
             };
 
             timing.record(decode_started.elapsed(), copy_len);
 
-            if let Some((rgba, frame_width, frame_height)) = converted {
+            if let Some(frame) = converted {
+                let (frame_width, frame_height) = (frame.width, frame.height);
                 if frame_width != n.width || frame_height != n.height {
                     // Once per occurrence rather than per frame: a camera that does this
                     // does it every frame, and the interesting fact is that it happens at
@@ -535,12 +632,7 @@ fn attach_and_connect(
                 }
                 // Newest frame dropped when full: blocking here would stall the PipeWire
                 // graph, which is far worse than losing a frame.
-                let _ = tx.try_send(VideoFrame {
-                    width: frame_width,
-                    height: frame_height,
-                    data: rgba,
-                    timestamp_us: 0,
-                });
+                let _ = tx.try_send(frame);
             } else {
                 tracing::warn!(
                     len = bytes.len(),
@@ -668,7 +760,12 @@ fn format_param() -> Vec<u8> {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::expect_used)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    clippy::panic
+)]
 mod tests {
     use super::{to_rgba, SourceFormat};
 
@@ -748,20 +845,107 @@ mod tests {
     /// pixels reads as a decoder bug rather than a dropped frame.
     #[test]
     fn refuses_a_malformed_mjpeg_frame() {
-        assert!(super::decode_mjpeg_to_rgba(&[0xFF, 0xD8, 0x00, 0x01]).is_none());
-        assert!(super::decode_mjpeg_to_rgba(&[]).is_none());
+        assert!(super::decode_mjpeg_to_i420(&[0xFF, 0xD8, 0x00, 0x01]).is_none());
+        assert!(super::decode_mjpeg_to_i420(&[]).is_none());
     }
 
-    /// A real JPEG decodes to exactly `width * height * 4` bytes of RGBA.
+    /// Encode a solid-colour JPEG, at a chosen chroma subsampling, to decode back.
+    fn jpeg_fixture(
+        width: u16,
+        height: u16,
+        rgb: [u8; 3],
+        sampling: jpeg_encoder::SamplingFactor,
+    ) -> Vec<u8> {
+        let pixels: Vec<u8> = rgb
+            .iter()
+            .copied()
+            .cycle()
+            .take(usize::from(width) * usize::from(height) * 3)
+            .collect();
+        let mut out = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut out, 90);
+        encoder.set_sampling_factor(sampling);
+        encoder
+            .encode(&pixels, width, height, jpeg_encoder::ColorType::Rgb)
+            .expect("encode fixture");
+        out
+    }
+
+    /// A decoded frame's planes must match the geometry it reports.
+    ///
+    /// This is the invariant whose violation shears a picture into sliding horizontal
+    /// bands: everything downstream reads the planes using the frame's own width, so a
+    /// frame whose planes disagree with it is read at the wrong stride. It was previously
+    /// left as a documented gap because there was no way to make a JPEG here; there is
+    /// now.
     #[test]
-    fn decodes_a_jpeg_to_tightly_packed_rgba() {
-        // Smallest valid JPEG this crate will produce: encode a 2x2 image via zune-jpeg's
-        // own round trip is not available, so this asserts the contract on the real camera
-        // path instead -- see `camera_probe`, which reports the decoded byte count and is
-        // checked against width*height*4.
-        //
-        // Kept as a documented gap rather than a fake assertion: fabricating a JPEG by hand
-        // here would test the fixture, not the decoder.
+    fn a_decoded_frame_is_self_consistent() {
+        let frame = super::decode_mjpeg_to_i420(&jpeg_fixture(
+            64,
+            32,
+            [200, 100, 50],
+            jpeg_encoder::SamplingFactor::F_2_2,
+        ))
+        .expect("decodes");
+
+        assert_eq!((frame.width, frame.height), (64, 32));
+        assert_eq!(frame.y.len(), 64 * 32, "luma plane matches the geometry");
+        assert_eq!(frame.u.len(), 32 * 16, "chroma is half in each axis");
+        assert_eq!(frame.v.len(), 32 * 16);
+    }
+
+    /// The decode must produce the colour that went in, not a channel-swapped one.
+    ///
+    /// A YUV plane order or channel swap is invisible in the sizes and obvious on screen,
+    /// so the sizes alone are not enough of a check.
+    #[test]
+    fn a_decoded_frame_keeps_its_colour() {
+        let frame = super::decode_mjpeg_to_i420(&jpeg_fixture(
+            64,
+            32,
+            [200, 60, 60],
+            jpeg_encoder::SamplingFactor::F_2_2,
+        ))
+        .expect("decodes");
+        let rgba = elementium_codec::i420_to_rgba(&frame);
+
+        // JPEG is lossy and the conversion is approximate, so this asserts the character
+        // of the colour -- strongly red -- rather than exact values.
+        let (r, g, b) = (rgba.data[0], rgba.data[1], rgba.data[2]);
+        assert!(
+            r > 150 && g < 110 && b < 110,
+            "expected a red pixel, got r={r} g={g} b={b}"
+        );
+    }
+
+    /// The chroma subsampling belongs to the JPEG, not to us.
+    ///
+    /// UVC webcams commonly emit 4:2:2 MJPEG and some emit 4:4:4, while I420 is 4:2:0.
+    /// Reading one as another puts chroma where luma is expected, which decoded a solid
+    /// red image to a murky green until this was handled -- a fault that is invisible in
+    /// the plane sizes and obvious on screen.
+    #[test]
+    fn every_chroma_subsampling_decodes_to_i420() {
+        for (name, sampling) in [
+            ("4:4:4", jpeg_encoder::SamplingFactor::F_1_1),
+            ("4:2:2", jpeg_encoder::SamplingFactor::F_2_1),
+            ("4:2:0", jpeg_encoder::SamplingFactor::F_2_2),
+        ] {
+            let frame =
+                super::decode_mjpeg_to_i420(&jpeg_fixture(64, 32, [200, 60, 60], sampling))
+                    .unwrap_or_else(|| panic!("{name} must decode"));
+
+            assert_eq!(frame.y.len(), 64 * 32, "{name}: luma plane");
+            assert_eq!(frame.u.len(), 32 * 16, "{name}: chroma must end up 4:2:0");
+            assert_eq!(frame.v.len(), 32 * 16, "{name}: chroma must end up 4:2:0");
+
+            let rgba = elementium_codec::i420_to_rgba(&frame);
+            let (r, g, b) = (rgba.data[0], rgba.data[1], rgba.data[2]);
+            assert!(
+                r > 150 && g < 110 && b < 110,
+                "{name}: expected red, got r={r} g={g} b={b}"
+            );
+        }
     }
 
     #[test]
