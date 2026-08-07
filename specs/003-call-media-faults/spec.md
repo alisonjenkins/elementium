@@ -133,6 +133,25 @@ So the latch is a severity amplifier, not the root cause. **The root cause found
 here is the encryption declaration**, and its symptom — a clean, well-paced,
 zero-concealment stream of noise — is exactly what the user reports.
 
+### Which path this actually fixes
+
+Not the one the application runs, and that must not be glossed over.
+
+`AddTrackRequest` is built by `LiveKitRoom`, which is used by the Rust harness and
+the `publish_test_tone` example. The application takes the shim path — our
+`RTCPeerConnection` beneath the real livekit-client — and there livekit-client
+builds the request itself, with `encryptionType` set to `GCM` by `setE2EEEnabled`.
+So the live path already declared its tracks correctly.
+
+What the fix repairs is the instrument, not the patient. Every "healthy" verdict the
+browser suite produced was taken through a publisher that announced NONE, so the
+receiver never decrypted anything and graded noise as clean audio. Those results
+are void, and the suite only became capable of detecting this class of fault with
+this change in place.
+
+The user-facing audio fault therefore remains open. What has changed is that the
+test that would show it now can.
+
 Eleven undecryptable frames reach that state. At 50 frames per second that is a
 fifth of a second, and it is exactly what a peer sees while our key is still in
 flight to them: at every call start, and at every rotation.
