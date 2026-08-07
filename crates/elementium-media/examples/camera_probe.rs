@@ -67,6 +67,20 @@ fn main() {
                                 started.get_or_insert(now);
                                 latest = Some(now);
                                 sample = Some((f.width, f.height, f.data.len()));
+                                // Write one frame out so the pixels can be inspected
+                                // directly. A capture that is geometrically or
+                                // chromatically wrong looks identical to a healthy one in
+                                // every scalar we log.
+                                if frames == 30 && std::env::var_os("ELEMENTIUM_DUMP_FRAME").is_some() {
+                                    let path = format!("/tmp/elementium_frame_{}.rgba", s.node_id);
+                                    match std::fs::write(&path, &f.data) {
+                                        Ok(()) => println!(
+                                            "    wrote {path} ({}x{}, {} bytes)",
+                                            f.width, f.height, f.data.len()
+                                        ),
+                                        Err(e) => println!("    frame dump failed: {e}"),
+                                    }
+                                }
                             } else {
                                 std::thread::sleep(Duration::from_millis(2));
                             }
