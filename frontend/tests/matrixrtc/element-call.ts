@@ -156,16 +156,32 @@ export async function inboundAudio(p: Participant): Promise<InboundAudio[]> {
 }
 
 /**
+ * Fraction of received audio a receiver may conceal before the stream counts as broken.
+ *
+ * Not zero: NetEq conceals a little while it sizes its jitter buffer at stream start, which
+ * is normal. The same threshold the browser receive-path suite uses, for the same reason --
+ * continuous concealment is orders of magnitude above this.
+ */
+const MAX_CONCEALMENT_RATIO = 0.05;
+
+/**
  * Audio this participant is receiving *and using*, per remote publisher.
  *
- * Packets arriving is not the same as audio being heard. A stream whose key never arrived
- * still produces packets, and one whose key is wrong produces samples -- of noise. Requiring
- * samples that are not concealed is the closest a receiver can get to "this was audible".
+ * Packets arriving is not the same as audio being heard, and the difference is the whole
+ * subject: a stream whose key never arrived still produces packets, and one whose key is
+ * wrong produces samples -- of noise.
+ *
+ * Silent concealment is subtracted before the comparison. NetEq emits it for a stream that
+ * is deliberately absent, such as a muted publisher, and counting that as damage would call
+ * a working call broken. What is left is the receiver inventing audio to paper over
+ * something it could not use.
  */
 export function usable(streams: InboundAudio[]): InboundAudio[] {
-  return streams.filter(
-    (s) => s.totalSamplesReceived > 0 && s.concealedSamples < s.totalSamplesReceived / 2,
-  );
+  return streams.filter((s) => {
+    if (s.totalSamplesReceived === 0) return false;
+    const invented = s.concealedSamples - s.silentConcealedSamples;
+    return invented / s.totalSamplesReceived < MAX_CONCEALMENT_RATIO;
+  });
 }
 
 /**
