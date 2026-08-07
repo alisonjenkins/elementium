@@ -83,32 +83,57 @@ pub struct EncoderCapability {
     pub max_height: u32,
 }
 
-/// Everything this machine can encode, hardware and software.
+/// Everything the graphics hardware offers the capture and encode path.
 ///
-/// Software support is unconditional; hardware support is whatever the platform reports.
+/// Encoding is the headline, but not the whole of it. Whether the GPU can decode JPEG
+/// decides which format is worth asking the camera for — MJPEG is the most expensive
+/// option when the CPU must decode it and the cheapest when the GPU can — and whether it
+/// has a post-processor decides whether a layout the encoder does not read can be accepted
+/// at all. All three come from the same driver query, so they are reported together rather
+/// than opening a VA display three times.
+#[derive(Debug, Default, Clone)]
+pub struct HardwareCapabilities {
+    /// Codecs the hardware can encode, with their size limits.
+    pub encoders: Vec<EncoderCapability>,
+    /// Whether the GPU has a JPEG decode block reachable through the driver.
+    pub jpeg_decode: bool,
+    /// Whether the GPU can convert between pixel layouts and scale.
+    pub video_proc: bool,
+}
+
+/// What this machine's graphics hardware can do.
 ///
 /// Probed once per process and cached. The answer cannot change while the application runs
 /// -- a GPU is not hot-plugged mid-call -- and asking is not free: initialising a VA
 /// display and enumerating its profiles takes milliseconds and logs as it goes, which is
 /// unacceptable on a path consulted whenever a codec is chosen.
 #[must_use]
-pub fn available_encoders() -> &'static [EncoderCapability] {
-    static CACHE: std::sync::OnceLock<Vec<EncoderCapability>> = std::sync::OnceLock::new();
+pub fn capabilities() -> &'static HardwareCapabilities {
+    static CACHE: std::sync::OnceLock<HardwareCapabilities> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
-        let mut caps: Vec<EncoderCapability> = VideoCodec::software_supported()
-            .iter()
-            .map(|&codec| EncoderCapability {
+        let mut caps = platform::probe();
+        // Software support is unconditional, and listed first so it is never absent.
+        let software = VideoCodec::software_supported().iter().map(|&codec| {
+            EncoderCapability {
                 codec,
                 backend: EncoderBackend::Software,
                 // No meaningful limit: a software encoder is bounded by memory and
                 // patience.
                 max_width: u32::MAX,
                 max_height: u32::MAX,
-            })
-            .collect();
-        caps.extend(platform::probe());
+            }
+        });
+        let mut encoders: Vec<EncoderCapability> = software.collect();
+        encoders.append(&mut caps.encoders);
+        caps.encoders = encoders;
         caps
     })
+}
+
+/// Everything this machine can encode, hardware and software.
+#[must_use]
+pub fn available_encoders() -> &'static [EncoderCapability] {
+    &capabilities().encoders
 }
 
 /// Pick the backend to encode `codec` with, preferring hardware.
@@ -217,57 +242,52 @@ pub fn negotiation_order(
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::EncoderCapability;
+    use super::HardwareCapabilities;
 
-    /// Hardware encoders VAAPI reports.
+    /// What VAAPI reports.
     ///
     /// Behind a feature because libva is a system library: a build without it should fail
     /// to find hardware rather than fail to compile, and a machine without a GPU driver is
     /// a normal machine.
     #[cfg(feature = "vaapi")]
-    pub fn probe() -> Vec<EncoderCapability> {
+    pub fn probe() -> HardwareCapabilities {
         crate::vaapi_probe::probe()
     }
 
     /// No VAAPI support compiled in.
     #[cfg(not(feature = "vaapi"))]
-    #[allow(clippy::missing_const_for_fn)] // Mirrors the feature-enabled signature.
-    pub fn probe() -> Vec<EncoderCapability> {
-        Vec::new()
+    pub fn probe() -> HardwareCapabilities {
+        HardwareCapabilities::default()
     }
 }
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::EncoderCapability;
+    use super::HardwareCapabilities;
 
-    /// Hardware encoders `VideoToolbox` reports. Not yet implemented; see the Linux probe.
-    #[allow(clippy::missing_const_for_fn)] // Will not be const once it queries the driver.
-    pub fn probe() -> Vec<EncoderCapability> {
-        Vec::new()
+    /// What `VideoToolbox` reports. Not yet implemented; see the Linux probe.
+    pub fn probe() -> HardwareCapabilities {
+        HardwareCapabilities::default()
     }
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::EncoderCapability;
+    use super::HardwareCapabilities;
 
-    /// Hardware encoders Media Foundation reports. Not yet implemented; see the Linux
-    /// probe.
-    #[allow(clippy::missing_const_for_fn)] // Will not be const once it queries the driver.
-    pub fn probe() -> Vec<EncoderCapability> {
-        Vec::new()
+    /// What Media Foundation reports. Not yet implemented; see the Linux probe.
+    pub fn probe() -> HardwareCapabilities {
+        HardwareCapabilities::default()
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod platform {
-    use super::EncoderCapability;
+    use super::HardwareCapabilities;
 
-    /// No hardware encoding is known for this platform.
-    #[allow(clippy::missing_const_for_fn)] // Will not be const once it queries the driver.
-    pub fn probe() -> Vec<EncoderCapability> {
-        Vec::new()
+    /// No hardware video acceleration is known for this platform.
+    pub fn probe() -> HardwareCapabilities {
+        HardwareCapabilities::default()
     }
 }
 

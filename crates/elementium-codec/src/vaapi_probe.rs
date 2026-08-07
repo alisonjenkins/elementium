@@ -17,7 +17,7 @@
 
 use std::os::raw::{c_int, c_uint};
 
-use crate::hardware::{EncoderBackend, EncoderCapability};
+use crate::hardware::{EncoderBackend, EncoderCapability, HardwareCapabilities};
 use crate::video::VideoCodec;
 
 /// Render nodes to try, in order.
@@ -57,42 +57,44 @@ fn profiles_of_interest() -> Vec<(VideoCodec, libva_sys::va_display_drm::VAProfi
     ]
 }
 
-/// Everything VAAPI reports this machine can encode.
+/// Everything VAAPI reports this machine can do.
 ///
-/// Returns an empty list on any failure. That is the correct outcome rather than an error:
-/// no hardware encoding is a normal state, and the caller's next step is the software
-/// encoder either way.
+/// Returns the default (nothing available) on any failure. That is the correct outcome
+/// rather than an error: no hardware acceleration is a normal state, and the caller's next
+/// step is the software path either way.
 #[must_use]
-pub fn probe() -> Vec<EncoderCapability> {
+pub fn probe() -> HardwareCapabilities {
     for node in RENDER_NODES {
         let caps = probe_node(node);
-        if !caps.is_empty() {
+        if !caps.encoders.is_empty() {
             tracing::info!(
                 node,
-                codecs = ?caps.iter().map(|c| c.codec.sdp_name()).collect::<Vec<_>>(),
-                "VAAPI hardware encoding available"
+                codecs = ?caps.encoders.iter().map(|c| c.codec.sdp_name()).collect::<Vec<_>>(),
+                jpeg_decode = caps.jpeg_decode,
+                video_proc = caps.video_proc,
+                "VAAPI hardware acceleration available"
             );
             return caps;
         }
     }
     tracing::info!("no VAAPI hardware encoder found; video will be encoded in software");
-    Vec::new()
+    HardwareCapabilities::default()
 }
 
 /// Query one render node.
-fn probe_node(path: &str) -> Vec<EncoderCapability> {
+fn probe_node(path: &str) -> HardwareCapabilities {
     // Read-write: the driver maps buffers through this descriptor, and a read-only
     // handle gets far enough to initialise and then fails inside Mesa with EACCES.
     let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
-        return Vec::new();
+        return HardwareCapabilities::default();
     };
     // The display borrows the descriptor, so the file must outlive it.
     let Some(display) = VaDisplay::open(&file) else {
-        return Vec::new();
+        return HardwareCapabilities::default();
     };
 
     let supported = display.encode_profiles();
-    let mut caps: Vec<EncoderCapability> = Vec::new();
+    let mut encoders: Vec<EncoderCapability> = Vec::new();
 
     for (codec, profile) in profiles_of_interest() {
         if !supported.contains(&profile) {
@@ -101,11 +103,11 @@ fn probe_node(path: &str) -> Vec<EncoderCapability> {
         // One codec, several profiles: the first that answers is enough, and the largest
         // size any of them supports is the one to report.
         let (max_width, max_height) = display.max_picture_size(profile);
-        if let Some(existing) = caps.iter_mut().find(|c| c.codec == codec) {
+        if let Some(existing) = encoders.iter_mut().find(|c| c.codec == codec) {
             existing.max_width = existing.max_width.max(max_width);
             existing.max_height = existing.max_height.max(max_height);
         } else {
-            caps.push(EncoderCapability {
+            encoders.push(EncoderCapability {
                 codec,
                 backend: EncoderBackend::Vaapi,
                 max_width,
@@ -114,7 +116,11 @@ fn probe_node(path: &str) -> Vec<EncoderCapability> {
         }
     }
 
-    caps
+    HardwareCapabilities {
+        encoders,
+        jpeg_decode: display.has_jpeg_decode(),
+        video_proc: display.has_video_proc(),
+    }
 }
 
 /// An initialised VA display, terminated on drop.
@@ -183,21 +189,73 @@ impl VaDisplay {
 
             profiles
                 .into_iter()
-                .filter(|&profile| self.can_encode(profile, max_entrypoints))
+                .filter(|&profile| {
+                    // `EncSlice` is the general case; `EncSliceLP` is the low-power path
+                    // some Intel parts offer instead. Either is hardware encoding.
+                    self.entrypoints(profile, max_entrypoints).iter().any(|&e| {
+                        e == va::VAEntrypoint_VAEntrypointEncSlice
+                            || e == va::VAEntrypoint_VAEntrypointEncSliceLP
+                    })
+                })
                 .collect()
         }
     }
 
-    /// Whether `profile` has an encoding entrypoint.
+    /// Whether the GPU can decode JPEG itself.
+    ///
+    /// This is what decides whether MJPEG is the cheapest capture format or the most
+    /// expensive one. With a JPEG block, the compressed bytes go to the GPU and the CPU
+    /// never touches a pixel; without one, every frame costs a full CPU decode.
+    ///
+    /// Asked for separately from encoding because it is a decode entrypoint (`VLD`) on a
+    /// profile no encoder uses, and because a GPU can perfectly well have one and not the
+    /// other.
+    fn has_jpeg_decode(&self) -> bool {
+        use libva_sys::va_display_drm as va;
+        self.has_entrypoint(
+            va::VAProfile_VAProfileJPEGBaseline,
+            va::VAEntrypoint_VAEntrypointVLD,
+        )
+    }
+
+    /// Whether the GPU can convert between pixel layouts and scale.
+    ///
+    /// Post-processing is attached to the pseudo-profile `VAProfileNone` rather than to any
+    /// codec, since it is not tied to one.
+    fn has_video_proc(&self) -> bool {
+        use libva_sys::va_display_drm as va;
+        self.has_entrypoint(
+            va::VAProfile_VAProfileNone,
+            va::VAEntrypoint_VAEntrypointVideoProc,
+        )
+    }
+
+    /// Whether `profile` offers `entrypoint`.
+    fn has_entrypoint(
+        &self,
+        profile: libva_sys::va_display_drm::VAProfile,
+        entrypoint: libva_sys::va_display_drm::VAEntrypoint,
+    ) -> bool {
+        // SAFETY: `handle` was initialised in `open`.
+        let max = unsafe { libva_sys::va_display_drm::vaMaxNumEntrypoints(self.handle) };
+        if max <= 0 {
+            return false;
+        }
+        // SAFETY: as above, and `max` is the driver's own bound on the buffer.
+        unsafe { self.entrypoints(profile, max) }.contains(&entrypoint)
+    }
+
+    /// The entrypoints `profile` offers, empty if the driver refuses the question.
     ///
     /// # Safety
     ///
-    /// `self.handle` must be an initialised display, which `open` guarantees.
-    unsafe fn can_encode(
+    /// `self.handle` must be an initialised display, which `open` guarantees, and
+    /// `max_entrypoints` must be what `vaMaxNumEntrypoints` reported.
+    unsafe fn entrypoints(
         &self,
         profile: libva_sys::va_display_drm::VAProfile,
         max_entrypoints: c_int,
-    ) -> bool {
+    ) -> Vec<libva_sys::va_display_drm::VAEntrypoint> {
         use libva_sys::va_display_drm as va;
 
         let mut entrypoints: Vec<va::VAEntrypoint> =
@@ -213,14 +271,10 @@ impl VaDisplay {
             )
         };
         if status != 0 {
-            return false;
+            return Vec::new();
         }
         entrypoints.truncate(usize::try_from(count).unwrap_or(0));
-        // `EncSlice` is the general case; `EncSliceLP` is the low-power path some Intel
-        // parts offer instead. Either is hardware encoding.
-        entrypoints.iter().any(|&e| {
-            e == va::VAEntrypoint_VAEntrypointEncSlice || e == va::VAEntrypoint_VAEntrypointEncSliceLP
-        })
+        entrypoints
     }
 
     /// The largest picture the driver will encode with `profile`.
@@ -301,11 +355,27 @@ mod tests {
     /// zero would silently exclude the encoder from every selection.
     #[test]
     fn whatever_is_reported_is_usable() {
-        for cap in probe() {
+        for cap in probe().encoders {
             assert_eq!(cap.backend, EncoderBackend::Vaapi);
             assert_ne!(cap.codec, VideoCodec::Vp8);
             assert!(cap.max_width >= 640, "unusable width: {}", cap.max_width);
             assert!(cap.max_height >= 480, "unusable height: {}", cap.max_height);
+        }
+    }
+
+    /// Accelerated decode and accelerated encode are separate facts about a GPU, and the
+    /// probe must not infer one from the other: a part can have an encode block and no
+    /// JPEG decoder, or a post-processor and neither. Claiming JPEG decode that is not
+    /// there would have the capture path ask for MJPEG on the strength of a GPU decode it
+    /// then cannot perform, which is the single worst format for the CPU.
+    #[test]
+    fn accelerated_decode_is_reported_separately_from_encode() {
+        let caps = probe();
+        if caps.encoders.is_empty() {
+            assert!(
+                !caps.jpeg_decode && !caps.video_proc,
+                "nothing should be claimed when no display could be opened"
+            );
         }
     }
 
@@ -316,9 +386,11 @@ mod tests {
         let first = probe();
         let second = probe();
         assert_eq!(
-            first.len(),
-            second.len(),
+            first.encoders.len(),
+            second.encoders.len(),
             "probe is not idempotent: {first:?} then {second:?}"
         );
+        assert_eq!(first.jpeg_decode, second.jpeg_decode);
+        assert_eq!(first.video_proc, second.video_proc);
     }
 }
