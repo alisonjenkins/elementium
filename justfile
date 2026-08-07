@@ -47,16 +47,32 @@ call-peers:
 app-join:
     cd test-env && ./configure-synapse.sh
     cd test-env && docker compose up -d
-    cd test-env && ./provision.sh > ../target/test-env-fixture.json
+    # Only if there is no fixture yet. `provision.sh` creates a *new* room every run, so
+    # re-provisioning here would put the app in a different room from the participants
+    # `just call-peers` already has in a call -- which looks exactly like a call that does
+    # not connect.
+    [ -f target/test-env-fixture.json ] || (cd test-env && ./provision.sh > ../target/test-env-fixture.json)
     cd frontend && pnpm exec vite build -c vite.shims.config.ts
-    cd frontend && pnpm exec vite build -c vite.autojoin.config.ts
     # The env has to reach `cargo tauri dev`, not just the patch above: tauri runs
     # `prepare-dev.sh` -- which calls the same patch script -- before starting. Without it
     # that run sees no ELEMENTIUM_TEST_ENV and no ELEMENTIUM_AUTOJOIN, so it restores the
     # production config and removes the autojoin driver, and the app comes up pointed at a
     # real homeserver doing nothing. Which is exactly what happened the first time.
+    # A throwaway profile, via XDG_DATA_HOME. Without it the webview uses the real one in
+    # ~/.local/share/io.github.elementium, and the autojoin's test session lands on top of
+    # whatever account is already signed in there. That produced "Unable to restore session"
+    # -- Element Web finding a token and device from the test homeserver against a crypto
+    # store belonging to a different account, and refusing rather than corrupting it. The
+    # offered remedy is "Clear Storage and Sign Out", which destroys encrypted history.
+    #
+    # Nothing this recipe does should be able to reach a real session, so it does not share
+    # a directory with one.
+    mkdir -p target/app-join-profile
     ELEMENTIUM_TEST_ENV=1 ELEMENTIUM_AUTOJOIN=1 \
         ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-1}" \
+        XDG_DATA_HOME="$PWD/target/app-join-profile/data" \
+        XDG_CONFIG_HOME="$PWD/target/app-join-profile/config" \
+        XDG_CACHE_HOME="$PWD/target/app-join-profile/cache" \
         nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
             cargo tauri dev
 

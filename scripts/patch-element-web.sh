@@ -78,6 +78,16 @@ if [[ "${ELEMENTIUM_AUTOJOIN:-}" == "1" ]]; then
         echo "[patch]        Run test-env/provision.sh first." >&2
         exit 1
     fi
+    # Built here rather than assumed: the shims build empties `dist-shims`, so a bundle
+    # produced before it is gone by the time this runs.
+    if [[ ! -f frontend/dist-shims/elementium-autojoin.js ]]; then
+        (cd frontend && pnpm exec vite build -c vite.autojoin.config.ts >/dev/null)
+    fi
+    # Built here rather than assumed: the shims build empties `dist-shims`, so a bundle
+    # produced before it is gone by the time this runs.
+    if [[ ! -f frontend/dist-shims/elementium-autojoin.js ]]; then
+        (cd frontend && pnpm exec vite build -c vite.autojoin.config.ts >/dev/null)
+    fi
     cp frontend/dist-shims/elementium-autojoin.js "$DIST_DIR/elementium-autojoin.js"
     # Participant index 0 by default; `just call-peers` uses the rest, so the app takes
     # tester1 and meets them.
