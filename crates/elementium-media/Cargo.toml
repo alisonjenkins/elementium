@@ -14,8 +14,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # SIMD-accelerated (AVX2/SSE/NEON, with scalar fallback) YUV<->RGB conversion.
 yuv = "0.8"
+pipewire = "0.10.0"
+libspa = "0.10.0"
+zune-jpeg = "0.5.15"
+zune-core = "0.5.1"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 elementium-observability-test = { workspace = true }
 elementium-codec = { workspace = true }
 
