@@ -143,10 +143,21 @@ export function setupMediaDevicesShim(): void {
             canvas.width = geometry?.width ?? 640;
             canvas.height = geometry?.height ?? 480;
             debugLog(`video track: canvas sized ${canvas.width}x${canvas.height}`);
-            // Attach to DOM (hidden) so captureStream works reliably in WebKitGTK
+            // In the DOM, inside the viewport, but invisible.
+            //
+            // It has to be attached for `captureStream` to work reliably in WebKitGTK, and
+            // it is kept *within* the viewport deliberately: an element parked at -9999px
+            // is never painted, and a capture implementation that samples the compositor
+            // rather than the backing store can then return partially-updated tiles --
+            // which looks exactly like the horizontal banding being chased here. Zero
+            // opacity keeps it painted and unseen.
             canvas.style.position = "fixed";
-            canvas.style.top = "-9999px";
-            canvas.style.left = "-9999px";
+            canvas.style.top = "0";
+            canvas.style.left = "0";
+            canvas.style.width = "1px";
+            canvas.style.height = "1px";
+            canvas.style.opacity = "0";
+            canvas.style.zIndex = "-1";
             canvas.style.pointerEvents = "none";
             (document.body || document.documentElement).appendChild(canvas);
             debugLog("video track: canvas in DOM");
@@ -299,6 +310,41 @@ async function firstFrameGeometry(
   return null;
 }
 
+
+/**
+ * Whether to draw the frame-number overlay. Read once from the native side.
+ *
+ * Shares the preview-dump switch, so `touch /tmp/elementium-dump-preview` turns on every
+ * video diagnostic at once.
+ */
+let videoDebug = false;
+void invoke<boolean>("video_debug_enabled")
+  .then((on) => {
+    videoDebug = on;
+    if (on) debugLog("video debug overlay enabled");
+  })
+  .catch(() => {});
+
+/**
+ * Stamp the frame number into the corner of the canvas.
+ *
+ * Turns "is the picture torn?" from a judgement into a reading. Every drawn frame carries
+ * a different number, so a displayed image containing two different numbers is composed of
+ * two different draws -- which is what tearing *is*, and it says so regardless of which
+ * layer introduced it. A single number across a banded image means the bands were already
+ * in one drawn frame, and the fault is upstream of the display entirely.
+ */
+function drawFrameMarker(ctx: CanvasRenderingContext2D, frameCount: number): void {
+  if (!videoDebug) return;
+  ctx.save();
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, 72, 28);
+  ctx.fillStyle = "#0f0";
+  ctx.font = "20px monospace";
+  ctx.fillText(String(frameCount % 1000).padStart(3, "0"), 6, 21);
+  ctx.restore();
+}
+
 function startLocalVideoFrameFetch(
   canvas: HTMLCanvasElement,
   trackId: string,
@@ -317,6 +363,9 @@ function startLocalVideoFrameFetch(
   let windowStart = Date.now();
   let windowFrames = 0;
   let windowFetchMs = 0;
+  let windowDrawn = 0;
+  let windowMismatches = 0;
+  let lastMismatch = "none";
 
   const fetchLoop = async () => {
     if (!running) return;
@@ -340,14 +389,11 @@ function startLocalVideoFrameFetch(
           const payload = buf.byteLength - 8;
           const expected = width * height * 4;
           if (payload !== expected) {
-            if (frameCount % 60 === 1) {
-              debugLog(
-                `frame geometry mismatch: header says ${width}x${height} (${expected} bytes), ` +
-                  `payload is ${payload} bytes (${payload - expected >= 0 ? "+" : ""}${payload - expected})`,
-              );
-            }
+            windowMismatches += 1;
+            lastMismatch = `${width}x${height} wants ${expected}, got ${payload}`;
             return scheduleNext();
           }
+          windowDrawn += 1;
           const rgba = new Uint8ClampedArray(buf.slice(8));
           const imageData = new ImageData(rgba, width, height);
           if (canvas.width === width && canvas.height === height) {
@@ -377,6 +423,7 @@ function startLocalVideoFrameFetch(
               ctx.drawImage(scratch, dx, dy, drawW, drawH);
             }
           }
+          drawFrameMarker(ctx, frameCount);
           // The draw is complete: publish it as one frame. Doing this instead of letting
           // the track sample on a timer is what stops a half-written canvas reaching the
           // wire.
@@ -395,11 +442,14 @@ function startLocalVideoFrameFetch(
       debugLog(
         `preview ${trackId}: ${(windowFrames / secs).toFixed(1)} fps, ` +
           `${(windowFetchMs / windowFrames).toFixed(1)}ms avg per frame ` +
-          `(${canvas.width}x${canvas.height})`,
+          `(${canvas.width}x${canvas.height}), drawn=${windowDrawn} ` +
+          `mismatched=${windowMismatches} last=${lastMismatch}`,
       );
       windowStart = Date.now();
       windowFrames = 0;
       windowFetchMs = 0;
+      windowDrawn = 0;
+      windowMismatches = 0;
     }
 
     scheduleNext(elapsed);
