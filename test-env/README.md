@@ -39,6 +39,17 @@ For tests, nothing: `pnpm exec playwright test` (or `just test-browser`) brings 
 stack up and takes it down again. If it was already running it is left alone, so a
 test run cannot destroy an environment someone was using.
 
+For the app:
+
+```sh
+just dev-test-env       # stack up, Element Web pointed here, participants created
+just test-env-down      # stop it
+```
+
+Log in as `tester1` / `test-password-1`. The app and any Playwright participants then
+share a homeserver — without that they are on different ones and never see each
+other, which looks exactly like a broken call.
+
 By hand:
 
 ```sh
@@ -84,7 +95,15 @@ why, so they are written down rather than rediscovered.
 - **`public_baseurl` is required** for synapse to serve `/.well-known/matrix/client`
   at all, which is how Element Call discovers the RTC focus.
 
+## How the app is pointed here
+
+`ELEMENTIUM_TEST_ENV=1` makes `scripts/patch-element-web.sh` deploy
+`element-web-config/config.test-env.json` instead of the usual one. That is the only
+difference; the normal config is untouched, so an ordinary `just dev` still talks to
+whatever homeserver it always did.
+
 ## What is not here yet
 
-The Elementium app still points at whatever homeserver its own config names, so it
-cannot yet meet these participants in a room. That is the next step.
+Tests that drive Element Call itself — joining a call, rotating keys, watching a
+participant leave — rather than livekit-client directly. That is what turns the two
+faults above from "reported" into "reproducible on demand", and it is the next step.

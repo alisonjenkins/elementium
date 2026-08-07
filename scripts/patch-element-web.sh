@@ -7,7 +7,15 @@ cd "$(dirname "$0")/.."
 
 DIST_DIR="element-web-dist"
 SHIMS_SRC="frontend/dist-shims/elementium-shims.js"
-CONFIG_SRC="element-web-config/config.json"
+# Which homeserver the app talks to. `ELEMENTIUM_TEST_ENV=1` selects the local
+# MatrixRTC stack in `test-env/`, so the app and the Playwright participants meet in
+# the same room -- without it they would be on different homeservers and never see
+# each other, which looks exactly like a broken call.
+if [[ "${ELEMENTIUM_TEST_ENV:-}" == "1" ]]; then
+    CONFIG_SRC="element-web-config/config.test-env.json"
+else
+    CONFIG_SRC="element-web-config/config.json"
+fi
 INDEX="$DIST_DIR/index.html"
 MARKER="<!-- elementium-shims-injected -->"
 
@@ -32,7 +40,7 @@ echo "[patch] Copied shims to $DIST_DIR/elementium-shims.js"
 
 # 2. Copy config
 cp "$CONFIG_SRC" "$DIST_DIR/config.json"
-echo "[patch] Copied config to $DIST_DIR/config.json"
+echo "[patch] Copied config ($CONFIG_SRC) to $DIST_DIR/config.json"
 
 # 3. Remove Element Web's CSP meta tag (Tauri's CSP is the security boundary)
 if grep -q 'http-equiv="Content-Security-Policy"' "$INDEX"; then

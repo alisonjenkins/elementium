@@ -8,6 +8,26 @@ list:
 dev:
     cargo tauri dev
 
+# Run against the local MatrixRTC stack in test-env/ rather than a real homeserver.
+#
+# Brings the stack up, points Element Web at it, and creates participants. Use this
+# when reproducing a fault that needs more than one person in the call: log in as
+# tester1 (password test-password-1) and let Playwright drive the rest.
+#
+# The stack is left running afterwards -- `just test-env-down` stops it.
+dev-test-env:
+    cd test-env && docker compose up -d
+    cd test-env && ./provision.sh
+    ELEMENTIUM_TEST_ENV=1 cargo tauri dev
+
+# Stop the local MatrixRTC stack.
+test-env-down:
+    cd test-env && docker compose down
+
+# Browser tests. Bring the stack up and tear it down around the run themselves.
+test-browser:
+    cd frontend && pnpm exec playwright test
+
 # Build release
 build:
     cargo tauri build
