@@ -29,10 +29,17 @@ pub struct Display {
     _node: std::fs::File,
 }
 
-// SAFETY: a VADisplay is usable from one thread at a time, which is how the encoder uses
-// it -- owned by the encoder, which is `Send` and not `Sync`. libva itself is thread-safe
-// for separate displays.
+// SAFETY: `VADisplay` is an opaque driver handle, not a pointer into this process's own
+// state, and libva's drivers serialise access to it internally -- which is what makes
+// `vaInitialize`/`vaTerminate` reference-counted per display rather than per thread.
+//
+// `Sync` is needed because the resources below share one display through an `Arc`, and an
+// `Arc<T>` is only `Send` when `T` is both. In practice concurrent access does not arise:
+// an encoder owns its display and is `Send` but not `Sync`, so no two threads hold one at
+// the same time. The driver's own locking is what makes the weaker guarantee sound anyway.
 unsafe impl Send for Display {}
+// SAFETY: as above.
+unsafe impl Sync for Display {}
 
 impl Display {
     /// Open the first render node that initialises.

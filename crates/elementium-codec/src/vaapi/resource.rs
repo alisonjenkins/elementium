@@ -6,18 +6,32 @@
 //! addresses a live object of the wrong kind.
 //!
 //! Every handle here is therefore a distinct newtype, and every resource owns its
-//! destruction. The rules libva expects are then enforced by the borrow checker rather than
-//! by remembering them:
+//! destruction. The rules libva expects are then enforced by the type system rather than by
+//! remembering them:
 //!
-//! - A resource cannot outlive its display, because it borrows it.
+//! - A resource cannot outlive its display, because it holds a reference to it.
+//! - A context cannot outlive its config, for the same reason.
 //! - A resource cannot be destroyed twice, because `Drop` runs once.
 //! - A resource cannot be leaked on an early return, because `Drop` runs anyway.
 //! - A handle of one kind cannot be passed where another is expected.
 //!
 //! None of that is free-standing pedantry. Each of those is a real failure mode of this
 //! API, and each produces a segfault or a silently corrupt encode rather than an error.
+//!
+//! # Why `Arc` rather than a lifetime
+//!
+//! These were borrowed types, which said the same thing at compile time and said it more
+//! cheaply. The encoder is what changed: it owns a display, a config, a context and a pool
+//! at once, and a borrowed `Config<'d>` inside a struct that also owns the `Display` it
+//! borrows is self-referential and not expressible.
+//!
+//! The ordering guarantee is unchanged -- a config still cannot be destroyed while a
+//! context uses it -- but it is now upheld by a reference count instead of by the borrow
+//! checker. The cost is one atomic increment per resource creation, which happens when a
+//! call starts and not per frame.
 
 use std::os::raw::c_int;
+use std::sync::Arc;
 
 use libva_sys::va_display_drm as va;
 
@@ -40,6 +54,14 @@ pub struct SurfaceId(va::VASurfaceID);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferId(va::VABufferID);
 
+impl ContextId {
+    /// The raw id, for the picture calls that take it directly.
+    #[must_use]
+    pub const fn raw(self) -> va::VAContextID {
+        self.0
+    }
+}
+
 impl SurfaceId {
     /// The raw id, for the few calls that take an array of them.
     #[must_use]
@@ -58,14 +80,14 @@ impl BufferId {
 
 /// A configuration, destroyed when dropped.
 ///
-/// Borrows the display so it cannot outlive it — destroying a config against a terminated
-/// display is undefined, and without the borrow nothing would stop it.
-pub struct Config<'d> {
-    display: &'d Display,
+/// Holds the display so it cannot outlive it — destroying a config against a terminated
+/// display is undefined, and without the reference nothing would stop it.
+pub struct Config {
+    display: Arc<Display>,
     id: ConfigId,
 }
 
-impl<'d> Config<'d> {
+impl Config {
     /// Create a configuration for encoding with `profile`.
     ///
     /// # Errors
@@ -73,7 +95,7 @@ impl<'d> Config<'d> {
     /// Returns the driver's status if it will not accept the profile, entrypoint or
     /// attributes — most often because the profile cannot be encoded, only decoded.
     pub fn for_encoding(
-        display: &'d Display,
+        display: &Arc<Display>,
         profile: va::VAProfile,
         attributes: &mut [va::VAConfigAttrib],
     ) -> Result<Self, Status> {
@@ -92,7 +114,7 @@ impl<'d> Config<'d> {
         };
         check(status, "vaCreateConfig")?;
         Ok(Self {
-            display,
+            display: Arc::clone(display),
             id: ConfigId(id),
         })
     }
@@ -103,12 +125,12 @@ impl<'d> Config<'d> {
     }
 
     #[must_use]
-    pub const fn display(&self) -> &'d Display {
-        self.display
+    pub const fn display(&self) -> &Arc<Display> {
+        &self.display
     }
 }
 
-impl Drop for Config<'_> {
+impl Drop for Config {
     fn drop(&mut self) {
         // SAFETY: created by `for_encoding` against this display, destroyed exactly once.
         unsafe {
@@ -122,12 +144,12 @@ impl Drop for Config<'_> {
 /// Allocated as a group because libva does, and because an encoder needs several at once:
 /// one for the frame being submitted and more for the reconstructed references the codec
 /// predicts from.
-pub struct SurfacePool<'d> {
-    display: &'d Display,
+pub struct SurfacePool {
+    display: Arc<Display>,
     ids: Vec<va::VASurfaceID>,
 }
 
-impl<'d> SurfacePool<'d> {
+impl SurfacePool {
     /// Allocate `count` NV12 surfaces of the given size.
     ///
     /// NV12 rather than I420 because that is what encoders take: a luma plane and one
@@ -138,7 +160,7 @@ impl<'d> SurfacePool<'d> {
     /// Returns the driver's status if the surfaces cannot be allocated, which on a busy
     /// GPU means exactly that and is worth falling back to software over.
     pub fn new_nv12(
-        display: &'d Display,
+        display: &Arc<Display>,
         width: u32,
         height: u32,
         count: usize,
@@ -171,7 +193,10 @@ impl<'d> SurfacePool<'d> {
             )
         };
         check(status, "vaCreateSurfaces")?;
-        Ok(Self { display, ids })
+        Ok(Self {
+            display: Arc::clone(display),
+            ids,
+        })
     }
 
     /// The surfaces, in allocation order.
@@ -187,7 +212,7 @@ impl<'d> SurfacePool<'d> {
     }
 }
 
-impl Drop for SurfacePool<'_> {
+impl Drop for SurfacePool {
     fn drop(&mut self) {
         // SAFETY: allocated by `new_nv12` against this display, destroyed exactly once.
         unsafe {
@@ -202,15 +227,20 @@ impl Drop for SurfacePool<'_> {
 
 /// An encoding context, destroyed when dropped.
 ///
-/// Borrows the config rather than the display, which is the relationship libva actually
-/// has: destroying a config while a context still uses it is undefined, and the borrow
-/// makes that unrepresentable rather than merely documented.
-pub struct Context<'c, 'd> {
-    config: &'c Config<'d>,
+/// Owns the config rather than the display, which is the relationship libva actually has:
+/// destroying a config while a context still uses it is undefined.
+///
+/// By value rather than by reference count, which orders the two destructions exactly as
+/// libva requires and costs nothing: `Drop` for this type runs before its fields are
+/// dropped, so `vaDestroyContext` is always called before the config's
+/// `vaDestroyConfig`. Reversing them is undefined behaviour that a reference count would
+/// permit and this does not.
+pub struct Context {
+    config: Config,
     id: ContextId,
 }
 
-impl<'c, 'd> Context<'c, 'd> {
+impl Context {
     /// Create a context for encoding frames of the given size.
     ///
     /// # Errors
@@ -218,7 +248,7 @@ impl<'c, 'd> Context<'c, 'd> {
     /// Returns the driver's status if the context cannot be created, typically because the
     /// size exceeds what the profile supports.
     pub fn new(
-        config: &'c Config<'d>,
+        config: Config,
         width: u32,
         height: u32,
         render_targets: &mut [va::VASurfaceID],
@@ -251,12 +281,12 @@ impl<'c, 'd> Context<'c, 'd> {
     }
 
     #[must_use]
-    pub const fn display(&self) -> &'d Display {
+    pub const fn display(&self) -> &Arc<Display> {
         self.config.display()
     }
 }
 
-impl Drop for Context<'_, '_> {
+impl Drop for Context {
     fn drop(&mut self) {
         // SAFETY: created by `new` against this display, destroyed exactly once.
         unsafe {
@@ -266,19 +296,19 @@ impl Drop for Context<'_, '_> {
 }
 
 /// A buffer handed to the GPU, destroyed when dropped.
-pub struct Buffer<'x> {
-    display: &'x Display,
+pub struct Buffer {
+    display: Arc<Display>,
     id: BufferId,
 }
 
-impl<'x> Buffer<'x> {
+impl Buffer {
     /// Create a buffer of `kind` holding `data`.
     ///
     /// # Errors
     ///
     /// Returns the driver's status if the buffer cannot be created.
     pub fn new<T>(
-        context: &Context<'_, 'x>,
+        context: &Context,
         kind: va::VABufferType,
         data: &mut T,
     ) -> Result<Self, Status> {
@@ -300,7 +330,42 @@ impl<'x> Buffer<'x> {
         };
         check(status, "vaCreateBuffer")?;
         Ok(Self {
-            display: context.display(),
+            display: Arc::clone(context.display()),
+            id: BufferId(id),
+        })
+    }
+
+    /// Create a buffer holding `data`, whose length is what libva is told to copy.
+    ///
+    /// Distinct from [`Buffer::new`], which takes a `T` and derives the size from the type.
+    /// A packed header is a run of bytes whose length is decided at run time, so the type
+    /// cannot supply it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the driver's status if the buffer cannot be created.
+    pub fn from_bytes(
+        context: &Context,
+        kind: va::VABufferType,
+        data: &mut [u8],
+    ) -> Result<Self, Status> {
+        let mut id: va::VABufferID = 0;
+        // SAFETY: `data` is a valid slice of its own length, which is exactly what libva is
+        // told to copy from it.
+        let status = unsafe {
+            va::vaCreateBuffer(
+                context.display().handle(),
+                context.id().raw(),
+                kind,
+                u32::try_from(data.len()).unwrap_or(0),
+                1,
+                data.as_mut_ptr().cast(),
+                std::ptr::addr_of_mut!(id),
+            )
+        };
+        check(status, "vaCreateBuffer")?;
+        Ok(Self {
+            display: Arc::clone(context.display()),
             id: BufferId(id),
         })
     }
@@ -311,7 +376,7 @@ impl<'x> Buffer<'x> {
     ///
     /// Returns the driver's status if the buffer cannot be created.
     pub fn empty(
-        context: &Context<'_, 'x>,
+        context: &Context,
         kind: va::VABufferType,
         size: usize,
     ) -> Result<Self, Status> {
@@ -331,7 +396,7 @@ impl<'x> Buffer<'x> {
         };
         check(status, "vaCreateBuffer")?;
         Ok(Self {
-            display: context.display(),
+            display: Arc::clone(context.display()),
             id: BufferId(id),
         })
     }
@@ -342,7 +407,7 @@ impl<'x> Buffer<'x> {
     }
 }
 
-impl Drop for Buffer<'_> {
+impl Drop for Buffer {
     fn drop(&mut self) {
         // SAFETY: created against this display, destroyed exactly once.
         unsafe {
@@ -360,8 +425,8 @@ mod tests {
 
     /// Skip rather than fail where there is no GPU: CI runners do not have one, and a test
     /// that fails there teaches people to ignore failures.
-    fn display() -> Option<Display> {
-        Display::open_any()
+    fn display() -> Option<std::sync::Arc<Display>> {
+        Display::open_any().map(std::sync::Arc::new)
     }
 
     /// The resources this encoder needs must be creatable on real hardware, in the order
@@ -388,7 +453,7 @@ mod tests {
         let mut pool = SurfacePool::new_nv12(&display, 640, 480, 4).expect("surfaces");
         assert_eq!(pool.surfaces().len(), 4);
 
-        let context = Context::new(&config, 640, 480, pool.raw()).expect("context");
+        let context = Context::new(config, 640, 480, pool.raw()).expect("context");
         // Distinct handle types: this would not compile if the ids were interchangeable,
         // which in the C API they are.
         assert_ne!(context.id().0, 0, "a real context id");
