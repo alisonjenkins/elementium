@@ -104,10 +104,18 @@ hasInvalidKeyAtIndex(i) -> failureTolerance >= 0 && failureCounts[i] > tolerance
 decrypt: if (this.keys.hasInvalidKeyAtIndex(keyIndex)) return;   // dropped
 ```
 
-The drop happens *before* decryption is attempted. The count is cleared only by a
-successful decryption at that index or by installing a new key there — and since no
-attempt is made, success is unreachable. The index is dead until the sender rotates
-away from it.
+The drop happens *before* decryption is attempted, so the successful decryption that
+would clear the count can never occur.
+
+And the obvious escape does not exist. `resetKeyStatus` has four callers: a
+successful decryption, a user-initiated ratchet, and `setCurrentKeyIndex` — which
+applies to the *local* participant's own encryption index. `setKey` for a remote
+participant does not call it. So when a peer's key finally arrives, late, the index
+it belongs to is already dead and installing the key does not revive it.
+
+That is the whole fault in one sentence: **a key that arrives too late is not merely
+late, it is useless** — the very outcome the user describes as keys taking ages and
+then still not working.
 
 Eleven undecryptable frames reach that state. At 50 frames per second that is a
 fifth of a second, and it is exactly what a peer sees while our key is still in

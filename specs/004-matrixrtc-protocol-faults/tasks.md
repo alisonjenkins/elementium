@@ -20,9 +20,10 @@ anecdote cannot tell a fix from a coincidence.
 
 ## Phase 3: Fix what the reproductions show
 
-- [ ] T008 [US1] **Now the highest-value task in either feature.** Establish whether we honour livekit's `useKeyDelay` when adopting a newly distributed key for *encryption*, and stop publishing frames encrypted with a key peers cannot yet hold. No longer speculative: eleven such frames — a fifth of a second — permanently kill that key index at every receiver running Element Call's default `failureTolerance` of 10, because the drop happens before decryption is attempted and only a successful decryption clears it. See the 2026-08-07 finding in `specs/003-call-media-faults/spec.md`
+- [X] T008 [US1] Establish whether we honour `useKeyDelay` when adopting a newly distributed key for *encryption*. **We do**, and it is not by design so much as by where we tap in: `e2ee-bridge.ts` intercepts the `setKey` message posted to livekit's worker, which Element Call only sends after its own delay (`delayBeforeUse` → `setTimeout(..., useKeyDelay)`, default **5000ms**, not the 1000ms assumed when this was written). We adopt exactly when livekit-client would. Suspect removed
+- [ ] T012 [US1][US2] Decide what to do about a rotation whose key does not reach a peer within `useKeyDelay`, which is the fault that survives T008. Five seconds is a guess about to-device latency, and when the guess is wrong the peer latches the index permanently. Options worth costing: raise the delay, defer adoption until distribution is acknowledged, or re-send at a fresh index on suspicion. See the 2026-08-07 finding in `specs/003-call-media-faults/spec.md`
 - [ ] T009 [US2] Fix whatever T005/T006 show, file path unknown until then
-- [ ] T010 [US3] For any key that dies inside `RTCEncryptionManager`, decide whether it is ours to work around or upstream's to fix, and record which
+- [ ] T010 [US3] For any key that dies inside `RTCEncryptionManager`, decide whether it is ours to work around or upstream's to fix, and record which. One answer is already in: the failure-count latch is **livekit's**, and reportable as such — `setKey` for a remote participant does not call `resetKeyStatus`, so a key that arrives after the index is latched cannot revive it. We must still work around it, because we cannot ship a patched livekit into Element Call
 
 ## Phase 4: Confirm
 
