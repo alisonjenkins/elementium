@@ -1,5 +1,11 @@
 //! Run the capture-to-wire path in a tight loop, for a profiler to sample.
 //!
+//! Also reports the per-frame budget at several frame rates. A high target is a useful
+//! magnifying glass: at 240fps the budget is 4.17ms for decode, downscale and encode
+//! together, which is tight enough that anything wasteful shows up as a deficit rather
+//! than as a number that looks fine in isolation. The rates a video call uses hide that --
+//! at 30fps almost anything fits.
+//!
 //! `cargo bench` measures stages against each other; a profiler shows what is happening
 //! *inside* the dominant one. The decode is roughly three quarters of the per-frame cost
 //! and is a single call from our side, so which part of it dominates -- entropy decoding,
@@ -70,6 +76,13 @@ fn main() {
     let mut encoder = Vp8Encoder::new(W, H, 2764).expect("encoder");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut frames = 0_u64;
+    // The app rate-limits the self-view independently of capture, because nothing consumes
+    // it faster than the webview fetches it. Mirrored here or this measures work the
+    // application does not do.
+    let preview_gap = std::time::Duration::from_nanos(1_000_000_000 / 30);
+    let mut last_preview = std::time::Instant::now()
+        .checked_sub(preview_gap)
+        .unwrap_or_else(std::time::Instant::now);
 
     while std::time::Instant::now() < deadline {
         let yuv = turbojpeg::decompress_to_yuv(&jpeg).expect("decode");
@@ -78,10 +91,24 @@ fn main() {
         let frame = I420Frame::from_padded(w, h, yuv.pixels, y_stride, uv_stride, 0)
             .expect("adopt decoder buffer");
 
-        let _preview = halve_i420(&frame).as_ref().map(i420_to_rgba);
+        if last_preview.elapsed() >= preview_gap {
+            last_preview = std::time::Instant::now();
+            let _preview = halve_i420(&frame).as_ref().map(i420_to_rgba);
+        }
         let _packets = encoder.encode(&frame).expect("encode");
         frames += 1;
     }
 
-    println!("{frames} frames in {seconds}s ({:.1} fps)", frames as f64 / seconds as f64);
+    let achieved = frames as f64 / seconds as f64;
+    let per_frame_ms = (seconds as f64 * 1000.0) / frames as f64;
+
+    println!("{frames} frames in {seconds}s ({achieved:.1} fps, {per_frame_ms:.2}ms per frame)");
+    println!();
+    println!("  target   budget    headroom");
+    for target in [30.0_f64, 60.0, 120.0, 240.0] {
+        let budget_ms = 1000.0 / target;
+        let headroom = (budget_ms - per_frame_ms) / budget_ms * 100.0;
+        let verdict = if headroom >= 0.0 { "ok" } else { "OVER" };
+        println!("  {target:>5.0}fps {budget_ms:>6.2}ms  {headroom:>+6.1}%  {verdict}");
+    }
 }

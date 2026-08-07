@@ -473,6 +473,19 @@ const NEGOTIATED_VIDEO_CODEC: VideoCodec = VideoCodec::Vp8;
 /// can see. The preview still shows every captured frame; only the encoder skips.
 const MAX_ENCODE_FPS: u64 = 30;
 
+/// How often the self-view is recomputed, however fast the camera runs.
+///
+/// The preview is a thumbnail a few centimetres across, fetched by the webview about
+/// thirty times a second. Recomputing it per captured frame means a downscale and a colour
+/// conversion per frame that nothing reads: at 240fps capture, seven eighths of that work
+/// is discarded before anyone sees it. The encoder has always been rate-limited; the
+/// preview was not.
+const PREVIEW_FPS: u64 = 30;
+
+/// Minimum gap between preview updates, from [`PREVIEW_FPS`].
+const MIN_PREVIEW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_nanos(1_000_000_000 / PREVIEW_FPS);
+
 /// [`MAX_ENCODE_FPS`] as the width the capture API takes.
 const MAX_ENCODE_FPS_U32: u32 = 30;
 
@@ -570,6 +583,9 @@ fn camera_pipeline_loop(
     let mut encoder: Option<NegotiatedEncoder> = None;
     let mut frame_count: u64 = 0;
     let mut last_keyframe = std::time::Instant::now();
+    let mut last_preview = std::time::Instant::now()
+        .checked_sub(MIN_PREVIEW_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
     let mut last_encode = std::time::Instant::now()
         .checked_sub(MIN_ENCODE_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
@@ -596,7 +612,8 @@ fn camera_pipeline_loop(
                     "Camera frame received"
                 );
             }
-            // The self-view: halved, then converted to RGBA for the canvas.
+            // The self-view: halved, then converted to RGBA for the canvas. Rate-limited
+            // independently of capture, because nothing consumes it faster.
             //
             // Halving first is the cheap order. I420 is 1.5 bytes per pixel against RGBA's
             // 4, so the downscale touches under 40% of the memory, and the conversion that
@@ -606,15 +623,16 @@ fn camera_pipeline_loop(
             // Every preview frame crosses the Rust-to-webview boundary as raw RGBA, so
             // halving also cuts that traffic fourfold. What peers receive is still the
             // full-resolution frame -- only the self-view is reduced.
-            let preview = elementium_codec::halve_i420(&frame)
-                .as_ref()
-                .map_or_else(
+            if last_preview.elapsed() >= MIN_PREVIEW_INTERVAL {
+                last_preview = std::time::Instant::now();
+                let preview = elementium_codec::halve_i420(&frame).as_ref().map_or_else(
                     || elementium_codec::i420_to_rgba(&frame),
                     elementium_codec::i420_to_rgba,
                 );
-            maybe_dump_preview(frame_count, &preview.data, preview.width, preview.height);
-            if let Ok(mut buf) = video_frames.lock() {
-                buf.insert(track_id.to_string(), preview);
+                maybe_dump_preview(frame_count, &preview.data, preview.width, preview.height);
+                if let Ok(mut buf) = video_frames.lock() {
+                    buf.insert(track_id.to_string(), preview);
+                }
             }
 
             // VP8 encode and send if encoding is active
