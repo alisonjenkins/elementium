@@ -410,11 +410,115 @@ pub fn resample_interleaved(data: &[f32], channels: u16, from_rate: u32, to_rate
     out
 }
 
-/// Per-track sample queues awaiting playback, keyed by track id.
+/// One remote track's buffered audio, and whether it is currently playing out.
+///
+/// The flag is the jitter buffer: a track that has not yet accumulated
+/// [`JitterConfig::prefill_samples`] contributes silence and keeps what it has, rather
+/// than playing a partial buffer and immediately starving. Without it, every packet that
+/// arrives even slightly late tears a hole in the output, which is heard as the
+/// crunchy, low-bitrate quality of a stream that is in fact being delivered intact.
+#[derive(Default)]
+pub struct TrackBuffer {
+    samples: std::collections::VecDeque<f32>,
+    playing: bool,
+}
+
+impl TrackBuffer {
+    /// Buffer newly-decoded samples, discarding the oldest if the track has run away.
+    ///
+    /// An over-full buffer is latency, not safety margin: a listener hears every buffered
+    /// sample before they hear the speaker's next word. Trimming from the front keeps the
+    /// delay bounded at the cost of one audible skip, which is the better trade against
+    /// a conversation that drifts permanently behind.
+    fn push(&mut self, samples: impl IntoIterator<Item = f32>, config: &JitterConfig) {
+        self.samples.extend(samples);
+        if self.samples.len() > config.max_samples {
+            let excess = self.samples.len().saturating_sub(config.max_samples);
+            drop(self.samples.drain(..excess));
+        }
+    }
+
+    /// Whether this track should contribute audio to the next callback.
+    fn ready(&mut self, config: &JitterConfig) -> bool {
+        if !self.playing && self.samples.len() >= config.prefill_samples {
+            self.playing = true;
+        }
+        self.playing
+    }
+
+    /// Number of buffered samples, for tests and stats.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Whether the track holds no audio at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+/// Per-track sample buffers awaiting playback, keyed by track id.
 ///
 /// One entry per remote track. Samples within an entry are strictly sequential in time;
 /// separate entries are concurrent with each other.
-pub type TrackQueues = std::collections::HashMap<String, std::collections::VecDeque<f32>>;
+pub type TrackQueues = std::collections::HashMap<String, TrackBuffer>;
+
+/// How much audio to hold back before playing a track, and how much to hold at most.
+///
+/// Both are in interleaved samples, so they depend on the output stream's rate and
+/// channel count -- 60ms is 5760 samples at 48kHz stereo and 2646 at 44.1kHz mono, and
+/// getting that conversion wrong is the difference between a jitter buffer and a
+/// quarter-second of latency.
+#[derive(Clone, Copy)]
+pub struct JitterConfig {
+    prefill_samples: usize,
+    max_samples: usize,
+}
+
+/// Audio held back before a track starts playing.
+///
+/// Covers ordinary network and scheduling jitter (a 20ms frame arriving up to two frames
+/// late) without being long enough to be perceived as delay in conversation.
+const PREFILL: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// The most audio a track may hold before the oldest is discarded.
+const MAX_BUFFER: std::time::Duration = std::time::Duration::from_millis(240);
+
+impl JitterConfig {
+    /// Buffer depths for an output stream running at `sample_rate` with `channels`.
+    #[must_use]
+    pub fn for_stream(sample_rate: u32, channels: u16) -> Self {
+        let per_second = u64::from(sample_rate).saturating_mul(u64::from(channels.max(1)));
+        let samples_for = |d: std::time::Duration| -> usize {
+            usize::try_from(
+                per_second
+                    .saturating_mul(u64::from(d.subsec_millis()))
+                    .checked_div(1000)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(usize::MAX)
+        };
+        Self {
+            prefill_samples: samples_for(PREFILL),
+            max_samples: samples_for(MAX_BUFFER),
+        }
+    }
+
+    /// Play everything the instant it arrives.
+    ///
+    /// For tests that are about mixing arithmetic rather than buffering, and for nothing
+    /// else: on a real stream this is what produces the underruns the jitter buffer exists
+    /// to prevent.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            prefill_samples: 0,
+            max_samples: usize::MAX,
+        }
+    }
+}
 
 /// Mix one callback's worth of audio: sequentially *within* each track, additively
 /// *across* tracks.
@@ -437,14 +541,21 @@ pub type TrackQueues = std::collections::HashMap<String, std::collections::VecDe
 /// A track that runs dry contributes silence for the remainder of the buffer rather than
 /// stalling the others. Fully-drained tracks are dropped so idle/departed participants
 /// don't accumulate.
-fn mix_tracks_into(output: &mut [f32], tracks: &mut TrackQueues) {
+fn mix_tracks_into(output: &mut [f32], tracks: &mut TrackQueues, config: &JitterConfig) {
     for sample in output.iter_mut() {
         *sample = 0.0;
     }
 
-    for queue in tracks.values_mut() {
+    for track in tracks.values_mut() {
+        if !track.ready(config) {
+            continue;
+        }
         for sample in output.iter_mut() {
-            let Some(value) = queue.pop_front() else {
+            let Some(value) = track.samples.pop_front() else {
+                // Running dry mid-callback means the buffer was too shallow for the
+                // jitter actually present. Re-arming the prefill costs one gap now
+                // instead of one per callback for as long as the condition lasts.
+                track.playing = false;
                 break;
             };
             *sample += value;
@@ -455,7 +566,10 @@ fn mix_tracks_into(output: &mut [f32], tracks: &mut TrackQueues) {
         *sample = sample.clamp(-1.0, 1.0);
     }
 
-    tracks.retain(|_, queue| !queue.is_empty());
+    // Fully-drained tracks are dropped so departed participants don't accumulate. A
+    // track that returns later re-prefills, which is the same thing that happens to a
+    // track that starves without being dropped.
+    tracks.retain(|_, track| !track.samples.is_empty());
 }
 
 fn build_output_stream(
@@ -469,6 +583,7 @@ fn build_output_stream(
     // own consecutive frames (which must play one after another) apart from different
     // tracks' frames (which must be summed) -- see `mix_tracks_into`.
     let mut tracks: TrackQueues = TrackQueues::new();
+    let jitter = JitterConfig::for_stream(config.sample_rate.0, config.channels);
 
     let stream = device
         .build_output_stream(
@@ -477,9 +592,12 @@ fn build_output_stream(
                 // Append everything that arrived since the last callback to its own
                 // track's queue, preserving arrival order within each track.
                 while let Ok((track_id, frame)) = rx.try_recv() {
-                    tracks.entry(track_id).or_default().extend(frame.data);
+                    tracks
+                        .entry(track_id)
+                        .or_default()
+                        .push(frame.data, &jitter);
                 }
-                mix_tracks_into(output, &mut tracks);
+                mix_tracks_into(output, &mut tracks, &jitter);
             },
             err_fn,
             None,
@@ -641,8 +759,17 @@ mod mix_tracks_tests {
     fn queues(entries: &[(&str, &[f32])]) -> TrackQueues {
         entries
             .iter()
-            .map(|(id, samples)| ((*id).to_string(), samples.iter().copied().collect()))
+            .map(|(id, samples)| {
+                let mut buffer = TrackBuffer::default();
+                buffer.push(samples.iter().copied(), &JitterConfig::none());
+                ((*id).to_string(), buffer)
+            })
             .collect()
+    }
+
+    /// Mix with no buffering, for the tests that are about mixing arithmetic.
+    fn mix(output: &mut [f32], tracks: &mut TrackQueues) {
+        mix_tracks_into(output, tracks, &JitterConfig::none());
     }
 
     /// A single track plays through unchanged (mixing is a no-op with one source).
@@ -650,7 +777,7 @@ mod mix_tracks_tests {
     fn single_track_passes_through() {
         let mut tracks = queues(&[("a", &[0.1, 0.2, 0.3, 0.4])]);
         let mut output = [0.0f32; 4];
-        mix_tracks_into(&mut output, &mut tracks);
+        mix(&mut output, &mut tracks);
         assert_eq!(output, [0.1, 0.2, 0.3, 0.4]);
     }
 
@@ -670,11 +797,11 @@ mod mix_tracks_tests {
         tracks
             .entry("track-a".to_string())
             .or_default()
-            .extend([0.1, 0.1, 0.5, 0.5]);
+            .push([0.1, 0.1, 0.5, 0.5], &JitterConfig::none());
 
         // Callback only has room for the first frame's worth.
         let mut first = [0.0f32; 2];
-        mix_tracks_into(&mut first, &mut tracks);
+        mix(&mut first, &mut tracks);
         assert_eq!(
             first, [0.1, 0.1],
             "first callback must play only the first frame, not the sum of both"
@@ -682,7 +809,7 @@ mod mix_tracks_tests {
 
         // The second frame must still be queued, and play next -- unconsumed and intact.
         let mut second = [0.0f32; 2];
-        mix_tracks_into(&mut second, &mut tracks);
+        mix(&mut second, &mut tracks);
         assert_eq!(
             second, [0.5, 0.5],
             "second frame must survive to play next, at its own amplitude"
@@ -696,7 +823,7 @@ mod mix_tracks_tests {
         let track_b = [0.05, 0.05, -0.1, 0.2];
         let mut tracks = queues(&[("a", &track_a), ("b", &track_b)]);
         let mut output = [0.0f32; 4];
-        mix_tracks_into(&mut output, &mut tracks);
+        mix(&mut output, &mut tracks);
 
         for (i, (got, (a, b))) in output.iter().zip(track_a.iter().zip(&track_b)).enumerate() {
             assert!((got - (a + b)).abs() < 1e-6, "sample {i}: got {got}, want {}", a + b);
@@ -708,7 +835,7 @@ mod mix_tracks_tests {
     fn summed_output_clamps_to_valid_range() {
         let mut tracks = queues(&[("a", &[0.9, -0.9]), ("b", &[0.8, -0.8])]);
         let mut output = [0.0f32; 2];
-        mix_tracks_into(&mut output, &mut tracks);
+        mix(&mut output, &mut tracks);
         assert_eq!(output, [1.0, -1.0]);
     }
 
@@ -717,12 +844,12 @@ mod mix_tracks_tests {
     fn partially_consumed_track_resumes_across_callbacks() {
         let mut tracks = queues(&[("a", &[0.1, 0.2, 0.3, 0.4])]);
         let mut first = [0.0f32; 2];
-        mix_tracks_into(&mut first, &mut tracks);
+        mix(&mut first, &mut tracks);
         assert_eq!(first, [0.1, 0.2]);
         assert_eq!(tracks.len(), 1, "track still has samples, must stay queued");
 
         let mut second = [0.0f32; 2];
-        mix_tracks_into(&mut second, &mut tracks);
+        mix(&mut second, &mut tracks);
         assert_eq!(second, [0.3, 0.4]);
         assert!(tracks.is_empty(), "drained track must be dropped");
     }
@@ -733,7 +860,7 @@ mod mix_tracks_tests {
     fn underrunning_track_yields_silence_without_blocking_others() {
         let mut tracks = queues(&[("short", &[1.0]), ("long", &[0.0, 0.25])]);
         let mut output = [0.0f32; 2];
-        mix_tracks_into(&mut output, &mut tracks);
+        mix(&mut output, &mut tracks);
         assert_eq!(output, [1.0, 0.25]);
     }
 
@@ -742,7 +869,7 @@ mod mix_tracks_tests {
     fn no_tracks_yields_silence() {
         let mut tracks = TrackQueues::new();
         let mut output = [1.0f32, -1.0, 0.5];
-        mix_tracks_into(&mut output, &mut tracks);
+        mix(&mut output, &mut tracks);
         assert_eq!(output, [0.0, 0.0, 0.0]);
     }
 
@@ -783,7 +910,7 @@ mod mix_tracks_tests {
 
         let mut tracks = queues(&[("a", &decoded_a.data), ("b", &decoded_b.data)]);
         let mut output = vec![0.0f32; decoded_a.data.len()];
-        mix_tracks_into(&mut output, &mut tracks);
+        mix(&mut output, &mut tracks);
 
         // Neither participant may be dropped or overwritten by the other.
         assert_ne!(output, decoded_a.data);
@@ -839,5 +966,128 @@ mod shared_sink_tests {
                 b.is_some()
             ),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod jitter_buffer_tests {
+    use super::{JitterConfig, TrackBuffer, TrackQueues, mix_tracks_into};
+
+    /// 48kHz stereo, and a callback of 10ms -- close enough to a real stream that the
+    /// sample counts mean something.
+    const RATE: u32 = 48_000;
+    const CHANNELS: u16 = 2;
+    const CALLBACK_SAMPLES: usize = 960;
+    /// One 20ms Opus frame at [`RATE`]/[`CHANNELS`], interleaved.
+    const ONE_FRAME: usize = 1_920;
+
+    fn config() -> JitterConfig {
+        JitterConfig::for_stream(RATE, CHANNELS)
+    }
+
+    fn track(sample_count: usize) -> TrackQueues {
+        let mut buffer = TrackBuffer::default();
+        buffer.push(std::iter::repeat_n(0.5_f32, sample_count), &config());
+        let mut tracks = TrackQueues::new();
+        tracks.insert("a".to_string(), buffer);
+        tracks
+    }
+
+    /// The whole point: one frame's worth of audio is not enough to start on.
+    ///
+    /// Playing it immediately produces 20ms of audio followed by a gap until the next
+    /// packet arrives, and repeats that for the life of the call. The gaps are what a
+    /// listener reports as "low bitrate" or "robotic" on a stream that is in fact being
+    /// delivered whole.
+    #[test]
+    fn a_track_holding_less_than_the_prefill_stays_silent_and_keeps_its_audio() {
+        let cfg = config();
+        let mut tracks = track(ONE_FRAME);
+        let mut output = [1.0_f32; CALLBACK_SAMPLES];
+
+        mix_tracks_into(&mut output, &mut tracks, &cfg);
+
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "a track below the prefill threshold must contribute silence"
+        );
+        assert_eq!(
+            tracks.get("a").map(TrackBuffer::len),
+            Some(ONE_FRAME),
+            "and must keep every sample it has, not consume them into the gap"
+        );
+    }
+
+    /// Once enough audio has accumulated, it plays -- and keeps playing across callbacks
+    /// without re-prefilling.
+    #[test]
+    fn a_track_past_the_prefill_plays_and_stays_playing() {
+        let cfg = config();
+        let mut tracks = track(CALLBACK_SAMPLES * 6);
+        let mut first = [0.0_f32; CALLBACK_SAMPLES];
+        let mut second = [0.0_f32; CALLBACK_SAMPLES];
+
+        mix_tracks_into(&mut first, &mut tracks, &cfg);
+        mix_tracks_into(&mut second, &mut tracks, &cfg);
+
+        assert!(first.iter().all(|s| *s == 0.5), "first callback plays");
+        assert!(
+            second.iter().all(|s| *s == 0.5),
+            "and the second does not stall waiting to prefill again"
+        );
+    }
+
+    /// A track that runs dry mid-callback re-arms its prefill, so the next callback waits
+    /// for a margin instead of tearing a fresh hole every time.
+    #[test]
+    fn a_starved_track_rearms_its_prefill() {
+        let cfg = config();
+        let mut tracks = track(CALLBACK_SAMPLES * 6);
+        let mut output = [0.0_f32; CALLBACK_SAMPLES];
+
+        for _ in 0..6_u8 {
+            mix_tracks_into(&mut output, &mut tracks, &cfg);
+        }
+        assert!(tracks.is_empty(), "a fully drained track is dropped");
+
+        // One late frame arrives. It must not play on its own.
+        tracks = track(ONE_FRAME);
+        let mut after = [1.0_f32; CALLBACK_SAMPLES];
+        mix_tracks_into(&mut after, &mut tracks, &cfg);
+        assert!(
+            after.iter().all(|s| *s == 0.0),
+            "a single late frame must buffer, not play into a starving stream"
+        );
+    }
+
+    /// Buffered audio is latency. A track that runs away is trimmed from the front, so a
+    /// listener catches up with one skip rather than falling permanently behind.
+    #[test]
+    fn a_runaway_track_is_trimmed_to_the_maximum() {
+        let cfg = config();
+        let max = JitterConfig::for_stream(RATE, CHANNELS);
+        let mut buffer = TrackBuffer::default();
+        buffer.push(std::iter::repeat_n(0.1_f32, 10_000_000), &cfg);
+
+        assert_eq!(
+            buffer.len(),
+            max.max_samples,
+            "the buffer must be bounded by the configured maximum"
+        );
+    }
+
+    /// The depths must be derived from the stream's real rate and channel count -- the
+    /// same duration is a different number of samples on every device.
+    #[test]
+    fn buffer_depths_scale_with_rate_and_channels() {
+        let stereo_48k = JitterConfig::for_stream(48_000, 2);
+        let mono_48k = JitterConfig::for_stream(48_000, 1);
+        let stereo_44k = JitterConfig::for_stream(44_100, 2);
+
+        assert_eq!(stereo_48k.prefill_samples, 5_760, "60ms at 48kHz stereo");
+        assert_eq!(mono_48k.prefill_samples, 2_880, "60ms at 48kHz mono");
+        assert_eq!(stereo_44k.prefill_samples, 5_292, "60ms at 44.1kHz stereo");
+        assert!(stereo_48k.max_samples > stereo_48k.prefill_samples);
     }
 }

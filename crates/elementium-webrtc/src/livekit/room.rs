@@ -964,6 +964,7 @@ fn generate_room_id() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod media_forwarder_tests {
     use super::{IoCommand, TransportCommand, spawn_media_forwarder};
     use elementium_types::PlaintextMedia;
