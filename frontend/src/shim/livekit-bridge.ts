@@ -11,6 +11,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { fetchFrame } from "../renderer/frame-fetcher";
+import { createCanvasTrack } from "./canvas-track";
 
 /**
  * Fixed geometry for canvas-backed remote video.
@@ -72,6 +73,7 @@ export class Track {
 export class RemoteTrack extends Track {
   private _canvas: HTMLCanvasElement | null = null;
   private _scratch: HTMLCanvasElement | null = null;
+  private _present: () => void = () => {};
   private _rendering = false;
   private _timerId: ReturnType<typeof setTimeout> | null = null;
 
@@ -94,9 +96,11 @@ export class RemoteTrack extends Track {
       this._rendering = true;
       this._renderLoop();
 
-      // Create a MediaStream from the canvas and attach to the element
-      const stream = this._canvas.captureStream(30);
-      el.srcObject = stream;
+      // Manually driven so a frame is only emitted once a draw has completed; the render
+      // loop calls `present` -- see `createCanvasTrack`.
+      const canvasTrack = createCanvasTrack(this._canvas);
+      this._present = canvasTrack.present;
+      el.srcObject = canvasTrack.stream;
       el.autoplay = true;
       (el as HTMLVideoElement).playsInline = true;
     }
@@ -158,6 +162,8 @@ export class RemoteTrack extends Track {
             );
           }
         }
+        // Draw complete: publish it as one frame.
+        this._present();
       }
     }
 

@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage } from "./e2ee-bridge";
+import { createCanvasTrack } from "./canvas-track";
 
 interface PeerConnectionResult {
   id: string;
@@ -180,14 +181,15 @@ class ElementiumRTCPeerConnection extends EventTarget {
       canvas.width = 1280;
       canvas.height = 720;
 
-      // Use captureStream to get a real MediaStreamTrack from the canvas
-      const canvasStream = canvas.captureStream(30);
-      const videoTrack = canvasStream.getVideoTracks()[0];
+      // Manually driven, so a frame is only ever emitted once a draw has completed --
+      // see `createCanvasTrack`.
+      const canvasTrack = createCanvasTrack(canvas);
+      const videoTrack = canvasTrack.track;
       if (videoTrack) {
         stream.addTrack(videoTrack);
 
         // Start rendering frames from Rust onto this canvas
-        this.startVideoFrameFetch(canvas, trackId);
+        this.startVideoFrameFetch(canvas, trackId, canvasTrack.present);
       }
     }
 
@@ -210,7 +212,11 @@ class ElementiumRTCPeerConnection extends EventTarget {
   /**
    * Fetch video frames from the Rust backend via Tauri IPC and render onto a canvas.
    */
-  private startVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string) {
+  private startVideoFrameFetch(
+    canvas: HTMLCanvasElement,
+    trackId: string,
+    present: () => void = () => {},
+  ) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
@@ -256,6 +262,8 @@ class ElementiumRTCPeerConnection extends EventTarget {
                 ctx.drawImage(scratch, dx, dy, dw, dh);
               }
             }
+            // Draw complete: publish it as one frame.
+            present();
           }
         }
       } catch {

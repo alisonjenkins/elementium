@@ -4,6 +4,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { createCanvasTrack } from "./canvas-track";
 
 interface NativeMediaDevice {
   id: string;
@@ -156,13 +157,15 @@ export function setupMediaDevicesShim(): void {
               initCtx.fillRect(0, 0, canvas.width, canvas.height);
             }
             debugLog(`video track: captureStream available? ${typeof canvas.captureStream}`);
-            const canvasStream = canvas.captureStream(30);
-            const videoTrack = canvasStream.getVideoTracks()[0];
+            // Manually driven: a frame is emitted only once a draw has completed, so the
+            // track can never sample a half-written canvas. See `createCanvasTrack`.
+            const canvasTrack = createCanvasTrack(canvas);
+            const videoTrack = canvasTrack.track;
             debugLog(`video track: captureStream returned track? ${!!videoTrack} readyState=${videoTrack?.readyState}`);
             if (videoTrack) {
               stream.addTrack(videoTrack);
               // Start fetching real camera frames from the Rust backend
-              startLocalVideoFrameFetch(canvas, id);
+              startLocalVideoFrameFetch(canvas, id, canvasTrack.present);
             }
           }
         }
@@ -197,8 +200,7 @@ export function setupMediaDevicesShim(): void {
         const canvas = document.createElement("canvas");
         canvas.width = 1920;
         canvas.height = 1080;
-        const canvasStream = canvas.captureStream(30);
-        const videoTrack = canvasStream.getVideoTracks()[0];
+        const videoTrack = createCanvasTrack(canvas).track;
         if (videoTrack) {
           stream.addTrack(videoTrack);
         }
@@ -297,7 +299,11 @@ async function firstFrameGeometry(
   return null;
 }
 
-function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): void {
+function startLocalVideoFrameFetch(
+  canvas: HTMLCanvasElement,
+  trackId: string,
+  present: () => void = () => {},
+): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
@@ -355,6 +361,10 @@ function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): 
               ctx.drawImage(scratch, dx, dy, drawW, drawH);
             }
           }
+          // The draw is complete: publish it as one frame. Doing this instead of letting
+          // the track sample on a timer is what stops a half-written canvas reaching the
+          // wire.
+          present();
         }
       }
     } catch (err) {
