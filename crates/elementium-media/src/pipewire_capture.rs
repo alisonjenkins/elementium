@@ -373,6 +373,9 @@ fn attach_and_connect(
     let fmt_state = Arc::clone(negotiated);
     let frame_state = Arc::clone(negotiated);
     let tx = frame_tx.clone();
+    // Owned by the process callback and reused every frame, so taking a snapshot of the
+    // mapped buffer costs no allocation.
+    let mut snapshot: Vec<u8> = Vec::new();
 
     let listener = stream
         .add_local_listener::<()>()
@@ -427,7 +430,25 @@ fn attach_and_connect(
             let Some(data) = datas.first_mut() else { return };
             let stride = usize::try_from(data.chunk().stride()).unwrap_or(0);
             let size = usize::try_from(data.chunk().size()).unwrap_or(0);
-            let Some(bytes) = data.data() else { return };
+            let Some(mapped) = data.data() else { return };
+
+            // Snapshot the buffer before decoding it.
+            //
+            // `data.data()` is memory the camera's driver writes into. Decoding straight
+            // out of it means reading, over several milliseconds, from a region another
+            // writer may update in the meantime -- so rows decoded before an update come
+            // from one frame and rows after it from the next. The result is an image cut
+            // into horizontal bands seconds apart, which is the fault this was chasing:
+            // reproduced in the app under load, never in a probe that did nothing else.
+            //
+            // Whether the driver *does* overwrite early is not something a client can
+            // establish; reading a buffer another writer owns is a race whether or not it
+            // has been observed to lose. The copy is a few hundred KB for MJPEG against a
+            // multi-millisecond decode, so it costs nothing worth measuring.
+            let copy_len = if size > 0 { size.min(mapped.len()) } else { mapped.len() };
+            snapshot.clear();
+            snapshot.extend_from_slice(mapped.get(..copy_len).unwrap_or(mapped));
+            let bytes: &[u8] = &snapshot;
 
             let width = usize::try_from(n.width).unwrap_or(0);
             let height = usize::try_from(n.height).unwrap_or(0);
@@ -437,11 +458,7 @@ fn attach_and_connect(
             // exactly the fault this used to have: the buffer was labelled with the
             // negotiated size regardless of what came out of the decoder.
             let converted = match n.encoding {
-                Encoding::Mjpeg => {
-                    // `size` is the meaningful byte count; the mapped buffer is larger.
-                    let jpeg = bytes.get(..size.min(bytes.len())).unwrap_or(bytes);
-                    decode_mjpeg_to_rgba(jpeg)
-                }
+                Encoding::Mjpeg => decode_mjpeg_to_rgba(bytes),
                 Encoding::Raw(format) => {
                     let stride = if stride == 0 {
                         width.saturating_mul(format.bytes_per_pixel())

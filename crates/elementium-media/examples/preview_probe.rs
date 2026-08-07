@@ -22,6 +22,7 @@
 
 use std::time::{Duration, Instant};
 
+use elementium_codec::Vp8Encoder;
 use elementium_media::video_source::VideoSource;
 
 fn main() {
@@ -29,6 +30,12 @@ fn main() {
 
     let source = VideoSource::start(Some(1280), Some(720)).expect("camera");
     println!("backend: {}", source.backend());
+
+    // The app VP8-encodes every frame as well as previewing it, which the first version of
+    // this probe did not -- so it drained the capture far faster than the app does and
+    // came back clean while the app was producing banded frames. Matching the app's real
+    // per-frame cost is the whole point of a reproduction.
+    let mut encoder: Option<Vp8Encoder> = None;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut frames = 0_u32;
@@ -53,6 +60,17 @@ fn main() {
                 height,
                 rgba.len()
             );
+        }
+
+        if encoder
+            .as_ref()
+            .is_none_or(|e| e.size() != (frame.width, frame.height))
+        {
+            encoder = Vp8Encoder::new(frame.width, frame.height, 2764).ok();
+        }
+        if let Some(enc) = encoder.as_mut() {
+            let i420 = elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
+            let _ = enc.encode(&i420);
         }
 
         if frames % 60 == 0 {
