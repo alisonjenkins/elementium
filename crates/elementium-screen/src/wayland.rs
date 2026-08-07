@@ -1,20 +1,27 @@
+//! Wayland screen capture via the XDG desktop portal and `PipeWire`.
+//!
+//! There is no way to read the screen directly on Wayland: the compositor does not expose
+//! one, by design. The supported route is the `org.freedesktop.portal.ScreenCast` portal,
+//! which shows the user a picker and hands back a `PipeWire` node id for whatever they
+//! chose. Frames then arrive over `PipeWire` exactly as camera frames do, so this reuses
+//! the same capture path rather than growing a second one.
+//!
+//! The portal call is asynchronous and shows UI; [`ScreenCapturer::start`] is synchronous,
+//! so the portal exchange runs on a short-lived runtime and blocks until the user has
+//! chosen. That wait is unbounded on purpose -- it is a person deciding, and a timeout
+//! would cancel a dialog they were still reading.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use elementium_types::{CaptureSource, ElementiumError, VideoFrame};
 
 use crate::traits::ScreenCapturer;
 
-/// Wayland screen capturer using ashpd (XDG Desktop Portal).
-///
-/// Flow:
-/// 1. Request screencast via `ashpd::desktop::screencast`
-/// 2. User selects source in the portal dialog
-/// 3. Portal returns a `PipeWire` node ID
-/// 4. Connect to `PipeWire` and read frames from the stream
-///
-/// Note: `PipeWire` integration requires the `pipewire` crate which adds
-/// a significant native dependency. For now, the portal dialog and
-/// `PipeWire` stream setup is implemented as a best-effort flow.
+/// Wayland screen capturer.
 pub struct WaylandCapturer {
-    active: bool,
+    /// Cleared to stop the pump thread, which owns the capture and closes it on the way out.
+    running: Arc<AtomicBool>,
 }
 
 impl Default for WaylandCapturer {
@@ -25,44 +32,105 @@ impl Default for WaylandCapturer {
 
 impl WaylandCapturer {
     #[must_use]
-    pub const fn new() -> Self {
-        Self { active: false }
+    pub fn new() -> Self {
+        Self { running: Arc::new(AtomicBool::new(false)) }
     }
+}
+
+/// Ask the portal for a screencast node id.
+///
+/// Returns the `PipeWire` node id of the first stream the user selected. Multiple streams
+/// are possible when several outputs are picked; the first is used, because everything
+/// above this expects a single video track.
+#[cfg(target_os = "linux")]
+async fn request_screencast_node() -> Result<u32, String> {
+    use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+
+    let proxy = Screencast::new().await.map_err(|e| e.to_string())?;
+    let session = proxy.create_session().await.map_err(|e| e.to_string())?;
+
+    proxy
+        .select_sources(
+            &session,
+            CursorMode::Embedded,
+            SourceType::Monitor | SourceType::Window,
+            // Single source: the rest of the pipeline publishes one video track.
+            false,
+            None,
+            ashpd::desktop::PersistMode::DoNot,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let response = proxy
+        .start(&session, None)
+        .await
+        .map_err(|e| e.to_string())?
+        .response()
+        .map_err(|e| e.to_string())?;
+
+    response
+        .streams()
+        .first()
+        .map(ashpd::desktop::screencast::Stream::pipe_wire_node_id)
+        .ok_or_else(|| "the portal returned no streams; the picker was probably cancelled".to_owned())
 }
 
 impl ScreenCapturer for WaylandCapturer {
     fn sources(&self) -> Result<Vec<CaptureSource>, ElementiumError> {
-        // On Wayland, source selection happens via the portal dialog.
-        // We return an empty list and let the portal handle picking.
+        // Source selection is the portal's job, not ours: the compositor will not tell an
+        // application what windows exist, and showing our own list would either be empty or
+        // a lie. An empty list here means "ask the portal", which `start` does.
         Ok(vec![])
     }
 
     fn start(
         &mut self,
         _source_id: &str,
-        _callback: Box<dyn Fn(VideoFrame) + Send>,
+        callback: Box<dyn Fn(VideoFrame) + Send>,
     ) -> Result<(), ElementiumError> {
-        tracing::info!("Starting Wayland screencast via XDG Desktop Portal");
-        self.active = true;
+        tracing::info!("Requesting a screencast session from the XDG desktop portal");
 
-        // TODO: Full PipeWire integration:
-        // 1. ashpd::desktop::screencast::Screencast::new()
-        // 2. create_session()
-        // 3. select_sources() - opens portal picker
-        // 4. start() - returns PipeWire stream fd + node_id
-        // 5. Connect to PipeWire, set up stream listener
-        // 6. Read SPA buffers, extract BGRA frames, call callback
-        //
-        // This requires the `pipewire` crate (0.9.x) and significant
-        // unsafe code to read SPA buffers. Implemented in a future phase.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ElementiumError::ScreenCapture(format!("runtime: {e}")))?;
 
-        tracing::warn!("Wayland screen capture not yet fully implemented (needs PipeWire integration)");
+        let node_id = runtime.block_on(request_screencast_node()).map_err(|e| {
+            tracing::warn!(reason = %e, "Screencast portal request failed");
+            ElementiumError::ScreenCapture(e)
+        })?;
+
+        tracing::info!(node_id, "Portal granted a screencast stream");
+
+        let capture = elementium_media::pipewire_capture::PipewireCapturer::start(node_id)
+            .map_err(|e| ElementiumError::ScreenCapture(e.to_string()))?;
+
+        self.running.store(true, Ordering::SeqCst);
+        let running = Arc::clone(&self.running);
+
+        // Frames are pumped on a thread so `start` returns once capture is live, matching
+        // the trait's callback contract.
+        std::thread::Builder::new()
+            .name("wayland-screencast".to_owned())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    if let Some(frame) = capture.try_recv() {
+                        callback(frame);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+                capture.stop();
+                tracing::info!("Wayland screencast pump stopped");
+            })
+            .map_err(|e| ElementiumError::ScreenCapture(format!("thread: {e}")))?;
 
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), ElementiumError> {
-        self.active = false;
+        self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 }

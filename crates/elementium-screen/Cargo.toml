@@ -6,8 +6,10 @@ license.workspace = true
 description = "Screen capture (Wayland via ashpd+pipewire, X11/macOS/Windows via xcap)"
 
 [dependencies]
+elementium-media = { version = "0.1.0", path = "../elementium-media" }
 elementium-types = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
