@@ -154,7 +154,6 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         commands::media_devices::enumerate_devices,
         commands::media_devices::get_user_media,
         commands::media_devices::get_video_frame,
-        commands::media_devices::video_debug_enabled,
         commands::media_devices::stop_track,
         commands::screen_capture::get_display_media,
         commands::screen_capture::get_capture_sources,

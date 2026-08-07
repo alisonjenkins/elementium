@@ -401,17 +401,6 @@ pub fn get_video_frame(
     }
 }
 
-/// Whether video debug overlays are switched on.
-///
-/// Shares the dump sentinel, so one `touch` enables every video diagnostic at once. Read
-/// through a command rather than baked into the startup script because the file is
-/// normally created while the app is already running.
-#[command]
-#[must_use]
-pub fn video_debug_enabled() -> bool {
-    std::path::Path::new(DUMP_PREVIEW_SENTINEL).exists()
-}
-
 /// Presence of this file turns preview dumping on, without restarting the app.
 ///
 /// An environment variable is the wrong switch for a desktop app: the process is usually
