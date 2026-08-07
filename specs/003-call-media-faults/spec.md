@@ -107,15 +107,31 @@ decrypt: if (this.keys.hasInvalidKeyAtIndex(keyIndex)) return;   // dropped
 The drop happens *before* decryption is attempted, so the successful decryption that
 would clear the count can never occur.
 
-And the obvious escape does not exist. `resetKeyStatus` has four callers: a
-successful decryption, a user-initiated ratchet, and `setCurrentKeyIndex` — which
-applies to the *local* participant's own encryption index. `setKey` for a remote
-participant does not call it. So when a peer's key finally arrives, late, the index
-it belongs to is already dead and installing the key does not revive it.
+There is one escape, and it matters: installing a key at that index clears the
+count.
 
-That is the whole fault in one sentence: **a key that arrives too late is not merely
-late, it is useless** — the very outcome the user describes as keys taking ages and
-then still not working.
+```js
+setKey(material, keyIndex, updateCurrentKeyIndex = true) {
+  await this.setKeyFromMaterial(material, keyIndex, null, updateCurrentKeyIndex);
+  if (updateCurrentKeyIndex) this.resetKeyStatus(keyIndex);
+}
+```
+
+Element Call always passes a key index, and livekit forwards that as
+`updateCurrentKeyIndex: true`, so a key arriving late does revive the index it
+belongs to. The latch is therefore *not* the permanent killer it first appears to
+be, and an earlier draft of this section said it was — wrongly, from reading
+`setKeySet` instead of the `setKey` that wraps it.
+
+What survives is narrower and still real: the index stays dead for any stream that
+keeps failing after the last key install at that index. A wrong AAD, a header-size
+mismatch, a stale key we never correct — anything that fails persistently rather
+than transiently — stops being retried after a fifth of a second and produces
+silence with no error on either side.
+
+So the latch is a severity amplifier, not the root cause. **The root cause found
+here is the encryption declaration**, and its symptom — a clean, well-paced,
+zero-concealment stream of noise — is exactly what the user reports.
 
 Eleven undecryptable frames reach that state. At 50 frames per second that is a
 fifth of a second, and it is exactly what a peer sees while our key is still in

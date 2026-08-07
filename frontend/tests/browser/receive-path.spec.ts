@@ -447,14 +447,18 @@ test.describe("browser receive path", () => {
     //   hasInvalidKeyAtIndex(i) -> failureTolerance >= 0 && failureCounts[i] > tolerance
     //   decrypt: if (this.keys.hasInvalidKeyAtIndex(keyIndex)) return;   // dropped
     //
-    // The drop happens *before* any decryption is attempted, and the only things that
-    // clear the count are a successful decryption at that index and installing a new key
-    // there. Since no decryption is attempted, success can never happen. The index is
-    // dead until the sender rotates away from it.
+    // The drop happens *before* any decryption is attempted, so the successful decryption
+    // that would clear the count can never occur. Eleven undecryptable frames -- a fifth
+    // of a second of audio -- are enough to reach that state, which is what a peer sees
+    // whenever we publish before our key has reached them: every call start, every
+    // rotation.
     //
-    // Eleven undecryptable frames -- a fifth of a second of audio -- are enough. That is
-    // not a hypothetical: it is what a peer sees whenever we publish before our key has
-    // reached them, which is every call start and every rotation.
+    // Installing a key at that index does clear the count (`setKey` calls
+    // `resetKeyStatus` when `updateCurrentKeyIndex` is set, and Element Call always passes
+    // a key index, so it is). So in a real call a late key recovers the stream. This test
+    // is the case where no such key ever arrives -- the publisher simply starts sending
+    // correct frames at the same index -- which is what isolates the latch from every
+    // other reason audio might resume.
     //
     // The pair with the test above is the experiment. Identical streams; the only
     // difference is the receiver's tolerance, and only the tolerant one recovers. So the
