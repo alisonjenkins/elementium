@@ -73,6 +73,7 @@ pub enum WebRtcEvent {
 #[command]
 pub async fn create_peer_connection(
     state: State<'_, WebRtcState>,
+    media_state: State<'_, MediaState>,
     app: AppHandle,
     config: Option<RtcConfiguration>,
 ) -> Result<PeerConnectionResult, String> {
@@ -109,6 +110,16 @@ pub async fn create_peer_connection(
         engine.create_connection(id.clone(), ice_servers.as_deref())?;
     }
 
+    // Adopt any capture pipeline that is currently attached to nothing.
+    //
+    // `create_offer` is otherwise the only place a pipeline is attached, which leaves a
+    // gap: a pipeline detached because its connection closed stays detached until an offer
+    // happens to be made, and if none is, the microphone is live and silent for the rest
+    // of the call. Filling only empty slots means an active attachment is never stolen,
+    // and `create_offer` still overwrites this if the real publishing connection turns out
+    // to be a different one.
+    adopt_idle_pipelines(&media_state, &state, &id);
+
     // Spawn a task to forward events from the I/O loop to the frontend. Instrumented
     // with the same span so events emitted while forwarding carry this connection's
     // correlation_id.
@@ -123,6 +134,39 @@ pub async fn create_peer_connection(
     );
 
     Ok(PeerConnectionResult { id })
+}
+
+/// Point any unattached capture pipeline at this connection.
+///
+/// Deliberately only fills empty slots. A pipeline already feeding a live connection must
+/// keep feeding it -- stealing it here would silence a working call whenever a second
+/// connection is created, which happens routinely for data channels.
+fn adopt_idle_pipelines(media_state: &MediaState, state: &WebRtcState, pc_id: &str) {
+    let Ok(engine) = state.0.lock() else {
+        return;
+    };
+    let Some(io_cmd_tx) = engine.get(pc_id).map(|managed| managed.io_cmd_tx.clone()) else {
+        return;
+    };
+    drop(engine);
+
+    if let Ok(guard) = media_state.audio_capture.lock()
+        && let Some(ref audio) = *guard
+        && let Ok(mut slot) = audio.encode_tx.lock()
+        && slot.is_none()
+    {
+        *slot = Some(io_cmd_tx.clone());
+        tracing::info!(pc_id, "unattached microphone adopted by a new peer connection");
+    }
+
+    if let Ok(guard) = media_state.camera.lock()
+        && let Some(ref camera) = *guard
+        && let Ok(mut slot) = camera.encode_tx.lock()
+        && slot.is_none()
+    {
+        *slot = Some(io_cmd_tx);
+        tracing::info!(pc_id, "unattached camera adopted by a new peer connection");
+    }
 }
 
 /// Data channel info from JS.

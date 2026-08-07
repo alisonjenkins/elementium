@@ -22,7 +22,7 @@ first because it is the single cause behind two of the three symptoms.
 
 - [X] T008 [US1][US3] Distinguish a closed channel from a full one at the `try_send` in `src-tauri/src/commands/media_devices.rs`, counting and reporting them separately
 - [X] T009 [US1][US3] Detach a pipeline whose channel is closed, so it stops encoding into nothing and reports itself as unattached (depends on T008)
-- [ ] T010 [US1][US3] Re-attach the capture pipelines when a peer connection is created, not only in `create_offer`, so a connection replaced mid-call is picked up in `src-tauri/src/commands/webrtc.rs`
+- [X] T010 [US1][US3] Re-attach the capture pipelines when a peer connection is created, not only in `create_offer`, so a connection replaced mid-call is picked up in `src-tauri/src/commands/webrtc.rs`
 - [ ] T011 [US1][US3] Test that a pipeline whose connection closes and is replaced resumes sending, without needing a new offer
 
 ## Phase 4: Confirmation in a real call
