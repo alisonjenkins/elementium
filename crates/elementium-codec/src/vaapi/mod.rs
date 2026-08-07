@@ -2,8 +2,9 @@
 //!
 //! Split so each layer can be checked on its own: [`status`] turns return codes into
 //! errors that cannot be ignored, [`display`] owns the connection to the driver,
-//! [`resource`] gives every libva handle a distinct type with its own destructor, and the
-//! encoder above them is written against those rather than against raw integers.
+//! [`resource`] gives every libva handle a distinct type with its own destructor,
+//! [`image`] gets frames into surfaces, and the encoder above them is written against those
+//! rather than against raw integers.
 //!
 //! That split is not decoration. libva's handles are all `u32`, its resources must be
 //! destroyed in the reverse order of creation, and every call returns a status that is
@@ -11,6 +12,7 @@
 //! answered by a type here.
 
 pub mod display;
+pub mod image;
 pub mod resource;
 pub mod status;
 
