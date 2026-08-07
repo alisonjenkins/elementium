@@ -36,6 +36,12 @@ pub enum PcEvent<P = PlaintextMedia> {
     Connected,
     /// A new remote media track was added.
     RemoteTrackAdded { mid: String, kind: String },
+    /// A receiver cannot decode our video and is asking for a keyframe (RTCP PLI/FIR).
+    ///
+    /// Must reach the encoder: until it produces a keyframe the receiver has nothing it
+    /// can decode, and it will keep asking. A log of repeating requests with no keyframe
+    /// in between is precisely what a corrupted remote picture looks like from our side.
+    KeyframeRequested { mid: String },
     /// Received audio data (Opus packet) on a specific remote track.
     ///
     /// `mid` identifies which media line this packet came from -- required because a
@@ -1195,19 +1201,16 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
             }
         }
         Event::MediaEgressStats(stats) => Some(egress_stats_event(&pc.id, &stats)),
-        // Nothing routes this back to the encoder yet -- the camera thread emits a
-        // keyframe on a timer instead. Logged at `warn` rather than swallowed into the
-        // catch-all because a stream of these is the signal that a receiver is asking to
-        // be able to decode us and being ignored, which looks from the far end exactly
-        // like a camera that is not sending at all.
         Event::KeyframeRequest(req) => {
-            tracing::warn!(
+            tracing::info!(
                 pc_id = %pc.id,
                 mid = %req.mid,
                 kind = ?req.kind,
-                "Receiver requested a keyframe; not yet routed to the encoder"
+                "Receiver requested a keyframe"
             );
-            None
+            Some(PcEvent::KeyframeRequested {
+                mid: req.mid.to_string(),
+            })
         }
         _ => {
             tracing::info!(pc_id = %pc.id, ?event, "Unhandled str0m event");

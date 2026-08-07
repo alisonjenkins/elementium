@@ -93,6 +93,7 @@ pub(crate) fn maybe_decrypt_event(
             PcEvent::ConnectionStateChange(s) => Some(PcEvent::ConnectionStateChange(s)),
             PcEvent::IceCandidate(c) => Some(PcEvent::IceCandidate(c)),
             PcEvent::IceGatheringComplete => Some(PcEvent::IceGatheringComplete),
+            PcEvent::KeyframeRequested { mid } => Some(PcEvent::KeyframeRequested { mid }),
             PcEvent::Connected => Some(PcEvent::Connected),
             PcEvent::RemoteTrackAdded { mid, kind } => Some(PcEvent::RemoteTrackAdded { mid, kind }),
             PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks } => {

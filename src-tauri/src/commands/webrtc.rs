@@ -5,6 +5,7 @@
 // statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
 // module-level allow here rather than the usual per-item scoping.
 #![allow(clippy::unreachable)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -366,7 +367,30 @@ fn route_pc_event(
             record_outbound_loss(routing.app, pc_id, &mid, loss, rtt_ms, packets, nacks);
             None
         }
+        PcEvent::KeyframeRequested { mid } => {
+            request_camera_keyframe(routing.app, pc_id, &mid);
+            None
+        }
     }
+}
+
+/// Tell the camera encoder that a receiver cannot decode us.
+///
+/// Until this existed the request was logged and dropped, and the encoder emitted a
+/// keyframe only on its own three-second timer -- so a receiver that lost one spent up to
+/// three seconds displaying a broken picture and asking again, repeatedly. A real log shows
+/// exactly that: PLIs at 06:16:14, :14.6, :15.2, :18.6, :21.7 with nothing in between.
+fn request_camera_keyframe(app: &AppHandle, pc_id: &str, mid: &str) {
+    let media_state = app.state::<MediaState>();
+    let Ok(guard) = media_state.camera.lock() else {
+        return;
+    };
+    let Some(ref camera) = *guard else {
+        tracing::debug!(pc_id, mid, "keyframe requested with no camera running");
+        return;
+    };
+    camera.keyframe_requested.store(true, Ordering::Relaxed);
+    tracing::debug!(pc_id, mid, "keyframe request passed to the camera encoder");
 }
 
 /// Feed loss measured by the peers back into the Opus encoder's FEC sizing.

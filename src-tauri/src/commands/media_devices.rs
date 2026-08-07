@@ -30,6 +30,12 @@ pub struct CameraPipelineHandle {
     /// Set to enable VP8 encoding and sending to a peer connection.
     /// When `None`, the pipeline only writes RGBA frames for preview.
     pub encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    /// Set when a receiver sends an RTCP keyframe request (PLI/FIR).
+    ///
+    /// A level rather than an event, like `loss_estimate` on the audio handle: several
+    /// receivers asking at once still means "one keyframe, now", and the encoder thread
+    /// only cares about the latest state. Cleared when the keyframe is produced.
+    pub keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Handle to a running audio capture pipeline.
@@ -275,6 +281,8 @@ pub async fn get_user_media(
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
             Arc::new(Mutex::new(inherited_connection));
         let encode_tx_clone = encode_tx.clone();
+        let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keyframe_requested_clone = keyframe_requested.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let tid = track_id.0.clone();
 
@@ -294,6 +302,7 @@ pub async fn get_user_media(
                 &tid,
                 &video_frames,
                 &encode_tx_clone,
+                &keyframe_requested_clone,
                 &stop_rx,
                 req_width,
                 req_height,
@@ -306,6 +315,7 @@ pub async fn get_user_media(
                 track_id: track_id.0.clone(),
                 stop_tx,
                 encode_tx,
+                keyframe_requested,
             });
         }
 
@@ -397,6 +407,12 @@ pub fn get_video_frame(
 /// rebuilding the encoder's rate control is negligible.
 const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The shortest gap between two keyframes, however many receivers ask.
+///
+/// A keyframe costs many times an interframe, and a receiver cannot benefit from a second
+/// one before the first has arrived. Roughly one round trip on a poor link.
+const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The fastest we encode, regardless of how fast the camera runs.
 ///
 /// The webcam delivers 60fps. Encoding all of it doubles the bitrate needed for the same
@@ -426,10 +442,12 @@ fn bitrate_for(width: u32, height: u32) -> u32 {
 
 /// Background thread: reads camera frames, writes RGBA to `VideoFrameBuffer` for
 /// preview, and optionally VP8-encodes + sends to a peer connection.
+#[allow(clippy::too_many_arguments)]
 fn camera_pipeline_loop(
     track_id: &str,
     video_frames: &VideoFrameBuffer,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     req_width: Option<u32>,
     req_height: Option<u32>,
@@ -506,6 +524,7 @@ fn camera_pipeline_loop(
                     &frame,
                     &mut encoder,
                     &mut last_keyframe,
+                    keyframe_requested,
                     encode_tx,
                 );
             }
@@ -524,6 +543,7 @@ fn encode_and_send_video_frame(
     frame: &elementium_types::VideoFrame,
     encoder: &mut Option<Vp8Encoder>,
     last_keyframe: &mut std::time::Instant,
+    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
     // Created lazily, and rebuilt if the source renegotiates its geometry:
@@ -549,18 +569,26 @@ fn encode_and_send_video_frame(
             }
             Err(e) => tracing::error!("Failed to create VP8 encoder: {e}"),
         }
-    } else if last_keyframe.elapsed() >= KEYFRAME_INTERVAL
-        && let Some(enc) = encoder.as_mut()
-    {
-        // Nothing routes a receiver's keyframe request back to this thread yet, so a peer
-        // that subscribes mid-call would otherwise wait out libvpx's default keyframe
-        // distance -- minutes -- before it could decode anything.
-        match enc.force_keyframe() {
-            Ok(()) => {
-                *last_keyframe = std::time::Instant::now();
-                tracing::debug!(track_id, "forced a VP8 keyframe");
+    } else {
+        // A receiver asking is the urgent case: until it gets a keyframe it displays a
+        // broken picture and keeps asking. The timer is the backstop for a receiver that
+        // subscribes without asking, since libvpx's own keyframe distance is minutes.
+        let asked = keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed);
+        // A receiver that is badly out of sync sends PLIs faster than keyframes can help.
+        // Honouring every one would rebuild the encoder several times a second, throwing
+        // away its rate control and making the picture worse than the fault being
+        // recovered from. One keyframe in flight at a time is the most that can help.
+        let recently = last_keyframe.elapsed() < MIN_KEYFRAME_GAP;
+        if ((asked && !recently) || last_keyframe.elapsed() >= KEYFRAME_INTERVAL)
+            && let Some(enc) = encoder.as_mut()
+        {
+            match enc.force_keyframe() {
+                Ok(()) => {
+                    *last_keyframe = std::time::Instant::now();
+                    tracing::info!(track_id, on_request = asked, "forced a VP8 keyframe");
+                }
+                Err(e) => tracing::warn!(track_id, reason = %e, "keyframe failed"),
             }
-            Err(e) => tracing::warn!(track_id, reason = %e, "keyframe failed"),
         }
     }
 
