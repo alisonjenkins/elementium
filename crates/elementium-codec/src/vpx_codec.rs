@@ -263,7 +263,7 @@ impl Vp8Encoder {
 
         let flags = if self.force_keyframe {
             self.force_keyframe = false;
-            u32::from(VPX_EFLAG_FORCE_KF)
+            VPX_EFLAG_FORCE_KF
         } else {
             0
         };

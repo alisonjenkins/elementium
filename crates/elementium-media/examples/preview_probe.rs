@@ -77,7 +77,7 @@ fn main() {
             let _ = enc.encode(&frame);
         }
 
-        if frames % 60 == 0 {
+        if frames.is_multiple_of(60) {
             let path =
                 format!("/tmp/elementium_preview_probe_{frames}_{width}x{height}.rgba");
             std::fs::write(&path, &rgba).expect("write dump");
