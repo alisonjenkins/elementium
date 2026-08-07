@@ -168,7 +168,10 @@ fn stages(c: &mut Criterion) {
     group.bench_function("turbo_decode_half_scale", |b| {
         b.iter(|| {
             let mut d = turbojpeg::Decompressor::new().expect("decompressor");
-            d.set_scaling_factor(turbojpeg::ScalingFactor::ONE_HALF);
+            // Checked, not ignored: a refused scaling factor would silently decode at
+            // full size and report the result as the half-scale cost.
+            d.set_scaling_factor(turbojpeg::ScalingFactor::ONE_HALF)
+                .expect("half-scale decode is supported");
             let header = d.read_header(&jpeg).expect("header");
             let (w, h) = (
                 turbojpeg::ScalingFactor::ONE_HALF.scale(header.width),
