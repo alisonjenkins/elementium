@@ -102,8 +102,58 @@ why, so they are written down rather than rediscovered.
 difference; the normal config is untouched, so an ordinary `just dev` still talks to
 whatever homeserver it always did.
 
-## What is not here yet
+## Driving Element Call
 
-Tests that drive Element Call itself — joining a call, rotating keys, watching a
-participant leave — rather than livekit-client directly. That is what turns the two
-faults above from "reported" into "reproducible on demand", and it is the next step.
+`frontend/tests/matrixrtc/call-faults.spec.ts` runs three real Element Web clients
+through a real Element Call: joining in sequence, one leaving, and hanging up and
+calling again. All of them pass, so neither reported fault is Element Call and Matrix
+alone on this stack.
+
+That leaves one configuration untested — Elementium as a participant — and Playwright
+cannot drive it, because it is a Tauri application with a native WebRTC stack. So the
+other side is supplied instead:
+
+```sh
+just call-peers      # tester2 and tester3 join a call and stay in it
+just dev-test-env    # in another terminal; log in as tester1 and join
+```
+
+While it holds, each participant reports what it can hear and whose keys it holds, so
+"did Elementium's key ever arrive" is answerable from the other side.
+
+## Things that were not obvious, part two
+
+Everything below stopped a call from happening at all, and none of it pointed at
+itself.
+
+- **Synapse has no MSC4143 `rtc/transports` endpoint**, and Element Web does *not* fall
+  back to the `org.matrix.msc4143.rtc_foci` entry in `.well-known` that carries the same
+  information. Without an answer it logs one warning and quietly makes a **Jitsi** call.
+  Hence the nginx in front of synapse, which answers that one endpoint and proxies
+  everything else — so every URL, including `public_baseurl`, is unchanged.
+- **Element Call is behind the `feature_group_calls` labs flag.** Without it the call
+  button is there and does something else.
+- **matrix-js-sdk discovers well-known from the server *name*, over https.** This
+  homeserver is `localhost`, so that is `https://localhost/` on port 443, which nothing
+  here serves. Element Call then refuses with `MISSING_MATRIX_RTC_FOCUS`, which reads as
+  a server misconfiguration and is not one. The Playwright harness answers it per page;
+  the application would need the same if run against this stack.
+- **Call membership is a state event**, so members at the default power level 0 are told
+  "You do not have permission to start video call". `provision.sh` grants exactly that
+  event rather than promoting anyone.
+- **The room must be encrypted.** Element Call performs frame encryption only in an
+  encrypted room; in a plain one it skips key generation, distribution and rotation
+  entirely. A call test in an unencrypted room exercises none of that and passes.
+- **Reusing a device id with a discarded crypto store breaks decryption silently.** A
+  fresh browser context around an old access token keeps the device and loses its Olm
+  state, so others encrypt keys to a device that cannot read them: packets arrive, not
+  one frame decrypts. It is indistinguishable from the fault being investigated, and it
+  was reported as a reproduction of it for a while. `freshSessions` exists so no test
+  does it by accident.
+
+## Rebuilding from nothing
+
+`configure-synapse.sh` generates the homeserver config and applies every setting above,
+idempotently, and `global-setup.ts` runs it before the stack starts. The config used to
+be hand edits to a gitignored file, which meant a clean checkout produced a homeserver
+no part of the stack could work with, for reasons spread across this README.
