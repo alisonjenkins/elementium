@@ -170,6 +170,7 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         commands::e2ee::e2ee_init,
         commands::e2ee::e2ee_set_key,
         commands::e2ee::e2ee_set_local_identity,
+        commands::e2ee::e2ee_set_sif_trailer,
         commands::console::console_log,
     ])
 }

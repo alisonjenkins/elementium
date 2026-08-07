@@ -86,6 +86,32 @@ pub async fn e2ee_set_key(
     Ok(())
 }
 
+/// Record the SFU's server-injected-frame marker.
+///
+/// Frames ending with it are the SFU's own -- silence or a black picture while a publisher
+/// is muted -- and carry no encryption, because the SFU holds no key. Without this every
+/// one is fed to AES-GCM, fails to authenticate and is dropped, which in a log is
+/// indistinguishable from a missing key.
+///
+/// # Errors
+///
+/// Returns an error if E2EE has not been initialised or the context lock is poisoned.
+#[command]
+pub async fn e2ee_set_sif_trailer(
+    state: State<'_, E2eeState>,
+    trailer: Vec<u8>,
+) -> Result<(), String> {
+    tracing::info!(len = trailer.len(), "E2EE server-injected-frame trailer received");
+
+    state
+        .ctx
+        .lock_str()?
+        .as_context()
+        .ok_or("E2EE not initialized — call e2ee_init first")?
+        .set_sif_trailer(trailer)
+        .map_err(|e| e.to_string())
+}
+
 #[command]
 pub async fn e2ee_set_local_identity(
     state: State<'_, E2eeState>,

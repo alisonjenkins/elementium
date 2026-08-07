@@ -437,6 +437,18 @@ struct E2eeContextInner {
     options: E2eeOptions,
     /// Per-participant frame counters for IV generation (outbound).
     frame_counter: u64,
+    /// The SFU's "server injected frame" marker, if it sent one.
+    ///
+    /// An SFU may insert its own frames into a stream -- silence or a black picture while a
+    /// publisher is muted, for instance. Those cannot be encrypted, because the SFU has no
+    /// key, so they arrive in the clear with this trailer appended to identify them.
+    /// livekit's own cryptor checks for it and passes such frames through untouched
+    /// (`isFrameServerInjected`, `FrameCryptor.ts`).
+    ///
+    /// Without it every server-injected frame is fed to AES-GCM, fails to authenticate, and
+    /// is dropped -- indistinguishable in the log from a missing key, and arriving exactly
+    /// when a participant mutes, which is the least convenient moment to be debugging.
+    sif_trailer: Option<Vec<u8>>,
 }
 
 impl Clone for E2eeContext {
@@ -457,6 +469,7 @@ impl E2eeContext {
                 key_manager: KeyManager::new(),
                 options,
                 frame_counter: 0,
+                sif_trailer: None,
             })),
             undecryptable_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -690,6 +703,15 @@ impl E2eeContext {
         frame: &WireMedia,
         kind: MediaKind,
     ) -> Result<Option<PlaintextMedia>, E2eeError> {
+        // The SFU's own frames carry no encryption, because the SFU holds no key. Checked
+        // before anything else: feeding one to AES-GCM cannot succeed, and the failure is
+        // indistinguishable from a missing key.
+        if self.is_server_injected(frame.as_bytes()) {
+            return Ok(Some(PlaintextMedia::assume_peer_sends_unencrypted(
+                WireMedia::from_network(frame.as_bytes().to_vec()),
+            )));
+        }
+
         let participants: Vec<ParticipantId> = {
             let inner = self.lock_read()?;
             inner.key_manager.participants.keys().cloned().collect()
@@ -743,6 +765,35 @@ impl E2eeContext {
             "tried {} participants, none could decrypt",
             participants.len()
         )))
+    }
+
+    /// Record the SFU's server-injected-frame marker.
+    ///
+    /// Sent by livekit as `setSifTrailer` when the room is joined. Frames ending with it
+    /// are the SFU's own and are not encrypted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`E2eeError`] if the context lock is poisoned.
+    pub fn set_sif_trailer(&self, trailer: Vec<u8>) -> Result<(), E2eeError> {
+        let mut inner = self.lock_write()?;
+        tracing::info!(
+            len = trailer.len(),
+            "E2EE server-injected-frame trailer recorded; such frames pass through in the clear"
+        );
+        inner.sif_trailer = if trailer.is_empty() { None } else { Some(trailer) };
+        Ok(())
+    }
+
+    /// Whether this frame is one the SFU injected, and so is not encrypted at all.
+    fn is_server_injected(&self, frame: &[u8]) -> bool {
+        let Ok(inner) = self.lock_read() else {
+            return false;
+        };
+        inner
+            .sif_trailer
+            .as_ref()
+            .is_some_and(|trailer| frame.ends_with(trailer))
     }
 
     /// Decrypt a media frame using the `LiveKit` E2EE frame format.
@@ -1208,6 +1259,35 @@ mod tests {
     ///
     /// This is the cheapest way to tell "we were never given the key" from "we are reading
     /// the wrong bytes", which otherwise look identical: both drop every frame.
+    /// The SFU's own frames are not encrypted and must pass through.
+    ///
+    /// It holds no key, so it cannot encrypt: the silence or black picture it injects
+    /// while a publisher is muted arrives in the clear with a marker appended. Feeding one
+    /// to AES-GCM cannot succeed, and the failure looks exactly like a missing key --
+    /// arriving, inconveniently, the moment someone mutes.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn server_injected_frames_pass_through_undecrypted() {
+        const SIF: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"test-key-material-1234567890abc");
+        ctx.set_sif_trailer(SIF.to_vec()).expect("trailer recorded");
+
+        let mut injected = b"the SFU's own silence".to_vec();
+        injected.extend_from_slice(SIF);
+        let out = ctx
+            .decrypt_frame_any(&WireMedia::from_network(injected.clone()), MediaKind::Audio)
+            .expect("a server-injected frame is not an error")
+            .expect("it passes through");
+        assert_eq!(out.as_bytes(), injected.as_slice(), "passed through untouched");
+
+        // A frame that merely fails to decrypt is still a failure: the marker is what
+        // distinguishes them, not the fact that decryption did not work.
+        let ordinary = WireMedia::from_network(vec![0x11; 40]);
+        assert!(ctx.decrypt_frame_any(&ordinary, MediaKind::Audio).is_err());
+    }
+
     #[test]
     fn a_trailer_is_recognised_by_its_iv_length() {
         // A tail shaped the way livekit writes one: [..][IV_LENGTH=12][key_index].

@@ -228,6 +228,28 @@ function handleSetKey(data: SetKeyMessage): void {
  */
 const unhandledKinds = new Set<string>();
 
+/**
+ * Forward the SFU's "server injected frame" marker.
+ *
+ * An SFU inserts its own frames into a stream -- silence or a black picture while a
+ * publisher is muted. It holds no key, so those cannot be encrypted; they arrive in the
+ * clear with this trailer appended to identify them, and livekit's own cryptor passes them
+ * through untouched rather than trying to decrypt them.
+ *
+ * Without this the native side feeds every one to AES-GCM, where it fails to authenticate
+ * and is dropped -- indistinguishable in a log from a missing key, and arriving exactly
+ * when someone mutes.
+ */
+function handleSifTrailer(data: Record<string, unknown>): void {
+  const trailer = toBytes(data["trailer"] ?? data["sifTrailer"]);
+  if (!trailer) {
+    console.warn("[Elementium] E2EE setSifTrailer without recognisable bytes; ignoring");
+    return;
+  }
+  console.log(`[Elementium] E2EE server-injected-frame trailer forwarded (${trailer.length} bytes)`);
+  invokeTauri("e2ee_set_sif_trailer", { trailer: Array.from(trailer) });
+}
+
 /** Inspect one message bound for a Web Worker, forwarding E2EE keys if it is one. */
 export function interceptE2eeWorkerMessage(message: unknown): void {
   if (!message || typeof message !== "object") return;
@@ -242,6 +264,8 @@ export function interceptE2eeWorkerMessage(message: unknown): void {
     handleInit(data);
   } else if (kind === "setKey") {
     handleSetKey(data as SetKeyMessage);
+  } else if (kind === "setSifTrailer") {
+    handleSifTrailer(data);
   } else if (typeof kind === "string" && !unhandledKinds.has(kind)) {
     // Once per kind, so a per-frame message cannot flood the log.
     unhandledKinds.add(kind);
