@@ -317,6 +317,9 @@ async function firstFrameGeometry(
  * Shares the preview-dump switch, so `touch /tmp/elementium-dump-preview` turns on every
  * video diagnostic at once.
  */
+/** Vertical gap between frame-number stamps, in canvas pixels. */
+const MARKER_SPACING = 60;
+
 let videoDebug = false;
 void invoke<boolean>("video_debug_enabled")
   .then((on) => {
@@ -334,14 +337,26 @@ void invoke<boolean>("video_debug_enabled")
  * layer introduced it. A single number across a banded image means the bands were already
  * in one drawn frame, and the fault is upstream of the display entirely.
  */
-function drawFrameMarker(ctx: CanvasRenderingContext2D, frameCount: number): void {
+function drawFrameMarker(
+  ctx: CanvasRenderingContext2D,
+  frameCount: number,
+  height: number,
+): void {
   if (!videoDebug) return;
+  const label = String(frameCount % 1000).padStart(3, "0");
   ctx.save();
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, 72, 28);
-  ctx.fillStyle = "#0f0";
   ctx.font = "20px monospace";
-  ctx.fillText(String(frameCount % 1000).padStart(3, "0"), 6, 21);
+  // Stamped at intervals down the full height, not once at the top. A single stamp only
+  // ever reports which draw the topmost rows came from, so it cannot tell one whole frame
+  // apart from a frame torn across several draws -- which is the entire question. With a
+  // stamp every band, two different numbers in one image is proof of tearing, and the
+  // same number throughout is proof it is not.
+  for (let y = 0; y < height; y += MARKER_SPACING) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, y, 72, 28);
+    ctx.fillStyle = "#0f0";
+    ctx.fillText(label, 6, y + 21);
+  }
   ctx.restore();
 }
 
@@ -424,7 +439,7 @@ function startLocalVideoFrameFetch(
               ctx.drawImage(scratch, dx, dy, drawW, drawH);
             }
           }
-          drawFrameMarker(ctx, frameCount);
+          drawFrameMarker(ctx, frameCount, canvas.height);
           // The draw is complete: publish it as one frame. Doing this instead of letting
           // the track sample on a timer is what stops a half-written canvas reaching the
           // wire.
