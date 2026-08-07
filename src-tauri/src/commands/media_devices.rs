@@ -880,6 +880,15 @@ struct OutboundAudioStats {
     encoded: u64,
     sent: u64,
     skipped_not_connected: u64,
+    /// Frames lost because the transport they were addressed to no longer exists.
+    ///
+    /// Counted apart from `dropped_channel_full` because they are opposite problems. A
+    /// full channel is back-pressure: the consumer is alive and behind, and the fix is to
+    /// send less or consume faster. A closed one means the peer connection went away and
+    /// nothing re-attached the pipeline, so every frame from here on is wasted -- and
+    /// while the two shared a counter it read as congestion, which is what hid a call
+    /// going permanently silent after a mid-call renegotiation.
+    dropped_channel_closed: u64,
     dropped_channel_full: u64,
     encode_errors: u64,
     /// Loudest raw sample seen since the last report; reset on each report so a quiet
@@ -987,6 +996,7 @@ impl OutboundAudioStats {
                 encoded_frames = self.encoded,
                 sent_frames = self.sent,
                 skipped_not_connected = self.skipped_not_connected,
+                dropped_channel_closed = self.dropped_channel_closed,
                 dropped_channel_full = self.dropped_channel_full,
                 encode_errors = self.encode_errors,
                 input_peak_amplitude = self.peak_since_report,
@@ -1070,14 +1080,37 @@ fn encode_and_send_frame(
                 &encoded_frame,
                 ctx.frame_samples,
             );
+            let mut closed = false;
             if let Ok(guard) = encode_tx.lock()
                 && let Some(ref tx) = *guard
             {
-                if tx.try_send(IoCommand::WriteAudio(encoded_frame)).is_ok() {
-                    stats.sent = stats.sent.saturating_add(1);
-                } else {
-                    stats.dropped_channel_full = stats.dropped_channel_full.saturating_add(1);
+                match tx.try_send(IoCommand::WriteAudio(encoded_frame)) {
+                    Ok(()) => stats.sent = stats.sent.saturating_add(1),
+                    Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                        stats.dropped_channel_full =
+                            stats.dropped_channel_full.saturating_add(1);
+                    }
+                    Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                        stats.dropped_channel_closed =
+                            stats.dropped_channel_closed.saturating_add(1);
+                        closed = true;
+                    }
                 }
+            }
+            // Let go of a transport that has gone, rather than encoding into it for the
+            // rest of the call. A closed channel never reopens: the peer connection it
+            // belonged to was torn down, and the pipeline has to be attached to whatever
+            // replaced it. Detaching makes that state visible as `skipped_not_connected`
+            // -- honestly unattached -- instead of as a stream of drops that reads like
+            // congestion.
+            if closed {
+                if let Ok(mut guard) = encode_tx.lock() {
+                    *guard = None;
+                }
+                tracing::warn!(
+                    "the peer connection this microphone was feeding has closed; \
+                     audio is detached until a connection replaces it"
+                );
             }
         }
         Err(e) => {
