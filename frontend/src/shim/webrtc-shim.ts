@@ -226,9 +226,20 @@ class ElementiumRTCPeerConnection extends EventTarget {
     let running = true;
     let timerId: ReturnType<typeof setTimeout> | null = null;
     let scratch: HTMLCanvasElement | null = null;
+    let attempts = 0;
+    let failures = 0;
 
     const fetchLoop = async () => {
-      if (!running) return;
+      if (!running) {
+        // Said out loud, because a loop that stops is indistinguishable from a track that
+        // never had frames: one remote camera in a three-way call was polled a handful of
+        // times and then never again, and nothing recorded that it had stopped.
+        console.log(
+          `[Elementium] remote video fetch stopped for ${trackId} after ${attempts} attempts`,
+        );
+        return;
+      }
+      attempts += 1;
       const started = Date.now();
 
       try {
@@ -269,8 +280,17 @@ class ElementiumRTCPeerConnection extends EventTarget {
             present();
           }
         }
-      } catch {
-        // Frame fetch failed, skip
+      } catch (e) {
+        // Counted, not ignored. A loop that fails every time still reschedules, so a silent
+        // catch turns "this track never renders" into a stream of nothing with no record of
+        // why -- which is exactly the state one remote camera was found in.
+        failures += 1;
+        if (failures === 1 || failures % 100 === 0) {
+          console.warn(
+            `[Elementium] remote video fetch failed for ${trackId} ` +
+              `(${failures} of ${attempts} attempts): ${String(e).slice(0, 120)}`,
+          );
+        }
       }
 
       if (running) {
