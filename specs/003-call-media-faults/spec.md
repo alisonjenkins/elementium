@@ -170,6 +170,52 @@ What follows from it is that we must not publish frames encrypted with a key our
 peers cannot yet hold. See feature 004 T008 (`useKeyDelay`), which is now the
 highest-value open task in either feature.
 
+
+## Finding — 2026-08-07: with Elementium in a real call, both directions work
+
+The first measurement of Elementium as a participant, against the local stack, with two
+real Element Web clients in the same call. Driven headlessly (`just call-peers` and
+`just app-join`), both sides instrumented at once.
+
+| Measured at | Result |
+|---|---|
+| Elementium outbound audio | 12,000 captured, 12,000 encoded, **12,000 sent**, 0 skipped, 48 kbps |
+| The peers, hearing it | **2/2 usable streams each**, and they hold `@tester1`'s key |
+| Elementium inbound audio | **1,219 Opus frames decoded** from the two peers |
+| Elementium inbound video | 4 `MediaAdded` (2 audio, 2 video), one track delivering frames |
+
+So audio works in both directions, E2EE keys are exchanged both ways, and neither
+reported fault reproduces here. That is worth stating plainly because it contradicts
+the assumption this feature started from: on this stack, with this homeserver,
+Elementium can hear and be heard.
+
+### The one thing that did not work: the second remote camera
+
+Two remote participants published video. The frontend asked for both display slots and
+only one ever had a frame:
+
+```
+pc-18c9a22d841cf3cf-2   has_frame=True    49 calls
+pc-18c9a22d841cf3cf-3   has_frame=False    1 call
+```
+
+The second track was requested **once** and never polled again. That is a real defect,
+and it matches "I cannot see other people's webcams" in the shape a user would meet it:
+in a call with two other people, one picture appears.
+
+It also confirms the per-track display fix from earlier today is doing its job -- the
+two ids differ by mid, where before both were `{pc_id}-video` and would have
+overwritten each other in one slot. The remaining fault is downstream of that: the
+frontend stops asking for the second track.
+
+### What this leaves
+
+The reported faults are real and were seen against a *different* environment: a
+homeserver using MSC2965 delegated authentication (`matrix-auth.`), a hosted SFU, and
+federation. None of those exist locally. Which of those differences matters is the open
+question -- and the local stack cannot answer it, but it can now serve as the control,
+which it could not before today.
+
 ## User Scenarios
 
 ### US1 (P1) — Participants can hear each other

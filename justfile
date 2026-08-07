@@ -69,6 +69,11 @@ app-join:
     #
     # Nothing this recipe does should be able to reach a real session, so it does not share
     # a directory with one.
+    # Wiped each run. The profile keeps a crypto store, and the fixture hands out a new
+    # device on every provision -- a new device against a store belonging to an older one is
+    # a client the server has keys for that it can no longer use, which presents as the room
+    # never loading.
+    rm -rf target/app-join-profile
     mkdir -p target/app-join-profile
     ELEMENTIUM_TEST_ENV=1 ELEMENTIUM_AUTOJOIN=1 \
         ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-1}" \

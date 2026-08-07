@@ -121,11 +121,12 @@ async function driveElementWeb(cfg: AutoJoinConfig): Promise<void> {
   // clickable and it looks as though the room never loaded.
   dismissVerificationPrompt();
 
-  await waitFor("the room view", () =>
-    document.querySelector<HTMLElement>(".mx_RoomView, [class*='RoomView']"),
-  );
-  log("room open; starting the call");
+  // Waiting for the call button rather than for a room-view container: the button only
+  // exists once the room is open, it is what this needs next, and it does not depend on a
+  // class name that changes when Element Web is restyled.
+  log("waiting for the room");
   (await waitFor("the video call button", byName(/^video call$/i))).click();
+  log("call opened");
 }
 
 /**
@@ -174,6 +175,10 @@ if (CONFIG) {
   // Deliberately not awaited at module scope: this runs before Element Web boots, and a
   // rejection here must not stop it loading. Failures are reported and left alone.
   run(CONFIG).catch((e: unknown) => {
-    console.error(`[Elementium autojoin] ${String(e)}`);
+    // What the page was showing when it gave up. Without it the report says only that
+    // something never appeared, which is true of a login screen, a room preview, an error
+    // dialog and a blank page alike.
+    const showing = document.body?.innerText?.replace(/\s+/g, " ").slice(0, 300) ?? "";
+    console.error(`[Elementium autojoin] ${String(e)} | page showing: ${showing}`);
   });
 }

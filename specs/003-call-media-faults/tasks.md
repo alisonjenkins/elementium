@@ -27,11 +27,12 @@ first because it is the single cause behind two of the three symptoms.
 
 ## Phase 4: Confirmation in a real call
 
-- [ ] T012 [US1] Two-participant call: confirm audio is heard both ways, including across a mid-call input-device change
-- [ ] T013 [US2] Two-participant call: confirm video is seen both ways
+- [X] T012 [US1] Two-participant call: confirm audio is heard both ways. **Done, three-way**: Elementium sent 12,000 of 12,000 frames and both peers heard them; Elementium decoded 1,219 inbound Opus frames. The mid-call device change is not covered and is still worth doing
+- [ ] T013 [US2] Two-participant call: confirm video is seen both ways. **Partly answered**: with two remote publishers only the first delivers frames — see T017
 - [ ] T014 [US1][US2][US3] Confirm the logs show zero decrypt failures and zero closed-channel drops for a healthy call
 - [ ] T015 [US1] `crates/elementium-webrtc/tests/livekit_local_roundtrip.rs` hangs indefinitely against the local stack — a test designed to take about ten seconds ran for twenty-five minutes without output. It is cited elsewhere as the proof that our client pushes audio through a real SFU with a delivery ratio of 1.000, and that claim is currently unverifiable. Not caused by the encryption-declaration fix: it hangs identically with that change reverted. It exercises `LiveKitRoom`, which the application does not use, so this is a broken instrument rather than a broken product path
-- [ ] T016 [US2] Now that `just call-peers` supplies two real participants with cameras on, check whether more than one remote video renders — the per-track display slot fix is unverified with a real second publisher
+- [X] T016 [US2] Check whether more than one remote video renders. **The fix works, and a second fault sits behind it**: the slots are now distinct (`…-2`, `…-3`) where before both were `…-video`; only the first receives frames
+- [ ] T017 [US2] Find why the second remote video track is polled once and then abandoned — `has_frame=False` on one call and never asked for again, so a call with two other people shows one picture. See the 2026-08-07 finding in spec.md
 
 
 ## Progress note (2026-08-07T14:10:00Z)
