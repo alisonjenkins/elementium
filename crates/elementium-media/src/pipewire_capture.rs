@@ -519,6 +519,17 @@ struct Negotiated {
     encoding: Encoding,
 }
 
+/// Why a captured buffer never became a frame.
+#[derive(Debug, Clone, Copy)]
+enum DropReason {
+    /// Arrived sooner than the requested frame rate allows.
+    RateLimited,
+    /// The consumer had not taken the frames already queued.
+    QueueFull,
+    /// Could not be decoded, or did not match the negotiated geometry.
+    Unusable,
+}
+
 /// Rolling per-frame cost of decoding captured buffers.
 ///
 /// Reported rather than assumed: this is the hottest path in the application, running on
@@ -530,12 +541,40 @@ struct CaptureTiming {
     total: std::time::Duration,
     worst: std::time::Duration,
     bytes: u64,
+    /// Buffers the source handed us, whether or not they became frames.
+    ///
+    /// The difference between this and `frames` is the whole diagnostic. "Capture is
+    /// running below the requested rate" has three quite different causes -- the camera
+    /// delivering fewer, us dropping them to hold a rate, or the consumer being too slow to
+    /// take them -- and they are indistinguishable from the far end. Counting each
+    /// separately turns "it feels choppy" into a number that names the cause.
+    offered: u64,
+    /// Dropped to hold the requested frame rate.
+    rate_limited: u64,
+    /// Dropped because the consumer had not taken the previous ones.
+    queue_full: u64,
+    /// Dropped because the buffer could not be decoded or was malformed.
+    unusable: u64,
 }
 
 impl CaptureTiming {
     /// Frames between reports. 300 is five seconds at 60fps -- often enough to notice a
     /// change, rare enough that the logging itself is not part of the cost.
     const REPORT_EVERY: u64 = 300;
+
+    /// A buffer arrived from the source.
+    const fn offered(&mut self) {
+        self.offered = self.offered.saturating_add(1);
+    }
+
+    /// A buffer was dropped, and why.
+    const fn dropped(&mut self, reason: DropReason) {
+        match reason {
+            DropReason::RateLimited => self.rate_limited = self.rate_limited.saturating_add(1),
+            DropReason::QueueFull => self.queue_full = self.queue_full.saturating_add(1),
+            DropReason::Unusable => self.unusable = self.unusable.saturating_add(1),
+        }
+    }
 
     fn record(&mut self, elapsed: std::time::Duration, bytes: usize) {
         self.frames = self.frames.saturating_add(1);
@@ -554,6 +593,10 @@ impl CaptureTiming {
                     .checked_div(self.frames)
                     .and_then(|b| b.checked_div(1024))
                     .unwrap_or(0),
+                offered = self.offered,
+                rate_limited = self.rate_limited,
+                queue_full = self.queue_full,
+                unusable = self.unusable,
                 "capture decode cost"
             );
             *self = Self::default();
@@ -850,12 +893,15 @@ fn attach_and_connect(
         .process(move |stream, ()| {
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
             let Ok(n) = frame_state.lock().map(|g| *g) else { return };
+            timing.offered();
             if n.encoding == Encoding::Unsupported {
+                timing.dropped(DropReason::Unusable);
                 return;
             }
             // Checked before anything is read out of the buffer, let alone decoded.
             let now = std::time::Instant::now();
             if last_decoded.is_some_and(|t| now.saturating_duration_since(t) < min_gap) {
+                timing.dropped(DropReason::RateLimited);
                 return;
             }
             last_decoded = Some(now);
@@ -914,7 +960,7 @@ fn attach_and_connect(
                 };
                 timing.record(std::time::Duration::ZERO, copy_len);
                 if tx.try_send(frame).is_err() {
-                    // Newest dropped when full, as below.
+                    timing.dropped(DropReason::QueueFull);
                 }
                 return;
             }
@@ -961,8 +1007,11 @@ fn attach_and_connect(
                 }
                 // Newest frame dropped when full: blocking here would stall the PipeWire
                 // graph, which is far worse than losing a frame.
-                let _ = tx.try_send(CapturedFrame::Planar(frame));
+                if tx.try_send(CapturedFrame::Planar(frame)).is_err() {
+                    timing.dropped(DropReason::QueueFull);
+                }
             } else {
+                timing.dropped(DropReason::Unusable);
                 tracing::warn!(
                     len = bytes.len(),
                     width, height, stride,
