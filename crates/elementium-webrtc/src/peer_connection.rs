@@ -1176,6 +1176,20 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
             }
         }
         Event::MediaEgressStats(stats) => Some(egress_stats_event(&pc.id, &stats)),
+        // Nothing routes this back to the encoder yet -- the camera thread emits a
+        // keyframe on a timer instead. Logged at `warn` rather than swallowed into the
+        // catch-all because a stream of these is the signal that a receiver is asking to
+        // be able to decode us and being ignored, which looks from the far end exactly
+        // like a camera that is not sending at all.
+        Event::KeyframeRequest(req) => {
+            tracing::warn!(
+                pc_id = %pc.id,
+                mid = %req.mid,
+                kind = ?req.kind,
+                "Receiver requested a keyframe; not yet routed to the encoder"
+            );
+            None
+        }
         _ => {
             tracing::info!(pc_id = %pc.id, ?event, "Unhandled str0m event");
             None
