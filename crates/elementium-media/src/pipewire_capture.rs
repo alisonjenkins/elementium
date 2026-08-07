@@ -924,10 +924,16 @@ fn attach_and_connect(
                 )
             };
             if encoding == Encoding::Unsupported {
+                // Error, and unlike a busy node this one is ours. We advertise the formats
+                // we accept in `format_params`, so settling on one we cannot decode means
+                // what we offer and what we handle have diverged. The caller still
+                // recovers -- no frame arrives, so it moves to the next source -- but the
+                // camera it lands on is not the one the policy chose.
                 tracing::error!(
                     format = ?info.format(),
                     subtype,
-                    "PipeWire negotiated an encoding we cannot decode; frames will be dropped"
+                    "PipeWire negotiated an encoding we cannot decode, so we asked for one \
+                     we do not handle; every frame from this stream will be dropped"
                 );
             }
             tracing::info!(
