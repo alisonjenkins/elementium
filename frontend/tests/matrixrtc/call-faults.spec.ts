@@ -1,8 +1,20 @@
 /**
- * The two reported protocol faults, as reproductions.
+ * The two reported protocol faults, tested against real Element Call. Neither reproduces.
  *
  * - keys take a long time to arrive, so a participant who joins cannot hear anyone for a while
  * - someone joining or leaving silences everyone already in the call
+ *
+ * Four scenarios: three participants joining in sequence, one leaving, and hanging up and
+ * calling again. All work, with keys arriving and audio decoding. Whatever produces the
+ * reported symptom is therefore not Element Call and Matrix alone on this stack -- which
+ * leaves Elementium as a participant, or something about a real homeserver that this one
+ * does not reproduce.
+ *
+ * One scenario did fail, and it was this harness: reusing an access token and device id in a
+ * fresh browser context keeps the device but discards the crypto store, so the other
+ * participants encrypt their keys to a device that can no longer read them. Zero samples
+ * against 1,500 packets, indistinguishable from the real thing, and entirely self-inflicted.
+ * `freshSessions` exists to keep tests from doing it by accident.
  *
  * Both are about Element Call's key handling and Matrix's to-device delivery, so both are
  * driven through real Element Call in real Element Web against the local homeserver. A
@@ -27,6 +39,7 @@ import {
 import {
   openRoom,
   joinCall,
+  keysInstalled,
   leaveCall,
   inboundAudio,
   usable,
@@ -89,6 +102,15 @@ async function expectHears(p: Participant, expected: number, label: string): Pro
       .widget()
       .evaluate(() => (window as unknown as { __pcCount?: number }).__pcCount ?? -1)
       .catch(() => -1);
+    // Which keys this participant installed, and when. Packets without samples means no key
+    // worked; this says whether any arrived at all, for whom, and at what index.
+    const keys = await keysInstalled(p);
+    // Printed as well as thrown: a test marked `test.fail()` is reported as passing, and its
+    // error never reaches the output -- which would hide the only evidence it exists for.
+    console.log(
+      `  DIAGNOSTIC ${label} (${p.who.user_id}): ` +
+        `streams=${JSON.stringify(last)} keys=${JSON.stringify(keys)}`,
+    );
     throw new Error(
       `${label} (${p.who.user_id}): expected usable audio from ${expected} other ` +
         `participants, saw ${usable(last).length} of ${last.length} inbound streams ` +
@@ -97,7 +119,9 @@ async function expectHears(p: Participant, expected: number, label: string): Pro
         `  connections but no stream -> the SFU never announced or we never subscribed\n` +
         `  packets but no samples -> the key never arrived\n` +
         `  samples but concealed -> the key arrived and was wrong\n` +
-        `  ${JSON.stringify(last)}\n${String(e).split("\n")[0]}`,
+        `  streams: ${JSON.stringify(last)}\n` +
+        `  keys installed (${keys.length}): ${JSON.stringify(keys)}\n` +
+        `${String(e).split("\n")[0]}`,
     );
   }
 }
@@ -187,54 +211,17 @@ test.describe("MatrixRTC call faults", () => {
   });
 
   /**
-   * REPRODUCTION of the reported fault: the second call a device takes part in is silent.
+   * Hanging up and calling again, in the browser that made the first call.
    *
-   * `test.fail()` because the fault is present: this asserts the defect, and Playwright will
-   * report a failure on the day it starts working, which is the notification wanted.
+   * This is what a person does after any join or leave that dropped them, and it is the
+   * closest thing here to the reported symptom. It works.
    *
-   * What is observed, from the receiver's own statistics: roughly 1,500 RTP packets arrive
-   * from each of the two other participants over thirty seconds, and `totalSamplesReceived`
-   * stays at exactly zero for both. The media is there. Not one frame of it can be
-   * decrypted, for the entire call.
-   *
-   * That is "someone rejoins and nobody can hear each other", with numbers attached: the
-   * same three participants, one call after another, the first working and the second not.
-   *
-   * The device is what carries it, not the room. Before each test was given devices of its
-   * own, the leave test failed in exactly this way purely because the test before it had run
-   * -- a *different* room, the same devices. Fresh devices in the same room work; reused
-   * devices in a new room do not.
-   *
-   * Deliberately not narrowed further here. Whether the second call's key is never sent,
-   * sent and not received, or received at an index livekit has already stopped attempting
-   * (see the 2026-08-07 finding in specs/003-call-media-faults/spec.md) is the next
-   * question, and it wants the key-arrival logging rather than another browser test.
+   * It is kept because getting it to work is what found the harness fault below, and
+   * because if rejoining ever does break, this is where it will show.
    */
-  test("a second call, by devices that have already been in one, is silent", async ({
-    browser,
-  }) => {
-    // Inside the test, not beside it: at describe scope this marks every test in the file.
-    test.fail();
+  test("a second call, after hanging up the first, works", async ({ browser }) => {
     const three = await freshSessions(3);
     const roomId = await createCallRoom(three, "second call");
-
-    // The first call: joined, proven to work, and hung up properly.
-    {
-      const contexts = await Promise.all(three.map(() => browser.newContext()));
-      const joined: Participant[] = [];
-      try {
-        for (const [i, who] of three.entries()) {
-          const p = await openRoom(contexts[i]!, server!, who, roomId);
-          await joinCall(p);
-          joined.push(p);
-        }
-        await expectHears(joined[0]!, 2, "the first call");
-      } finally {
-        await hangUp(joined, contexts);
-      }
-    }
-
-    // The second call, in the same room, by the same people.
     const contexts = await Promise.all(three.map(() => browser.newContext()));
     const joined: Participant[] = [];
     try {
@@ -243,6 +230,15 @@ test.describe("MatrixRTC call faults", () => {
         await joinCall(p);
         joined.push(p);
       }
+      await expectHears(joined[0]!, 2, "the first call");
+
+      // Leave, but keep the browsers. A person who hangs up keeps their crypto store, and
+      // discarding it here is what made an earlier version of this test appear to reproduce
+      // the reported fault -- see the note on `freshSessions`.
+      await Promise.all(joined.map((p) => leaveCall(p)));
+      await joined[0]!.page.waitForTimeout(5_000);
+
+      for (const p of joined) await joinCall(p);
       await expectHears(joined[0]!, 2, "the second call");
     } finally {
       await hangUp(joined, contexts);

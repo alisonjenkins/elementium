@@ -39,48 +39,62 @@ production logs:
   and has not yet been observed in a real call.
 
 
-## Finding — 2026-08-07: one of the two faults is now reproducible on demand
+## Finding — 2026-08-07: neither fault reproduces with Element Call alone
 
-Three real Element Web clients, in a real Element Call, on the local stack. Of the
-three scenarios built, two work and one fails — and the one that fails is the one
-that was reported.
+Three real Element Web clients, in a real Element Call, on the local stack. Four
+scenarios, all of which work:
 
 | Scenario | Result |
 |---|---|
 | Three join in sequence; the last hears the other two | works |
 | Three join; one leaves; the other two keep hearing each other | works |
-| **A second call, by devices that have already been in one** | **silent for everyone** |
+| Everyone hangs up and calls again in the same browser | works |
+| The room is encrypted, so key handling actually runs | asserted |
 
-The failure, from the receiver's own statistics: roughly **1,500 RTP packets** arrive
-from each of the two other participants over thirty seconds, and
-`totalSamplesReceived` stays at **exactly zero** for both. The media is delivered.
-Not one frame of it can be decrypted, for the entire call.
+That last row matters: Element Call performs frame encryption only in an encrypted
+room, and the first version of this suite used a plain one. It exercised none of the
+key handling these faults live in, and passed.
 
-**The device carries it, not the room.** Before each test was given devices of its
-own, the leave scenario failed in exactly this way purely because the test before it
-had run — a different room, the same devices. Fresh devices in the same room work;
-reused devices in a new room do not.
+So whatever produces the reported symptom is not Element Call and Matrix alone on
+this stack. What remains is Elementium as a participant, or something about a real
+homeserver — federation, slower to-device delivery, a busier sync — that a local
+Synapse with four users does not reproduce.
 
-This reframes US1 and US2. The reported symptom is described as following a join or
-a leave, and neither a join nor a leave reproduces it. What reproduces it is a device
-taking part in a second call, which is what a person does after any join or leave
-they were disconnected by — so the anecdote and the measurement agree, while pointing
-somewhere different.
+### A false reproduction, and what it was worth
 
-### What this does not yet say
+An earlier version of this section reported the fault as reproduced on demand, with
+numbers: about 1,500 RTP packets arriving from each remote participant over thirty
+seconds and `totalSamplesReceived` at exactly zero — media delivered, not one frame
+decrypting. That was real, repeatable, and self-inflicted.
 
-Zero samples against 1,500 packets is "no key ever worked", not "the key was late" or
-"the key was wrong" — those produce samples, of noise. Which of the three possible
-causes it is:
+The cause was the harness reusing an access token and device id in a *fresh browser
+context*. That keeps the device and discards the crypto store, so the other
+participants encrypt their keys to a device that can no longer read them. Indistinguishable
+from the reported fault by any measurement taken at the receiver.
 
-- the second call's key is never sent
-- it is sent and never received
-- it is received at an index livekit has already stopped attempting
+It was caught by testing a prediction and having it refuted. If the re-send were driven
+by a new membership fingerprint appearing, a brand-new participant joining the stuck call
+should have unstuck it. It did not — and the next hypothesis, that a browser keeping its
+crypto store would be fine, held.
 
-is the next question. It wants the key-arrival logging from T001 and the
-derived-versus-forwarded counting from T002 read from a failing run, not another
-browser test. The third possibility is described in the 2026-08-07 finding in
-`specs/003-call-media-faults/spec.md`.
+Two things follow, and both are kept:
+
+- `freshSessions` logs each test's participants in again, so no test reuses a device by
+  accident. Tests that reuse one now do it deliberately and say so.
+- **Packets-without-samples does not identify a cause.** A key never sent, a key sent to a
+  device that cannot read it, and a key arriving at an index the receiver has stopped
+  attempting all look identical from the receiver. Distinguishing them needs the sender's
+  side, which is what the key-arrival logging is for.
+
+### The instrument that settled it
+
+The harness records every `setKey` message on its way to livekit's worker — participant
+and index only, never material. It is what turned "no audio" into a specific claim:
+
+```
+first call  (works):  ... @tester2:localhost:AUUTRURUIG index 0 ...
+second call (broken): only @tester1's own key, seven times
+```
 
 ## User Scenarios
 

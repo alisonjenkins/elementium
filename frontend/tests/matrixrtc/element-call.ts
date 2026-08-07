@@ -11,6 +11,13 @@ import { useSession, type Credentials, type ElementWebServer } from "./element-w
 
 const HOMESERVER = "http://localhost:8008";
 
+/** One `setKey` message on its way to livekit's E2EE worker. */
+export interface KeyEvent {
+  at: number;
+  participantIdentity: string;
+  keyIndex: number;
+}
+
 /** Inbound audio as the receiving browser reports it. */
 export interface InboundAudio {
   ssrc: number;
@@ -72,6 +79,7 @@ export async function openRoom(
 ): Promise<Participant> {
   const page = await context.newPage();
   await recordPeerConnections(page);
+  await observeKeys(page);
   await useSession(page, who, HOMESERVER);
   console.log(`  [${who.user_id}] loading the room`);
   await page.goto(`${server.origin}/#/room/${roomId}`);
@@ -158,4 +166,56 @@ export function usable(streams: InboundAudio[]): InboundAudio[] {
   return streams.filter(
     (s) => s.totalSamplesReceived > 0 && s.concealedSamples < s.totalSamplesReceived / 2,
   );
+}
+
+/**
+ * Record every encryption key Element Call installs, without recording any key material.
+ *
+ * The same interception Elementium's own bridge uses -- `Worker.prototype.postMessage` --
+ * because livekit constructs its E2EE worker internally and there is no handle to hook more
+ * narrowly. Here it is purely observational.
+ *
+ * This is the instrument the reproduction needs. "1,500 packets and zero samples" says no
+ * key ever worked; it cannot say whether a key was never installed, installed for the wrong
+ * participant, or installed at an index the sender had already moved past. Those are
+ * different faults with different owners, and they are distinguishable only by watching the
+ * keys go past.
+ *
+ * Identity and index only. A `setKey` payload holds key material, and one careless line puts
+ * a call's encryption key in a test log.
+ */
+export async function observeKeys(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const store = window as unknown as { __keyLog?: KeyEvent[] };
+    store.__keyLog = [];
+    const started = Date.now();
+    const original = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (this: Worker, message: unknown, ...rest: unknown[]) {
+      try {
+        const msg = message as { kind?: string; data?: Record<string, unknown> };
+        if (msg?.kind === "setKey") {
+          store.__keyLog!.push({
+            at: Date.now() - started,
+            participantIdentity: String(msg.data?.["participantIdentity"] ?? "?"),
+            keyIndex: Number(msg.data?.["keyIndex"] ?? -1),
+          });
+        }
+      } catch {
+        /* observation must never break the call */
+      }
+      return (original as (this: Worker, m: unknown, ...r: unknown[]) => void).call(
+        this,
+        message,
+        ...rest,
+      );
+    } as typeof Worker.prototype.postMessage;
+  });
+}
+
+/** Keys this participant has installed, oldest first. */
+export async function keysInstalled(p: Participant): Promise<KeyEvent[]> {
+  return p
+    .widget()
+    .evaluate(() => (window as unknown as { __keyLog?: KeyEvent[] }).__keyLog ?? [])
+    .catch(() => []) as Promise<KeyEvent[]>;
 }

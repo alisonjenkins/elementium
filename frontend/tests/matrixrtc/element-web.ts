@@ -245,6 +245,12 @@ export async function createCallRoom(
  * not. Where reusing a device is the point, a test does it deliberately and says so.
  *
  * Users are `testerN` / `test-password-N`, as `provision.sh` creates them.
+ *
+ * A fresh *login*, not a fresh browser context around an old token: reusing a device id
+ * while discarding the crypto store leaves a device the other participants have cached keys
+ * for and which can no longer decrypt anything sent to it. That produces exactly the symptom
+ * being investigated -- packets arriving, not one frame decrypting -- and is entirely an
+ * artefact. An earlier version of this suite reported it as a reproduction of the fault.
  */
 export async function freshSessions(count: number): Promise<Credentials[]> {
   const out: Credentials[] = [];
