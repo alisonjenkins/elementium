@@ -185,17 +185,43 @@ fn negotiated_subtype(pod: &libspa::pod::Pod) -> Option<u32> {
         })
 }
 
-/// Decode one MJPEG buffer to tightly packed RGBA.
+/// Decode one MJPEG buffer to tightly packed RGBA, with the dimensions it really had.
 ///
 /// Returns `None` on a malformed frame rather than a partial image: a camera occasionally
 /// emits a truncated JPEG, and half a frame followed by stale pixels looks like a decoder
 /// bug rather than a dropped frame.
+///
+/// The dimensions are returned rather than assumed because **each JPEG carries its own**,
+/// and they are not guaranteed to match what the stream negotiated. A buffer labelled with
+/// the wrong geometry is read at the wrong stride by everything downstream: rows step by
+/// the wrong number of bytes, so the picture breaks into horizontal bands that slide
+/// sideways, and because a row offset that is not a multiple of four rotates the RGBA
+/// components, the bands take on colour casts. It looks like a corrupt encoder and is
+/// nothing of the kind -- the pixels are perfect and the label is wrong.
+///
+/// A decode whose output does not match its own stated size is refused outright; there is
+/// no geometry that would describe such a buffer correctly.
 #[must_use]
-pub fn decode_mjpeg_to_rgba(jpeg: &[u8]) -> Option<Vec<u8>> {
+pub fn decode_mjpeg_to_rgba(jpeg: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let options = zune_core::options::DecoderOptions::default()
         .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGBA);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(jpeg), options);
-    decoder.decode().ok()
+    let pixels = decoder.decode().ok()?;
+    let (width, height) = decoder.dimensions()?;
+
+    let expected = width.checked_mul(height)?.checked_mul(4)?;
+    if pixels.len() != expected {
+        tracing::warn!(
+            decoded_len = pixels.len(),
+            width,
+            height,
+            expected,
+            "MJPEG decode produced a buffer that does not match its own dimensions; frame dropped"
+        );
+        return None;
+    }
+
+    Some((pixels, u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }
 
 /// Negotiated geometry, shared between the format callback and the frame callback.
@@ -406,6 +432,10 @@ fn attach_and_connect(
             let width = usize::try_from(n.width).unwrap_or(0);
             let height = usize::try_from(n.height).unwrap_or(0);
 
+            // Every frame carries the geometry it was actually decoded at, not the
+            // geometry the stream negotiated, because a mismatch between the two is
+            // exactly the fault this used to have: the buffer was labelled with the
+            // negotiated size regardless of what came out of the decoder.
             let converted = match n.encoding {
                 Encoding::Mjpeg => {
                     // `size` is the meaningful byte count; the mapped buffer is larger.
@@ -419,16 +449,29 @@ fn attach_and_connect(
                         stride
                     };
                     to_rgba(bytes, width, height, stride, format)
+                        .map(|rgba| (rgba, n.width, n.height))
                 }
                 Encoding::Unsupported => None,
             };
 
-            if let Some(rgba) = converted {
+            if let Some((rgba, frame_width, frame_height)) = converted {
+                if frame_width != n.width || frame_height != n.height {
+                    // Once per occurrence rather than per frame: a camera that does this
+                    // does it every frame, and the interesting fact is that it happens at
+                    // all, not how often.
+                    tracing::warn!(
+                        negotiated_width = n.width,
+                        negotiated_height = n.height,
+                        frame_width,
+                        frame_height,
+                        "camera delivered a frame of a different size than negotiated"
+                    );
+                }
                 // Newest frame dropped when full: blocking here would stall the PipeWire
                 // graph, which is far worse than losing a frame.
                 let _ = tx.try_send(VideoFrame {
-                    width: n.width,
-                    height: n.height,
+                    width: frame_width,
+                    height: frame_height,
                     data: rgba,
                     timestamp_us: 0,
                 });
