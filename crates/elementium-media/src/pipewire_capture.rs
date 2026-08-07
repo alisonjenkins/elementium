@@ -771,10 +771,21 @@ fn attach_and_connect(
     // frame that arrives early is dropped here, before the decode. That ordering is the
     // whole point: decoding is a third of this path's cost, so decoding a frame nothing
     // will consume is the most expensive possible way to do nothing.
+    // With a tolerance, and it matters more than it looks. A camera asked for 30fps
+    // delivers frames about 33.3ms apart, but "about" is doing real work: jitter of a
+    // fraction of a millisecond puts many of them just inside an exact 1/30s gap, each one
+    // is dropped, and the next then falls outside -- so a source running at precisely the
+    // requested rate is decimated to roughly half of it. Measured at 17-20fps from a 30fps
+    // camera before this allowance.
+    //
+    // An eighth is comfortably more than any jitter observed and still less than the gap to
+    // the next rate a camera would plausibly run at, so a genuinely faster source is still
+    // limited.
+    let nominal_gap = 1_000_000_000_u64
+        .checked_div(u64::from(target_fps.max(1)))
+        .unwrap_or(0);
     let min_gap = std::time::Duration::from_nanos(
-        1_000_000_000_u64
-            .checked_div(u64::from(target_fps.max(1)))
-            .unwrap_or(0),
+        nominal_gap.saturating_sub(nominal_gap.checked_div(8).unwrap_or(0)),
     );
     let mut last_decoded: Option<std::time::Instant> = None;
 
