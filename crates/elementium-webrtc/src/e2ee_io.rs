@@ -143,11 +143,17 @@ pub(crate) fn maybe_decrypt_event(
                 }
                 Ok(None) => None,
                 Err(e) => {
-                    tracing::warn!(
-                        %mid,
-                        reason = %e,
-                        "E2EE dropping inbound audio frame: decrypt failed"
-                    );
+                    // Throttled: one real call produced hundreds of identical lines, which
+                    // buries the events either side of it. The interesting fact was never
+                    // the count but that it happened at all, and which key index the sender
+                    // used -- which `decrypt_frame_any` reports on its own throttle.
+                    if should_report_drop() {
+                        tracing::warn!(
+                            %mid,
+                            reason = %e,
+                            "E2EE dropping inbound audio frame: decrypt failed"
+                        );
+                    }
                     None
                 }
             }
@@ -157,17 +163,36 @@ pub(crate) fn maybe_decrypt_event(
                 Ok(Some(decrypted)) => Some(PcEvent::VideoData { mid, data: decrypted }),
                 Ok(None) => None,
                 Err(e) => {
-                    tracing::warn!(
-                        %mid,
-                        reason = %e,
-                        "E2EE dropping inbound video frame: decrypt failed"
-                    );
+                    // Throttled: one real call produced hundreds of identical lines, which
+                    // buries the events either side of it. The interesting fact was never
+                    // the count but that it happened at all, and which key index the sender
+                    // used -- which `decrypt_frame_any` reports on its own throttle.
+                    if should_report_drop() {
+                        tracing::warn!(
+                            %mid,
+                            reason = %e,
+                            "E2EE dropping inbound video frame: decrypt failed"
+                        );
+                    }
                     None
                 }
             }
         }
         other => passthrough(other),
     }
+}
+
+/// Whether this dropped frame is worth a line in the log.
+///
+/// The first always is: the transition from working to not is the moment worth seeing.
+/// After that every 500th, which at roughly 50 frames a second per stream is one line every
+/// ten seconds -- enough to show the fault persisting, little enough to read past.
+fn should_report_drop() -> bool {
+    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DROPPED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    n == 1 || n.is_multiple_of(500)
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ first because it is the single cause behind two of the three symptoms.
 
 - [ ] T005 [US1][US2] Fix the difference T002 identifies (depends on T002, T004)
 - [ ] T006 [US1][US2] Make a decrypt failure name the participant, key index and reason rather than only a count, in `crates/elementium-webrtc/src/e2ee_io.rs`
-- [ ] T007 [US1][US2] Rate-limit the failure log: 331 identical lines for one call is unreadable, and the interesting fact is that it happens at all
+- [X] T007 [US1][US2] Rate-limit the failure log: 331 identical lines for one call is unreadable, and the interesting fact is that it happens at all
 
 ## Phase 3: The transport outliving its connection (US1, US3)
 
