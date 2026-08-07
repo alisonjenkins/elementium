@@ -10,11 +10,11 @@ first because it is the single cause behind two of the three symptoms.
 - [X] T001 [US1][US2] Record what our E2EE encrypt path actually produces for one frame — key, key index, IV, AAD, trailer layout — in `crates/elementium-e2ee/src/lib.rs`, and write it down in `research.md` beside what LiveKit's own client does
 - [X] T002 [US1][US2] Compare against the reference: read the key derivation and frame layout the JS `livekit-client` E2EE worker uses, and record every point where ours differs
 - [X] T003 [US1][US2] Write a round-trip test in `crates/elementium-e2ee/` that encrypts with our code and decrypts with our code, to establish the internal contract holds before questioning the wire format
-- [ ] T004 [US1][US2] Write a test against a captured real frame from the reference client, so "matches LiveKit" is checked rather than assumed
+- [X] T004 [US1][US2] Check our format against the reference implementation rather than against ourselves — satisfied more strongly than written: `frontend/tests/browser/receive-path.spec.ts` has a real Chromium running livekit's own E2EE worker decrypt what our Rust encrypts, which tests the whole format against the reference rather than one captured frame
 
 ## Phase 2: E2EE correctness (US1, US2)
 
-- [ ] T005 [US1][US2] Fix the difference T002 identifies (depends on T002, T004)
+- [X] T005 [US1][US2] ~~Fix the difference T002 identifies~~ — there is no difference. Closed as answered rather than done; see the finding below
 - [X] T006 [US1][US2] Make a decrypt failure name the participant, key index and reason rather than only a count, in `crates/elementium-webrtc/src/e2ee_io.rs`
 - [X] T007 [US1][US2] Rate-limit the failure log: 331 identical lines for one call is unreadable, and the interesting fact is that it happens at all
 
@@ -62,3 +62,39 @@ with its descriptor attached, would fail exactly this way and produce
 
 T004 is now the priority, and the check is cheap: the second-to-last byte of
 a livekit frame is always 12. `trailer_looks_like_livekit` reports it.
+
+
+## Finding (2026-08-07T16:40:00Z): E2EE is not the fault
+
+T005 assumed T002 would find a discrepancy. It did not, and the assumption is
+worth recording because it was wrong in a useful way.
+
+Our frame layout, unencrypted header sizes, AAD and HKDF parameters were checked
+against livekit-client, Element Call and LiveKit's native transformer, and every
+one matches. Then the stronger check: a real Chromium running livekit's own E2EE
+worker decrypts audio our Rust encrypted, with **500 packets, 0 lost, 0 concealed
+samples**. Our encryption is interoperable with the reference implementation.
+
+So the outbound half of US1 is not an encryption fault. The rest of that path is
+also accounted for:
+
+| Link | Evidence |
+|---|---|
+| Encoded | `encoded 724` |
+| Encrypted | no encryption-failure warnings |
+| SDP well-formed | `m=audio 111 opus/48000/2`, `sendonly`, msid and ssrc present |
+| Track associated | `Added transceiver mid=DKP kind=Audio track_id=ed854cca-…` |
+| Written to the socket | `Outbound audio socket pacing: packets 500` |
+| **Received by the SFU** | `MediaEgressStats { mid: DKP, packets: 612, rtt: Some(..) }` |
+
+That last line is RTCP receiver reports coming back: the SFU has our audio. The
+fault is therefore **downstream of the SFU** — either it does not announce our
+track to the other participant, or that participant does not subscribe to it.
+
+Two real bugs were found and fixed while establishing that, neither of which was
+the reported one: a 16-slot key ring that aliased index 19 onto index 3 while
+Element Call rotates modulo 256, and server-injected frames being fed to AES-GCM
+instead of passed through.
+
+T012-T014 remain, and now need the far end's view rather than ours. See feature
+004, which builds the environment for exactly that.

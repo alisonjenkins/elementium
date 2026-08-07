@@ -1,0 +1,29 @@
+# Tasks: Finish the hardware video pipeline
+
+**Spec**: [spec.md](spec.md)
+
+T001 gates everything else. If H.264 is never negotiated, the rest of this feature
+is answering a question nobody asked.
+
+## Phase 1: Does it engage at all?
+
+- [ ] T001 [US1] Read the SDP from a real call and record whether H.264 is offered and negotiated — the log already contains the offer and answer, so this needs reading rather than instrumenting
+- [ ] T002 [US1] Log the selected encoder backend and codec once per call in `src-tauri/src/commands/media_devices.rs`, so "is the GPU being used" is answerable from a log rather than by reasoning about the policy
+- [ ] T003 [US1] If H.264 is not negotiated, establish whether that is Element Call's choice, the SFU's `enabled_publish_codecs`, or our own offer being wrong — the three have different owners
+
+## Phase 2: Prove the saving
+
+- [ ] T004 [US2] Measure CPU per frame on the software path with a real camera, as a baseline (the capture counters added for the frame-rate work already report decode cost)
+- [ ] T005 [US2] Measure the same on the hardware path and record both, so the claim about 37.6% is checked rather than repeated
+- [ ] T006 [US3] Confirm no CPU JPEG decode happens on the hardware path beyond the rate-limited self-view, using the `offered`/`rate_limited` counters
+
+## Phase 3: The rest of the hardware
+
+- [ ] T007 [US3] Implement the `VideoToolbox` probe and encoder for macOS in `crates/elementium-codec/src/hardware.rs` and a new `videotoolbox` module — the selection policy is already platform-independent, so only the probe and construction are new
+- [ ] T008 [US3] Implement the Media Foundation probe and encoder for Windows, likewise
+- [ ] T009 [US1] AV1 encoding on VAAPI: the GPU offers it to 8192x4352 and it carries the same quality in roughly two thirds of H.264's bitrate. Only worth doing once H.264 is proven to engage
+
+## Phase 4: The copies that remain
+
+- [ ] T010 [US2] Import the camera's buffer as a DMA-BUF so it reaches the GPU without the CPU touching it, removing the two remaining copies on the accelerated path. This is a different mechanism from the current staging-image upload rather than an optimisation of it
+- [ ] T011 [US2] Extend the zero-copy test to cover the surface upload, so a copy reintroduced there fails a test rather than showing up in a benchmark later
