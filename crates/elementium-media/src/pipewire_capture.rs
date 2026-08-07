@@ -506,6 +506,13 @@ pub struct PipewireCapturer {
     frame_rx: mpsc::Receiver<I420Frame>,
     stop_tx: mpsc::Sender<()>,
     negotiated: Arc<Mutex<Negotiated>>,
+    /// Set when the stream enters its error state.
+    ///
+    /// A stream can negotiate a format and then fail on the buffers, which leaves it
+    /// reporting a perfectly good size and delivering nothing at all. Without this a caller
+    /// has no way to tell that from a camera that is merely slow to start, and waits out
+    /// its whole timeout on a stream that will never produce a frame.
+    failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PipewireCapturer {
@@ -551,9 +558,11 @@ impl PipewireCapturer {
         let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let negotiated = Arc::new(Mutex::new(Negotiated::default()));
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         let thread_negotiated = Arc::clone(&negotiated);
+        let thread_failed = Arc::clone(&failed);
         std::thread::Builder::new()
             .name(format!("pw-capture-{node_id}"))
             .spawn(move || {
@@ -564,6 +573,7 @@ impl PipewireCapturer {
                     &frame_tx,
                     stop_rx,
                     &thread_negotiated,
+                    &thread_failed,
                     &ready_tx,
                 );
             })
@@ -571,7 +581,12 @@ impl PipewireCapturer {
 
         // Surface setup failures to the caller instead of leaving a silent dead thread.
         match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self { frame_rx, stop_tx, negotiated }),
+            Ok(Ok(())) => Ok(Self {
+                frame_rx,
+                stop_tx,
+                negotiated,
+                failed,
+            }),
             Ok(Err(e)) => Err(PipewireError::Connect(e)),
             Err(e) => Err(PipewireError::Connect(format!("stream setup timed out: {e}"))),
         }
@@ -581,6 +596,15 @@ impl PipewireCapturer {
     #[must_use]
     pub fn try_recv(&self) -> Option<I420Frame> {
         self.frame_rx.try_recv().ok()
+    }
+
+    /// Whether the stream has given up.
+    ///
+    /// Distinct from "no frames yet": a camera can take a moment to start, and a stream
+    /// that has errored never will.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Negotiated frame size, or `(0, 0)` before the format callback has run.
@@ -605,6 +629,7 @@ impl Drop for PipewireCapturer {
 
 /// Body of the capture thread: build the stream, run the loop until stopped.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 fn run_stream(
     node_id: u32,
     target_fps: u32,
@@ -612,6 +637,7 @@ fn run_stream(
     frame_tx: &mpsc::SyncSender<I420Frame>,
     stop_rx: mpsc::Receiver<()>,
     negotiated: &Arc<Mutex<Negotiated>>,
+    failed: &Arc<std::sync::atomic::AtomicBool>,
     ready_tx: &mpsc::Sender<Result<(), String>>,
 ) {
     pipewire::init();
@@ -647,7 +673,7 @@ fn run_stream(
         }
     };
 
-    if let Err(e) = attach_and_connect(&stream, node_id, target_fps, target, negotiated, frame_tx) {
+    if let Err(e) = attach_and_connect(&stream, node_id, target_fps, target, negotiated, failed, frame_tx) {
         let _ = ready_tx.send(Err(e));
         return;
     }
@@ -660,12 +686,14 @@ fn run_stream(
 /// Returns the listener, which must outlive the stream: dropping it silently stops every
 /// callback, so the stream would connect and then deliver nothing.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn attach_and_connect(
     stream: &pipewire::stream::StreamRc,
     node_id: u32,
     target_fps: u32,
     target: elementium_codec::EncodeTarget,
     negotiated: &Arc<Mutex<Negotiated>>,
+    failed: &Arc<std::sync::atomic::AtomicBool>,
     frame_tx: &mpsc::SyncSender<I420Frame>,
 ) -> Result<(), String> {
     let fmt_state = Arc::clone(negotiated);
@@ -692,8 +720,15 @@ fn attach_and_connect(
 
     let listener = stream
         .add_local_listener::<()>()
-        .state_changed(|_, (), old, new| {
-            tracing::info!(?old, ?new, "PipeWire capture stream state");
+        .state_changed({
+            let failed = Arc::clone(failed);
+            move |_, (), old, new| {
+                tracing::info!(?old, ?new, "PipeWire capture stream state");
+                if let pipewire::stream::StreamState::Error(reason) = &new {
+                    tracing::error!(reason = %reason, "PipeWire capture stream failed");
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         })
         .param_changed(move |_, (), id, pod| {
             // Only the fixated `Format` matters; the stream also reports Props, Buffers,

@@ -17,12 +17,12 @@ use elementium_types::I420Frame;
 use crate::camera::CameraCapturer;
 use crate::pipewire_capture::PipewireCapturer;
 
-/// How long to wait for `PipeWire` to negotiate a format before deciding it will not.
+/// How long a source has to produce its first frame.
 ///
-/// Negotiation is a round trip with the daemon and the device; a camera that has not
-/// settled within this has something wrong with it, and falling back is better than
-/// blocking a call's video indefinitely.
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Covers a round trip with the daemon, the device settling, and a cold USB camera starting
+/// its sensor. Short enough that falling back to `V4L2` still feels like starting rather
+/// than hanging.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// A running video capture, from whichever backend worked.
 pub enum VideoSource {
@@ -129,12 +129,43 @@ impl VideoSource {
     }
 }
 
-/// Start the first `PipeWire` source that actually negotiates a format.
+/// Wait for one frame, or say why it will not come.
 ///
-/// A node can connect and then fail to agree on a format -- a virtual camera offering only
-/// layouts we cannot decode does exactly that -- so "connected" is not enough to call it
-/// working. Each candidate is given until [`NEGOTIATION_TIMEOUT`] to report a size, and the
-/// next is tried otherwise.
+/// Gives up early when the stream reports an error rather than waiting out the timeout: a
+/// stream that has failed will not recover, and every second spent here is a second the
+/// camera is not running on the path that would have worked.
+fn wait_for_first_frame(capturer: &PipewireCapturer) -> Result<(), String> {
+    let deadline = Instant::now().checked_add(FIRST_FRAME_TIMEOUT);
+    while deadline.is_some_and(|d| Instant::now() < d) {
+        if capturer.try_recv().is_some() {
+            return Ok(());
+        }
+        if capturer.failed() {
+            return Err("the stream failed after connecting".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (width, height) = capturer.size();
+    if width > 0 && height > 0 {
+        return Err(format!(
+            "negotiated {width}x{height} and then delivered no frames"
+        ));
+    }
+    Err("negotiated no usable format".to_owned())
+}
+
+/// Start the first `PipeWire` source that actually delivers a frame.
+///
+/// A frame, not a format. Negotiating a size proves only that both ends agreed on what a
+/// picture would look like, and a stream can do that and then fail on the buffers — which
+/// is what an OBSBOT Tiny 2 does here, reporting a perfectly good 1280x720 and then
+/// producing nothing at all. Accepting that leaves the camera silently dead: the log says
+/// capture started, no frames ever arrive, and the `V4L2` path that would have worked is
+/// never tried.
+///
+/// The cost is one frame, which is consumed to prove the stream is live and cannot be put
+/// back. That is a fair price for knowing the difference between a working camera and a
+/// convincing impression of one.
 fn start_pipewire(
     target_fps: u32,
     target: elementium_codec::EncodeTarget,
@@ -148,27 +179,27 @@ fn start_pipewire(
     for source in &sources {
         match PipewireCapturer::start_at(source.node_id, target_fps, target) {
             Ok(capturer) => {
-                let deadline = Instant::now().checked_add(NEGOTIATION_TIMEOUT);
-                while deadline.is_some_and(|d| Instant::now() < d) {
-                    let (w, h) = capturer.size();
-                    if w > 0 && h > 0 {
+                match wait_for_first_frame(&capturer) {
+                    Ok(()) => {
+                        let (width, height) = capturer.size();
                         tracing::info!(
                             node_id = source.node_id,
                             name = %source.description,
-                            width = w,
-                            height = h,
+                            width,
+                            height,
                             "Camera capture started via PipeWire"
                         );
                         return Ok(VideoSource::Pipewire(capturer));
                     }
-                    std::thread::sleep(Duration::from_millis(20));
+                    Err(reason) => {
+                        capturer.stop();
+                        last_error = format!(
+                            "node {} ({}): {reason}",
+                            source.node_id, source.description
+                        );
+                        tracing::warn!(reason = %last_error, "Skipping PipeWire source");
+                    }
                 }
-                capturer.stop();
-                last_error = format!(
-                    "node {} ({}) connected but negotiated no usable format",
-                    source.node_id, source.description
-                );
-                tracing::warn!(reason = %last_error, "Skipping PipeWire source");
             }
             Err(e) => {
                 last_error = format!("node {}: {e}", source.node_id);
