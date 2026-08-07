@@ -16,5 +16,21 @@ tracing = { workspace = true }
 # replacing hand-rolled per-pixel scalar float math on the video hot path.
 yuv = "0.8"
 
+# libjpeg-turbo, linked from the system (the devshell provides 3.1.4). MJPEG decode is the
+# single largest cost on the capture path, and turbo's SIMD Huffman/IDCT plus its ability
+# to emit YUV planes directly removes both the decode cost and the colour conversion that
+# followed it.
+turbojpeg = { workspace = true }
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+jpeg-encoder = "0.7.1"
+zune-core = "0.5.1"
+zune-jpeg = "0.5.15"
+
+[[bench]]
+name = "media_pipeline"
+harness = false

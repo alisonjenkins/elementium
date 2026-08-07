@@ -246,6 +246,48 @@ struct Negotiated {
     encoding: Encoding,
 }
 
+/// Rolling per-frame cost of decoding captured buffers.
+///
+/// Reported rather than assumed: this is the hottest path in the application, running on
+/// every frame from every camera, and on a laptop it is battery while on a desktop it is
+/// CPU taken from whatever else the machine is doing.
+#[derive(Default)]
+struct CaptureTiming {
+    frames: u64,
+    total: std::time::Duration,
+    worst: std::time::Duration,
+    bytes: u64,
+}
+
+impl CaptureTiming {
+    /// Frames between reports. 300 is five seconds at 60fps -- often enough to notice a
+    /// change, rare enough that the logging itself is not part of the cost.
+    const REPORT_EVERY: u64 = 300;
+
+    fn record(&mut self, elapsed: std::time::Duration, bytes: usize) {
+        self.frames = self.frames.saturating_add(1);
+        self.total = self.total.saturating_add(elapsed);
+        self.worst = self.worst.max(elapsed);
+        self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(0));
+
+        if self.frames.is_multiple_of(Self::REPORT_EVERY) {
+            let mean = self.total.checked_div(u32::try_from(self.frames).unwrap_or(u32::MAX));
+            tracing::info!(
+                frames = self.frames,
+                mean_ms = mean.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                worst_ms = self.worst.as_secs_f64() * 1000.0,
+                mean_source_kb = self
+                    .bytes
+                    .checked_div(self.frames)
+                    .and_then(|b| b.checked_div(1024))
+                    .unwrap_or(0),
+                "capture decode cost"
+            );
+            *self = Self::default();
+        }
+    }
+}
+
 /// A running `PipeWire` video capture.
 pub struct PipewireCapturer {
     frame_rx: mpsc::Receiver<VideoFrame>,
@@ -376,6 +418,10 @@ fn attach_and_connect(
     // Owned by the process callback and reused every frame, so taking a snapshot of the
     // mapped buffer costs no allocation.
     let mut snapshot: Vec<u8> = Vec::new();
+    // Per-stage cost, reported periodically. This runs on every captured frame on every
+    // user's machine, so its cost is battery on a laptop and frames stolen from whatever
+    // else the machine is doing. Guessing which stage dominates has been wrong before.
+    let mut timing = CaptureTiming::default();
 
     let listener = stream
         .add_local_listener::<()>()
@@ -457,6 +503,7 @@ fn attach_and_connect(
             // geometry the stream negotiated, because a mismatch between the two is
             // exactly the fault this used to have: the buffer was labelled with the
             // negotiated size regardless of what came out of the decoder.
+            let decode_started = std::time::Instant::now();
             let converted = match n.encoding {
                 Encoding::Mjpeg => decode_mjpeg_to_rgba(bytes),
                 Encoding::Raw(format) => {
@@ -470,6 +517,8 @@ fn attach_and_connect(
                 }
                 Encoding::Unsupported => None,
             };
+
+            timing.record(decode_started.elapsed(), copy_len);
 
             if let Some((rgba, frame_width, frame_height)) = converted {
                 if frame_width != n.width || frame_height != n.height {
