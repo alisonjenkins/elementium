@@ -15,10 +15,12 @@ pub mod bitstream;
 pub mod display;
 pub mod h264;
 pub mod image;
+pub mod jpeg;
 pub mod jpeg_headers;
 pub mod resource;
 pub mod status;
 
 pub use display::Display;
 pub use h264::H264Encoder;
+pub use jpeg::JpegDecoder;
 pub use status::Status;
