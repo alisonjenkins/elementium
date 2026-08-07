@@ -62,6 +62,10 @@ test("hold a call open for Elementium to join", async ({ browser }) => {
   console.log("  │ Now run `just dev-test-env`, log in as tester1 (test-password-1)");
   console.log("  │ and join the video call in the same room.");
   console.log("  │");
+  console.log("  │ These participants publish a continuous 440Hz tone, not Chromium's");
+  console.log("  │ own fake microphone -- that one is a pulsed beep, so a gap in it means");
+  console.log("  │ nothing. With a solid tone, any gap you hear is real.");
+  console.log("  │");
   console.log("  │ Below, each line is what these participants can hear. If Elementium");
   console.log("  │ publishes audio they can use, the count goes up when it joins.");
   console.log("  └─────────────────────────────────────────────────────────────");

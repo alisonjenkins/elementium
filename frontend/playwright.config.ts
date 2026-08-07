@@ -10,6 +10,13 @@ import { readdirSync } from "node:fs";
  * revision-directory lookup fails. Pointing at the binary sidesteps version coupling
  * entirely and keeps the shell hermetic.
  */
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+/** Looped by Chromium for the whole run; a whole number of cycles, so the join is silent. */
+const TONE = path.resolve(HERE, "../test-env/tone-440.wav");
+
 const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
 const chromiumPath = process.env.ELEMENTIUM_CHROMIUM;
 
@@ -38,6 +45,11 @@ export default defineConfig({
         // none anyway.
         "--use-fake-ui-for-media-stream",
         "--use-fake-device-for-media-stream",
+        // A continuous 440Hz tone instead of the fake device's own audio. Chromium's fake
+        // microphone is a *pulsed* beep -- roughly one per second, with silence between --
+        // so listening to it says nothing: a gap is what it sounds like when it is working.
+        // A solid tone makes any gap mean something, by ear and in the concealment numbers.
+        `--use-file-for-fake-audio-capture=${TONE}`,
         // Insertable streams back livekit's E2EE worker; without this the encrypted test
         // would fail for a reason unrelated to what it is measuring.
         "--enable-blink-features=RTCInsertableStreams",
