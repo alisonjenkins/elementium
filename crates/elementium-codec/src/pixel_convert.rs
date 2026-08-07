@@ -132,7 +132,8 @@ pub fn rgb_to_i420(width: u32, height: u32, rgb: &[u8]) -> I420Frame {
 #[must_use]
 pub fn halve_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
-    if w < 2 || h < 2 || rgba.len() < w.checked_mul(h)?.checked_mul(4)? {
+    let row_bytes = w.checked_mul(4)?;
+    if w < 2 || h < 2 || rgba.len() < row_bytes.checked_mul(h)? {
         return None;
     }
 
@@ -142,27 +143,34 @@ pub fn halve_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(Vec<u8>, u32,
     let mut out = Vec::with_capacity(out_w.saturating_mul(out_h).saturating_mul(4));
 
     for y in 0..out_h {
-        let row0 = y.saturating_mul(2).saturating_mul(w).saturating_mul(4);
-        let row1 = row0.saturating_add(w.saturating_mul(4));
-        for x in 0..out_w {
-            let col = x.saturating_mul(8);
-            for channel in 0..4_usize {
-                let mut sum = 0_u16;
-                for base in [row0, row1] {
-                    for pixel in [0_usize, 4] {
-                        let at = base
-                            .saturating_add(col)
-                            .saturating_add(pixel)
-                            .saturating_add(channel);
-                        sum = sum.saturating_add(u16::from(*rgba.get(at)?));
-                    }
-                }
-                out.push(u8::try_from(sum / 4).unwrap_or(u8::MAX));
-            }
+        let top_start = y.checked_mul(2)?.checked_mul(row_bytes)?;
+        let bottom_start = top_start.checked_add(row_bytes)?;
+        let top = rgba.get(top_start..top_start.checked_add(row_bytes)?)?;
+        let bottom = rgba.get(bottom_start..bottom_start.checked_add(row_bytes)?)?;
+
+        // Two source pixels at a time, as fixed-size arrays. The bounds check happens once
+        // per 8 bytes instead of once per byte, and the channels are unrolled rather than
+        // indexed -- which matters far more than it looks: at one checked read per byte
+        // this took 111ms per 720p frame in a debug build, an 9fps ceiling on the camera
+        // thread, while costing 1.4ms in release. `just dev` builds debug, so the
+        // unoptimised cost is the one developers actually run into.
+        for (t, b) in top.chunks_exact(8).zip(bottom.chunks_exact(8)) {
+            let [t0, t1, t2, t3, t4, t5, t6, t7]: [u8; 8] = t.try_into().ok()?;
+            let [b0, b1, b2, b3, b4, b5, b6, b7]: [u8; 8] = b.try_into().ok()?;
+            out.push(mean4(t0, t4, b0, b4));
+            out.push(mean4(t1, t5, b1, b5));
+            out.push(mean4(t2, t6, b2, b6));
+            out.push(mean4(t3, t7, b3, b7));
         }
     }
 
     Some((out, u32::try_from(out_w).ok()?, u32::try_from(out_h).ok()?))
+}
+
+/// Mean of four samples. Cannot overflow: four `u8`s sum to at most 1020.
+#[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
+const fn mean4(a: u8, b: u8, c: u8, d: u8) -> u8 {
+    ((a as u16 + b as u16 + c as u16 + d as u16) / 4) as u8
 }
 
 /// Convert I420 (YUV 4:2:0 planar) to RGBA pixel data.
