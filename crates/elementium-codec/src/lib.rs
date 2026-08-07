@@ -2,6 +2,8 @@ pub mod opus_codec;
 pub mod pixel_convert;
 pub mod hardware;
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
+pub mod vaapi;
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
 pub mod vaapi_probe;
 pub mod video;
 pub mod vpx_codec;
