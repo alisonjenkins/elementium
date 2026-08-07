@@ -4,7 +4,7 @@ use keyring::Entry;
 use tracing::{debug, warn};
 
 use crate::error::{Result, SecretStoreError};
-use crate::{SENSITIVE_KEYS, SecretStore, SERVICE_NAME};
+use crate::{SENSITIVE_KEYS, SERVICE_NAME, SecretStore};
 
 pub struct KeyringBackend;
 

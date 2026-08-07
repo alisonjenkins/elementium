@@ -10,11 +10,15 @@
 //! appears where none should. It is a separate test binary because a global allocator can
 //! only be installed once per binary.
 
-#![allow(clippy::expect_used, clippy::as_conversions, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects
+)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use elementium_codec::Vp8Encoder;
 use elementium_types::I420Frame;
+use std::alloc::{GlobalAlloc, Layout, System};
 
 // Bytes allocated on *this thread* since its counter was last reset.
 //
@@ -99,7 +103,11 @@ fn adopting_a_decoded_buffer_allocates_nothing() {
         "adopting a decoder buffer allocated {bytes} bytes; it must move, not copy"
     );
     assert_eq!(frame.width(), W);
-    assert_eq!(frame.y_stride(), y_stride, "padding must be preserved, not repacked");
+    assert_eq!(
+        frame.y_stride(),
+        y_stride,
+        "padding must be preserved, not repacked"
+    );
 }
 
 /// Encoding must read the frame where it lies.
@@ -111,8 +119,8 @@ fn encoding_does_not_copy_the_frame() {
     let mut encoder = Vp8Encoder::new(W, H, 2764).expect("encoder");
     let y_stride = (W as usize).next_multiple_of(32);
     let uv_stride = ((W as usize) / 2).next_multiple_of(32);
-    let frame = I420Frame::from_padded(W, H, padded_buffer(), y_stride, uv_stride, 0)
-        .expect("valid frame");
+    let frame =
+        I420Frame::from_padded(W, H, padded_buffer(), y_stride, uv_stride, 0).expect("valid frame");
 
     // Prime it: the first encode allocates the codec's internal buffers, which is a
     // one-off and not what this is measuring.
@@ -140,9 +148,8 @@ fn building_from_separate_planes_is_understood_to_copy() {
     let u = vec![0x80_u8; (W as usize) / 2 * (H as usize) / 2];
     let v = u.clone();
 
-    let (_frame, bytes) = allocated_during(|| {
-        I420Frame::from_planes(W, H, &y, &u, &v, 0).expect("valid frame")
-    });
+    let (_frame, bytes) =
+        allocated_during(|| I420Frame::from_planes(W, H, &y, &u, &v, 0).expect("valid frame"));
 
     assert!(
         bytes >= FRAME_BYTES,

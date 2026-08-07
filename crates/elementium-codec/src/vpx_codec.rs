@@ -65,9 +65,9 @@ impl Vp8Encoder {
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
         use std::mem::MaybeUninit;
         use vpx_sys::{
+            VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION, vp8e_enc_control_id::VP8E_SET_CPUUSED,
             vpx_codec_enc_config_default, vpx_codec_enc_init_ver, vpx_codec_vp8_cx,
-            vp8e_enc_control_id::VP8E_SET_CPUUSED, vpx_kf_mode::VPX_KF_AUTO,
-            vpx_rc_mode::VPX_CBR, VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION,
+            vpx_kf_mode::VPX_KF_AUTO, vpx_rc_mode::VPX_CBR,
         };
 
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -204,7 +204,11 @@ impl Vp8Encoder {
         if ret != vpx_sys::VPX_CODEC_OK {
             return Err(format!("VP8 set bitrate {kbps}kbps: {ret:?}"));
         }
-        tracing::info!(from_kbps = self.bitrate_kbps, to_kbps = kbps, "VP8 bitrate retargeted");
+        tracing::info!(
+            from_kbps = self.bitrate_kbps,
+            to_kbps = kbps,
+            "VP8 bitrate retargeted"
+        );
         self.bitrate_kbps = kbps;
         Ok(())
     }
@@ -219,9 +223,9 @@ impl Vp8Encoder {
     #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
     pub fn encode(&mut self, frame: &I420Frame) -> Result<Vec<Vp8Packet>, String> {
         use vpx_sys::{
+            VPX_CODEC_OK, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF, VPX_FRAME_IS_KEY,
             vpx_codec_cx_pkt_kind, vpx_codec_encode, vpx_codec_get_cx_data, vpx_codec_iter_t,
-            vpx_img_fmt, vpx_img_wrap, VPX_CODEC_OK, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF,
-            VPX_FRAME_IS_KEY,
+            vpx_img_fmt, vpx_img_wrap,
         };
 
         if frame.width() != self.width || frame.height() != self.height {
@@ -235,7 +239,10 @@ impl Vp8Encoder {
             );
             return Err(format!(
                 "Frame size mismatch: encoder={}x{}, frame={}x{}",
-                self.width, self.height, frame.width(), frame.height()
+                self.width,
+                self.height,
+                frame.width(),
+                frame.height()
             ));
         }
 
@@ -326,8 +333,7 @@ impl Vp8Encoder {
                     continue;
                 }
                 let frame_pkt = pkt.data.frame;
-                let bytes =
-                    std::slice::from_raw_parts(frame_pkt.buf.cast::<u8>(), frame_pkt.sz);
+                let bytes = std::slice::from_raw_parts(frame_pkt.buf.cast::<u8>(), frame_pkt.sz);
                 packets.push(Vp8Packet {
                     data: PlaintextMedia::from_encoder(bytes.to_vec()),
                     is_keyframe: (frame_pkt.flags & VPX_FRAME_IS_KEY) != 0,
@@ -386,8 +392,8 @@ impl Vp8Decoder {
     pub fn new() -> Result<Self, String> {
         use std::mem::MaybeUninit;
         use vpx_sys::{
-            vpx_codec_dec_cfg_t, vpx_codec_dec_init_ver, vpx_codec_vp8_dx, VPX_CODEC_OK,
-            VPX_DECODER_ABI_VERSION,
+            VPX_CODEC_OK, VPX_DECODER_ABI_VERSION, vpx_codec_dec_cfg_t, vpx_codec_dec_init_ver,
+            vpx_codec_vp8_dx,
         };
 
         // SAFETY: `ctx` and `cfg` are plain-old-data FFI structs; libvpx
@@ -433,7 +439,7 @@ impl Vp8Decoder {
     /// packet.
     pub fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
         use std::ptr;
-        use vpx_sys::{vpx_codec_decode, vpx_codec_get_frame, vpx_codec_iter_t, VPX_CODEC_OK};
+        use vpx_sys::{VPX_CODEC_OK, vpx_codec_decode, vpx_codec_get_frame, vpx_codec_iter_t};
 
         let data = data.as_bytes();
 
@@ -485,8 +491,10 @@ impl Vp8Decoder {
                 };
                 let img_w = im.d_w;
                 let img_h = im.d_h;
-                let w_usize = usize::try_from(img_w).map_err(|_| "VP8 decode: invalid width".to_string())?;
-                let h_usize = usize::try_from(img_h).map_err(|_| "VP8 decode: invalid height".to_string())?;
+                let w_usize =
+                    usize::try_from(img_w).map_err(|_| "VP8 decode: invalid width".to_string())?;
+                let h_usize =
+                    usize::try_from(img_h).map_err(|_| "VP8 decode: invalid height".to_string())?;
                 let uv_w = w_usize / 2;
                 let uv_h = h_usize / 2;
 
@@ -529,10 +537,7 @@ impl Vp8Decoder {
                     let src = std::slice::from_raw_parts(y_plane_ptr.add(offset), w_usize);
                     y_row.copy_from_slice(src);
                 }
-                for ((row, u_row), v_row) in u
-                    .chunks_mut(uv_w)
-                    .enumerate()
-                    .zip(v.chunks_mut(uv_w))
+                for ((row, u_row), v_row) in u.chunks_mut(uv_w).enumerate().zip(v.chunks_mut(uv_w))
                 {
                     let u_offset = row.saturating_mul(u_stride);
                     let v_offset = row.saturating_mul(v_stride);
@@ -568,7 +573,6 @@ impl Drop for Vp8Decoder {
     }
 }
 
-
 impl crate::video::VideoEncoder for Vp8Encoder {
     fn codec(&self) -> crate::video::VideoCodec {
         crate::video::VideoCodec::Vp8
@@ -578,10 +582,7 @@ impl crate::video::VideoEncoder for Vp8Encoder {
         Self::size(self)
     }
 
-    fn encode(
-        &mut self,
-        frame: &I420Frame,
-    ) -> Result<Vec<crate::video::EncodedFrame>, String> {
+    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<crate::video::EncodedFrame>, String> {
         Ok(Self::encode(self, frame)?
             .into_iter()
             .map(|p| crate::video::EncodedFrame {
@@ -634,7 +635,8 @@ mod tests {
         let u_plane = vec![128u8; uv_w.saturating_mul(uv_h)];
         let v_plane = vec![128u8; uv_w.saturating_mul(uv_h)];
 
-        let frame = I420Frame::from_planes(width, height, &y_plane, &u_plane, &v_plane, 0).expect("planes match the geometry");
+        let frame = I420Frame::from_planes(width, height, &y_plane, &u_plane, &v_plane, 0)
+            .expect("planes match the geometry");
 
         let mut encoder = Vp8Encoder::new(width, height, 500).expect("encoder creation");
         let mut decoder = Vp8Decoder::new().expect("decoder creation");
@@ -642,7 +644,9 @@ mod tests {
         // Encode the frame
         let packets = encoder.encode(&frame).expect("encode");
         assert!(!packets.is_empty(), "Should produce at least one packet");
-        let first_packet = packets.first().expect("packets should be non-empty (checked above)");
+        let first_packet = packets
+            .first()
+            .expect("packets should be non-empty (checked above)");
         assert!(first_packet.is_keyframe, "First frame should be keyframe");
 
         // Decode the packet
@@ -758,6 +762,14 @@ mod tests {
         let w = usize::try_from(width).expect("bad width");
         let h = usize::try_from(height).expect("bad height");
         let uv = (w / 2).saturating_mul(h / 2);
-        I420Frame::from_planes(width, height, &vec![luma; w.saturating_mul(h)], &vec![128u8; uv], &vec![128u8; uv], 0).expect("planes match the geometry")
+        I420Frame::from_planes(
+            width,
+            height,
+            &vec![luma; w.saturating_mul(h)],
+            &vec![128u8; uv],
+            &vec![128u8; uv],
+            0,
+        )
+        .expect("planes match the geometry")
     }
 }

@@ -55,9 +55,9 @@ use super::display::Display;
 use super::image::SurfaceUpload;
 use super::jpeg::JpegDecoder;
 use super::jpeg_headers::Subsampling;
-use super::vpp::Converter;
 use super::resource::{Buffer, Config, Context, SurfaceId, SurfacePool};
 use super::status::{Status, check};
+use super::vpp::Converter;
 use crate::video::{EncodedFrame, PixelLayout, VideoCodec, VideoEncoder};
 
 /// Macroblocks are 16x16, always, in every H.264 profile.
@@ -184,9 +184,10 @@ impl H264Encoder {
     /// generate its own headers, or if any resource cannot be created. Every one of those
     /// means the caller should fall back to software rather than fail the call.
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, Status> {
-        let display = Arc::new(
-            Display::open_any().ok_or(Status { operation: "no usable render node", code: -1 })?,
-        );
+        let display = Arc::new(Display::open_any().ok_or(Status {
+            operation: "no usable render node",
+            code: -1,
+        })?);
 
         let mut attributes = [
             va::VAConfigAttrib {
@@ -352,14 +353,20 @@ impl H264Encoder {
     /// requirement: surfaces belong to a display, and a decoder that opened its own would
     /// force every frame back through system memory -- the entire cost being avoided.
     fn build_mjpeg_path(&self, jpeg: &[u8]) -> Result<MjpegPath, Status> {
-        let headers = super::jpeg_headers::parse(jpeg)
-            .map_err(|_| Status { operation: "not a baseline JPEG", code: -1 })?;
+        let headers = super::jpeg_headers::parse(jpeg).map_err(|_| Status {
+            operation: "not a baseline JPEG",
+            code: -1,
+        })?;
         if u32::from(headers.width) != self.width || u32::from(headers.height) != self.height {
-            return Err(Status { operation: "JPEG is not the negotiated size", code: -1 });
+            return Err(Status {
+                operation: "JPEG is not the negotiated size",
+                code: -1,
+            });
         }
-        let subsampling = headers
-            .subsampling()
-            .ok_or(Status { operation: "unrecognised chroma subsampling", code: -1 })?;
+        let subsampling = headers.subsampling().ok_or(Status {
+            operation: "unrecognised chroma subsampling",
+            code: -1,
+        })?;
 
         let display = self.context.display();
         let decoder = JpegDecoder::with_display(display, self.width, self.height, subsampling)?;
@@ -382,10 +389,10 @@ impl H264Encoder {
 
     /// Decode a JPEG on the GPU and encode the result, without it leaving the GPU.
     fn encode_jpeg(&mut self, jpeg: &[u8]) -> Result<Vec<EncodedFrame>, Status> {
-        let mut path = self
-            .mjpeg
-            .take()
-            .ok_or(Status { operation: "no MJPEG path", code: -1 })?;
+        let mut path = self.mjpeg.take().ok_or(Status {
+            operation: "no MJPEG path",
+            code: -1,
+        })?;
         let result = (|| {
             let decoded = path.decoder.decode(jpeg)?;
             // 4:2:0 decodes straight into what the encoder reads; anything else needs
@@ -402,9 +409,10 @@ impl H264Encoder {
 
     /// Upload one frame and encode it.
     fn encode_frame(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, Status> {
-        let source = self
-            .input_for(self.frame_index)
-            .ok_or(Status { operation: "no input surface available", code: -1 })?;
+        let source = self.input_for(self.frame_index).ok_or(Status {
+            operation: "no input surface available",
+            code: -1,
+        })?;
 
         // Upload first: the surface must hold the picture before the encode is submitted.
         self.upload.upload(frame, source)?;
@@ -424,9 +432,10 @@ impl H264Encoder {
     fn submit_and_collect(&mut self, source: SurfaceId) -> Result<Vec<EncodedFrame>, Status> {
         let index = self.frame_index;
         let keyframe = self.wants_keyframe();
-        let reconstruction = self
-            .reconstruction_for(index)
-            .ok_or(Status { operation: "no reconstruction surface available", code: -1 })?;
+        let reconstruction = self.reconstruction_for(index).ok_or(Status {
+            operation: "no reconstruction surface available",
+            code: -1,
+        })?;
 
         let coded = Buffer::empty(
             &self.context,
@@ -527,7 +536,10 @@ impl H264Encoder {
         // SAFETY: a picture is in progress on this context.
         check(unsafe { va::vaEndPicture(handle, context) }, "vaEndPicture")?;
         // SAFETY: the surface was just submitted; this blocks until the GPU is done with it.
-        check(unsafe { va::vaSyncSurface(handle, surface.raw()) }, "vaSyncSurface")
+        check(
+            unsafe { va::vaSyncSurface(handle, surface.raw()) },
+            "vaSyncSurface",
+        )
     }
 
     /// Map the coded buffer and copy the bitstream out.
@@ -563,7 +575,10 @@ impl H264Encoder {
         }
 
         // SAFETY: mapped immediately above, unmapped exactly once.
-        check(unsafe { va::vaUnmapBuffer(handle, coded.id().raw()) }, "vaUnmapBuffer")?;
+        check(
+            unsafe { va::vaUnmapBuffer(handle, coded.id().raw()) },
+            "vaUnmapBuffer",
+        )?;
         Ok(out)
     }
 
@@ -702,7 +717,9 @@ impl H264Encoder {
             seq.seq_fields.bits.set_chroma_format_idc(1); // 4:2:0
             seq.seq_fields.bits.set_frame_mbs_only_flag(1); // progressive
             seq.seq_fields.bits.set_direct_8x8_inference_flag(1);
-            seq.seq_fields.bits.set_log2_max_frame_num_minus4(u32::from(LOG2_MAX_FRAME_NUM_MINUS4));
+            seq.seq_fields
+                .bits
+                .set_log2_max_frame_num_minus4(u32::from(LOG2_MAX_FRAME_NUM_MINUS4));
             seq.seq_fields.bits.set_pic_order_cnt_type(0);
             seq.seq_fields
                 .bits
@@ -751,7 +768,9 @@ impl H264Encoder {
         }
         if let (false, Some(previous), Some(slot)) = (
             keyframe,
-            index.checked_sub(1).and_then(|i| self.reconstruction_for(i)),
+            index
+                .checked_sub(1)
+                .and_then(|i| self.reconstruction_for(i)),
             pic.ReferenceFrames.first_mut(),
         ) {
             slot.picture_id = previous.raw();
@@ -773,7 +792,9 @@ impl H264Encoder {
             // CAVLC, not CABAC: Constrained Baseline does not permit CABAC, and asking for
             // it is refused by the driver rather than silently downgraded.
             pic.pic_fields.bits.set_entropy_coding_mode_flag(0);
-            pic.pic_fields.bits.set_deblocking_filter_control_present_flag(1);
+            pic.pic_fields
+                .bits
+                .set_deblocking_filter_control_present_flag(1);
         }
         pic
     }
@@ -797,13 +818,19 @@ impl H264Encoder {
         slice.slice_qp_delta = 0;
         slice.disable_deblocking_filter_idc = 0;
 
-        for entry in slice.RefPicList0.iter_mut().chain(slice.RefPicList1.iter_mut()) {
+        for entry in slice
+            .RefPicList0
+            .iter_mut()
+            .chain(slice.RefPicList1.iter_mut())
+        {
             entry.picture_id = va::VA_INVALID_ID;
             entry.flags = va::VA_PICTURE_H264_INVALID;
         }
         if let (false, Some(previous), Some(slot)) = (
             keyframe,
-            index.checked_sub(1).and_then(|i| self.reconstruction_for(i)),
+            index
+                .checked_sub(1)
+                .and_then(|i| self.reconstruction_for(i)),
             slice.RefPicList0.first_mut(),
         ) {
             slot.picture_id = previous.raw();
@@ -920,12 +947,18 @@ mod tests {
 
         let packets = VideoEncoder::encode(&mut encoder, &frame(80)).expect("encode");
         let first = packets.first().expect("a packet");
-        assert!(first.is_keyframe, "the first frame must be independently decodable");
+        assert!(
+            first.is_keyframe,
+            "the first frame must be independently decodable"
+        );
 
         let types = nal_types(first.data.as_bytes());
         assert!(types.contains(&7), "no SPS in the first frame: {types:?}");
         assert!(types.contains(&8), "no PPS in the first frame: {types:?}");
-        assert!(types.contains(&5), "no IDR slice in the first frame: {types:?}");
+        assert!(
+            types.contains(&5),
+            "no IDR slice in the first frame: {types:?}"
+        );
     }
 
     /// Later frames must predict rather than repeat: a P slice, and materially smaller
@@ -944,7 +977,10 @@ mod tests {
         assert!(!packet.is_keyframe);
 
         let types = nal_types(packet.data.as_bytes());
-        assert!(types.contains(&1), "expected a non-IDR slice, got {types:?}");
+        assert!(
+            types.contains(&1),
+            "expected a non-IDR slice, got {types:?}"
+        );
         assert!(
             packet.data.as_bytes().len() < key_len,
             "a predicted frame of identical content ({} bytes) should be far smaller than \
@@ -1154,7 +1190,11 @@ mod tests {
     fn jpeg_of_bar(row: usize, sampling: jpeg_encoder::SamplingFactor) -> Vec<u8> {
         let mut rgb = vec![0_u8; WIDTH * HEIGHT * 3];
         for r in 0..HEIGHT {
-            let value = if (row..row + 40).contains(&r) { 230 } else { 60 };
+            let value = if (row..row + 40).contains(&r) {
+                230
+            } else {
+                60
+            };
             for c in 0..WIDTH {
                 let at = (r * WIDTH + c) * 3;
                 rgb[at] = value;
@@ -1212,6 +1252,9 @@ mod tests {
     #[test]
     fn the_coded_buffer_is_large_enough_for_a_keyframe() {
         assert!(coded_buffer_size(1280, 720) >= 1280 * 720 / 2);
-        assert!(coded_buffer_size(16, 16) >= 64 * 1024, "a floor for tiny frames");
+        assert!(
+            coded_buffer_size(16, 16) >= 64 * 1024,
+            "a floor for tiny frames"
+        );
     }
 }

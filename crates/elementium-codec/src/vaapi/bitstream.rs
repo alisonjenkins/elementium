@@ -82,7 +82,10 @@ impl BitWriter {
     /// Signed values are mapped onto unsigned ones by alternating sign: 0, 1, -1, 2, -2.
     pub fn se(&mut self, value: i32) {
         let mapped = if value > 0 {
-            u32::try_from(value).unwrap_or(0).saturating_mul(2).saturating_sub(1)
+            u32::try_from(value)
+                .unwrap_or(0)
+                .saturating_mul(2)
+                .saturating_sub(1)
         } else {
             value
                 .checked_neg()
@@ -141,7 +144,11 @@ fn escape_into(payload: &[u8], out: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::{BitWriter, nal_unit};
 
@@ -254,7 +261,11 @@ mod tests {
         (0..count)
             .map(|i| {
                 let byte = bytes[i / 8];
-                if byte & (0x80 >> (i % 8)) == 0 { '0' } else { '1' }
+                if byte & (0x80 >> (i % 8)) == 0 {
+                    '0'
+                } else {
+                    '1'
+                }
             })
             .collect()
     }

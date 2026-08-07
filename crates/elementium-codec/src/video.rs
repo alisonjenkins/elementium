@@ -282,13 +282,11 @@ impl NegotiatedEncoder {
                 config.bitrate_kbps,
             )?)),
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
-            VideoCodec::H264 => crate::vaapi::H264Encoder::new(
-                config.width,
-                config.height,
-                config.bitrate_kbps,
-            )
-            .map(Self::VaapiH264)
-            .map_err(|e| e.to_string()),
+            VideoCodec::H264 => {
+                crate::vaapi::H264Encoder::new(config.width, config.height, config.bitrate_kbps)
+                    .map(Self::VaapiH264)
+                    .map_err(|e| e.to_string())
+            }
             // Negotiable but not encodable here. Reported as an error rather than silently
             // substituting VP8: a caller that asked for H.264 has told the far end it will
             // send H.264, and sending something else produces a peer that receives
@@ -417,7 +415,15 @@ mod tests {
     fn frame(width: u32, height: u32) -> I420Frame {
         let (w, h) = (width as usize, height as usize);
         let uv = (w / 2) * (h / 2);
-        I420Frame::from_planes(width, height, &vec![128; w * h], &vec![128; uv], &vec![128; uv], 0).expect("planes match the geometry")
+        I420Frame::from_planes(
+            width,
+            height,
+            &vec![128; w * h],
+            &vec![128; uv],
+            &vec![128; uv],
+            0,
+        )
+        .expect("planes match the geometry")
     }
 
     fn config(width: u32, height: u32) -> EncoderConfig {
@@ -439,7 +445,8 @@ mod tests {
 
     #[test]
     fn an_encoder_is_usable_through_its_trait_bound() {
-        let mut encoder = NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
+        let mut encoder =
+            NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
 
         assert_eq!(encoder.codec(), VideoCodec::Vp8);
         assert_eq!(VideoEncoder::size(&encoder), (320, 240));
@@ -463,7 +470,8 @@ mod tests {
 
     #[test]
     fn a_decoder_decodes_what_the_encoder_produced() {
-        let mut encoder = NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
+        let mut encoder =
+            NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
         let mut decoder = NegotiatedDecoder::new(VideoCodec::Vp8).expect("decoder");
         assert_eq!(VideoDecoder::codec(&decoder), VideoCodec::Vp8);
 
@@ -475,13 +483,17 @@ mod tests {
         let frames = VideoDecoder::decode(&mut decoder, &keyframe.data).expect("decode");
 
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames.first().map(|f| (f.width(), f.height())), Some((320, 240)));
+        assert_eq!(
+            frames.first().map(|f| (f.width(), f.height())),
+            Some((320, 240))
+        );
     }
 
     /// A frame of the wrong size must be refused, not encoded into a corrupt picture.
     #[test]
     fn a_frame_of_the_wrong_size_is_refused() {
-        let mut encoder = NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
+        let mut encoder =
+            NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
         assert!(VideoEncoder::encode(&mut encoder, &frame(640, 480)).is_err());
     }
 

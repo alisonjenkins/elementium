@@ -56,9 +56,10 @@ impl JpegDecoder {
     /// Returns [`Status`] if no device offers JPEG decoding, or if the resources cannot be
     /// created. Either means the caller should decode on the CPU instead.
     pub fn new(width: u32, height: u32, subsampling: Subsampling) -> Result<Self, Status> {
-        let display = Arc::new(
-            Display::open_any().ok_or(Status { operation: "no usable render node", code: -1 })?,
-        );
+        let display = Arc::new(Display::open_any().ok_or(Status {
+            operation: "no usable render node",
+            code: -1,
+        })?);
         Self::with_display(&display, width, height, subsampling)
     }
 
@@ -92,8 +93,14 @@ impl JpegDecoder {
             &mut attributes,
         )?;
 
-        let mut surfaces =
-            SurfacePool::new_format(display, format, fourcc(subsampling), width, height, SURFACE_COUNT)?;
+        let mut surfaces = SurfacePool::new_format(
+            display,
+            format,
+            fourcc(subsampling),
+            width,
+            height,
+            SURFACE_COUNT,
+        )?;
         let context = Context::new(config, width, height, surfaces.raw())?;
 
         Ok(Self {
@@ -134,7 +141,10 @@ impl JpegDecoder {
             code: -1,
         })?;
         if u32::from(headers.width) != self.width || u32::from(headers.height) != self.height {
-            return Err(Status { operation: "JPEG is not the negotiated size", code: -1 });
+            return Err(Status {
+                operation: "JPEG is not the negotiated size",
+                code: -1,
+            });
         }
         if headers.subsampling() != Some(self.subsampling) {
             return Err(Status {
@@ -150,16 +160,15 @@ impl JpegDecoder {
                 .unwrap_or(0),
         )
         .unwrap_or(0);
-        let surface = self
-            .surfaces
-            .surfaces()
-            .get(slot)
-            .copied()
-            .ok_or(Status { operation: "no surface available", code: -1 })?;
+        let surface = self.surfaces.surfaces().get(slot).copied().ok_or(Status {
+            operation: "no surface available",
+            code: -1,
+        })?;
 
-        let scan = jpeg
-            .get(headers.scan_data.clone())
-            .ok_or(Status { operation: "scan data out of range", code: -1 })?;
+        let scan = jpeg.get(headers.scan_data.clone()).ok_or(Status {
+            operation: "scan data out of range",
+            code: -1,
+        })?;
 
         let mut picture = picture_parameters(&headers);
         let mut quantisers = quantisation_tables(&headers);
@@ -173,7 +182,11 @@ impl JpegDecoder {
                 va::VABufferType_VAPictureParameterBufferType,
                 &mut picture,
             )?,
-            Buffer::new(&self.context, va::VABufferType_VAIQMatrixBufferType, &mut quantisers)?,
+            Buffer::new(
+                &self.context,
+                va::VABufferType_VAIQMatrixBufferType,
+                &mut quantisers,
+            )?,
             Buffer::new(
                 &self.context,
                 va::VABufferType_VAHuffmanTableBufferType,
@@ -233,7 +246,10 @@ impl JpegDecoder {
         // Waited for here rather than by the caller: the surface is handed on immediately,
         // and a consumer reading it before the decode lands sees the previous frame.
         // SAFETY: the surface was just submitted.
-        check(unsafe { va::vaSyncSurface(handle, surface.raw()) }, "vaSyncSurface")
+        check(
+            unsafe { va::vaSyncSurface(handle, surface.raw()) },
+            "vaSyncSurface",
+        )
     }
 }
 
@@ -314,7 +330,10 @@ fn huffman_tables(headers: &JpegHeaders) -> va::VAHuffmanTableBufferJPEGBaseline
 }
 
 /// The scan: where the data is, and which tables each component reads.
-fn slice_parameters(headers: &JpegHeaders, scan_len: usize) -> va::VASliceParameterBufferJPEGBaseline {
+fn slice_parameters(
+    headers: &JpegHeaders,
+    scan_len: usize,
+) -> va::VASliceParameterBufferJPEGBaseline {
     // SAFETY: as `picture_parameters`.
     let mut slice: va::VASliceParameterBufferJPEGBaseline = unsafe { std::mem::zeroed() };
     slice.slice_data_size = u32::try_from(scan_len).unwrap_or(0);
@@ -340,8 +359,8 @@ fn slice_parameters(headers: &JpegHeaders, scan_len: usize) -> va::VASliceParame
     clippy::many_single_char_names
 )]
 mod tests {
-    use super::{JpegDecoder, Subsampling};
     use super::super::image::SurfaceDownload;
+    use super::{JpegDecoder, Subsampling};
 
     // A realistic capture size. Hardware JPEG decoders have a minimum as well as a
     // maximum -- this one refuses 64x48 with "resolution not supported" -- so a fixture
@@ -370,7 +389,12 @@ mod tests {
         let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 90);
         encoder.set_sampling_factor(sampling);
         encoder
-            .encode(&rgb, u16::try_from(w).expect("w"), u16::try_from(h).expect("h"), jpeg_encoder::ColorType::Rgb)
+            .encode(
+                &rgb,
+                u16::try_from(w).expect("w"),
+                u16::try_from(h).expect("h"),
+                jpeg_encoder::ColorType::Rgb,
+            )
             .expect("encode");
         (jpeg, rgb)
     }
@@ -392,8 +416,7 @@ mod tests {
         };
         let surface = decoder.decode(&jpeg).expect("decode");
 
-        let mut download =
-            SurfaceDownload::new(decoder.display(), W, H).expect("a download image");
+        let mut download = SurfaceDownload::new(decoder.display(), W, H).expect("a download image");
         let bytes = download.read(surface).expect("read the surface back");
         let layout = download.layout().expect("two planes");
 

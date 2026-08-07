@@ -99,7 +99,12 @@ impl Config {
         profile: va::VAProfile,
         attributes: &mut [va::VAConfigAttrib],
     ) -> Result<Self, Status> {
-        Self::new(display, profile, va::VAEntrypoint_VAEntrypointEncSlice, attributes)
+        Self::new(
+            display,
+            profile,
+            va::VAEntrypoint_VAEntrypointEncSlice,
+            attributes,
+        )
     }
 
     /// Create a configuration for decoding with `profile`.
@@ -114,7 +119,12 @@ impl Config {
         profile: va::VAProfile,
         attributes: &mut [va::VAConfigAttrib],
     ) -> Result<Self, Status> {
-        Self::new(display, profile, va::VAEntrypoint_VAEntrypointVLD, attributes)
+        Self::new(
+            display,
+            profile,
+            va::VAEntrypoint_VAEntrypointVLD,
+            attributes,
+        )
     }
 
     /// Create a configuration for post-processing.
@@ -380,11 +390,7 @@ impl Buffer {
     /// # Errors
     ///
     /// Returns the driver's status if the buffer cannot be created.
-    pub fn new<T>(
-        context: &Context,
-        kind: va::VABufferType,
-        data: &mut T,
-    ) -> Result<Self, Status> {
+    pub fn new<T>(context: &Context, kind: va::VABufferType, data: &mut T) -> Result<Self, Status> {
         let mut id: va::VABufferID = 0;
         // SAFETY: `data` is a single valid `T`, and its size is what libva is told to
         // copy. The generic parameter is what keeps the size and the pointer in step --
@@ -448,11 +454,7 @@ impl Buffer {
     /// # Errors
     ///
     /// Returns the driver's status if the buffer cannot be created.
-    pub fn empty(
-        context: &Context,
-        kind: va::VABufferType,
-        size: usize,
-    ) -> Result<Self, Status> {
+    pub fn empty(context: &Context, kind: va::VABufferType, size: usize) -> Result<Self, Status> {
         let mut id: va::VABufferID = 0;
         // SAFETY: a null data pointer means "allocate, do not copy", which is the
         // documented way to create an output buffer.
@@ -492,8 +494,8 @@ impl Drop for Buffer {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{Config, Context, SurfacePool};
     use super::super::display::Display;
+    use super::{Config, Context, SurfacePool};
     use libva_sys::va_display_drm as va;
 
     /// Skip rather than fail where there is no GPU: CI runners do not have one, and a test

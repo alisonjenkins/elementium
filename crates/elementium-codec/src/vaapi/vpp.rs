@@ -81,12 +81,10 @@ impl Converter {
                 .unwrap_or(0),
         )
         .unwrap_or(0);
-        let output = self
-            .outputs
-            .surfaces()
-            .get(slot)
-            .copied()
-            .ok_or(Status { operation: "no output surface available", code: -1 })?;
+        let output = self.outputs.surfaces().get(slot).copied().ok_or(Status {
+            operation: "no output surface available",
+            code: -1,
+        })?;
 
         // Both regions cover the whole picture: this converts, it does not scale or crop.
         // Held in locals because the parameter buffer points at them and the driver reads
@@ -160,7 +158,10 @@ impl Converter {
         // Waited for here: the surface is handed straight to an encoder, and one that read
         // it before the conversion landed would encode the previous frame.
         // SAFETY: the surface was just written.
-        check(unsafe { va::vaSyncSurface(handle, output.raw()) }, "vaSyncSurface")
+        check(
+            unsafe { va::vaSyncSurface(handle, output.raw()) },
+            "vaSyncSurface",
+        )
     }
 }
 
@@ -172,10 +173,10 @@ impl Converter {
     clippy::many_single_char_names
 )]
 mod tests {
-    use super::Converter;
     use super::super::display::Display;
     use super::super::image::{SurfaceDownload, SurfaceUpload};
     use super::super::resource::SurfacePool;
+    use super::Converter;
     use elementium_types::I420Frame;
 
     const W: u32 = 640;
@@ -245,7 +246,11 @@ mod tests {
             }
         }
         assert_eq!(bytes[layout.chroma_offset], 90, "U survived the conversion");
-        assert_eq!(bytes[layout.chroma_offset + 1], 240, "V survived the conversion");
+        assert_eq!(
+            bytes[layout.chroma_offset + 1],
+            240,
+            "V survived the conversion"
+        );
     }
 
     /// The converter must exist before anything relies on it, and a machine without a

@@ -36,6 +36,10 @@ fn main() {
         "halve_rgba {w}x{h}: {:.2}ms per frame ({:.0} fps ceiling){}",
         per.as_secs_f64() * 1000.0,
         1.0 / per.as_secs_f64(),
-        if cfg!(debug_assertions) { "  [debug build]" } else { "  [release build]" },
+        if cfg!(debug_assertions) {
+            "  [debug build]"
+        } else {
+            "  [release build]"
+        },
     );
 }

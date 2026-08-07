@@ -260,16 +260,24 @@ fn next_marker(data: &[u8], cursor: &mut usize) -> Result<u8, ParseError> {
 /// The body of the segment at `cursor`, advancing past it.
 fn segment_at<'d>(data: &'d [u8], cursor: &mut usize) -> Result<&'d [u8], ParseError> {
     let length = usize::from(u16::from_be_bytes([
-        *data.get(*cursor).ok_or(ParseError::Malformed("truncated segment"))?,
+        *data
+            .get(*cursor)
+            .ok_or(ParseError::Malformed("truncated segment"))?,
         *data
             .get(cursor.saturating_add(1))
             .ok_or(ParseError::Malformed("truncated segment"))?,
     ]));
     // The length counts itself, so a segment shorter than two bytes is nonsense.
-    let body = length.checked_sub(2).ok_or(ParseError::Malformed("segment length"))?;
+    let body = length
+        .checked_sub(2)
+        .ok_or(ParseError::Malformed("segment length"))?;
     let start = cursor.saturating_add(2);
-    let end = start.checked_add(body).ok_or(ParseError::Malformed("segment length"))?;
-    let segment = data.get(start..end).ok_or(ParseError::Malformed("truncated segment"))?;
+    let end = start
+        .checked_add(body)
+        .ok_or(ParseError::Malformed("segment length"))?;
+    let segment = data
+        .get(start..end)
+        .ok_or(ParseError::Malformed("truncated segment"))?;
     *cursor = end;
     Ok(segment)
 }
@@ -303,18 +311,16 @@ fn read_frame_header(segment: &[u8], headers: &mut JpegHeaders) -> Result<(), Pa
     if segment.first().copied() != Some(8) {
         return Err(ParseError::Unsupported("only 8-bit samples are supported"));
     }
-    headers.height = u16::from_be_bytes([
-        *segment.get(1).ok_or(short)?,
-        *segment.get(2).ok_or(short)?,
-    ]);
-    headers.width = u16::from_be_bytes([
-        *segment.get(3).ok_or(short)?,
-        *segment.get(4).ok_or(short)?,
-    ]);
+    headers.height =
+        u16::from_be_bytes([*segment.get(1).ok_or(short)?, *segment.get(2).ok_or(short)?]);
+    headers.width =
+        u16::from_be_bytes([*segment.get(3).ok_or(short)?, *segment.get(4).ok_or(short)?]);
     let count = usize::from(*segment.get(5).ok_or(short)?);
     headers.components.clear();
     for i in 0..count {
-        let at = 6_usize.checked_add(i.checked_mul(3).ok_or(short)?).ok_or(short)?;
+        let at = 6_usize
+            .checked_add(i.checked_mul(3).ok_or(short)?)
+            .ok_or(short)?;
         let sampling = *segment.get(at.saturating_add(1)).ok_or(short)?;
         headers.components.push(FrameComponent {
             id: *segment.get(at).ok_or(short)?,
@@ -332,7 +338,9 @@ fn read_scan_header(segment: &[u8], headers: &mut JpegHeaders) -> Result<(), Par
     let count = usize::from(*segment.first().ok_or(short)?);
     headers.scan.clear();
     for i in 0..count {
-        let at = 1_usize.checked_add(i.checked_mul(2).ok_or(short)?).ok_or(short)?;
+        let at = 1_usize
+            .checked_add(i.checked_mul(2).ok_or(short)?)
+            .ok_or(short)?;
         let tables = *segment.get(at.saturating_add(1)).ok_or(short)?;
         headers.scan.push(ScanComponent {
             selector: *segment.get(at).ok_or(short)?,
@@ -355,8 +363,12 @@ fn read_quantisation_tables(segment: &[u8], headers: &mut JpegHeaders) -> Result
         }
         let index = usize::from(spec & 0x0F);
         let start = at.saturating_add(1);
-        let end = start.checked_add(64).ok_or(ParseError::Malformed("short DQT"))?;
-        let values = segment.get(start..end).ok_or(ParseError::Malformed("short DQT"))?;
+        let end = start
+            .checked_add(64)
+            .ok_or(ParseError::Malformed("short DQT"))?;
+        let values = segment
+            .get(start..end)
+            .ok_or(ParseError::Malformed("short DQT"))?;
         let mut table = [0_u8; 64];
         table.copy_from_slice(values);
         *headers
@@ -389,7 +401,9 @@ fn read_huffman_tables(segment: &[u8], headers: &mut JpegHeaders) -> Result<(), 
         let mut values = [0_u8; 162];
         // A malformed table claiming more values than an AC table can hold would otherwise
         // panic on the copy.
-        let room = values.get_mut(..total).ok_or(ParseError::Malformed("oversized Huffman table"))?;
+        let room = values
+            .get_mut(..total)
+            .ok_or(ParseError::Malformed("oversized Huffman table"))?;
         room.copy_from_slice(values_slice);
 
         let table = HuffmanTable { counts, values };
@@ -460,7 +474,11 @@ const fn standard_ac_table(index: usize) -> HuffmanTable {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::{ParseError, Subsampling, parse};
 
@@ -484,7 +502,10 @@ mod tests {
         let headers = parse(&data).expect("parse");
         assert_eq!((headers.width, headers.height), (64, 48));
         assert_eq!(headers.components.len(), 3, "one luma and two chroma");
-        assert!(!headers.scan.is_empty(), "the scan maps components to tables");
+        assert!(
+            !headers.scan.is_empty(),
+            "the scan maps components to tables"
+        );
     }
 
     /// The subsampling decides what format the decoded surface is in, so reading it wrongly
@@ -537,7 +558,11 @@ mod tests {
     #[test]
     fn partial_mcus_are_counted() {
         let headers = parse(&fixture(65, 33, jpeg_encoder::SamplingFactor::F_2_2)).expect("parse");
-        assert_eq!(headers.mcu_count(), 5 * 3, "65x33 needs 5 by 3 sixteen-pixel MCUs");
+        assert_eq!(
+            headers.mcu_count(),
+            5 * 3,
+            "65x33 needs 5 by 3 sixteen-pixel MCUs"
+        );
     }
 
     /// Tables the stream carries must be read, and both kinds are indexed separately -- a
@@ -546,7 +571,10 @@ mod tests {
     fn quantisation_and_huffman_tables_are_read() {
         let data = fixture(64, 48, jpeg_encoder::SamplingFactor::F_2_2);
         let headers = parse(&data).expect("parse");
-        assert!(headers.quantisers[0].is_some(), "no luma quantisation table");
+        assert!(
+            headers.quantisers[0].is_some(),
+            "no luma quantisation table"
+        );
         assert!(headers.dc_tables[0].is_some());
         assert!(headers.ac_tables[0].is_some());
     }

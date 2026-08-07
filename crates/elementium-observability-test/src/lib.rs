@@ -55,7 +55,8 @@ struct FieldVisitor<'a> {
 
 impl Visit for FieldVisitor<'_> {
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_owned(), value.to_owned());
+        self.fields
+            .insert(field.name().to_owned(), value.to_owned());
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
@@ -155,16 +156,19 @@ impl LogCapture {
     /// All events captured so far, in emission order.
     #[must_use]
     pub fn events(&self) -> Vec<CapturedEvent> {
-        self.events.lock().map(|guard| guard.clone()).unwrap_or_default()
+        self.events
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Find the first captured event whose message or metadata name contains
     /// `needle` as a substring.
     #[must_use]
     pub fn find_event(&self, needle: &str) -> Option<CapturedEvent> {
-        self.events().into_iter().find(|e| {
-            e.message().is_some_and(|m| m.contains(needle)) || e.name.contains(needle)
-        })
+        self.events()
+            .into_iter()
+            .find(|e| e.message().is_some_and(|m| m.contains(needle)) || e.name.contains(needle))
     }
 
     /// Assert that `needle` (the exact field value) is present on the event

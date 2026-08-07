@@ -94,7 +94,9 @@ impl OpusEncoder {
                     error_kind = "unsupported_channels",
                     "Opus encoder: unsupported channel count"
                 );
-                return Err(OpusError::Encoder(format!("unsupported channel count: {channels}")));
+                return Err(OpusError::Encoder(format!(
+                    "unsupported channel count: {channels}"
+                )));
             }
         };
 
@@ -110,19 +112,20 @@ impl OpusEncoder {
                 OpusError::Encoder(e.to_string())
             })?;
 
-        let apply = |result: Result<(), opus::Error>, setting: &'static str| -> Result<(), OpusError> {
-            result.map_err(|e| {
-                tracing::error!(
-                    sample_rate,
-                    channels,
-                    setting,
-                    error_kind = "encoder_config",
-                    error = %e,
-                    "Failed to apply Opus encoder setting"
-                );
-                OpusError::Encoder(format!("{setting}: {e}"))
-            })
-        };
+        let apply =
+            |result: Result<(), opus::Error>, setting: &'static str| -> Result<(), OpusError> {
+                result.map_err(|e| {
+                    tracing::error!(
+                        sample_rate,
+                        channels,
+                        setting,
+                        error_kind = "encoder_config",
+                        error = %e,
+                        "Failed to apply Opus encoder setting"
+                    );
+                    OpusError::Encoder(format!("{setting}: {e}"))
+                })
+            };
 
         apply(
             encoder.set_bitrate(opus::Bitrate::Bits(config.bitrate_bps)),
@@ -181,17 +184,20 @@ impl OpusEncoder {
     pub fn encode(&mut self, frame: &AudioFrame) -> Result<PlaintextMedia, OpusError> {
         // Opus max packet size
         let mut output = vec![0u8; 4000];
-        let len = self.inner.encode_float(&frame.data, &mut output).map_err(|e| {
-            tracing::error!(
-                sample_rate = self.sample_rate,
-                channels = self.channels,
-                input_samples = frame.data.len(),
-                error_kind = "encode",
-                error = %e,
-                "Opus encode failed"
-            );
-            OpusError::Encoder(e.to_string())
-        })?;
+        let len = self
+            .inner
+            .encode_float(&frame.data, &mut output)
+            .map_err(|e| {
+                tracing::error!(
+                    sample_rate = self.sample_rate,
+                    channels = self.channels,
+                    input_samples = frame.data.len(),
+                    error_kind = "encode",
+                    error = %e,
+                    "Opus encode failed"
+                );
+                OpusError::Encoder(e.to_string())
+            })?;
         output.truncate(len);
         Ok(PlaintextMedia::from_encoder(output))
     }
@@ -231,7 +237,9 @@ impl OpusDecoder {
                     error_kind = "unsupported_channels",
                     "Opus decoder: unsupported channel count"
                 );
-                return Err(OpusError::Decoder(format!("unsupported channel count: {channels}")));
+                return Err(OpusError::Decoder(format!(
+                    "unsupported channel count: {channels}"
+                )));
             }
         };
 
@@ -267,18 +275,21 @@ impl OpusDecoder {
         let channels = usize::from(self.channels);
         let total_samples = frame_size.saturating_mul(channels);
         let mut output = vec![0.0f32; total_samples];
-        let decoded = self.inner.decode_float(packet.as_bytes(), &mut output, false).map_err(|e| {
-            tracing::error!(
-                sample_rate = self.sample_rate,
-                channels = self.channels,
-                packet_len = packet.len(),
-                frame_size,
-                error_kind = "decode",
-                error = %e,
-                "Opus decode failed"
-            );
-            OpusError::Decoder(e.to_string())
-        })?;
+        let decoded = self
+            .inner
+            .decode_float(packet.as_bytes(), &mut output, false)
+            .map_err(|e| {
+                tracing::error!(
+                    sample_rate = self.sample_rate,
+                    channels = self.channels,
+                    packet_len = packet.len(),
+                    frame_size,
+                    error_kind = "decode",
+                    error = %e,
+                    "Opus decode failed"
+                );
+                OpusError::Decoder(e.to_string())
+            })?;
         output.truncate(decoded.saturating_mul(channels));
 
         Ok(AudioFrame {
@@ -327,17 +338,20 @@ impl OpusDecoder {
         let mut output = vec![0.0f32; total_samples];
         // An empty input slice tells libopus this is a concealment request (it maps to a
         // NULL packet pointer internally), not a zero-length real packet.
-        let decoded = self.inner.decode_float(&[], &mut output, false).map_err(|e| {
-            tracing::error!(
-                sample_rate = self.sample_rate,
-                channels = self.channels,
-                frame_size,
-                error_kind = "conceal",
-                error = %e,
-                "Opus packet-loss concealment failed"
-            );
-            OpusError::Decoder(e.to_string())
-        })?;
+        let decoded = self
+            .inner
+            .decode_float(&[], &mut output, false)
+            .map_err(|e| {
+                tracing::error!(
+                    sample_rate = self.sample_rate,
+                    channels = self.channels,
+                    frame_size,
+                    error_kind = "conceal",
+                    error = %e,
+                    "Opus packet-loss concealment failed"
+                );
+                OpusError::Decoder(e.to_string())
+            })?;
         output.truncate(decoded.saturating_mul(channels));
 
         Ok(AudioFrame {
@@ -413,7 +427,12 @@ mod tests {
     /// decoder that has already decoded at least one real packet (nothing to conceal a gap
     /// from on a totally fresh decoder, but that's a pre-condition the caller enforces).
     #[test]
-    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::cast_precision_loss, clippy::as_conversions)]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_precision_loss,
+        clippy::as_conversions
+    )]
     fn conceal_after_a_real_frame_produces_a_playable_frame_of_the_right_shape() {
         let sample_rate = 48000;
         let channels = 2u16;
@@ -429,9 +448,16 @@ mod tests {
                 [s, s]
             })
             .collect();
-        let frame = AudioFrame { sample_rate, channels, data: samples, timestamp_us: 0 };
+        let frame = AudioFrame {
+            sample_rate,
+            channels,
+            data: samples,
+            timestamp_us: 0,
+        };
         let opus_bytes = encoder.encode(&frame).expect("encode");
-        decoder.decode(&opus_bytes, frame_size).expect("prime the decoder with a real frame");
+        decoder
+            .decode(&opus_bytes, frame_size)
+            .expect("prime the decoder with a real frame");
 
         // Simulate a lost packet: ask for concealment instead of feeding the next real
         // packet straight in.
@@ -445,7 +471,9 @@ mod tests {
 
         // Decoding must still work normally on the next real packet after concealment.
         let opus_bytes_2 = encoder.encode(&frame).expect("encode second frame");
-        let after = decoder.decode(&opus_bytes_2, frame_size).expect("decode after concealment");
+        let after = decoder
+            .decode(&opus_bytes_2, frame_size)
+            .expect("decode after concealment");
         assert_eq!(after.data.len(), frame_size * usize::from(channels));
     }
 
@@ -493,8 +521,10 @@ mod tests {
                         #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
                         let t = (frame_idx * frame_size + i) as f32 / sample_rate as f32;
                         let fundamental = (2.0 * std::f32::consts::PI * base_freq * t).sin();
-                        let overtone2 = 0.5 * (2.0 * std::f32::consts::PI * base_freq * 2.0 * t).sin();
-                        let overtone3 = 0.25 * (2.0 * std::f32::consts::PI * base_freq * 3.0 * t).sin();
+                        let overtone2 =
+                            0.5 * (2.0 * std::f32::consts::PI * base_freq * 2.0 * t).sin();
+                        let overtone3 =
+                            0.25 * (2.0 * std::f32::consts::PI * base_freq * 3.0 * t).sin();
                         (fundamental + overtone2 + overtone3) * 0.3
                     })
                     .collect(),
@@ -508,10 +538,16 @@ mod tests {
             .collect();
 
         // Baseline: decode every real packet with no concealment ever invoked.
-        let mut baseline_decoder = OpusDecoder::new(sample_rate, channels).expect("decoder creation");
+        let mut baseline_decoder =
+            OpusDecoder::new(sample_rate, channels).expect("decoder creation");
         let baseline: Vec<Vec<f32>> = packets
             .iter()
-            .map(|p| baseline_decoder.decode(p, frame_size).expect("baseline decode").data)
+            .map(|p| {
+                baseline_decoder
+                    .decode(p, frame_size)
+                    .expect("baseline decode")
+                    .data
+            })
             .collect();
 
         // Same packet sequence, but call conceal() before every 5th real decode --
@@ -523,7 +559,12 @@ mod tests {
             if i > 0 && i.is_multiple_of(5) {
                 plc_decoder.conceal(frame_size).expect("conceal");
             }
-            with_plc.push(plc_decoder.decode(packet, frame_size).expect("plc-interleaved decode").data);
+            with_plc.push(
+                plc_decoder
+                    .decode(packet, frame_size)
+                    .expect("plc-interleaved decode")
+                    .data,
+            );
         }
 
         // Pins the confirmed hazard, not a desired outcome: real packets decoded right
@@ -687,7 +728,9 @@ mod packet_validity_tests {
         let packet = encoder.encode(&frame).expect("encode");
 
         assert_eq!(
-            decoder.packet_sample_count(&packet).expect("valid Opus must parse"),
+            decoder
+                .packet_sample_count(&packet)
+                .expect("valid Opus must parse"),
             frame_size,
             "a real 20ms Opus packet must report 960 samples per channel"
         );

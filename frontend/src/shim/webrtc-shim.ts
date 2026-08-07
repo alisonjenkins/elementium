@@ -170,7 +170,10 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
     // For video tracks, create a canvas source that renders frames from Rust
     if (kind === "video" && this.pcId) {
-      const trackId = `${this.pcId}-video`;
+      // Per track, not per connection: on an SFU every remote participant's video arrives
+      // on one connection and is told apart only by mid, so a key without it makes two
+      // people share a display slot and overwrite each other.
+      const trackId = `${this.pcId}-${mid}`;
       const canvas = document.createElement("canvas");
       // Fixed at 720p and never resized afterwards. `captureStream` fixes the resulting
       // track's frame size when it is called; resizing the canvas later leaves the track

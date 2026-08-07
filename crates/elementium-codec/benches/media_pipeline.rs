@@ -29,7 +29,7 @@
     clippy::suboptimal_flops
 )]
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use elementium_codec::{Vp8Encoder, halve_i420, halve_rgba, i420_to_rgba, rgba_to_i420};
 use elementium_types::I420Frame;
 
@@ -151,9 +151,7 @@ fn stages(c: &mut Criterion) {
 
     // libjpeg-turbo, decoding to RGBA -- a like-for-like comparison against zune.
     group.bench_function("turbo_decode_to_rgba", |b| {
-        b.iter(|| {
-            turbojpeg::decompress(&jpeg, turbojpeg::PixelFormat::RGBA).expect("turbo rgba")
-        });
+        b.iter(|| turbojpeg::decompress(&jpeg, turbojpeg::PixelFormat::RGBA).expect("turbo rgba"));
     });
 
     // libjpeg-turbo straight to I420 planes: the encoder's input format, and the JPEG's
@@ -184,7 +182,8 @@ fn stages(c: &mut Criterion) {
                 height: h,
                 format: turbojpeg::PixelFormat::RGBA,
             };
-            d.decompress(&jpeg, img.as_deref_mut()).expect("half decode");
+            d.decompress(&jpeg, img.as_deref_mut())
+                .expect("half decode");
             img
         });
     });

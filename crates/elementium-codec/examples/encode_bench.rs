@@ -64,7 +64,10 @@ fn main() {
         let elapsed = started.elapsed();
         encode_total += elapsed;
         worst = worst.max(elapsed);
-        bytes += packets.iter().map(|p| p.data.as_bytes().len()).sum::<usize>();
+        bytes += packets
+            .iter()
+            .map(|p| p.data.as_bytes().len())
+            .sum::<usize>();
     }
 
     let convert = convert_total / frames;
@@ -73,8 +76,15 @@ fn main() {
     let _ = uv;
     println!("{width}x{height}, {frames} frames of noise");
     println!("  rgba->i420 {:>7.2}ms", convert.as_secs_f64() * 1000.0);
-    println!("  vp8 encode {:>7.2}ms (worst {:.2}ms)", encode.as_secs_f64() * 1000.0, worst.as_secs_f64() * 1000.0);
-    println!("  total      {:>7.2}ms per frame", per_frame.as_secs_f64() * 1000.0);
+    println!(
+        "  vp8 encode {:>7.2}ms (worst {:.2}ms)",
+        encode.as_secs_f64() * 1000.0,
+        worst.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  total      {:>7.2}ms per frame",
+        per_frame.as_secs_f64() * 1000.0
+    );
     println!("  {:.0} fps sustainable", 1.0 / per_frame.as_secs_f64());
     println!("  {} bytes per frame average", bytes / frames as usize);
 }

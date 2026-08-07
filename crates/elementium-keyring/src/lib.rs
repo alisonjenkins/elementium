@@ -120,7 +120,9 @@ pub fn create_backend() -> Option<SecretBackend> {
             Some(SecretBackend::Keyring(kb))
         }
         Err(e) => {
-            tracing::warn!("OS keyring unavailable ({e}), secrets need manual setup or will fall back to localStorage");
+            tracing::warn!(
+                "OS keyring unavailable ({e}), secrets need manual setup or will fall back to localStorage"
+            );
             None
         }
     }

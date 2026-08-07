@@ -11,7 +11,9 @@
 #![allow(clippy::print_stdout)]
 
 fn main() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     println!("all encoders this machine reports:");
     for cap in elementium_codec::available_encoders() {

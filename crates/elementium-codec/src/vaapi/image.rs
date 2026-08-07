@@ -112,7 +112,11 @@ impl SurfaceUpload {
         // SAFETY: `image.buf` belongs to an image created in `new` on this display.
         check(
             unsafe {
-                va::vaMapBuffer(self.display.handle(), self.image.buf, std::ptr::addr_of_mut!(data))
+                va::vaMapBuffer(
+                    self.display.handle(),
+                    self.image.buf,
+                    std::ptr::addr_of_mut!(data),
+                )
             },
             "vaMapBuffer",
         )?;
@@ -203,7 +207,11 @@ impl SurfaceUpload {
         // SAFETY: `image.buf` belongs to an image created in `new` on this display.
         check(
             unsafe {
-                va::vaMapBuffer(self.display.handle(), self.image.buf, std::ptr::addr_of_mut!(data))
+                va::vaMapBuffer(
+                    self.display.handle(),
+                    self.image.buf,
+                    std::ptr::addr_of_mut!(data),
+                )
             },
             "vaMapBuffer",
         )?;
@@ -274,7 +282,10 @@ impl ImageView {
     /// frame. Both mean the image was not the one the caller thought it was, which is worth
     /// refusing rather than writing past a plane.
     fn write_i420(&mut self, frame: &I420Frame) -> Result<(), Status> {
-        let fail = |what: &'static str| Status { operation: what, code: -1 };
+        let fail = |what: &'static str| Status {
+            operation: what,
+            code: -1,
+        };
 
         if self.image.format.fourcc != FOURCC_NV12 {
             return Err(fail("derived image is not NV12"));
@@ -307,7 +318,10 @@ impl ImageView {
                 .ok_or_else(|| fail("luma plane too small"))?;
             let start = layout
                 .luma_offset
-                .checked_add(row.checked_mul(layout.luma_pitch).ok_or_else(|| fail("luma row"))?)
+                .checked_add(
+                    row.checked_mul(layout.luma_pitch)
+                        .ok_or_else(|| fail("luma row"))?,
+                )
                 .ok_or_else(|| fail("luma row"))?;
             bytes
                 .get_mut(start..start.checked_add(width).ok_or_else(|| fail("luma row"))?)
@@ -316,7 +330,9 @@ impl ImageView {
         }
 
         for row in 0..chroma_height {
-            let offset = row.checked_mul(uv_stride).ok_or_else(|| fail("chroma row"))?;
+            let offset = row
+                .checked_mul(uv_stride)
+                .ok_or_else(|| fail("chroma row"))?;
             let u_row = u_plane
                 .get(offset..)
                 .and_then(|r| r.get(..chroma_width))
@@ -328,7 +344,8 @@ impl ImageView {
             let start = layout
                 .chroma_offset
                 .checked_add(
-                    row.checked_mul(layout.chroma_pitch).ok_or_else(|| fail("chroma row"))?,
+                    row.checked_mul(layout.chroma_pitch)
+                        .ok_or_else(|| fail("chroma row"))?,
                 )
                 .ok_or_else(|| fail("chroma row"))?;
             let interleaved = bytes
@@ -351,7 +368,6 @@ impl ImageView {
 
         Ok(())
     }
-
 }
 
 /// Reading a surface back into ordinary memory.
@@ -412,7 +428,11 @@ impl SurfaceDownload {
         // SAFETY: `image.buf` belongs to an image created on this display.
         check(
             unsafe {
-                va::vaMapBuffer(self.display.handle(), self.image.buf, std::ptr::addr_of_mut!(data))
+                va::vaMapBuffer(
+                    self.display.handle(),
+                    self.image.buf,
+                    std::ptr::addr_of_mut!(data),
+                )
             },
             "vaMapBuffer",
         )?;
@@ -483,9 +503,9 @@ impl PlaneLayout {
     clippy::many_single_char_names
 )]
 mod tests {
-    use super::{PlaneLayout, SurfaceUpload};
     use super::super::display::Display;
     use super::super::resource::SurfacePool;
+    use super::{PlaneLayout, SurfaceUpload};
     use elementium_types::I420Frame;
 
     const W: u32 = 64;
@@ -497,7 +517,9 @@ mod tests {
     /// offset is visible rather than merely plausible.
     fn test_frame() -> I420Frame {
         let (w, h) = (WIDTH, HEIGHT);
-        let y: Vec<u8> = (0..w * h).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
+        let y: Vec<u8> = (0..w * h)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
         let u: Vec<u8> = (0..(w / 2) * (h / 2))
             .map(|i| u8::try_from(100 + i % 50).unwrap_or(0))
             .collect();
@@ -508,7 +530,11 @@ mod tests {
     }
 
     /// Everything needed for an upload, or `None` where there is no GPU.
-    fn fixture() -> Option<(SurfaceUpload, super::super::resource::SurfaceId, SurfacePool)> {
+    fn fixture() -> Option<(
+        SurfaceUpload,
+        super::super::resource::SurfaceId,
+        SurfacePool,
+    )> {
         let display = std::sync::Arc::new(Display::open_any()?);
         let pool = SurfacePool::new_nv12(&display, W, H, 1).ok()?;
         let surface = pool.surfaces().first().copied()?;
@@ -581,7 +607,10 @@ mod tests {
 
         let bytes = upload.download(surface).expect("read back");
         let layout = upload.layout().expect("two planes");
-        assert_eq!(bytes[layout.luma_offset], 17, "the first frame is still there");
+        assert_eq!(
+            bytes[layout.luma_offset], 17,
+            "the first frame is still there"
+        );
         assert_eq!(bytes[layout.chroma_offset], 33);
         assert_eq!(bytes[layout.chroma_offset + 1], 44);
     }
@@ -617,13 +646,25 @@ mod tests {
         let Some((upload, _surface, _pool)) = fixture() else {
             return;
         };
-        let PlaneLayout { luma_pitch, chroma_offset, chroma_pitch, .. } =
-            upload.layout().expect("the driver described fewer than two planes");
-        assert!(luma_pitch >= WIDTH, "luma pitch {luma_pitch} is narrower than the frame");
+        let PlaneLayout {
+            luma_pitch,
+            chroma_offset,
+            chroma_pitch,
+            ..
+        } = upload
+            .layout()
+            .expect("the driver described fewer than two planes");
+        assert!(
+            luma_pitch >= WIDTH,
+            "luma pitch {luma_pitch} is narrower than the frame"
+        );
         assert!(
             chroma_pitch >= WIDTH,
             "chroma pitch {chroma_pitch} cannot hold interleaved UV"
         );
-        assert!(chroma_offset > 0, "chroma cannot start at the same place as luma");
+        assert!(
+            chroma_offset > 0,
+            "chroma cannot start at the same place as luma"
+        );
     }
 }

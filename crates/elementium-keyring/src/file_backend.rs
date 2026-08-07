@@ -42,15 +42,18 @@ impl FileBackend {
                     "secrets file too short".into(),
                 ));
             }
-            let salt = data.get(..SALT_LEN).ok_or_else(|| {
-                SecretStoreError::Decryption("secrets file too short".into())
-            })?;
+            let salt = data
+                .get(..SALT_LEN)
+                .ok_or_else(|| SecretStoreError::Decryption("secrets file too short".into()))?;
             derive_key(password, salt)?
         } else {
             // New file — generate salt + write empty store
             let salt = random_bytes::<SALT_LEN>();
             let key = derive_key(password, &salt)?;
-            let backend = Self { path: path.clone(), key: key.clone() };
+            let backend = Self {
+                path: path.clone(),
+                key: key.clone(),
+            };
             backend.write_map(&HashMap::new())?;
             return Ok(Self { path, key });
         };
@@ -79,14 +82,14 @@ impl FileBackend {
         let nonce_start = SALT_LEN;
         let ciphertext_start = SALT_LEN + NONCE_LEN;
 
-        let nonce_bytes = data.get(nonce_start..ciphertext_start).ok_or_else(|| {
-            SecretStoreError::Decryption("secrets file too short".into())
-        })?;
+        let nonce_bytes = data
+            .get(nonce_start..ciphertext_start)
+            .ok_or_else(|| SecretStoreError::Decryption("secrets file too short".into()))?;
         #[allow(deprecated)]
         let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-        let ciphertext = data.get(ciphertext_start..).ok_or_else(|| {
-            SecretStoreError::Decryption("secrets file too short".into())
-        })?;
+        let ciphertext = data
+            .get(ciphertext_start..)
+            .ok_or_else(|| SecretStoreError::Decryption("secrets file too short".into()))?;
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_slice())
             .map_err(|e| SecretStoreError::Decryption(e.to_string()))?;
@@ -105,11 +108,13 @@ impl FileBackend {
         // Read existing salt or generate new one
         let salt = if self.path.exists() {
             let existing = fs::read(&self.path)?;
-            existing.get(..SALT_LEN).map_or_else(random_bytes::<SALT_LEN>, |salt_bytes| {
-                let mut s = [0u8; SALT_LEN];
-                s.copy_from_slice(salt_bytes);
-                s
-            })
+            existing
+                .get(..SALT_LEN)
+                .map_or_else(random_bytes::<SALT_LEN>, |salt_bytes| {
+                    let mut s = [0u8; SALT_LEN];
+                    s.copy_from_slice(salt_bytes);
+                    s
+                })
         } else {
             random_bytes::<SALT_LEN>()
         };
@@ -235,7 +240,10 @@ mod tests {
             backend.get("mx_pickle_key")? == Some("pickle!".to_string()),
             "mx_pickle_key mismatch",
         )?;
-        check(backend.get("nonexistent")?.is_none(), "nonexistent should be None")?;
+        check(
+            backend.get("nonexistent")?.is_none(),
+            "nonexistent should be None",
+        )?;
 
         backend.delete("mx_access_token")?;
         check(

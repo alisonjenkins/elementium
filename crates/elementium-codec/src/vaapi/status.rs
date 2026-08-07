@@ -58,7 +58,10 @@ pub fn check(status: va::VAStatus, operation: &'static str) -> Result<(), Status
     if status == i32::try_from(va::VA_STATUS_SUCCESS).unwrap_or(0) {
         Ok(())
     } else {
-        Err(Status { operation, code: status })
+        Err(Status {
+            operation,
+            code: status,
+        })
     }
 }
 
@@ -82,16 +85,16 @@ mod tests {
     fn a_failure_names_the_operation() {
         let err = check(-1, "vaCreateContext").expect_err("should fail");
         assert_eq!(err.operation, "vaCreateContext");
-        assert!(
-            err.to_string().contains("vaCreateContext"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains("vaCreateContext"), "got {err}");
     }
 
     /// The driver's description is more use than the number.
     #[test]
     fn a_failure_describes_itself() {
-        let status = Status { operation: "vaCreateConfig", code: -1 };
+        let status = Status {
+            operation: "vaCreateConfig",
+            code: -1,
+        };
         assert!(!status.describe().is_empty());
     }
 }

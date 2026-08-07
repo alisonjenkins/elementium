@@ -50,7 +50,10 @@ const ASSUMED_MAX_HEIGHT: u32 = 4096;
 fn profiles_of_interest() -> Vec<(VideoCodec, libva_sys::va_display_drm::VAProfile)> {
     use libva_sys::va_display_drm as va;
     vec![
-        (VideoCodec::H264, va::VAProfile_VAProfileH264ConstrainedBaseline),
+        (
+            VideoCodec::H264,
+            va::VAProfile_VAProfileH264ConstrainedBaseline,
+        ),
         (VideoCodec::H264, va::VAProfile_VAProfileH264Main),
         (VideoCodec::H264, va::VAProfile_VAProfileH264High),
         (VideoCodec::Av1, va::VAProfile_VAProfileAV1Profile0),
@@ -85,7 +88,11 @@ pub fn probe() -> HardwareCapabilities {
 fn probe_node(path: &str) -> HardwareCapabilities {
     // Read-write: the driver maps buffers through this descriptor, and a read-only
     // handle gets far enough to initialise and then fails inside Mesa with EACCES.
-    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
         return HardwareCapabilities::default();
     };
     // The display borrows the descriptor, so the file must outlive it.

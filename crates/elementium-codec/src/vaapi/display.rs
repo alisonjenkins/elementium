@@ -63,12 +63,18 @@ impl Display {
             .read(true)
             .write(true)
             .open(path)
-            .map_err(|_| Status { operation: "open render node", code: -1 })?;
+            .map_err(|_| Status {
+                operation: "open render node",
+                code: -1,
+            })?;
 
         // SAFETY: the descriptor is valid and outlives the display, which owns the file.
         let handle = unsafe { va::vaGetDisplayDRM(node.as_raw_fd()) };
         if handle.is_null() {
-            return Err(Status { operation: "vaGetDisplayDRM", code: -1 });
+            return Err(Status {
+                operation: "vaGetDisplayDRM",
+                code: -1,
+            });
         }
 
         let (mut major, mut minor): (c_int, c_int) = (0, 0);
@@ -82,7 +88,10 @@ impl Display {
         };
         check(status, "vaInitialize")?;
 
-        Ok(Self { handle, _node: node })
+        Ok(Self {
+            handle,
+            _node: node,
+        })
     }
 
     /// The raw display, for calls that need it.

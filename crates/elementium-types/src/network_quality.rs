@@ -47,7 +47,11 @@ impl NetworkLossEstimate {
     #[must_use]
     pub fn new(initial_perc: u8) -> Self {
         Self {
-            centi_perc: AtomicU32::new(u32::from(initial_perc).min(MAX_LOSS_PERC).saturating_mul(CENTI)),
+            centi_perc: AtomicU32::new(
+                u32::from(initial_perc)
+                    .min(MAX_LOSS_PERC)
+                    .saturating_mul(CENTI),
+            ),
         }
     }
 
@@ -155,7 +159,10 @@ mod network_loss_estimate_tests {
             estimate.observe(0.0);
         }
         let good = estimate.percent();
-        assert!(bad > 20, "should have risen under sustained loss, got {bad}");
+        assert!(
+            bad > 20,
+            "should have risen under sustained loss, got {bad}"
+        );
         assert_eq!(good, 0, "should return to zero on a clean link, got {good}");
     }
 

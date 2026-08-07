@@ -216,11 +216,7 @@ pub fn selectable_backend_from(
 /// VP8 stays in the list regardless, and last: everything speaks it, and it is what
 /// [`BackupCodecPolicy`](https://docs.rs/livekit-protocol) regression falls back to.
 #[must_use]
-pub fn negotiation_order(
-    width: u32,
-    height: u32,
-    server_allows: &[VideoCodec],
-) -> Vec<VideoCodec> {
+pub fn negotiation_order(width: u32, height: u32, server_allows: &[VideoCodec]) -> Vec<VideoCodec> {
     let caps = available_encoders();
     let mut codecs: Vec<VideoCodec> = VideoCodec::all()
         .iter()
@@ -344,7 +340,10 @@ mod tests {
     /// SDP, wins the negotiation, and then produces no frames at all.
     #[test]
     fn present_hardware_without_an_encoder_is_not_selected() {
-        let caps = [software(VideoCodec::Vp8), hardware(VideoCodec::H264, 4096, 4096)];
+        let caps = [
+            software(VideoCodec::Vp8),
+            hardware(VideoCodec::H264, 4096, 4096),
+        ];
         assert_eq!(
             best_backend_from(&caps, VideoCodec::H264, 1920, 1080),
             EncoderBackend::Vaapi,
@@ -364,7 +363,10 @@ mod tests {
     /// The policy prefers hardware that can do the job.
     #[test]
     fn hardware_wins_when_it_supports_the_codec_and_size() {
-        let caps = [software(VideoCodec::Vp8), hardware(VideoCodec::H264, 4096, 4096)];
+        let caps = [
+            software(VideoCodec::Vp8),
+            hardware(VideoCodec::H264, 4096, 4096),
+        ];
         assert_eq!(
             best_backend_from(&caps, VideoCodec::H264, 1920, 1080),
             EncoderBackend::Vaapi
@@ -377,7 +379,10 @@ mod tests {
     /// failure appears mid-call as video stopping for no visible reason.
     #[test]
     fn hardware_is_rejected_above_its_size_limit() {
-        let caps = [software(VideoCodec::H264), hardware(VideoCodec::H264, 1920, 1080)];
+        let caps = [
+            software(VideoCodec::H264),
+            hardware(VideoCodec::H264, 1920, 1080),
+        ];
         assert_eq!(
             best_backend_from(&caps, VideoCodec::H264, 3840, 2160),
             EncoderBackend::Software,

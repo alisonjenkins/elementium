@@ -59,11 +59,6 @@ impl VideoPipeline {
             let mut decoders: HashMap<String, Vp8Decoder> = HashMap::new();
 
             tracing::info!(pc_id = %pc_id, "Video playback pipeline started");
-            // The frontend looks this key up by pc_id alone (it doesn't know our
-            // internal per-mid decoder split), so every track's decoded frames land in
-            // the same display slot -- same external contract as before this fix,
-            // which only changed decoder *state* isolation, not the display key.
-            let track_key = format!("{pc_id}-video");
 
             loop {
                 let event = {
@@ -90,6 +85,15 @@ impl VideoPipeline {
                             },
                         };
 
+                        // One display slot per track, not per connection.
+                        //
+                        // On an SFU every remote participant's video arrives on the same
+                        // subscriber connection, told apart only by mid. Keyed by connection,
+                        // two people on camera write to one slot sixty times a second and
+                        // overwrite each other -- the viewer gets one flickering picture of
+                        // two people, and no way to show the second at all. The decoders were
+                        // already split per mid; only the display key was not.
+                        let track_key = format!("{pc_id}-{mid}");
                         match decoder.decode(&vp8_packet) {
                             Ok(frames) => {
                                 for i420_frame in frames {

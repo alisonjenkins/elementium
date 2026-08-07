@@ -90,7 +90,14 @@ fn convert_to_i420(
 #[must_use]
 pub fn bgra_to_i420(width: u32, height: u32, bgra: &[u8]) -> I420Frame {
     convert_to_i420(width, height, bgra, 4, |target, data, stride| {
-        yuv::bgra_to_yuv420(target, data, stride, RANGE, MATRIX, YuvConversionMode::default())
+        yuv::bgra_to_yuv420(
+            target,
+            data,
+            stride,
+            RANGE,
+            MATRIX,
+            YuvConversionMode::default(),
+        )
     })
 }
 
@@ -99,7 +106,14 @@ pub fn bgra_to_i420(width: u32, height: u32, bgra: &[u8]) -> I420Frame {
 #[must_use]
 pub fn rgba_to_i420(width: u32, height: u32, rgba: &[u8]) -> I420Frame {
     convert_to_i420(width, height, rgba, 4, |target, data, stride| {
-        yuv::rgba_to_yuv420(target, data, stride, RANGE, MATRIX, YuvConversionMode::default())
+        yuv::rgba_to_yuv420(
+            target,
+            data,
+            stride,
+            RANGE,
+            MATRIX,
+            YuvConversionMode::default(),
+        )
     })
 }
 
@@ -108,7 +122,14 @@ pub fn rgba_to_i420(width: u32, height: u32, rgba: &[u8]) -> I420Frame {
 #[must_use]
 pub fn rgb_to_i420(width: u32, height: u32, rgb: &[u8]) -> I420Frame {
     convert_to_i420(width, height, rgb, 3, |target, data, stride| {
-        yuv::rgb_to_yuv420(target, data, stride, RANGE, MATRIX, YuvConversionMode::default())
+        yuv::rgb_to_yuv420(
+            target,
+            data,
+            stride,
+            RANGE,
+            MATRIX,
+            YuvConversionMode::default(),
+        )
     })
 }
 
@@ -164,7 +185,11 @@ pub fn halve_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(Vec<u8>, u32,
 }
 
 /// Mean of four samples. Cannot overflow: four `u8`s sum to at most 1020.
-#[allow(clippy::arithmetic_side_effects, clippy::cast_possible_truncation, clippy::as_conversions)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::as_conversions
+)]
 const fn mean4(a: u8, b: u8, c: u8, d: u8) -> u8 {
     ((a as u16 + b as u16 + c as u16 + d as u16) / 4) as u8
 }
@@ -391,7 +416,15 @@ mod halve_i420_tests {
     fn frame(width: u32, height: u32, y: u8, u: u8, v: u8) -> I420Frame {
         let (w, h) = (width as usize, height as usize);
         let uv = (w / 2) * (h / 2);
-        I420Frame::from_planes(width, height, &vec![y; w * h], &vec![u; uv], &vec![v; uv], 7).expect("planes match the geometry")
+        I420Frame::from_planes(
+            width,
+            height,
+            &vec![y; w * h],
+            &vec![u; uv],
+            &vec![v; uv],
+            7,
+        )
+        .expect("planes match the geometry")
     }
 
     /// Halving must produce a frame whose planes match its stated geometry. A frame whose

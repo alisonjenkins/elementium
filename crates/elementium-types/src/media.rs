@@ -470,10 +470,19 @@ mod media_boundary_tests {
     #[test]
     fn wrapping_preserves_bytes_exactly() {
         let raw = vec![1u8, 2, 3, 4, 5];
-        assert_eq!(PlaintextMedia::from_decrypted(raw.clone()).into_bytes(), raw);
+        assert_eq!(
+            PlaintextMedia::from_decrypted(raw.clone()).into_bytes(),
+            raw
+        );
         assert_eq!(WireMedia::from_network(raw.clone()).into_bytes(), raw);
-        assert_eq!(PlaintextMedia::from_encoder(raw.clone()).as_bytes(), raw.as_slice());
-        assert_eq!(WireMedia::from_encrypted(raw.clone()).as_bytes(), raw.as_slice());
+        assert_eq!(
+            PlaintextMedia::from_encoder(raw.clone()).as_bytes(),
+            raw.as_slice()
+        );
+        assert_eq!(
+            WireMedia::from_encrypted(raw.clone()).as_bytes(),
+            raw.as_slice()
+        );
     }
 
     /// Crossing the boundary in either direction is byte-preserving but requires naming
@@ -482,10 +491,16 @@ mod media_boundary_tests {
     fn explicit_boundary_crossings_preserve_bytes() {
         let raw = vec![9u8, 8, 7];
         let wire = WireMedia::from_network(raw.clone());
-        assert_eq!(PlaintextMedia::assume_peer_sends_unencrypted(wire).as_bytes(), raw.as_slice());
+        assert_eq!(
+            PlaintextMedia::assume_peer_sends_unencrypted(wire).as_bytes(),
+            raw.as_slice()
+        );
 
         let plain = PlaintextMedia::from_encoder(raw.clone());
-        assert_eq!(WireMedia::deliberately_unencrypted(plain).as_bytes(), raw.as_slice());
+        assert_eq!(
+            WireMedia::deliberately_unencrypted(plain).as_bytes(),
+            raw.as_slice()
+        );
     }
 
     /// Length/emptiness accessors report the payload, not the wrapper.
@@ -497,7 +512,11 @@ mod media_boundary_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::expect_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects
+)]
 mod i420_frame_tests {
     use super::I420Frame;
 
