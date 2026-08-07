@@ -12,8 +12,8 @@ use tracing::Instrument;
 use livekit_protocol::signal_request;
 use livekit_protocol::signal_response;
 use livekit_protocol::{
-    AddTrackRequest, JoinResponse, ParticipantInfo,
-    SessionDescription as LkSessionDescription, SignalTarget, TrackInfo, TrackSource, TrackType,
+    AddTrackRequest, JoinResponse, ParticipantInfo, SessionDescription as LkSessionDescription,
+    SignalTarget, TrackInfo, TrackSource, TrackType, encryption,
 };
 
 use elementium_types::{CorrelationId, SdpType, SessionDescription};
@@ -55,10 +55,7 @@ pub enum RoomEvent {
         track_sid: String,
     },
     #[serde(rename_all = "camelCase")]
-    ConnectionStateChanged {
-        room_id: String,
-        state: String,
-    },
+    ConnectionStateChanged { room_id: String, state: String },
     #[serde(rename_all = "camelCase")]
     ActiveSpeakersChanged {
         room_id: String,
@@ -71,6 +68,20 @@ pub enum RoomEvent {
     /// than deciding for itself, because only the SFU knows who is subscribed.
     #[serde(rename_all = "camelCase")]
     PublishCodecChanged { room_id: String, codec: String },
+}
+
+/// What to put in `AddTrackRequest.encryption` for a room running under `policy`.
+///
+/// Derived from the policy rather than passed in separately, so the field that tells
+/// subscribers how to treat our frames cannot disagree with what the transport does to
+/// them. Our E2EE is AES-GCM in `LiveKit`'s own frame layout, so `Gcm` is the accurate
+/// description -- `Custom` would tell subscribers to expect a scheme we do not use.
+const fn declared_encryption(policy: &EncryptionPolicy) -> encryption::Type {
+    if policy.as_context().is_some() {
+        encryption::Type::Gcm
+    } else {
+        encryption::Type::None
+    }
 }
 
 /// The `LiveKit` room manages signaling, transport, and participant state.
@@ -101,6 +112,13 @@ pub struct LiveKitRoom {
     media_tx: mpsc::Sender<IoCommand>,
     shutdown: bool,
     correlation_id: CorrelationId,
+    /// How every track this room publishes is described to the SFU.
+    ///
+    /// Must agree with what the transport actually does to the frames. A track encrypted
+    /// with our E2EE key but announced as `NONE` is relayed to subscribers who were told
+    /// the payload is plaintext -- they hand ciphertext straight to Opus or VP8 and get
+    /// noise or nothing, with no error anywhere to say why.
+    track_encryption: encryption::Type,
 }
 
 impl LiveKitRoom {
@@ -151,7 +169,10 @@ impl LiveKitRoom {
 
         let signal_sender = signal_client.sender();
         let Some(mut signal_rx) = signal_client.take_receiver() else {
-            tracing::error!(reason = "signal receiver already taken", "connect attempt failed");
+            tracing::error!(
+                reason = "signal receiver already taken",
+                "connect attempt failed"
+            );
             return Err(crate::error::WebRtcError::ChannelClosed(
                 "signal receiver already taken",
             ));
@@ -209,6 +230,11 @@ impl LiveKitRoom {
             participants.insert(p.sid.clone(), p.clone());
         }
 
+        // What we will tell the SFU about every track we publish. Decided here, before the
+        // policy is moved into the transport, so the declaration and the behaviour cannot
+        // drift apart: whatever encrypts the frames is what describes them.
+        let track_encryption = declared_encryption(&e2ee);
+
         // Create transport (Publisher + Subscriber PeerConnections)
         let transport = match Transport::new_with_e2ee(&room_id, e2ee, None) {
             Ok(t) => t,
@@ -261,6 +287,7 @@ impl LiveKitRoom {
             media_tx,
             shutdown: false,
             correlation_id,
+            track_encryption,
         };
 
         // Spawn signal processing loop, instrumented with the ambient session
@@ -312,7 +339,11 @@ impl LiveKitRoom {
         let track_type: i32 = match kind {
             "audio" => TrackType::Audio.into(),
             "video" => TrackType::Video.into(),
-            _ => return Err(crate::error::WebRtcError::UnknownTrackKind(kind.to_string())),
+            _ => {
+                return Err(crate::error::WebRtcError::UnknownTrackKind(
+                    kind.to_string(),
+                ));
+            }
         };
 
         let track_source: i32 = match source {
@@ -338,31 +369,34 @@ impl LiveKitRoom {
 
         // Send AddTrack request
         #[allow(deprecated)]
-        if let Err(e) = self
-            .signal_sender
-            .send(signal_request::Message::AddTrack(AddTrackRequest {
-                cid: cid.clone(),
-                name: format!("{kind}_{source}"),
-                r#type: track_type,
-                source: track_source,
-                width: if is_video { 640 } else { 0 },
-                height: if is_video { 480 } else { 0 },
-                // How the SFU should handle a subscriber that cannot decode our codec.
-                //
-                // The case this exists for: a room where everyone supports AV1 gains a
-                // participant who does not. The SFU does not transcode, so either that
-                // participant sees nothing, or the publisher moves to a codec they can
-                // decode. `PreferRegression` asks for the second -- one stream, changed to
-                // suit the room.
-                //
-                // Not `Simulcast`, which would encode both codecs at once: that doubles
-                // the encoding cost for the whole call to accommodate one participant, and
-                // encoding cost is the reason for choosing a hardware codec in the first
-                // place.
-                backup_codec_policy: livekit_protocol::BackupCodecPolicy::PreferRegression
-                    .into(),
-                ..Default::default()
-            }))
+        if let Err(e) =
+            self.signal_sender
+                .send(signal_request::Message::AddTrack(AddTrackRequest {
+                    cid: cid.clone(),
+                    name: format!("{kind}_{source}"),
+                    r#type: track_type,
+                    source: track_source,
+                    width: if is_video { 640 } else { 0 },
+                    height: if is_video { 480 } else { 0 },
+                    // How the SFU should handle a subscriber that cannot decode our codec.
+                    //
+                    // The case this exists for: a room where everyone supports AV1 gains a
+                    // participant who does not. The SFU does not transcode, so either that
+                    // participant sees nothing, or the publisher moves to a codec they can
+                    // decode. `PreferRegression` asks for the second -- one stream, changed to
+                    // suit the room.
+                    //
+                    // Not `Simulcast`, which would encode both codecs at once: that doubles
+                    // the encoding cost for the whole call to accommodate one participant, and
+                    // encoding cost is the reason for choosing a hardware codec in the first
+                    // place.
+                    backup_codec_policy: livekit_protocol::BackupCodecPolicy::PreferRegression
+                        .into(),
+                    // Subscribers decide whether to decrypt from this, not from anything in the
+                    // media itself. Defaulting it left every E2EE track announced as plaintext.
+                    encryption: self.track_encryption.into(),
+                    ..Default::default()
+                }))
         {
             tracing::error!(reason = %e, "publish track failed");
             return Err(crate::error::WebRtcError::Signaling(format!(
@@ -383,7 +417,10 @@ impl LiveKitRoom {
             self.audio_cid = Some(cid.clone());
         }
         tracing::info!(cid = %cid, kind, source, "AddTrack cid, also used as the offer msid track id");
-        let offer = match self.transport.create_publisher_offer(include_video, audio_cid, video_cid) {
+        let offer = match self
+            .transport
+            .create_publisher_offer(include_video, audio_cid, video_cid)
+        {
             Ok(o) => o,
             Err(e) => {
                 tracing::error!(reason = %e, "publish track failed");
@@ -391,13 +428,13 @@ impl LiveKitRoom {
             }
         };
 
-        if let Err(e) = self
-            .signal_sender
-            .send(signal_request::Message::Offer(LkSessionDescription {
-                r#type: "offer".to_string(),
-                sdp: offer.sdp,
-                ..Default::default()
-            }))
+        if let Err(e) =
+            self.signal_sender
+                .send(signal_request::Message::Offer(LkSessionDescription {
+                    r#type: "offer".to_string(),
+                    sdp: offer.sdp,
+                    ..Default::default()
+                }))
         {
             tracing::error!(reason = %e, "publish track failed");
             return Err(crate::error::WebRtcError::Signaling(format!(
@@ -655,7 +692,10 @@ async fn signal_processing_loop(
                 // SFU answer for our Publisher offer. Logged on arrival and on application:
                 // without this, a publisher that never completes negotiation is silent in
                 // the log, and looks identical to one whose media is being dropped later.
-                tracing::info!(sdp_len = answer.sdp.len(), "publisher answer received from SFU");
+                tracing::info!(
+                    sdp_len = answer.sdp.len(),
+                    "publisher answer received from SFU"
+                );
                 let desc = SessionDescription {
                     sdp_type: SdpType::Answer,
                     sdp: answer.sdp,
@@ -670,7 +710,9 @@ async fn signal_processing_loop(
                 };
                 match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                     Ok(_) => tracing::info!(pc_id = %pc.id, "publisher answer applied"),
-                    Err(e) => tracing::error!(pc_id = %pc.id, reason = %e, "publisher answer failed"),
+                    Err(e) => {
+                        tracing::error!(pc_id = %pc.id, reason = %e, "publisher answer failed")
+                    }
                 }
             }
             signal_response::Message::Offer(offer) => {
@@ -970,7 +1012,11 @@ fn process_transport_events(
         };
 
         match event {
-            Some(TransportEvent::SubscriberEvent(PcEvent::AudioData { mid, data: opus_data, contiguous: _ })) => {
+            Some(TransportEvent::SubscriberEvent(PcEvent::AudioData {
+                mid,
+                data: opus_data,
+                contiguous: _,
+            })) => {
                 decoded_audio_count = decode_and_play_subscriber_audio(
                     &mid,
                     &opus_data,
@@ -979,11 +1025,16 @@ fn process_transport_events(
                     decoded_audio_count,
                 );
             }
-            Some(TransportEvent::SubscriberEvent(PcEvent::VideoData { mid, data: vp8_data })) => {
+            Some(TransportEvent::SubscriberEvent(PcEvent::VideoData {
+                mid,
+                data: vp8_data,
+            })) => {
                 let decoder = match vp8_decoders.entry(mid.clone()) {
                     std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
                     std::collections::hash_map::Entry::Vacant(v) => {
-                        elementium_codec::Vp8Decoder::new().ok().map(|d| v.insert(d))
+                        elementium_codec::Vp8Decoder::new()
+                            .ok()
+                            .map(|d| v.insert(d))
                     }
                 };
                 if let Some(decoder) = decoder
@@ -1043,7 +1094,11 @@ fn generate_room_id() -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod media_forwarder_tests {
-    use super::{IoCommand, TransportCommand, spawn_media_forwarder};
+    use super::{
+        EncryptionPolicy, IoCommand, TransportCommand, declared_encryption, encryption,
+        spawn_media_forwarder,
+    };
+    use elementium_e2ee::{E2eeContext, E2eeOptions};
     use elementium_types::PlaintextMedia;
     use tokio::sync::mpsc;
 
@@ -1098,6 +1153,26 @@ mod media_forwarder_tests {
         assert!(
             matches!(cmd_rx.recv().await, Some(TransportCommand::WriteAudio(_))),
             "the frames that did fit must still arrive"
+        );
+    }
+
+    /// The declaration must follow the policy, not a constant.
+    ///
+    /// Announcing `NONE` while encrypting is the failure this exists to prevent: the SFU
+    /// relays the track faithfully and the subscriber, told the payload is plaintext, feeds
+    /// ciphertext to its decoder. Nothing errors -- there is simply no audio and no picture.
+    #[test]
+    fn encryption_is_declared_to_match_what_is_done_to_the_frames() {
+        assert_eq!(
+            declared_encryption(&EncryptionPolicy::ExplicitlyUnencrypted),
+            encryption::Type::None,
+        );
+        assert_eq!(
+            declared_encryption(&EncryptionPolicy::Encrypted(E2eeContext::new(
+                E2eeOptions::default()
+            ))),
+            encryption::Type::Gcm,
+            "frames leave encrypted; a subscriber told otherwise cannot decode them",
         );
     }
 

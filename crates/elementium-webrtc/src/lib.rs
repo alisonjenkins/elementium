@@ -9,8 +9,8 @@ pub mod video_pipeline;
 
 pub use audio_pipeline::start_playback as start_audio_playback;
 pub use e2ee_io::EncryptionPolicy;
-pub use error::WebRtcError;
 pub use engine::{IoCommand, VideoFrameBuffer, WebRtcEngine};
+pub use error::WebRtcError;
 pub use livekit::{LiveKitRoom, RoomEvent};
 pub use peer_connection::{PcEvent, PeerConnectionHandle};
 pub use video_pipeline::VideoPipeline;

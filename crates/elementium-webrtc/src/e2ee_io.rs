@@ -95,10 +95,22 @@ pub(crate) fn maybe_decrypt_event(
             PcEvent::IceGatheringComplete => Some(PcEvent::IceGatheringComplete),
             PcEvent::KeyframeRequested { mid } => Some(PcEvent::KeyframeRequested { mid }),
             PcEvent::Connected => Some(PcEvent::Connected),
-            PcEvent::RemoteTrackAdded { mid, kind } => Some(PcEvent::RemoteTrackAdded { mid, kind }),
-            PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks } => {
-                Some(PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks })
+            PcEvent::RemoteTrackAdded { mid, kind } => {
+                Some(PcEvent::RemoteTrackAdded { mid, kind })
             }
+            PcEvent::EgressStats {
+                mid,
+                loss,
+                rtt_ms,
+                packets,
+                nacks,
+            } => Some(PcEvent::EgressStats {
+                mid,
+                loss,
+                rtt_ms,
+                packets,
+                nacks,
+            }),
             PcEvent::AudioData { .. } | PcEvent::VideoData { .. } => None,
         }
     };
@@ -112,7 +124,11 @@ pub(crate) fn maybe_decrypt_event(
         // Warned once per process (not per frame) so the condition is impossible to miss
         // without drowning the log at 50 frames/sec.
         return match event {
-            PcEvent::AudioData { mid, data, contiguous } => {
+            PcEvent::AudioData {
+                mid,
+                data,
+                contiguous,
+            } => {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     tracing::warn!(
@@ -136,11 +152,17 @@ pub(crate) fn maybe_decrypt_event(
     };
 
     match event {
-        PcEvent::AudioData { mid, data, contiguous } => {
+        PcEvent::AudioData {
+            mid,
+            data,
+            contiguous,
+        } => {
             match ctx.decrypt_frame_any(&data, E2eeMediaKind::Audio) {
-                Ok(Some(decrypted)) => {
-                    Some(PcEvent::AudioData { mid, data: decrypted, contiguous })
-                }
+                Ok(Some(decrypted)) => Some(PcEvent::AudioData {
+                    mid,
+                    data: decrypted,
+                    contiguous,
+                }),
                 Ok(None) => None,
                 Err(e) => {
                     // Throttled: one real call produced hundreds of identical lines, which
@@ -160,7 +182,10 @@ pub(crate) fn maybe_decrypt_event(
         }
         PcEvent::VideoData { mid, data } => {
             match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
-                Ok(Some(decrypted)) => Some(PcEvent::VideoData { mid, data: decrypted }),
+                Ok(Some(decrypted)) => Some(PcEvent::VideoData {
+                    mid,
+                    data: decrypted,
+                }),
                 Ok(None) => None,
                 Err(e) => {
                     // Throttled: one real call produced hundreds of identical lines, which
@@ -236,7 +261,12 @@ mod tests {
         let capture = LogCapture::new();
 
         let result = capture.run(|| {
-            encrypt_or_drop(Some(&ctx), PlaintextMedia::from_encoder(b"plaintext-frame".to_vec()), E2eeMediaKind::Audio, "audio")
+            encrypt_or_drop(
+                Some(&ctx),
+                PlaintextMedia::from_encoder(b"plaintext-frame".to_vec()),
+                E2eeMediaKind::Audio,
+                "audio",
+            )
         });
 
         // Fail closed: the frame must be dropped, never sent as plaintext.
@@ -256,9 +286,17 @@ mod tests {
     fn encrypt_or_drop_passes_through_when_no_e2ee_configured() {
         let capture = LogCapture::new();
         let result = capture.run(|| {
-            encrypt_or_drop(None, PlaintextMedia::from_encoder(b"plaintext-frame".to_vec()), E2eeMediaKind::Audio, "audio")
+            encrypt_or_drop(
+                None,
+                PlaintextMedia::from_encoder(b"plaintext-frame".to_vec()),
+                E2eeMediaKind::Audio,
+                "audio",
+            )
         });
-        assert_eq!(result.map(WireMedia::into_bytes), Some(b"plaintext-frame".to_vec()));
+        assert_eq!(
+            result.map(WireMedia::into_bytes),
+            Some(b"plaintext-frame".to_vec())
+        );
         assert!(capture.find_event("Dropping outbound frame").is_none());
     }
 
@@ -278,7 +316,11 @@ mod tests {
 
         let result = capture.run(|| {
             maybe_decrypt_event(
-                PcEvent::AudioData { mid: "1".to_string(), data: WireMedia::from_network(b"ciphertext-looking-bytes".to_vec()), contiguous: true },
+                PcEvent::AudioData {
+                    mid: "1".to_string(),
+                    data: WireMedia::from_network(b"ciphertext-looking-bytes".to_vec()),
+                    contiguous: true,
+                },
                 Some(&ctx),
             )
         });
@@ -297,17 +339,26 @@ mod tests {
         sender.set_key("alice", 0, b"test-key-material-1234567890abc");
         let plaintext = b"hello-from-alice";
         let encrypted = sender
-            .encrypt_frame(&PlaintextMedia::from_encoder(plaintext.to_vec()), elementium_e2ee::MediaKind::Audio)
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(plaintext.to_vec()),
+                elementium_e2ee::MediaKind::Audio,
+            )
             .expect("encrypt should succeed with a key set");
 
         let receiver = E2eeContext::new(E2eeOptions::default());
         receiver.set_key("alice", 0, b"test-key-material-1234567890abc");
 
         let result = maybe_decrypt_event(
-            PcEvent::AudioData { mid: "1".to_string(), data: encrypted, contiguous: true },
+            PcEvent::AudioData {
+                mid: "1".to_string(),
+                data: encrypted,
+                contiguous: true,
+            },
             Some(&receiver),
         );
-        let PcEvent::AudioData { data: decrypted, .. } = result.expect("decrypt should succeed")
+        let PcEvent::AudioData {
+            data: decrypted, ..
+        } = result.expect("decrypt should succeed")
         else {
             panic!("expected AudioData variant");
         };
@@ -318,7 +369,11 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used, clippy::panic)]
     fn maybe_decrypt_event_passes_through_when_no_e2ee_configured() {
-        let event = PcEvent::AudioData { mid: "1".to_string(), data: WireMedia::from_network(b"raw-unencrypted-opus".to_vec()), contiguous: true };
+        let event = PcEvent::AudioData {
+            mid: "1".to_string(),
+            data: WireMedia::from_network(b"raw-unencrypted-opus".to_vec()),
+            contiguous: true,
+        };
         let result = maybe_decrypt_event(event, None);
         let PcEvent::AudioData { data, .. } = result.expect("no-op passthrough should return Some")
         else {

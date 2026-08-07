@@ -236,7 +236,11 @@ fn layer2_e2ee_round_trip_returns_the_opus_payload_byte_for_byte() {
         let wire = ctx
             .encrypt_frame(&packet, MediaKind::Audio)
             .expect("encryption is configured");
-        assert_ne!(wire.as_bytes(), packet.as_bytes(), "frame must be encrypted");
+        assert_ne!(
+            wire.as_bytes(),
+            packet.as_bytes(),
+            "frame must be encrypted"
+        );
 
         let back = ctx
             .decrypt_frame(&wire, LOCAL, MediaKind::Audio)
@@ -271,7 +275,9 @@ fn layer2_audio_survives_encrypt_decrypt_decode() {
                 timestamp_us: 0,
             })
             .expect("encode");
-        let wire = ctx.encrypt_frame(&packet, MediaKind::Audio).expect("encrypt");
+        let wire = ctx
+            .encrypt_frame(&packet, MediaKind::Audio)
+            .expect("encrypt");
         let back = ctx
             .decrypt_frame(&wire, LOCAL, MediaKind::Audio)
             .expect("decrypt")
@@ -280,7 +286,10 @@ fn layer2_audio_survives_encrypt_decrypt_decode() {
     }
 
     let (corr, _) = best_correlation(&reference, &received, 1000);
-    assert!(corr > 0.9, "E2EE must not degrade the audio (correlation {corr:.3})");
+    assert!(
+        corr > 0.9,
+        "E2EE must not degrade the audio (correlation {corr:.3})"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +322,9 @@ fn layer3_every_rotation_index_decrypts_including_past_the_ring_size() {
     // Every value the trailer byte can hold, each with its key at its own index.
     for rotation in [0u8, 1, 15, 16, 17, 19, 25, 63, 128, 200, 255] {
         let ctx = e2ee_ctx(rotation);
-        let wire = ctx.encrypt_frame(&packet, MediaKind::Audio).expect("encrypt");
+        let wire = ctx
+            .encrypt_frame(&packet, MediaKind::Audio)
+            .expect("encrypt");
 
         // The encoder writes the index it was given; a real peer writes the same counter.
         assert_eq!(
@@ -323,7 +334,11 @@ fn layer3_every_rotation_index_decrypts_including_past_the_ring_size() {
         );
 
         let back = ctx
-            .decrypt_frame(&WireMedia::from_network(wire.as_bytes().to_vec()), LOCAL, MediaKind::Audio)
+            .decrypt_frame(
+                &WireMedia::from_network(wire.as_bytes().to_vec()),
+                LOCAL,
+                MediaKind::Audio,
+            )
             .unwrap_or_else(|e| panic!("rotation {rotation} must decrypt: {e}"))
             .unwrap_or_else(|| panic!("rotation {rotation} found no key"));
         assert_eq!(back.as_bytes(), packet.as_bytes(), "rotation {rotation}");
@@ -453,7 +468,10 @@ fn empty_video_buffer() -> elementium_webrtc::engine::VideoFrameBuffer {
 ///
 /// Returns the ratio so callers can report it even when it passes -- a run at 0.91 and a
 /// run at 1.00 are very different states of health, and a bare pass hides that.
-async fn measure_sfu_delivery(policy_for: impl Fn() -> EncryptionPolicy, frame_count: usize) -> f64 {
+async fn measure_sfu_delivery(
+    policy_for: impl Fn() -> EncryptionPolicy,
+    frame_count: usize,
+) -> f64 {
     let capture = shared_capture();
     capture.clear();
 

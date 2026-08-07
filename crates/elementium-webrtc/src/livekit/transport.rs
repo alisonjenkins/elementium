@@ -323,12 +323,17 @@ fn pc_io_loop(
             match peer_connection::poll_once(&mut pc, &socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        if let Some(event) =
-                            log_and_decrypt_event(event, e2ee.as_context(), &mut inbound_audio_count)
-                            && event_tx.try_send(event).is_err()
+                        if let Some(event) = log_and_decrypt_event(
+                            event,
+                            e2ee.as_context(),
+                            &mut inbound_audio_count,
+                        ) && event_tx.try_send(event).is_err()
                         {
                             dropped_events = dropped_events.saturating_add(1);
-                            tracing::warn!(dropped_events, "PcEvent dropped: event_tx to room.rs full");
+                            tracing::warn!(
+                                dropped_events,
+                                "PcEvent dropped: event_tx to room.rs full"
+                            );
                         }
                     }
                     deadline
@@ -425,7 +430,10 @@ fn write_encrypted_or_drop(
     let Some(data) = crate::e2ee_io::encrypt_or_drop(e2ee, data, kind, label) else {
         counters.encrypt_dropped = counters.encrypt_dropped.saturating_add(1);
         counters.last_failure = Some("e2ee encryption failed".to_owned());
-        if counters.offered.is_multiple_of(PublishCounters::REPORT_EVERY) {
+        if counters
+            .offered
+            .is_multiple_of(PublishCounters::REPORT_EVERY)
+        {
             counters.report(label);
         }
         return;
@@ -446,7 +454,10 @@ fn write_encrypted_or_drop(
         }
     }
 
-    if counters.offered.is_multiple_of(PublishCounters::REPORT_EVERY) {
+    if counters
+        .offered
+        .is_multiple_of(PublishCounters::REPORT_EVERY)
+    {
         counters.report(label);
     }
 }

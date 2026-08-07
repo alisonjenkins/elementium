@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
+use str0m::channel::{ChannelConfig, Reliability};
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
-use str0m::channel::{ChannelConfig, Reliability};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use elementium_types::{
@@ -60,7 +60,11 @@ pub enum PcEvent<P = PlaintextMedia> {
     /// harsh broadband noise bursts audible as "digital screeching", not just an
     /// occasional click. Carried through so the playback pipeline can call Opus's
     /// packet-loss concealment for the gap before decoding the real packet.
-    AudioData { mid: String, data: P, contiguous: bool },
+    AudioData {
+        mid: String,
+        data: P,
+        contiguous: bool,
+    },
     /// Received video data (VP8 packet) on a specific remote track. See `AudioData` for
     /// why `mid` is required.
     VideoData { mid: String, data: P },
@@ -327,7 +331,11 @@ impl TransceiverInfo {
             Some("inactive") => Direction::Inactive,
             _ => Direction::SendRecv,
         };
-        Self { kind, direction, track_id }
+        Self {
+            kind,
+            direction,
+            track_id,
+        }
     }
 }
 
@@ -416,7 +424,9 @@ pub fn create_offer(
 ///
 /// Returns an error if no answer has been cached, i.e. `set_remote_description`
 /// was not called with an offer first.
-pub fn create_answer(pc: &mut PeerConnectionInner) -> Result<SessionDescription, crate::error::WebRtcError> {
+pub fn create_answer(
+    pc: &mut PeerConnectionInner,
+) -> Result<SessionDescription, crate::error::WebRtcError> {
     pc.cached_answer
         .take()
         .ok_or_else(|| "No cached answer — call set_remote_description(offer) first".into())
@@ -572,7 +582,10 @@ fn audio_wallclock(epoch: Instant, rtp_offset: u64, now: Instant) -> Instant {
 ///
 /// Never panics: `48_000` is a non-zero literal, so the internal `NonZeroU32`
 /// construction always succeeds.
-pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &WireMedia) -> Result<(), crate::error::WebRtcError> {
+pub fn write_audio(
+    pc: &mut PeerConnectionInner,
+    opus_data: &WireMedia,
+) -> Result<(), crate::error::WebRtcError> {
     let opus_data = opus_data.as_bytes();
     let mid = pc.audio_mid.ok_or("No audio mid configured")?;
 
@@ -624,7 +637,10 @@ pub fn write_audio(pc: &mut PeerConnectionInner, opus_data: &WireMedia) -> Resul
 ///
 /// Never panics: `90_000` is a non-zero literal, so the internal `NonZeroU32`
 /// construction always succeeds.
-pub fn write_video(pc: &mut PeerConnectionInner, vp8_data: &WireMedia) -> Result<(), crate::error::WebRtcError> {
+pub fn write_video(
+    pc: &mut PeerConnectionInner,
+    vp8_data: &WireMedia,
+) -> Result<(), crate::error::WebRtcError> {
     let vp8_data = vp8_data.as_bytes();
     let mid = pc.video_mid.ok_or("No video mid configured")?;
 
@@ -793,7 +809,9 @@ pub fn recv_and_feed(
                 .get(..len)
                 .ok_or("received length exceeds recv buffer")?;
             let pkt_type = classify_packet(recv_slice);
-            if pc.recv_log_count <= 20 || pc.recv_log_count.is_multiple_of(100) || pkt_type != "STUN"
+            if pc.recv_log_count <= 20
+                || pc.recv_log_count.is_multiple_of(100)
+                || pkt_type != "STUN"
             {
                 tracing::info!(pc_id = %pc.id, %source, len, count = pc.recv_log_count, pkt_type, "UDP received");
             }
@@ -816,9 +834,7 @@ pub fn recv_and_feed(
                     proto: Protocol::Udp,
                     source,
                     destination: dest,
-                    contents: contents_slice
-                        .try_into()
-                        .map_err(|e| format!("{e:?}"))?,
+                    contents: contents_slice.try_into().map_err(|e| format!("{e:?}"))?,
                 },
             );
             pc.rtc
@@ -991,8 +1007,8 @@ impl AudioSendPacing {
         self.packets = self.packets.saturating_add(1);
 
         if let Some(last) = self.last_send {
-            let gap_us = u64::try_from(now.saturating_duration_since(last).as_micros())
-                .unwrap_or(u64::MAX);
+            let gap_us =
+                u64::try_from(now.saturating_duration_since(last).as_micros()).unwrap_or(u64::MAX);
             self.gaps = self.gaps.saturating_add(1);
             self.total_gap_us = self.total_gap_us.saturating_add(gap_us);
             self.max_gap_us = self.max_gap_us.max(gap_us);
@@ -1058,8 +1074,8 @@ fn record_audio_send(pc: &mut PeerConnectionInner, contents: &[u8], now: Instant
 
 const fn classify_packet(data: &[u8]) -> &'static str {
     match data.first() {
-        Some(0..=3) => "STUN",       // STUN Binding Request/Response/Indication
-        Some(20..=63) => "DTLS",      // DTLS records (ContentType: 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=ApplicationData)
+        Some(0..=3) => "STUN",         // STUN Binding Request/Response/Indication
+        Some(20..=63) => "DTLS", // DTLS records (ContentType: 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=ApplicationData)
         Some(128..=191) => "RTP/RTCP", // RTP (128-191) or RTCP
         Some(b) => {
             if *b == 0 || *b == 1 {
@@ -1177,16 +1193,27 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
                         "Inbound audio frame arrived OUT OF ORDER: scrambles decoded audio in time"
                     );
                 }
-                Some(PcEvent::AudioData { mid, data: WireMedia::from_network(data.data), contiguous })
+                Some(PcEvent::AudioData {
+                    mid,
+                    data: WireMedia::from_network(data.data),
+                    contiguous,
+                })
             } else if codec == Codec::Vp8 {
-                Some(PcEvent::VideoData { mid, data: WireMedia::from_network(data.data) })
+                Some(PcEvent::VideoData {
+                    mid,
+                    data: WireMedia::from_network(data.data),
+                })
             } else if codec == Codec::Unknown
                 && pc.remote_mids.get(&data.mid) == Some(&MediaKind::Audio)
             {
                 // Almost certainly RFC 2198 RED (str0m has no "red" Codec variant, so RED
                 // packets land here as Unknown) -- unwrap it instead of dropping it.
                 if let Some(primary) = unwrap_red_primary(&data.data) {
-                    Some(PcEvent::AudioData { mid, data: WireMedia::from_network(primary.to_vec()), contiguous })
+                    Some(PcEvent::AudioData {
+                        mid,
+                        data: WireMedia::from_network(primary.to_vec()),
+                        contiguous,
+                    })
                 } else {
                     tracing::warn!(pc_id = %pc.id, mid, len = data.data.len(), "Unhandled audio codec on inbound media (not RED-decodable), dropping");
                     None
@@ -1248,7 +1275,9 @@ fn egress_stats_event(pc_id: &str, stats: &str0m::stats::MediaEgressStats) -> Wi
 ///
 /// A poisoned lock means a previous holder panicked — we recover the
 /// inner data and keep going rather than cascading the panic.
-pub(crate) fn lock_pc(handle: &PeerConnectionHandle) -> std::sync::MutexGuard<'_, PeerConnectionInner> {
+pub(crate) fn lock_pc(
+    handle: &PeerConnectionHandle,
+) -> std::sync::MutexGuard<'_, PeerConnectionInner> {
     match handle.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -1277,8 +1306,8 @@ pub(crate) fn discover_and_add_srflx(
                 if let Some(srflx_addr) = crate::stun::discover_srflx(socket, stun_addr) {
                     // Use the real local IP as the base (not 0.0.0.0)
                     let base = if local_addr.ip().is_unspecified() {
-                        let real_ip =
-                            get_local_ip().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                        let real_ip = get_local_ip()
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
                         SocketAddr::new(real_ip, local_addr.port())
                     } else {
                         local_addr
@@ -1306,10 +1335,15 @@ mod tests {
     // another thread; unwrap() on the test's own assertions is idiomatic test-fail style.
     // significant_drop_tightening false-positives on the assert! immediately after the
     // guard's last use inside its own scope.
-    #[allow(clippy::unwrap_used, clippy::panic, clippy::significant_drop_tightening)]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::significant_drop_tightening
+    )]
     fn lock_pc_recovers_from_a_poisoned_lock() {
-        let handle: PeerConnectionHandle =
-            std::sync::Arc::new(std::sync::Mutex::new(create_peer_connection("test-pc".to_string())));
+        let handle: PeerConnectionHandle = std::sync::Arc::new(std::sync::Mutex::new(
+            create_peer_connection("test-pc".to_string()),
+        ));
 
         // Poison the lock by panicking while holding it, on another thread.
         let poison_handle = handle.clone();
@@ -1346,7 +1380,10 @@ mod tests {
             .expect("timeout is not an error");
         let elapsed = start.elapsed();
 
-        assert!(!received, "no datagram was sent; must report no data received");
+        assert!(
+            !received,
+            "no datagram was sent; must report no data received"
+        );
         assert!(
             elapsed < Duration::from_millis(500),
             "must not hang well past the requested timeout, took {elapsed:?}"
@@ -1384,7 +1421,10 @@ mod tests {
         // Case 1: no redundant blocks yet (e.g. the very first packet of a stream). Just
         // a 1-byte primary header (F=0, PT=111) followed by the primary payload.
         let primary_only = [&[0x6F][..], &[0xAA, 0xBB, 0xCC]].concat();
-        assert_eq!(unwrap_red_primary(&primary_only), Some(&[0xAA, 0xBB, 0xCC][..]));
+        assert_eq!(
+            unwrap_red_primary(&primary_only),
+            Some(&[0xAA, 0xBB, 0xCC][..])
+        );
 
         // Case 2: one redundant block (an older, already-decoded frame carried again for
         // loss resilience) followed by the primary block -- the steady-state shape once a
@@ -1404,7 +1444,10 @@ mod tests {
             &primary_payload[..],
         ]
         .concat();
-        assert_eq!(unwrap_red_primary(&with_redundancy), Some(&primary_payload[..]));
+        assert_eq!(
+            unwrap_red_primary(&with_redundancy),
+            Some(&primary_payload[..])
+        );
     }
 
     /// Malformed/truncated RED framing must fail closed (`None`), never panic or return
@@ -1476,7 +1519,7 @@ mod audio_wallclock_tests {
 
 #[cfg(test)]
 mod audio_send_pacing_tests {
-    use super::{rtp_payload_type, AudioSendPacing};
+    use super::{AudioSendPacing, rtp_payload_type};
     use std::time::{Duration, Instant};
 
     /// Minimal 12-byte RTP header: version 2, the given `[marker:1][pt:7]` byte, rest zero.
@@ -1681,14 +1724,20 @@ mod offer_track_id_tests {
             Some(first_mid),
             "the audio transceiver must keep its original mid across a renegotiation"
         );
-        assert!(pc.video_mid.is_some(), "the new video transceiver must be added");
+        assert!(
+            pc.video_mid.is_some(),
+            "the new video transceiver must be added"
+        );
         assert_ne!(pc.video_mid, pc.audio_mid);
     }
 }
 
 #[cfg(test)]
 mod ice_disconnect_tests {
-    use super::{ICE_DISCONNECT_GRACE, IceState, create_peer_connection, ice_disconnect_expired, note_ice_state};
+    use super::{
+        ICE_DISCONNECT_GRACE, IceState, create_peer_connection, ice_disconnect_expired,
+        note_ice_state,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1708,7 +1757,10 @@ mod ice_disconnect_tests {
     #[test]
     fn a_disconnection_past_the_grace_period_expires() {
         let since = Instant::now();
-        assert!(ice_disconnect_expired(Some(since), since + ICE_DISCONNECT_GRACE));
+        assert!(ice_disconnect_expired(
+            Some(since),
+            since + ICE_DISCONNECT_GRACE
+        ));
     }
 
     /// The whole point: `Disconnected` must not kill the connection on its own.
@@ -1720,7 +1772,10 @@ mod ice_disconnect_tests {
     fn disconnecting_does_not_kill_the_connection() {
         let mut pc = create_peer_connection("test".to_owned());
         note_ice_state(&mut pc, IceState::Disconnected);
-        assert!(pc.alive, "a disconnection must not mark the connection dead");
+        assert!(
+            pc.alive,
+            "a disconnection must not mark the connection dead"
+        );
         assert!(pc.ice_disconnected_since.is_some(), "the clock must start");
     }
 
@@ -1757,7 +1812,10 @@ mod local_candidate_tests {
             assert!(!ip.is_loopback(), "loopback must not be advertised: {ip}");
             match ip {
                 std::net::IpAddr::V4(v4) => {
-                    assert!(!v4.is_link_local(), "link-local must not be advertised: {v4}");
+                    assert!(
+                        !v4.is_link_local(),
+                        "link-local must not be advertised: {v4}"
+                    );
                 }
                 std::net::IpAddr::V6(v6) => {
                     assert!(

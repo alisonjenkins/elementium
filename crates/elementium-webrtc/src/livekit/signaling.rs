@@ -47,9 +47,7 @@ impl SignalSender {
     /// Returns [`SignalError::ChannelClosed`] if the writer task has stopped
     /// and the outgoing channel is closed.
     pub fn send(&self, msg: signal_request::Message) -> Result<(), SignalError> {
-        let req = SignalRequest {
-            message: Some(msg),
-        };
+        let req = SignalRequest { message: Some(msg) };
         self.tx.send(req).map_err(|_| SignalError::ChannelClosed)
     }
 }
@@ -187,17 +185,12 @@ fn build_ws_url(sfu_url: &str, token: &str) -> Result<String, SignalError> {
     Ok(url.to_string())
 }
 
-type WsWrite = futures_util::stream::SplitSink<
-    WebSocketStream<MaybeTlsStream<TcpStream>>,
-    WsMessage,
->;
+type WsWrite =
+    futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 type WsRead = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Background task: reads outgoing `SignalRequests`, encodes to protobuf, sends to WebSocket.
-async fn ws_writer_loop(
-    mut rx: mpsc::UnboundedReceiver<SignalRequest>,
-    mut ws_write: WsWrite,
-) {
+async fn ws_writer_loop(mut rx: mpsc::UnboundedReceiver<SignalRequest>, mut ws_write: WsWrite) {
     while let Some(req) = rx.recv().await {
         let mut buf = Vec::with_capacity(req.encoded_len());
         if let Err(e) = req.encode(&mut buf) {

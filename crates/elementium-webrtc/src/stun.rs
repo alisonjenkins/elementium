@@ -159,12 +159,7 @@ fn parse_binding_response(data: &[u8], transaction_id: &[u8; 12]) -> Option<Sock
     }
 
     // Verify magic cookie
-    let cookie = u32::from_be_bytes([
-        *data.get(4)?,
-        *data.get(5)?,
-        *data.get(6)?,
-        *data.get(7)?,
-    ]);
+    let cookie = u32::from_be_bytes([*data.get(4)?, *data.get(5)?, *data.get(6)?, *data.get(7)?]);
     if cookie != MAGIC_COOKIE {
         tracing::debug!("Invalid STUN magic cookie");
         return None;
@@ -232,12 +227,8 @@ fn parse_xor_mapped_address(data: &[u8], transaction_id: &[u8; 12]) -> Option<So
     match family {
         0x01 => {
             // IPv4
-            let xor_ip = u32::from_be_bytes([
-                *data.get(4)?,
-                *data.get(5)?,
-                *data.get(6)?,
-                *data.get(7)?,
-            ]);
+            let xor_ip =
+                u32::from_be_bytes([*data.get(4)?, *data.get(5)?, *data.get(6)?, *data.get(7)?]);
             let ip = xor_ip ^ MAGIC_COOKIE;
             let addr = std::net::Ipv4Addr::from(ip);
             Some(SocketAddr::new(std::net::IpAddr::V4(addr), port))
@@ -280,12 +271,8 @@ fn parse_mapped_address(data: &[u8]) -> Option<SocketAddr> {
 
     match family {
         0x01 => {
-            let ip = std::net::Ipv4Addr::new(
-                *data.get(4)?,
-                *data.get(5)?,
-                *data.get(6)?,
-                *data.get(7)?,
-            );
+            let ip =
+                std::net::Ipv4Addr::new(*data.get(4)?, *data.get(5)?, *data.get(6)?, *data.get(7)?);
             Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
         }
         _ => None,
@@ -388,7 +375,16 @@ mod tests {
         let xor_port = (port ^ cookie_high).to_be_bytes();
         let xor_ip = (u32::from_be_bytes(ip) ^ MAGIC_COOKIE).to_be_bytes();
         let _ = tid; // XOR-MAPPED-ADDRESS IPv4 doesn't mix in the transaction id
-        vec![0x00, 0x01, xor_port[0], xor_port[1], xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]]
+        vec![
+            0x00,
+            0x01,
+            xor_port[0],
+            xor_port[1],
+            xor_ip[0],
+            xor_ip[1],
+            xor_ip[2],
+            xor_ip[3],
+        ]
     }
 
     fn mapped_address_attr(ip: [u8; 4], port: u16) -> Vec<u8> {

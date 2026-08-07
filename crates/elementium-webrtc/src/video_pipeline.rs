@@ -74,7 +74,10 @@ impl VideoPipeline {
                 };
 
                 match event {
-                    Some(PcEvent::VideoData { mid, data: vp8_packet }) => {
+                    Some(PcEvent::VideoData {
+                        mid,
+                        data: vp8_packet,
+                    }) => {
                         let decoder = match decoders.entry(mid.clone()) {
                             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                             std::collections::hash_map::Entry::Vacant(v) => match Vp8Decoder::new()
@@ -91,8 +94,7 @@ impl VideoPipeline {
                             Ok(frames) => {
                                 for i420_frame in frames {
                                     // Convert I420 to RGBA for display
-                                    let rgba_frame =
-                                        elementium_codec::i420_to_rgba(&i420_frame);
+                                    let rgba_frame = elementium_codec::i420_to_rgba(&i420_frame);
 
                                     // Store in the shared frame buffer.
                                     if let Ok(mut buf) = frame_buffer.lock() {
@@ -133,4 +135,3 @@ impl Default for VideoPipeline {
         Self::new()
     }
 }
-

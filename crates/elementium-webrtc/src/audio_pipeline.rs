@@ -29,7 +29,12 @@ use crate::peer_connection::PcEvent;
 /// [`PlaintextMedia`]: the type proves the bytes crossed the decryption boundary, this
 /// proves the peer's idea of "plaintext" matches ours. Failing it means playing the bytes
 /// would emit noise at the user, so the caller drops the packet instead.
-fn is_decodable_opus(decoder: &OpusDecoder, packet: &PlaintextMedia, pc_id: &str, mid: &str) -> bool {
+fn is_decodable_opus(
+    decoder: &OpusDecoder,
+    packet: &PlaintextMedia,
+    pc_id: &str,
+    mid: &str,
+) -> bool {
     let toc_byte = packet.as_bytes().first().copied().unwrap_or(0);
     match decoder.packet_sample_count(packet) {
         Ok(_) => true,
@@ -112,7 +117,11 @@ pub fn start_playback(
             match event {
                 // `contiguous` intentionally unused -- see the comment below on why
                 // gap-triggered concealment is disabled.
-                Some(PcEvent::AudioData { mid, data: opus_packet, contiguous: _ }) => {
+                Some(PcEvent::AudioData {
+                    mid,
+                    data: opus_packet,
+                    contiguous: _,
+                }) => {
                     let is_new_track = seen_mids.insert(mid.clone());
                     if is_new_track {
                         tracing::info!(
@@ -218,4 +227,3 @@ pub fn start_playback(
 
     Ok(())
 }
-

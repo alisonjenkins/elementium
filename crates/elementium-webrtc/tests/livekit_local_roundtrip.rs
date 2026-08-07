@@ -119,8 +119,8 @@ fn sine_wave_chunks(duration_ms: u32, freq_hz: f32) -> Vec<Vec<f32>> {
     for _ in 0..num_chunks {
         let mut chunk = Vec::with_capacity(SAMPLES_PER_CHUNK * 2);
         for _ in 0..SAMPLES_PER_CHUNK {
-            let t = f32::from(u16::try_from(sample_index % SAMPLE_RATE).unwrap_or(0))
-                / SAMPLE_RATE_F32;
+            let t =
+                f32::from(u16::try_from(sample_index % SAMPLE_RATE).unwrap_or(0)) / SAMPLE_RATE_F32;
             let sample = (t * freq_hz * std::f32::consts::TAU).sin() * 0.5;
             chunk.push(sample); // left
             chunk.push(sample); // right

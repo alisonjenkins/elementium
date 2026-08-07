@@ -147,7 +147,10 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| s.get(i..i.saturating_add(2)).and_then(|b| u8::from_str_radix(b, 16).ok()))
+        .map(|i| {
+            s.get(i..i.saturating_add(2))
+                .and_then(|b| u8::from_str_radix(b, 16).ok())
+        })
         .collect()
 }
 
@@ -164,27 +167,35 @@ async fn main() {
     let sfu = arg("--sfu").unwrap_or_else(|| "http://127.0.0.1:7880".to_owned());
     let room = arg("--room").expect("--room is required");
     let identity = arg("--identity").unwrap_or_else(|| "rust-publisher".to_owned());
-    let seconds: u64 = arg("--seconds")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let seconds: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(20);
 
     let rotate_frames: u64 = arg("--rotate-frames")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let bad_frames: u64 = arg("--bad-frames").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let bad_frames: u64 = arg("--bad-frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
-    let base_key = arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
+    let base_key =
+        arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
     let ctx = base_key.as_ref().map(|material| {
         let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
         ctx.set_local_identity(&identity);
         // Start on a key the far end does not have, if asked: `--bad-frames` needs the
         // first frames to be undecryptable, and encrypting with the wrong key is exactly
         // what the receiver sees when it has not yet been given the right one.
-        let start = if bad_frames > 0 { wrong_key(material) } else { rotated_key(material, 0) };
+        let start = if bad_frames > 0 {
+            wrong_key(material)
+        } else {
+            rotated_key(material, 0)
+        };
         ctx.set_key(&identity, 0, &start);
         ctx
     });
-    let policy = ctx.clone().map_or(EncryptionPolicy::ExplicitlyUnencrypted, EncryptionPolicy::Encrypted);
+    let policy = ctx.clone().map_or(
+        EncryptionPolicy::ExplicitlyUnencrypted,
+        EncryptionPolicy::Encrypted,
+    );
 
     let video_frames: elementium_webrtc::engine::VideoFrameBuffer =
         Arc::new(Mutex::new(HashMap::new()));
@@ -254,9 +265,7 @@ async fn main() {
         }
 
         let frame = tone_frame(sample_index);
-        sample_index = sample_index.wrapping_add(
-            u32::try_from(FRAME_SAMPLES).unwrap_or(960),
-        );
+        sample_index = sample_index.wrapping_add(u32::try_from(FRAME_SAMPLES).unwrap_or(960));
         if let Ok(packet) = encoder.encode(&AudioFrame {
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
