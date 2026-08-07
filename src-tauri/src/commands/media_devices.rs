@@ -17,7 +17,7 @@ use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::device_enumeration;
 use elementium_types::observability::CorrelationId;
 use elementium_types::{
-    AudioFrame, MediaConstraints, MediaDevice, NetworkLossEstimate, TrackId, VideoFrame,
+    AudioFrame, MediaConstraints, MediaDevice, NetworkLossEstimate, TrackId,
 };
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
@@ -38,6 +38,8 @@ pub struct CameraPipelineHandle {
     /// receivers asking at once still means "one keyframe, now", and the encoder thread
     /// only cares about the latest state. Cleared when the keyframe is produced.
     pub keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// The codec the SFU currently wants from us, which can change mid-call.
+    pub active_codec: Arc<ActiveCodec>,
 }
 
 /// Handle to a running audio capture pipeline.
@@ -290,6 +292,8 @@ pub async fn get_user_media(
         let encode_tx_clone = encode_tx.clone();
         let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let keyframe_requested_clone = keyframe_requested.clone();
+        let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
+        let active_codec_clone = active_codec.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let tid = track_id.0.clone();
 
@@ -310,6 +314,7 @@ pub async fn get_user_media(
                 &video_frames,
                 &encode_tx_clone,
                 &keyframe_requested_clone,
+                &active_codec_clone,
                 &stop_rx,
                 req_width,
                 req_height,
@@ -324,6 +329,7 @@ pub async fn get_user_media(
                 stop_tx,
                 encode_tx,
                 keyframe_requested,
+                active_codec,
             });
         }
 
@@ -458,13 +464,64 @@ const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// one before the first has arrived. Roughly one round trip on a poor link.
 const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// The codec used for outbound video.
+/// The codec used for outbound video until negotiation says otherwise.
 ///
-/// A constant only until SDP negotiation is threaded through to here: the far end decides
-/// what it can decode, and the capture path is already written against the trait, so
-/// honouring that choice becomes a matter of passing the negotiated value rather than
-/// changing how frames are encoded.
-const NEGOTIATED_VIDEO_CODEC: VideoCodec = VideoCodec::Vp8;
+/// VP8 because it is the one every peer speaks. The live value is carried by
+/// [`ActiveCodec`], which the SFU can change mid-call.
+const DEFAULT_VIDEO_CODEC: VideoCodec = VideoCodec::Vp8;
+
+/// The codec the capture pipeline should currently be encoding with.
+///
+/// Shared rather than passed, and mutable during a call, because the answer changes while
+/// the call is running. A room where everyone supports AV1 gains a participant who does
+/// not: the SFU does not transcode, so either that participant sees nothing or the
+/// publisher regresses to a codec they can decode. `LiveKit` signals this through
+/// `BackupCodecPolicy` and `SubscribedCodec`, and the encoder has to be able to follow.
+///
+/// A level rather than an event, like the keyframe request: several notifications still
+/// mean "encode with this now", and the capture thread only cares about the latest value.
+#[derive(Debug)]
+pub struct ActiveCodec(std::sync::atomic::AtomicU8);
+
+impl ActiveCodec {
+    /// Start with `codec`.
+    #[must_use]
+    pub const fn new(codec: VideoCodec) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Self::encode(codec)))
+    }
+
+    /// The codec to encode with now.
+    #[must_use]
+    pub fn get(&self) -> VideoCodec {
+        Self::decode(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Ask for a different codec from the next frame on.
+    pub fn set(&self, codec: VideoCodec) {
+        self.0
+            .store(Self::encode(codec), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `VideoCodec` as an atom. An explicit mapping rather than a cast, so adding a codec
+    /// is a compile error here rather than a value that silently decodes as another.
+    const fn encode(codec: VideoCodec) -> u8 {
+        match codec {
+            VideoCodec::Vp8 => 0,
+            VideoCodec::H264 => 1,
+            VideoCodec::Av1 => 2,
+        }
+    }
+
+    /// Inverse of [`ActiveCodec::encode`]. Anything unrecognised falls back to the codec
+    /// every peer speaks, because a wrong codec is worse than a slow one.
+    const fn decode(raw: u8) -> VideoCodec {
+        match raw {
+            1 => VideoCodec::H264,
+            2 => VideoCodec::Av1,
+            _ => DEFAULT_VIDEO_CODEC,
+        }
+    }
+}
 
 /// The fastest we encode, regardless of how fast the camera runs.
 ///
@@ -549,6 +606,7 @@ fn camera_pipeline_loop(
     video_frames: &VideoFrameBuffer,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
+    active_codec: &Arc<ActiveCodec>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     req_width: Option<u32>,
     req_height: Option<u32>,
@@ -647,6 +705,7 @@ fn camera_pipeline_loop(
                     &mut encoder,
                     &mut last_keyframe,
                     keyframe_requested,
+                    active_codec,
                     encode_tx,
                 );
             }
@@ -665,13 +724,15 @@ fn ensure_encoder(
     encoder: &mut Option<NegotiatedEncoder>,
     frame: &elementium_types::I420Frame,
     last_keyframe: &mut std::time::Instant,
+    wanted: VideoCodec,
 ) {
-    // Rebuilt if the source renegotiates its geometry: an encoder rejects a frame whose
-    // size does not match its configuration, so a mid-stream resolution change would
-    // otherwise fail every frame from then on and stop the video permanently.
+    // Rebuilt when the geometry changes, because an encoder rejects a frame whose size
+    // does not match its configuration and would otherwise fail every frame from then on;
+    // and when the codec changes, because the SFU can ask us to regress mid-call once a
+    // participant joins who cannot decode what everyone else could.
     if encoder
         .as_ref()
-        .is_some_and(|e| e.size() == (frame.width(), frame.height()))
+        .is_some_and(|e| e.size() == (frame.width(), frame.height()) && e.codec() == wanted)
     {
         return;
     }
@@ -683,21 +744,24 @@ fn ensure_encoder(
         bitrate_kbps: bitrate,
         max_framerate: u32::try_from(MAX_ENCODE_FPS).unwrap_or(30),
     };
-    match NegotiatedEncoder::new(NEGOTIATED_VIDEO_CODEC, config) {
+    match NegotiatedEncoder::new(wanted, config) {
         Ok(enc) => {
             tracing::info!(
                 width = frame.width(),
                 height = frame.height(),
                 bitrate_kbps = bitrate,
                 max_fps = MAX_ENCODE_FPS,
-                codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),
+                codec = wanted.sdp_name(),
                 "video encoder created for camera"
             );
             *encoder = Some(enc);
             *last_keyframe = std::time::Instant::now();
         }
+        // Left as-is on failure rather than cleared: an encoder that already works is
+        // better than none, and a codec we cannot build is a negotiation fault to report,
+        // not a reason to stop sending video.
         Err(e) => tracing::error!(
-            codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),
+            codec = wanted.sdp_name(),
             "Failed to create video encoder: {e}"
         ),
     }
@@ -763,10 +827,14 @@ fn encode_and_send_video_frame(
     encoder: &mut Option<NegotiatedEncoder>,
     last_keyframe: &mut std::time::Instant,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
+    active_codec: &Arc<ActiveCodec>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
-    let existed = encoder.is_some();
-    ensure_encoder(encoder, frame, last_keyframe);
+    let wanted = active_codec.get();
+    let existed = encoder
+        .as_ref()
+        .is_some_and(|e| e.codec() == wanted);
+    ensure_encoder(encoder, frame, last_keyframe, wanted);
 
     let Some(enc) = encoder.as_mut() else {
         return;
@@ -1302,5 +1370,48 @@ mod requested_fps_tests {
         assert_eq!(requested_fps(0.0), 1, "clamped, not zero");
         assert_eq!(requested_fps(-5.0), 1);
         assert_eq!(requested_fps(100_000.0), 120, "clamped to the highest offered");
+    }
+}
+
+#[cfg(test)]
+mod active_codec_tests {
+    use super::{ActiveCodec, DEFAULT_VIDEO_CODEC};
+    use elementium_codec::VideoCodec;
+
+    /// The codec must be changeable while a call is running.
+    ///
+    /// The case this exists for: a room where everyone decodes AV1 gains a participant who
+    /// cannot. The SFU does not transcode, so the publisher has to move -- and it has to
+    /// move without restarting the track, because renegotiating drops video for everyone
+    /// to accommodate one late arrival.
+    #[test]
+    fn the_codec_can_change_during_a_call() {
+        let active = ActiveCodec::new(VideoCodec::Av1);
+        assert_eq!(active.get(), VideoCodec::Av1);
+
+        active.set(VideoCodec::Vp8);
+        assert_eq!(active.get(), VideoCodec::Vp8, "regression must take effect");
+
+        active.set(VideoCodec::H264);
+        assert_eq!(active.get(), VideoCodec::H264, "and be able to move again");
+    }
+
+    /// Every codec must survive the round trip through the shared cell. A mapping that
+    /// loses one would encode with a codec nobody agreed to, which the far end receives as
+    /// undecodable video.
+    #[test]
+    fn every_codec_round_trips() {
+        for &codec in VideoCodec::all() {
+            let active = ActiveCodec::new(codec);
+            assert_eq!(active.get(), codec, "{codec:?} did not survive");
+        }
+    }
+
+    /// An unrecognised value must decode to the codec every peer speaks. A wrong codec is
+    /// worse than a slow one: it produces video nobody can decode.
+    #[test]
+    fn the_default_is_the_universally_supported_codec() {
+        assert_eq!(DEFAULT_VIDEO_CODEC, VideoCodec::Vp8);
+        assert_eq!(ActiveCodec::new(DEFAULT_VIDEO_CODEC).get(), VideoCodec::Vp8);
     }
 }

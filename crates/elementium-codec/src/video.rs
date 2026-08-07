@@ -93,6 +93,20 @@ impl VideoCodec {
         }
     }
 
+    /// Match an RTP mime type, as the SFU reports its enabled codecs.
+    ///
+    /// The SFU sends `enabled_publish_codecs` as mime strings such as `video/H264`.
+    /// Matching is case-insensitive because the case is not guaranteed and a mismatch
+    /// would silently drop a codec the server does in fact allow.
+    #[must_use]
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        let name = mime.rsplit('/').next()?;
+        Self::all()
+            .iter()
+            .copied()
+            .find(|codec| codec.sdp_name().eq_ignore_ascii_case(name))
+    }
+
     /// The RTP clock rate, in Hz.
     ///
     /// 90kHz for every video codec RTP carries; kept as a method rather than a constant
@@ -416,5 +430,17 @@ mod tests {
     fn codecs_report_their_wire_identity() {
         assert_eq!(VideoCodec::Vp8.sdp_name(), "VP8");
         assert_eq!(VideoCodec::Vp8.clock_rate(), 90_000);
+    }
+
+    /// The SFU reports its enabled codecs as mime types, and the case is not guaranteed.
+    /// A mismatch here silently drops a codec the server does allow.
+    #[test]
+    fn mime_types_map_back_to_codecs() {
+        assert_eq!(VideoCodec::from_mime("video/VP8"), Some(VideoCodec::Vp8));
+        assert_eq!(VideoCodec::from_mime("video/h264"), Some(VideoCodec::H264));
+        assert_eq!(VideoCodec::from_mime("video/AV1"), Some(VideoCodec::Av1));
+        assert_eq!(VideoCodec::from_mime("VP8"), Some(VideoCodec::Vp8));
+        assert_eq!(VideoCodec::from_mime("audio/opus"), None);
+        assert_eq!(VideoCodec::from_mime(""), None);
     }
 }

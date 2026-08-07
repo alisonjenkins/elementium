@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State, command};
+use tauri::{AppHandle, Emitter, Manager, State, command};
 use tracing::Instrument;
 
 use elementium_types::CorrelationId;
@@ -91,9 +91,19 @@ pub async fn livekit_connect(
         // events keep the same correlation_id.
         let app_clone = app.clone();
         let forwarder_span = tracing::Span::current();
+        // Resolved from the app handle rather than taken as a parameter: the forwarder
+        // outlives this call, so it cannot borrow a `State` guard.
+        let app_for_codec = app.clone();
         tokio::spawn(
             async move {
                 while let Some(event) = event_rx.recv().await {
+                    // Acted on, not only forwarded. The SFU is the only party that knows
+                    // who is subscribed, so when it says the room has moved to a codec the
+                    // encoder must follow -- otherwise a participant who cannot decode our
+                    // stream simply sees nothing, with nothing to explain it.
+                    if let RoomEvent::PublishCodecChanged { codec, .. } = &event {
+                        apply_publish_codec(&app_for_codec.state::<MediaState>(), codec);
+                    }
                     let event_name = match &event {
                         RoomEvent::ParticipantJoined { .. } => "livekit-participant-joined",
                         RoomEvent::ParticipantLeft { .. } => "livekit-participant-left",
@@ -101,6 +111,7 @@ pub async fn livekit_connect(
                         RoomEvent::TrackUnsubscribed { .. } => "livekit-track-unsubscribed",
                         RoomEvent::ConnectionStateChanged { .. } => "livekit-connection-state",
                         RoomEvent::ActiveSpeakersChanged { .. } => "livekit-active-speakers",
+                        RoomEvent::PublishCodecChanged { .. } => "livekit-publish-codec-changed",
                     };
                     let _ = app_clone.emit(event_name, &event);
                 }
@@ -136,6 +147,30 @@ pub async fn livekit_publish_track(
     };
     attach_capture_pipeline(&media_state, media_tx, &kind);
     Ok(())
+}
+
+/// Tell the capture pipeline which codec the SFU wants from now on.
+///
+/// The pipeline rebuilds its encoder on the next frame. Nothing is renegotiated and the
+/// track is not restarted: a late participant who cannot decode the current codec must not
+/// cost everyone else an interruption.
+fn apply_publish_codec(media_state: &MediaState, codec: &str) {
+    let Some(codec) = elementium_codec::VideoCodec::from_mime(codec) else {
+        tracing::warn!(codec, "SFU named a codec we do not recognise; leaving the encoder alone");
+        return;
+    };
+    let Ok(guard) = media_state.camera.lock() else {
+        return;
+    };
+    let Some(camera) = guard.as_ref() else {
+        tracing::debug!(codec = codec.sdp_name(), "codec change with no camera running");
+        return;
+    };
+    if camera.active_codec.get() == codec {
+        return;
+    }
+    camera.active_codec.set(codec);
+    tracing::info!(codec = codec.sdp_name(), "switching publish codec at the SFU's request");
 }
 
 /// Point the running capture pipeline for `kind` at this room, so its encoded frames

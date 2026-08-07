@@ -64,6 +64,13 @@ pub enum RoomEvent {
         room_id: String,
         speakers: Vec<String>,
     },
+    /// The SFU has told us which codec subscribers can actually take.
+    ///
+    /// Emitted when that changes mid-call -- typically because a participant joined who
+    /// cannot decode what everyone else could. The capture pipeline follows this rather
+    /// than deciding for itself, because only the SFU knows who is subscribed.
+    #[serde(rename_all = "camelCase")]
+    PublishCodecChanged { room_id: String, codec: String },
 }
 
 /// The `LiveKit` room manages signaling, transport, and participant state.
@@ -174,6 +181,20 @@ impl LiveKitRoom {
             .as_ref()
             .map(|p| p.sid.clone())
             .unwrap_or_default();
+
+        // What the SFU will accept from us. Offering a codec it has not enabled wastes a
+        // negotiation round at best, and at worst has it forward a stream no subscriber
+        // asked for. An empty list means the server did not say.
+        let server_codecs: Vec<elementium_codec::VideoCodec> = join_response
+            .enabled_publish_codecs
+            .iter()
+            .filter_map(|c| elementium_codec::VideoCodec::from_mime(&c.mime))
+            .collect();
+        tracing::info!(
+            server_codecs = ?server_codecs.iter().map(|c| c.sdp_name()).collect::<Vec<_>>(),
+            raw = ?join_response.enabled_publish_codecs.iter().map(|c| c.mime.as_str()).collect::<Vec<_>>(),
+            "SFU published its enabled codecs"
+        );
 
         tracing::info!(
             room_id = %room_id,
@@ -326,6 +347,20 @@ impl LiveKitRoom {
                 source: track_source,
                 width: if is_video { 640 } else { 0 },
                 height: if is_video { 480 } else { 0 },
+                // How the SFU should handle a subscriber that cannot decode our codec.
+                //
+                // The case this exists for: a room where everyone supports AV1 gains a
+                // participant who does not. The SFU does not transcode, so either that
+                // participant sees nothing, or the publisher moves to a codec they can
+                // decode. `PreferRegression` asks for the second -- one stream, changed to
+                // suit the room.
+                //
+                // Not `Simulcast`, which would encode both codecs at once: that doubles
+                // the encoding cost for the whole call to accommodate one participant, and
+                // encoding cost is the reason for choosing a hardware codec in the first
+                // place.
+                backup_codec_policy: livekit_protocol::BackupCodecPolicy::PreferRegression
+                    .into(),
                 ..Default::default()
             }))
         {
@@ -554,6 +589,9 @@ fn send_room_event(tx: &mpsc::UnboundedSender<RoomEvent>, event: RoomEvent) {
         RoomEvent::ConnectionStateChanged { room_id, state } => {
             tracing::info!(room_id = %room_id, state = %state, "connection state changed");
         }
+        RoomEvent::PublishCodecChanged { room_id, codec } => {
+            tracing::info!(room_id, codec, "publish codec changed by the SFU");
+        }
         RoomEvent::ActiveSpeakersChanged { room_id, speakers } => {
             tracing::debug!(room_id = %room_id, speakers = ?speakers, "active speakers changed");
         }
@@ -730,6 +768,45 @@ async fn signal_processing_loop(
                             },
                         );
                     }
+                }
+            }
+            // The SFU telling us which codecs subscribers are actually taking.
+            //
+            // This is how a mid-call regression arrives: a room where everyone decoded AV1
+            // gains a participant who cannot, the SFU works out that the AV1 stream now has
+            // no audience, and says so here. Acting on it is the difference between that
+            // participant seeing video and seeing nothing, because the SFU does not
+            // transcode.
+            signal_response::Message::SubscribedQualityUpdate(update) => {
+                let wanted: Vec<elementium_codec::VideoCodec> = update
+                    .subscribed_codecs
+                    .iter()
+                    .filter(|c| c.qualities.iter().any(|q| q.enabled))
+                    .filter_map(|c| elementium_codec::VideoCodec::from_mime(&c.codec))
+                    .collect();
+
+                if wanted.is_empty() {
+                    tracing::debug!(
+                        track_sid = %update.track_sid,
+                        "subscriber quality update named no enabled codec"
+                    );
+                } else {
+                    tracing::info!(
+                        track_sid = %update.track_sid,
+                        codecs = ?wanted.iter().map(|c| c.sdp_name()).collect::<Vec<_>>(),
+                        "SFU reported the codecs subscribers are taking"
+                    );
+                    send_room_event(
+                        &event_tx,
+                        RoomEvent::PublishCodecChanged {
+                            room_id: room_id.clone(),
+                            codec: wanted
+                                .iter()
+                                .min_by_key(|c| c.negotiation_rank())
+                                .map_or("VP8", |c| c.sdp_name())
+                                .to_string(),
+                        },
+                    );
                 }
             }
             signal_response::Message::TrackPublished(track_published) => {

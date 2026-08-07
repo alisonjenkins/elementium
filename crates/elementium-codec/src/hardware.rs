@@ -113,21 +113,51 @@ pub fn best_backend_from(
         .map_or(EncoderBackend::Software, |c| c.backend)
 }
 
-/// The codecs worth offering in SDP, best first.
+/// The codecs worth offering, best first, limited to what the server permits.
 ///
-/// Ordering is a negotiation decision, not a preference: a codec that this machine can
-/// encode in hardware saves a core's worth of CPU on every call that uses it, so it is
-/// offered ahead of one that cannot, even if the software encoder is more mature.
+/// `server_allows` is the SFU's `enabled_publish_codecs` from its join response. Offering
+/// a codec it has not enabled wastes a negotiation round at best; at worst the SFU accepts
+/// the m-line and forwards a stream no subscriber asked for. An empty list is treated as
+/// "the server did not say", and everything is offered.
 ///
-/// VP8 stays in the list regardless, and last: everything speaks it, and it is the
-/// fallback when a peer offers nothing better.
+/// Ordering is a negotiation decision rather than a taste. Two things drive it:
+///
+/// **Hardware first.** A codec this machine encodes in hardware saves a core's worth of
+/// CPU for the whole call, which on a laptop is battery and on a desktop is whatever else
+/// the machine is doing.
+///
+/// **Then compression.** AV1 carries the same quality in roughly two thirds of H.264's
+/// bitrate, so it is preferred where both are available.
+///
+/// The two can conflict, and hardware wins deliberately. AV1 encoded in software costs
+/// far more CPU than it saves in bandwidth for a real-time call, and the SFU does not
+/// transcode -- so every subscriber must decode whatever is sent, and AV1 hardware
+/// *decode* is much rarer than AV1 hardware encode. Preferring software AV1 would spend
+/// our CPU to encode it and every peer's battery to decode it.
+///
+/// VP8 stays in the list regardless, and last: everything speaks it, and it is what
+/// [`BackupCodecPolicy`](https://docs.rs/livekit-protocol) regression falls back to.
 #[must_use]
-pub fn negotiation_order(width: u32, height: u32) -> Vec<VideoCodec> {
+pub fn negotiation_order(
+    width: u32,
+    height: u32,
+    server_allows: &[VideoCodec],
+) -> Vec<VideoCodec> {
     let caps = available_encoders();
-    let mut codecs: Vec<VideoCodec> = VideoCodec::all().to_vec();
+    let mut codecs: Vec<VideoCodec> = VideoCodec::all()
+        .iter()
+        .copied()
+        .filter(|codec| server_allows.is_empty() || server_allows.contains(codec))
+        // A codec we cannot actually produce must never be offered: the far end would
+        // agree to it and then receive nothing.
+        .filter(|&codec| {
+            VideoCodec::software_supported().contains(&codec)
+                || best_backend_from(&caps, codec, width, height).is_hardware()
+        })
+        .collect();
+
     codecs.sort_by_key(|&codec| {
         let hardware = best_backend_from(&caps, codec, width, height).is_hardware();
-        // Hardware first, then the codec's own preference order.
         (!hardware, codec.negotiation_rank())
     });
     codecs
@@ -274,20 +304,37 @@ mod tests {
         );
     }
 
-    /// Codecs this machine can encode in hardware are offered first, because the saving is
-    /// a core's worth of CPU on every call that uses one.
+    /// A codec with no encoder must never be offered. The far end would agree to it and
+    /// then receive nothing, which is worse than never having offered it.
     #[test]
-    fn negotiation_offers_every_codec() {
-        let order = negotiation_order(1280, 720);
+    fn only_codecs_we_can_actually_produce_are_offered() {
+        let order = negotiation_order(1280, 720, &[]);
         assert!(
             order.contains(&VideoCodec::Vp8),
             "VP8 must always be offered: it is the one every peer speaks"
         );
-        assert_eq!(
-            order.len(),
-            VideoCodec::all().len(),
-            "every codec must be offered, ordered rather than filtered"
+        for codec in &order {
+            assert!(
+                VideoCodec::software_supported().contains(codec),
+                "{codec:?} was offered with no encoder available for it"
+            );
+        }
+    }
+
+    /// The server's `enabled_publish_codecs` is a constraint, not advice.
+    #[test]
+    fn the_servers_list_limits_what_is_offered() {
+        let order = negotiation_order(1280, 720, &[VideoCodec::H264]);
+        assert!(
+            !order.contains(&VideoCodec::Vp8),
+            "VP8 must not be offered when the server has not enabled it"
         );
+    }
+
+    /// An empty server list means it did not say, not that nothing is allowed.
+    #[test]
+    fn an_empty_server_list_permits_everything() {
+        assert!(!negotiation_order(1280, 720, &[]).is_empty());
     }
 
     /// Backends must be distinguishable in logs and stats: "the call is slow" and "the
