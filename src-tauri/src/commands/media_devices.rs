@@ -397,6 +397,33 @@ pub fn get_video_frame(
 /// rebuilding the encoder's rate control is negligible.
 const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The fastest we encode, regardless of how fast the camera runs.
+///
+/// The webcam delivers 60fps. Encoding all of it doubles the bitrate needed for the same
+/// picture quality and doubles the CPU cost, for a difference nobody watching a video call
+/// can see. The preview still shows every captured frame; only the encoder skips.
+const MAX_ENCODE_FPS: u64 = 30;
+
+/// Minimum gap between encoded frames, from [`MAX_ENCODE_FPS`].
+const MIN_ENCODE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_nanos(1_000_000_000 / MAX_ENCODE_FPS);
+
+/// Pick a VP8 bitrate for a given frame size.
+///
+/// A fixed 500kbps was used for every resolution. At 1280x720 that is roughly a tenth of
+/// what the picture needs: the encoder meets the budget by discarding detail, and what
+/// arrives is blocky and smeared with colour bleeding across blocks. It looks like a
+/// transmission fault and is not one.
+///
+/// The rate is ~0.1 bits per pixel per frame at [`MAX_ENCODE_FPS`], which is the usual
+/// rule of thumb for VP8 at conversational quality, clamped to a sane range.
+fn bitrate_for(width: u32, height: u32) -> u32 {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    let bits_per_second = pixels.saturating_mul(MAX_ENCODE_FPS).saturating_div(10);
+    let kbps = bits_per_second.saturating_div(1000);
+    u32::try_from(kbps.clamp(300, 4000)).unwrap_or(2000)
+}
+
 /// Background thread: reads camera frames, writes RGBA to `VideoFrameBuffer` for
 /// preview, and optionally VP8-encodes + sends to a peer connection.
 fn camera_pipeline_loop(
@@ -429,6 +456,9 @@ fn camera_pipeline_loop(
     let mut encoder: Option<Vp8Encoder> = None;
     let mut frame_count: u64 = 0;
     let mut last_keyframe = std::time::Instant::now();
+    let mut last_encode = std::time::Instant::now()
+        .checked_sub(MIN_ENCODE_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -468,7 +498,9 @@ fn camera_pipeline_loop(
             // VP8 encode and send if encoding is active
             let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
 
-            if should_encode {
+            // The preview above gets every captured frame; the encoder is rate-limited.
+            if should_encode && last_encode.elapsed() >= MIN_ENCODE_INTERVAL {
+                last_encode = std::time::Instant::now();
                 encode_and_send_video_frame(
                     track_id,
                     &frame,
@@ -502,11 +534,14 @@ fn encode_and_send_video_frame(
         .as_ref()
         .is_none_or(|e| e.size() != (frame.width, frame.height))
     {
-        match Vp8Encoder::new(frame.width, frame.height, 500) {
+        let bitrate = bitrate_for(frame.width, frame.height);
+        match Vp8Encoder::new(frame.width, frame.height, bitrate) {
             Ok(enc) => {
                 tracing::info!(
                     width = frame.width,
                     height = frame.height,
+                    bitrate_kbps = bitrate,
+                    max_fps = MAX_ENCODE_FPS,
                     "VP8 encoder created for camera"
                 );
                 *encoder = Some(enc);
@@ -990,3 +1025,48 @@ fn generate_track_id() -> String {
     format!("{t:x}")
 }
 
+
+#[cfg(test)]
+mod video_bitrate_tests {
+    use super::{MAX_ENCODE_FPS, MIN_ENCODE_INTERVAL, bitrate_for};
+
+    /// The regression this guards: a fixed 500kbps was used at every resolution. At 720p
+    /// that is about a tenth of what the picture needs, and the encoder meets the budget
+    /// by throwing away detail -- blocky, smeared output that looks like a transmission
+    /// fault and is not one.
+    #[test]
+    fn bitrate_scales_with_resolution() {
+        let vga = bitrate_for(640, 480);
+        let hd = bitrate_for(1280, 720);
+
+        assert!(
+            hd > vga.saturating_mul(2),
+            "720p has three times the pixels of VGA and must get far more than {vga}kbps, got {hd}"
+        );
+        assert!(
+            hd >= 2000,
+            "720p needs a bitrate in the megabits, got {hd}kbps"
+        );
+    }
+
+    /// Absurd geometry must not produce an absurd bitrate in either direction.
+    #[test]
+    fn bitrate_is_clamped_at_both_ends() {
+        assert_eq!(bitrate_for(1, 1), 300, "a tiny frame still needs a floor");
+        assert_eq!(
+            bitrate_for(7680, 4320),
+            4000,
+            "8K must not ask for hundreds of megabits"
+        );
+    }
+
+    /// The encode interval must match the declared cap; deriving one from the other by
+    /// hand is how they drift apart.
+    #[test]
+    fn the_encode_interval_matches_the_frame_rate_cap() {
+        let per_second = 1_000_000_000_u64
+            .checked_div(MIN_ENCODE_INTERVAL.as_nanos().try_into().unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        assert_eq!(per_second, MAX_ENCODE_FPS);
+    }
+}
