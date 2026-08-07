@@ -22,10 +22,17 @@ yuv = "0.8"
 # followed it.
 turbojpeg = { workspace = true }
 
+# VAAPI, for asking the GPU what it can encode. Optional and Linux-only: libva is a system
+# library, and a machine without a GPU driver should fail to find hardware rather than fail
+# to build.
+[target.'cfg(target_os = "linux")'.dependencies]
+libva-sys = { version = "0.1.2", optional = true }
+
 [lints]
 workspace = true
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 jpeg-encoder = "0.7.1"
 zune-core = "0.5.1"
@@ -39,3 +46,8 @@ harness = false
 name = "pipeline_profile"
 # Needs the JPEG encoder to build its fixture, which is a dev-dependency.
 required-features = []
+
+[features]
+default = ["vaapi"]
+# Hardware-encoder discovery through VAAPI.
+vaapi = ["dep:libva-sys"]

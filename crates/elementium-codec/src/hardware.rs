@@ -35,6 +35,23 @@ pub enum EncoderBackend {
 }
 
 impl EncoderBackend {
+    /// Whether an encoder for this backend actually exists in this build.
+    ///
+    /// Distinct from the hardware being *present*. The probe reports what the GPU can do,
+    /// which is a fact about the machine; this reports what we can do with it, which is a
+    /// fact about the code. Conflating them offers a codec in SDP, wins the negotiation,
+    /// and then fails to produce a single frame — the far end sees a track that never
+    /// starts, with nothing to explain it.
+    ///
+    /// Only software today. Each hardware backend flips its arm as its encoder lands.
+    #[must_use]
+    pub const fn has_encoder(self) -> bool {
+        match self {
+            Self::Software => true,
+            Self::Vaapi | Self::VideoToolbox | Self::MediaFoundation => false,
+        }
+    }
+
     /// Whether this backend uses dedicated hardware.
     #[must_use]
     pub const fn is_hardware(self) -> bool {
@@ -69,20 +86,29 @@ pub struct EncoderCapability {
 /// Everything this machine can encode, hardware and software.
 ///
 /// Software support is unconditional; hardware support is whatever the platform reports.
+///
+/// Probed once per process and cached. The answer cannot change while the application runs
+/// -- a GPU is not hot-plugged mid-call -- and asking is not free: initialising a VA
+/// display and enumerating its profiles takes milliseconds and logs as it goes, which is
+/// unacceptable on a path consulted whenever a codec is chosen.
 #[must_use]
-pub fn available_encoders() -> Vec<EncoderCapability> {
-    let mut caps: Vec<EncoderCapability> = VideoCodec::software_supported()
-        .iter()
-        .map(|&codec| EncoderCapability {
-            codec,
-            backend: EncoderBackend::Software,
-            // No meaningful limit: a software encoder is bounded by memory and patience.
-            max_width: u32::MAX,
-            max_height: u32::MAX,
-        })
-        .collect();
-    caps.extend(platform::probe());
-    caps
+pub fn available_encoders() -> &'static [EncoderCapability] {
+    static CACHE: std::sync::OnceLock<Vec<EncoderCapability>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut caps: Vec<EncoderCapability> = VideoCodec::software_supported()
+            .iter()
+            .map(|&codec| EncoderCapability {
+                codec,
+                backend: EncoderBackend::Software,
+                // No meaningful limit: a software encoder is bounded by memory and
+                // patience.
+                max_width: u32::MAX,
+                max_height: u32::MAX,
+            })
+            .collect();
+        caps.extend(platform::probe());
+        caps
+    })
 }
 
 /// Pick the backend to encode `codec` with, preferring hardware.
@@ -91,11 +117,15 @@ pub fn available_encoders() -> Vec<EncoderCapability> {
 /// size, which is the common case for VP8 — no GPU encodes it.
 #[must_use]
 pub fn best_backend(codec: VideoCodec, width: u32, height: u32) -> EncoderBackend {
-    best_backend_from(&available_encoders(), codec, width, height)
+    selectable_backend_from(available_encoders(), codec, width, height)
 }
 
-/// [`best_backend`] against a given capability list, so the policy is testable without
-/// depending on the machine the tests run on.
+/// Which backend the *policy* would choose, ignoring whether it is implemented.
+///
+/// Kept separate from [`selectable_backend_from`] because they answer different questions
+/// and both matter. This one is about the machine: does a hardware encoder exist that
+/// handles this codec at this size? That answer stays true as encoders are implemented,
+/// so the policy can be tested without the tests changing every time one lands.
 #[must_use]
 pub fn best_backend_from(
     caps: &[EncoderCapability],
@@ -111,6 +141,27 @@ pub fn best_backend_from(
                 && c.max_height >= height
         })
         .map_or(EncoderBackend::Software, |c| c.backend)
+}
+
+/// Which backend can actually be used, which is what every caller wants.
+///
+/// The policy's choice, narrowed to backends this build has an encoder for. Hardware being
+/// present on the machine and being usable from here are different facts, and offering a
+/// codec on the strength of the first wins the SDP negotiation and then produces no
+/// frames.
+#[must_use]
+pub fn selectable_backend_from(
+    caps: &[EncoderCapability],
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+) -> EncoderBackend {
+    let chosen = best_backend_from(caps, codec, width, height);
+    if chosen.has_encoder() {
+        chosen
+    } else {
+        EncoderBackend::Software
+    }
 }
 
 /// The codecs worth offering, best first, limited to what the server permits.
@@ -149,15 +200,16 @@ pub fn negotiation_order(
         .copied()
         .filter(|codec| server_allows.is_empty() || server_allows.contains(codec))
         // A codec we cannot actually produce must never be offered: the far end would
-        // agree to it and then receive nothing.
+        // agree to it and then receive nothing. Hardware being *present* is not enough --
+        // the encoder for it has to exist in this build too.
         .filter(|&codec| {
             VideoCodec::software_supported().contains(&codec)
-                || best_backend_from(&caps, codec, width, height).is_hardware()
+                || selectable_backend_from(caps, codec, width, height).is_hardware()
         })
         .collect();
 
     codecs.sort_by_key(|&codec| {
-        let hardware = best_backend_from(&caps, codec, width, height).is_hardware();
+        let hardware = selectable_backend_from(caps, codec, width, height).is_hardware();
         (!hardware, codec.negotiation_rank())
     });
     codecs
@@ -169,14 +221,17 @@ mod platform {
 
     /// Hardware encoders VAAPI reports.
     ///
-    /// Not yet implemented: enumerating VA profiles needs a libva binding and a rendering
-    /// node, and returning a guess would be worse than returning nothing — a capability
-    /// claimed and then not delivered fails at encode time, mid-call, with video simply
-    /// stopping.
-    ///
-    /// Until then every call selects the software backend, which is the behaviour that
-    /// existed before this module and is correct, just slower.
-    #[allow(clippy::missing_const_for_fn)] // Will not be const once it queries the driver.
+    /// Behind a feature because libva is a system library: a build without it should fail
+    /// to find hardware rather than fail to compile, and a machine without a GPU driver is
+    /// a normal machine.
+    #[cfg(feature = "vaapi")]
+    pub fn probe() -> Vec<EncoderCapability> {
+        crate::vaapi_probe::probe()
+    }
+
+    /// No VAAPI support compiled in.
+    #[cfg(not(feature = "vaapi"))]
+    #[allow(clippy::missing_const_for_fn)] // Mirrors the feature-enabled signature.
     pub fn probe() -> Vec<EncoderCapability> {
         Vec::new()
     }
@@ -221,7 +276,7 @@ mod platform {
 mod tests {
     use super::{
         EncoderBackend, EncoderCapability, available_encoders, best_backend_from,
-        negotiation_order,
+        negotiation_order, selectable_backend_from,
     };
     use crate::video::VideoCodec;
 
@@ -260,7 +315,31 @@ mod tests {
         );
     }
 
-    /// Hardware is preferred when it can do the job.
+    /// Hardware that is present but has no encoder in this build must not be selected.
+    ///
+    /// The probe reports what the GPU can do, which is a fact about the machine. Whether
+    /// we can use it is a fact about the code, and conflating the two offers a codec in
+    /// SDP, wins the negotiation, and then produces no frames at all.
+    #[test]
+    fn present_hardware_without_an_encoder_is_not_selected() {
+        let caps = [software(VideoCodec::Vp8), hardware(VideoCodec::H264, 4096, 4096)];
+        assert_eq!(
+            best_backend_from(&caps, VideoCodec::H264, 1920, 1080),
+            EncoderBackend::Vaapi,
+            "the policy should still say hardware is the right choice"
+        );
+        assert_eq!(
+            selectable_backend_from(&caps, VideoCodec::H264, 1920, 1080),
+            if EncoderBackend::Vaapi.has_encoder() {
+                EncoderBackend::Vaapi
+            } else {
+                EncoderBackend::Software
+            },
+            "but it can only be selected once an encoder for it exists"
+        );
+    }
+
+    /// The policy prefers hardware that can do the job.
     #[test]
     fn hardware_wins_when_it_supports_the_codec_and_size() {
         let caps = [software(VideoCodec::Vp8), hardware(VideoCodec::H264, 4096, 4096)];

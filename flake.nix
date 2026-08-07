@@ -69,6 +69,13 @@
           libopus
           libjpeg
 
+          # Hardware video encoding. VAAPI is the Linux interface to whatever the GPU
+          # offers -- H.264, HEVC and AV1 on current AMD and Intel parts, none of which
+          # includes VP8. `libva-utils` provides `vainfo`, which is how a human checks what
+          # the machine can do without running the application.
+          libva
+          libva-utils
+
           # GStreamer (needed by WebKitGTK for media playback)
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
