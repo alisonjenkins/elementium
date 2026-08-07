@@ -7,6 +7,7 @@ pub struct Vp8Encoder {
     encoder: vpx_encode::Encoder,
     width: u32,
     height: u32,
+    bitrate_kbps: u32,
     pts: i64,
 }
 
@@ -52,8 +53,44 @@ impl Vp8Encoder {
             encoder,
             width,
             height,
+            bitrate_kbps,
             pts: 0,
         })
+    }
+
+    /// The geometry this encoder was configured for.
+    ///
+    /// Frames of any other size are rejected, so a caller whose source can renegotiate
+    /// must check this rather than assume the size it asked for is the size it gets.
+    #[must_use]
+    pub const fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Make the next encoded frame a keyframe.
+    ///
+    /// A receiver cannot decode anything until it has one: interframes reference frames it
+    /// never saw. libvpx's default maximum keyframe distance is 9999 frames -- over two
+    /// minutes at 60fps -- so a peer that subscribes after our first keyframe, or that
+    /// loses one, sees nothing at all until the encoder happens to emit another. Real
+    /// stacks solve this by responding to a receiver's keyframe request; this is the
+    /// mechanism that makes such a response possible.
+    ///
+    /// Implemented by rebuilding the encoder, because `vpx_encode::Encoder` exposes no way
+    /// to set `VPX_EFLAG_FORCE_KF` on a single frame. The cost is the encoder's
+    /// rate-control state, which it rebuilds within a few frames; the alternative is
+    /// hand-rolling the FFI encoder, which is a great deal more code to get wrong for a
+    /// path that runs seconds apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the replacement encoder fails to initialize. The old
+    /// encoder is kept in that case, so a failure degrades to "no keyframe yet" rather
+    /// than to no video at all.
+    pub fn force_keyframe(&mut self) -> Result<(), String> {
+        let replacement = Self::new(self.width, self.height, self.bitrate_kbps)?;
+        self.encoder = replacement.encoder;
+        Ok(())
     }
 
     /// Encode an I420 frame. Returns zero or more VP8 packets.
@@ -419,5 +456,74 @@ mod tests {
         // Not a valid VP8 bitstream -- libvpx must reject it, not panic or hang.
         let garbage = PlaintextMedia::from_encoder(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert!(decoder.decode(&garbage).is_err());
+    }
+
+    /// A receiver that joins late can only start decoding at a keyframe, so the encoder
+    /// must be able to produce one on demand. Without this, libvpx's default maximum
+    /// keyframe distance (9999 frames) leaves a late subscriber staring at nothing for
+    /// minutes while every interframe references pictures it never received.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn force_keyframe_makes_the_next_frame_decodable_on_its_own() {
+        let (width, height) = (320_u32, 240_u32);
+        let mut encoder = Vp8Encoder::new(width, height, 500).expect("encoder creation");
+
+        // Drive several frames so the encoder has settled past its initial keyframe.
+        let mut produced_keyframe = false;
+        for i in 0..10_u8 {
+            let frame = solid_frame(width, height, 100_u8.saturating_add(i));
+            let packets = encoder.encode(&frame).expect("encode");
+            if i > 0 {
+                produced_keyframe |= packets.iter().any(|p| p.is_keyframe);
+            }
+        }
+        assert!(
+            !produced_keyframe,
+            "the encoder is not expected to emit keyframes on its own here -- if it does, \
+             this test no longer proves that force_keyframe is what caused the next one"
+        );
+
+        encoder.force_keyframe().expect("rebuild the encoder");
+        let packets = encoder
+            .encode(&solid_frame(width, height, 200))
+            .expect("encode after forcing a keyframe");
+
+        assert!(
+            packets.iter().any(|p| p.is_keyframe),
+            "the frame after a forced keyframe must be a keyframe"
+        );
+
+        // And it must genuinely stand alone: decodable by a decoder that has seen nothing.
+        let mut fresh_decoder = Vp8Decoder::new().expect("decoder creation");
+        let keyframe = packets
+            .iter()
+            .find(|p| p.is_keyframe)
+            .expect("checked above");
+        let decoded = fresh_decoder.decode(&keyframe.data).expect("decode");
+        assert_eq!(decoded.len(), 1, "a keyframe decodes with no prior state");
+    }
+
+    /// Forcing a keyframe must not change the encoder's configured geometry.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn force_keyframe_preserves_the_configured_size() {
+        let mut encoder = Vp8Encoder::new(640, 480, 500).expect("encoder creation");
+        encoder.force_keyframe().expect("rebuild the encoder");
+        assert_eq!(encoder.size(), (640, 480));
+    }
+
+    #[allow(clippy::expect_used)]
+    fn solid_frame(width: u32, height: u32, luma: u8) -> I420Frame {
+        let w = usize::try_from(width).expect("bad width");
+        let h = usize::try_from(height).expect("bad height");
+        let uv = (w / 2).saturating_mul(h / 2);
+        I420Frame {
+            width,
+            height,
+            y: vec![luma; w.saturating_mul(h)],
+            u: vec![128u8; uv],
+            v: vec![128u8; uv],
+            timestamp_us: 0,
+        }
     }
 }
