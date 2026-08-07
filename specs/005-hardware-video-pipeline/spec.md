@@ -50,6 +50,41 @@ the same machine and the same camera.
 macOS and Windows have hardware encoders; their probes currently return nothing, so
 those machines silently take the software path.
 
+## Finding — 2026-08-07: the question T001 asked is answered, and the answer is us
+
+H.264 is never negotiated, and Element Call is not the reason. **We never offer it.**
+
+From the 14:27 session log, our own `createOffer raw SDP` (str0m, our side):
+
+```
+m=video 9 UDP/TLS/RTP/SAVPF 96 97
+a=rtpmap:96 VP8/90000
+a=rtpmap:97 rtx/90000
+```
+
+The SFU's answer mirrors it exactly, because an answer cannot introduce a codec the
+offer did not contain. So the SFU's `enabled_publish_codecs` and Element Call's
+preferences are both exonerated — neither was ever consulted.
+
+The cause is one line, `crates/elementium-webrtc/src/peer_connection.rs:159`:
+
+```rust
+RtcConfig::new().clear_codecs().enable_opus(true).enable_vp8(true)
+```
+
+`clear_codecs()` removes str0m's defaults and only Opus and VP8 are put back.
+
+This changes what the rest of this feature is. It was written as "find out whether
+the hardware path engages"; the answer is that it cannot, for a reason entirely
+inside this repository. Enabling H.264 is not a one-line change either — the send
+path selects a payload by `Codec::Vp8` (`peer_connection.rs:637`) and packetises
+accordingly, so a second codec needs the payload choice and the packetiser to follow
+the negotiated codec rather than assume one.
+
+Deliberately not done yet: video is currently not received at all (feature 003), and
+changing the offered codec set while that is unexplained would confound the two.
+H.264 goes in after remote video works, not before.
+
 ## Success Criteria
 
 - **SC1**: A real call on this machine logs `backend=vaapi` for video, or logs why
