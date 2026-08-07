@@ -401,18 +401,34 @@ pub fn get_video_frame(
     }
 }
 
-/// Write a preview frame to disk when `ELEMENTIUM_DUMP_PREVIEW` is set.
+/// Presence of this file turns preview dumping on, without restarting the app.
+///
+/// An environment variable is the wrong switch for a desktop app: the process is usually
+/// started by a dev server or a desktop launcher that was itself started long before, so
+/// exporting a variable in a terminal does not reach it. That is exactly what happened on
+/// the first attempt to use this -- the dump was compiled in, running, and silently
+/// disabled, which is the same failure mode as the bugs it exists to find.
+const DUMP_PREVIEW_SENTINEL: &str = "/tmp/elementium-dump-preview";
+
+/// Write a preview frame to disk while dumping is enabled.
 ///
 /// Settles a question that cannot be answered from either end alone: whether a corrupt
 /// self-view is corrupt in the pixels Rust produces, or only after they have crossed into
-/// the webview and been drawn to a canvas. The camera probe already shows the capture path
-/// clean, and the preview shows torn output; exactly one of the steps between them is
-/// responsible, and reasoning about which has not converged.
+/// the webview and been drawn to a canvas. The camera probe shows the capture path clean
+/// and the preview shows torn output; exactly one of the steps between them is
+/// responsible, and reading the code has not settled which.
+///
+/// Enabled by `ELEMENTIUM_DUMP_PREVIEW` or by creating [`DUMP_PREVIEW_SENTINEL`].
 ///
 /// Raw RGBA with the geometry in the filename, because writing a PNG encoder here to
 /// inspect one frame is not worth it -- `ffmpeg -f rawvideo -pix_fmt rgba -s WxH` reads it.
 fn maybe_dump_preview(frame_count: u64, rgba: &[u8], width: u32, height: u32) {
-    if !frame_count.is_multiple_of(60) || std::env::var_os("ELEMENTIUM_DUMP_PREVIEW").is_none() {
+    if !frame_count.is_multiple_of(60) {
+        return;
+    }
+    if std::env::var_os("ELEMENTIUM_DUMP_PREVIEW").is_none()
+        && !std::path::Path::new(DUMP_PREVIEW_SENTINEL).exists()
+    {
         return;
     }
     let path = format!("/tmp/elementium_preview_{frame_count}_{width}x{height}.rgba");
