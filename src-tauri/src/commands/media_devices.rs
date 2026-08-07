@@ -16,9 +16,7 @@ use elementium_codec::{
 use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::device_enumeration;
 use elementium_types::observability::CorrelationId;
-use elementium_types::{
-    AudioFrame, MediaConstraints, MediaDevice, NetworkLossEstimate, TrackId,
-};
+use elementium_types::{AudioFrame, MediaConstraints, MediaDevice, NetworkLossEstimate, TrackId};
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
 use super::LockExt;
@@ -220,14 +218,23 @@ fn stop_pipeline_inheriting_connection<H: CapturePipeline>(
     slot: &Mutex<Option<H>>,
 ) -> StoppedPipeline {
     let Ok(mut guard) = slot.lock() else {
-        return StoppedPipeline { existed: false, connection: None };
+        return StoppedPipeline {
+            existed: false,
+            connection: None,
+        };
     };
     let Some(old) = guard.take() else {
-        return StoppedPipeline { existed: false, connection: None };
+        return StoppedPipeline {
+            existed: false,
+            connection: None,
+        };
     };
     let _ = old.stop_sender().send(());
     let connection = old.connection().lock().ok().and_then(|c| c.clone());
-    StoppedPipeline { existed: true, connection }
+    StoppedPipeline {
+        existed: true,
+        connection,
+    }
 }
 
 #[command]
@@ -447,7 +454,13 @@ fn maybe_dump_preview(frame_count: u64, rgba: &[u8], width: u32, height: u32) {
     }
     let path = format!("/tmp/elementium_preview_{frame_count}_{width}x{height}.rgba");
     match std::fs::write(&path, rgba) {
-        Ok(()) => tracing::info!(path, width, height, bytes = rgba.len(), "preview frame dumped"),
+        Ok(()) => tracing::info!(
+            path,
+            width,
+            height,
+            bytes = rgba.len(),
+            "preview frame dumped"
+        ),
         Err(e) => tracing::warn!(path, reason = %e, "could not dump preview frame"),
     }
 }
@@ -624,11 +637,23 @@ fn camera_pipeline_loop(
         req_width.unwrap_or(1280),
         req_height.unwrap_or(720),
     );
+    // Once per camera pipeline, so "is the GPU doing this" is answerable by reading a log
+    // rather than by re-deriving the selection policy from the codec, the geometry and what
+    // the driver reported. The three fields are what the policy actually decided on, and
+    // `capture_preference` is what it will ask the camera for as a result -- the whole point
+    // of the negotiation being that MJPEG is the worst format in software and the best on a
+    // GPU that decodes it.
+    tracing::info!(
+        codec = active_codec.get().sdp_name(),
+        backend = ?target.backend,
+        layout = ?target.layout,
+        gpu_jpeg_decode = target.gpu_jpeg_decode,
+        capture_preference = ?elementium_codec::capture_format::preference(target),
+        track_id = %track_id,
+        "video encode target negotiated"
+    );
     let capturer = match elementium_media::video_source::VideoSource::start_at(
-        req_width,
-        req_height,
-        req_fps,
-        target,
+        req_width, req_height, req_fps, target,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -857,10 +882,14 @@ fn encode_and_send_video_frame(
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
     let wanted = active_codec.get();
-    let existed = encoder
-        .as_ref()
-        .is_some_and(|e| e.codec() == wanted);
-    ensure_encoder(encoder, frame.width(), frame.height(), last_keyframe, wanted);
+    let existed = encoder.as_ref().is_some_and(|e| e.codec() == wanted);
+    ensure_encoder(
+        encoder,
+        frame.width(),
+        frame.height(),
+        last_keyframe,
+        wanted,
+    );
 
     let Some(enc) = encoder.as_mut() else {
         return;
@@ -972,7 +1001,9 @@ impl OutboundAudioStats {
 
     /// Record one encoded packet against the window's size statistics.
     fn record_packet(&mut self, len: usize, input_peak: f32) {
-        self.bytes_since_report = self.bytes_since_report.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        self.bytes_since_report = self
+            .bytes_since_report
+            .saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         if len <= SILENT_PACKET_BYTES {
             self.silent_packets_since_report = self.silent_packets_since_report.saturating_add(1);
             if input_peak > LOUD_INPUT_PEAK {
@@ -1086,8 +1117,7 @@ fn encode_and_send_frame(
                     stats.dropped_channel_full = stats.dropped_channel_full.saturating_add(1);
                 }
                 Delivery::Closed => {
-                    stats.dropped_channel_closed =
-                        stats.dropped_channel_closed.saturating_add(1);
+                    stats.dropped_channel_closed = stats.dropped_channel_closed.saturating_add(1);
                     tracing::warn!(
                         "the peer connection this microphone was feeding has closed; \
                          audio is detached until a connection replaces it"
@@ -1140,7 +1170,9 @@ fn deliver(
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => Delivery::Closed,
         }
     };
-    if outcome == Delivery::Closed && let Ok(mut guard) = slot.lock() {
+    if outcome == Delivery::Closed
+        && let Ok(mut guard) = slot.lock()
+    {
         *guard = None;
     }
     outcome
@@ -1375,7 +1407,6 @@ fn generate_track_id() -> String {
     format!("{t:x}")
 }
 
-
 #[cfg(test)]
 mod video_bitrate_tests {
     use super::{MAX_ENCODE_FPS, MIN_ENCODE_INTERVAL, bitrate_for};
@@ -1415,7 +1446,12 @@ mod video_bitrate_tests {
     #[test]
     fn the_encode_interval_matches_the_frame_rate_cap() {
         let per_second = 1_000_000_000_u64
-            .checked_div(MIN_ENCODE_INTERVAL.as_nanos().try_into().unwrap_or(u64::MAX))
+            .checked_div(
+                MIN_ENCODE_INTERVAL
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            )
             .unwrap_or(0);
         assert_eq!(per_second, MAX_ENCODE_FPS);
     }
@@ -1454,7 +1490,11 @@ mod requested_fps_tests {
         assert_eq!(requested_fps(f64::INFINITY), MAX_ENCODE_FPS_U32);
         assert_eq!(requested_fps(0.0), 1, "clamped, not zero");
         assert_eq!(requested_fps(-5.0), 1);
-        assert_eq!(requested_fps(100_000.0), 120, "clamped to the highest offered");
+        assert_eq!(
+            requested_fps(100_000.0),
+            120,
+            "clamped to the highest offered"
+        );
     }
 }
 
@@ -1505,8 +1545,8 @@ mod active_codec_tests {
 #[allow(clippy::expect_used)]
 mod delivery_tests {
     use super::{Delivery, deliver};
-    use elementium_webrtc::engine::IoCommand;
     use elementium_types::PlaintextMedia;
+    use elementium_webrtc::engine::IoCommand;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc as tokio_mpsc;
 

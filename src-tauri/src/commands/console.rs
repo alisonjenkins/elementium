@@ -68,7 +68,8 @@ mod redaction_tests {
             "and the removal must be visible, not silent: {redacted}"
         );
         assert!(
-            redacted.contains("\"index\":1") && redacted.contains("io.element.call.encryption_keys"),
+            redacted.contains("\"index\":1")
+                && redacted.contains("io.element.call.encryption_keys"),
             "everything that makes the line useful must remain: {redacted}"
         );
     }

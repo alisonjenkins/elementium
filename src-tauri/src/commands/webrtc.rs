@@ -156,7 +156,10 @@ fn adopt_idle_pipelines(media_state: &MediaState, state: &WebRtcState, pc_id: &s
         && slot.is_none()
     {
         *slot = Some(io_cmd_tx.clone());
-        tracing::info!(pc_id, "unattached microphone adopted by a new peer connection");
+        tracing::info!(
+            pc_id,
+            "unattached microphone adopted by a new peer connection"
+        );
     }
 
     if let Ok(guard) = media_state.camera.lock()
@@ -258,12 +261,18 @@ pub async fn create_offer(
         .unwrap_or_default()
         .into_iter()
         .map(|tc| {
-            peer_connection::TransceiverInfo::from_js(&tc.kind, tc.direction.as_deref(), tc.track_id)
+            peer_connection::TransceiverInfo::from_js(
+                &tc.kind,
+                tc.direction.as_deref(),
+                tc.track_id,
+            )
         })
         .collect();
 
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos)?)
+    Ok(peer_connection::create_offer(
+        &mut pc, &dc_infos, &tc_infos,
+    )?)
 }
 
 /// Look up an active peer connection's handle by ID.
@@ -309,7 +318,10 @@ pub async fn set_remote_description(
     tracing::info!(pc_id = %pc_id, sdp_type = ?description.sdp_type, "Setting remote description");
     let handle = get_pc_handle(&state, &pc_id)?;
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::set_remote_description(&mut pc, &description)?)
+    Ok(peer_connection::set_remote_description(
+        &mut pc,
+        &description,
+    )?)
 }
 
 #[command]
@@ -321,7 +333,10 @@ pub async fn add_ice_candidate(
     tracing::info!(pc_id = %pc_id, candidate = %candidate.candidate, "Adding ICE candidate");
     let handle = get_pc_handle(&state, &pc_id)?;
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::add_ice_candidate(&mut pc, &candidate.candidate)?)
+    Ok(peer_connection::add_ice_candidate(
+        &mut pc,
+        &candidate.candidate,
+    )?)
 }
 
 #[command]
@@ -390,8 +405,16 @@ fn route_pc_event(
             mid,
             kind,
         }),
-        PcEvent::AudioData { mid, data, contiguous } => {
-            let ev = PcEvent::AudioData { mid: mid.clone(), data, contiguous };
+        PcEvent::AudioData {
+            mid,
+            data,
+            contiguous,
+        } => {
+            let ev = PcEvent::AudioData {
+                mid: mid.clone(),
+                data,
+                contiguous,
+            };
             if routing.audio_tx.try_send(ev).is_err() {
                 *dropped_audio_events = dropped_audio_events.saturating_add(1);
                 tracing::warn!(
@@ -407,7 +430,13 @@ fn route_pc_event(
             let _ = routing.video_tx.try_send(PcEvent::VideoData { mid, data });
             None
         }
-        PcEvent::EgressStats { mid, loss, rtt_ms, packets, nacks } => {
+        PcEvent::EgressStats {
+            mid,
+            loss,
+            rtt_ms,
+            packets,
+            nacks,
+        } => {
             record_outbound_loss(routing.app, pc_id, &mid, loss, rtt_ms, packets, nacks);
             None
         }
@@ -504,7 +533,10 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
             }
         }
         None => {
-            tracing::error!(pc_id = pc_id, "No shared audio player available; inbound audio for this connection will not play");
+            tracing::error!(
+                pc_id = pc_id,
+                "No shared audio player available; inbound audio for this connection will not play"
+            );
         }
     }
 
@@ -539,7 +571,12 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
             Some(pc_event) => {
                 let Some(tauri_event) = route_pc_event(
                     pc_event,
-                    &Routing { app, pc_id, audio_tx: &audio_tx, video_tx: &video_tx },
+                    &Routing {
+                        app,
+                        pc_id,
+                        audio_tx: &audio_tx,
+                        video_tx: &video_tx,
+                    },
                     &mut dropped_audio_events,
                 ) else {
                     continue;

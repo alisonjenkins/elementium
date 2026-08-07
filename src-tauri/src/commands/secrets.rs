@@ -93,7 +93,9 @@ pub async fn secret_get_backend_status(
     state: State<'_, SecretStoreState>,
 ) -> Result<BackendType, String> {
     let guard = state.backend.lock_str()?;
-    Ok(guard.as_ref().map_or(BackendType::NeedsSetup, SecretBackend::kind))
+    Ok(guard
+        .as_ref()
+        .map_or(BackendType::NeedsSetup, SecretBackend::kind))
 }
 
 #[command]

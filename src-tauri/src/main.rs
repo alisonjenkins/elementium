@@ -232,7 +232,11 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     let (file_layer, guard) = match writer {
         Some((file_writer, guard)) => (
-            Some(tracing_subscriber::fmt::layer().json().with_writer(file_writer)),
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(file_writer),
+            ),
             Some(guard),
         ),
         None => (None, None),
@@ -262,7 +266,8 @@ fn main() -> tauri::Result<()> {
     // instead of being logged uncorrelated; call/session spans layer their own more specific
     // correlation_id field on top once a call starts.
     let app_instance_id = CorrelationId::new();
-    let _app_span = tracing::info_span!("app_instance", correlation_id = %app_instance_id).entered();
+    let _app_span =
+        tracing::info_span!("app_instance", correlation_id = %app_instance_id).entered();
 
     // Initialize secret storage backend
     let backend = create_backend();

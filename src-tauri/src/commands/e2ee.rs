@@ -11,8 +11,8 @@ use serde::Deserialize;
 use tauri::{State, command};
 
 use elementium_e2ee::E2eeOptions;
-use elementium_webrtc::EncryptionPolicy;
 use elementium_webrtc::E2eeContext;
+use elementium_webrtc::EncryptionPolicy;
 
 use super::LockExt;
 
@@ -101,7 +101,10 @@ pub async fn e2ee_set_sif_trailer(
     state: State<'_, E2eeState>,
     trailer: Vec<u8>,
 ) -> Result<(), String> {
-    tracing::info!(len = trailer.len(), "E2EE server-injected-frame trailer received");
+    tracing::info!(
+        len = trailer.len(),
+        "E2EE server-injected-frame trailer received"
+    );
 
     state
         .ctx

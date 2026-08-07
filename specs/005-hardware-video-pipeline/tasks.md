@@ -8,7 +8,7 @@ is answering a question nobody asked.
 ## Phase 1: Does it engage at all?
 
 - [X] T001 [US1] Read the SDP from a real call and record whether H.264 is offered and negotiated — the log already contains the offer and answer, so this needs reading rather than instrumenting. **Answered: it is not offered.** See the Finding in spec.md
-- [ ] T002 [US1] Log the selected encoder backend and codec once per call in `src-tauri/src/commands/media_devices.rs`, so "is the GPU being used" is answerable from a log rather than by reasoning about the policy
+- [X] T002 [US1] Log the selected encoder backend and codec once per call in `src-tauri/src/commands/media_devices.rs`, so "is the GPU being used" is answerable from a log rather than by reasoning about the policy
 - [X] T003 [US1] If H.264 is not negotiated, establish whether that is Element Call's choice, the SFU's `enabled_publish_codecs`, or our own offer being wrong — the three have different owners. **Answered: ours.** `clear_codecs().enable_opus(true).enable_vp8(true)` at `peer_connection.rs:159` never offers H.264, so the other two were never consulted
 - [ ] T012 [US1] Make the offered codec set include H.264 and make the send path follow the negotiated codec instead of assuming VP8 (payload selection at `peer_connection.rs:637`, and the packetiser). Blocked on feature 003: changing the offer while remote video does not work at all would confound the two
 

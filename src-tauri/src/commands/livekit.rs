@@ -156,21 +156,30 @@ pub async fn livekit_publish_track(
 /// cost everyone else an interruption.
 fn apply_publish_codec(media_state: &MediaState, codec: &str) {
     let Some(codec) = elementium_codec::VideoCodec::from_mime(codec) else {
-        tracing::warn!(codec, "SFU named a codec we do not recognise; leaving the encoder alone");
+        tracing::warn!(
+            codec,
+            "SFU named a codec we do not recognise; leaving the encoder alone"
+        );
         return;
     };
     let Ok(guard) = media_state.camera.lock() else {
         return;
     };
     let Some(camera) = guard.as_ref() else {
-        tracing::debug!(codec = codec.sdp_name(), "codec change with no camera running");
+        tracing::debug!(
+            codec = codec.sdp_name(),
+            "codec change with no camera running"
+        );
         return;
     };
     if camera.active_codec.get() == codec {
         return;
     }
     camera.active_codec.set(codec);
-    tracing::info!(codec = codec.sdp_name(), "switching publish codec at the SFU's request");
+    tracing::info!(
+        codec = codec.sdp_name(),
+        "switching publish codec at the SFU's request"
+    );
 }
 
 /// Point the running capture pipeline for `kind` at this room, so its encoded frames
@@ -240,8 +249,7 @@ pub async fn livekit_disconnect(
 
     if let Some(room) = room {
         let mut room = room.lock().await;
-        let span =
-            tracing::info_span!("session", correlation_id = %room.correlation_id(), room_id = %room_id);
+        let span = tracing::info_span!("session", correlation_id = %room.correlation_id(), room_id = %room_id);
         async {
             tracing::info!("disconnect requested");
             room.disconnect().await;
