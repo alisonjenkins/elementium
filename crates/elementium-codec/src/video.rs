@@ -10,6 +10,13 @@
 //! [`VideoCodec`]; it does not mean touching capture, the preview, the peer connection, or
 //! anything else that handles frames.
 //!
+//! Dispatch is static throughout. Functions on the frame path take `impl VideoEncoder` or
+//! a generic parameter, and the runtime choice of codec is carried by
+//! [`NegotiatedEncoder`], an enum that implements the trait by matching. Nothing here
+//! boxes, allocates per call, or goes through a vtable — this runs thirty times a second
+//! for the length of every call, and the exhaustive enum additionally turns "a codec was
+//! added but not handled" from a runtime surprise into a compile error.
+//!
 //! # What the traits deliberately do and do not assume
 //!
 //! **Frames are I420.** Every software video codec in use on the web takes planar YUV
@@ -158,35 +165,105 @@ pub trait VideoDecoder: Send {
     fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String>;
 }
 
-/// Build an encoder for a negotiated codec.
+/// The encoder for whichever codec was negotiated.
 ///
-/// The indirection is the point: the codec comes from SDP at runtime, so the choice cannot
-/// be made where the pipeline is written.
+/// Codec choice is a runtime decision — the far end says what it can decode — but that
+/// does not require runtime dispatch. This wraps the concrete encoders in an enum that
+/// implements [`VideoEncoder`] by matching, so every call is statically dispatched and
+/// inlinable, and no allocation or vtable is involved on a path that runs thirty times a
+/// second for the length of a call.
 ///
-/// # Errors
-///
-/// Returns an error if the codec is not supported or the encoder fails to initialise.
-pub fn make_encoder(
-    codec: VideoCodec,
-    config: EncoderConfig,
-) -> Result<Box<dyn VideoEncoder>, String> {
-    match codec {
-        VideoCodec::Vp8 => Ok(Box::new(crate::vpx_codec::Vp8Encoder::new(
-            config.width,
-            config.height,
-            config.bitrate_kbps,
-        )?)),
+/// The enum also buys something `dyn` cannot: it is exhaustive. Adding a codec is a
+/// compile error at every site that has to account for it, rather than something that
+/// builds and then behaves oddly at runtime.
+pub enum NegotiatedEncoder {
+    Vp8(crate::vpx_codec::Vp8Encoder),
+}
+
+impl NegotiatedEncoder {
+    /// Build the encoder for `codec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the encoder fails to initialise.
+    pub fn new(codec: VideoCodec, config: EncoderConfig) -> Result<Self, String> {
+        match codec {
+            VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Encoder::new(
+                config.width,
+                config.height,
+                config.bitrate_kbps,
+            )?)),
+        }
     }
 }
 
-/// Build a decoder for a negotiated codec.
-///
-/// # Errors
-///
-/// Returns an error if the codec is not supported or the decoder fails to initialise.
-pub fn make_decoder(codec: VideoCodec) -> Result<Box<dyn VideoDecoder>, String> {
-    match codec {
-        VideoCodec::Vp8 => Ok(Box::new(crate::vpx_codec::Vp8Decoder::new()?)),
+impl VideoEncoder for NegotiatedEncoder {
+    fn codec(&self) -> VideoCodec {
+        match self {
+            Self::Vp8(e) => e.codec(),
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Vp8(e) => VideoEncoder::size(e),
+        }
+    }
+
+    fn preferred_input(&self) -> PixelLayout {
+        match self {
+            Self::Vp8(e) => e.preferred_input(),
+        }
+    }
+
+    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, String> {
+        match self {
+            Self::Vp8(e) => VideoEncoder::encode(e, frame),
+        }
+    }
+
+    fn request_keyframe(&mut self) {
+        match self {
+            Self::Vp8(e) => e.request_keyframe(),
+        }
+    }
+
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+        match self {
+            Self::Vp8(e) => VideoEncoder::set_bitrate(e, kbps),
+        }
+    }
+}
+
+/// The decoder for whichever codec was negotiated. See [`NegotiatedEncoder`].
+pub enum NegotiatedDecoder {
+    Vp8(crate::vpx_codec::Vp8Decoder),
+}
+
+impl NegotiatedDecoder {
+    /// Build the decoder for `codec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the decoder fails to initialise.
+    pub fn new(codec: VideoCodec) -> Result<Self, String> {
+        match codec {
+            VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Decoder::new()?)),
+        }
+    }
+}
+
+impl VideoDecoder for NegotiatedDecoder {
+    fn codec(&self) -> VideoCodec {
+        match self {
+            Self::Vp8(d) => d.codec(),
+        }
+    }
+
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+        match self {
+            Self::Vp8(d) => VideoDecoder::decode(d, data),
+        }
     }
 }
 
@@ -198,7 +275,10 @@ pub fn make_decoder(codec: VideoCodec) -> Result<Box<dyn VideoDecoder>, String> 
     clippy::indexing_slicing
 )]
 mod tests {
-    use super::{EncoderConfig, PixelLayout, VideoCodec, make_decoder, make_encoder};
+    use super::{
+        EncoderConfig, NegotiatedDecoder, NegotiatedEncoder, PixelLayout, VideoCodec, VideoDecoder,
+        VideoEncoder,
+    };
     use elementium_types::I420Frame;
 
     fn frame(width: u32, height: u32) -> I420Frame {
@@ -214,85 +294,69 @@ mod tests {
         }
     }
 
-    /// The pipeline holds a `dyn VideoEncoder` because the codec is chosen by negotiation
-    /// at runtime. A trait that is not object-safe cannot be used that way, and the failure
-    /// would only appear when a second codec was added.
+    fn config(width: u32, height: u32) -> EncoderConfig {
+        EncoderConfig {
+            width,
+            height,
+            bitrate_kbps: 500,
+            max_framerate: 30,
+        }
+    }
+
+    /// Written against the bound rather than a concrete type: this is how the pipeline
+    /// uses an encoder, and compiling it proves the trait is usable generically. It is
+    /// also what keeps the trait honest -- anything VP8-shaped that crept into the
+    /// signature would fail to compile here first.
+    fn drive<E: VideoEncoder>(encoder: &mut E, frame: &I420Frame) -> Vec<super::EncodedFrame> {
+        encoder.encode(frame).expect("encode")
+    }
+
     #[test]
-    fn an_encoder_can_be_held_and_driven_behind_a_trait_object() {
-        let mut encoder = make_encoder(
-            VideoCodec::Vp8,
-            EncoderConfig {
-                width: 320,
-                height: 240,
-                bitrate_kbps: 500,
-                max_framerate: 30,
-            },
-        )
-        .expect("encoder");
+    fn an_encoder_is_usable_through_its_trait_bound() {
+        let mut encoder = NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
 
         assert_eq!(encoder.codec(), VideoCodec::Vp8);
-        assert_eq!(encoder.size(), (320, 240));
+        assert_eq!(VideoEncoder::size(&encoder), (320, 240));
         assert_eq!(encoder.preferred_input(), PixelLayout::I420);
 
-        let packets = encoder.encode(&frame(320, 240)).expect("encode");
+        let packets = drive(&mut encoder, &frame(320, 240));
         assert!(
             packets.iter().any(|p| p.is_keyframe),
             "the first frame must be independently decodable"
         );
 
-        encoder.set_bitrate(900).expect("retarget bitrate");
+        VideoEncoder::set_bitrate(&mut encoder, 900).expect("retarget bitrate");
         encoder.request_keyframe();
-        let after = encoder.encode(&frame(320, 240)).expect("encode");
         assert!(
-            after.iter().any(|p| p.is_keyframe),
+            drive(&mut encoder, &frame(320, 240))
+                .iter()
+                .any(|p| p.is_keyframe),
             "a requested keyframe must arrive"
         );
     }
 
-    /// Decoders are chosen the same way and must be usable the same way.
     #[test]
-    fn a_decoder_behind_a_trait_object_decodes_what_the_encoder_produced() {
-        let mut encoder = make_encoder(
-            VideoCodec::Vp8,
-            EncoderConfig {
-                width: 320,
-                height: 240,
-                bitrate_kbps: 500,
-                max_framerate: 30,
-            },
-        )
-        .expect("encoder");
-        let mut decoder = make_decoder(VideoCodec::Vp8).expect("decoder");
-        assert_eq!(decoder.codec(), VideoCodec::Vp8);
+    fn a_decoder_decodes_what_the_encoder_produced() {
+        let mut encoder = NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
+        let mut decoder = NegotiatedDecoder::new(VideoCodec::Vp8).expect("decoder");
+        assert_eq!(VideoDecoder::codec(&decoder), VideoCodec::Vp8);
 
-        let packets = encoder.encode(&frame(320, 240)).expect("encode");
+        let packets = drive(&mut encoder, &frame(320, 240));
         let keyframe = packets
             .iter()
             .find(|p| p.is_keyframe)
             .expect("a keyframe to decode");
-        let frames = decoder.decode(&keyframe.data).expect("decode");
+        let frames = VideoDecoder::decode(&mut decoder, &keyframe.data).expect("decode");
 
         assert_eq!(frames.len(), 1);
-        assert_eq!(
-            frames.first().map(|f| (f.width, f.height)),
-            Some((320, 240))
-        );
+        assert_eq!(frames.first().map(|f| (f.width, f.height)), Some((320, 240)));
     }
 
     /// A frame of the wrong size must be refused, not encoded into a corrupt picture.
     #[test]
     fn a_frame_of_the_wrong_size_is_refused() {
-        let mut encoder = make_encoder(
-            VideoCodec::Vp8,
-            EncoderConfig {
-                width: 320,
-                height: 240,
-                bitrate_kbps: 500,
-                max_framerate: 30,
-            },
-        )
-        .expect("encoder");
-        assert!(encoder.encode(&frame(640, 480)).is_err());
+        let mut encoder = NegotiatedEncoder::new(VideoCodec::Vp8, config(320, 240)).expect("encoder");
+        assert!(VideoEncoder::encode(&mut encoder, &frame(640, 480)).is_err());
     }
 
     /// The SDP name is part of the negotiation contract, not a label.

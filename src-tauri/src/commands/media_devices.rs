@@ -11,7 +11,7 @@ use tauri::{State, command};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use elementium_codec::{
-    EncoderConfig, OpusEncoder, OpusEncoderConfig, VideoCodec, VideoEncoder, make_encoder,
+    EncoderConfig, NegotiatedEncoder, OpusEncoder, OpusEncoderConfig, VideoCodec, VideoEncoder,
 };
 use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::device_enumeration;
@@ -518,9 +518,10 @@ fn camera_pipeline_loop(
         "Camera pipeline started"
     );
 
-    // Held behind the trait: which codec is in use comes from SDP negotiation, so the
-    // capture loop must not name one. See `elementium_codec::video`.
-    let mut encoder: Option<Box<dyn VideoEncoder>> = None;
+    // The codec comes from SDP negotiation, so the capture loop must not name one. Held
+    // as `NegotiatedEncoder` rather than a trait object: dispatch stays static on a path
+    // that runs thirty times a second. See `elementium_codec::video`.
+    let mut encoder: Option<NegotiatedEncoder> = None;
     let mut frame_count: u64 = 0;
     let mut last_keyframe = std::time::Instant::now();
     let mut last_encode = std::time::Instant::now()
@@ -591,72 +592,91 @@ fn camera_pipeline_loop(
     }
 }
 
-/// VP8-encode one captured frame and hand the packets to the connection.
+/// Keep `encoder` valid for `frame`, creating or replacing it when the geometry changes.
 ///
-/// Owns the encoder's lifecycle because two things can invalidate it: the source
-/// renegotiating its geometry, and the need for a periodic keyframe.
-fn encode_and_send_video_frame(
-    track_id: &str,
+/// Split from the encode step so that step can be written against a trait bound rather
+/// than a concrete type: construction is the one place the negotiated codec has to be
+/// named, and it has no business being on the per-frame path.
+fn ensure_encoder(
+    encoder: &mut Option<NegotiatedEncoder>,
     frame: &elementium_types::VideoFrame,
-    encoder: &mut Option<Box<dyn VideoEncoder>>,
     last_keyframe: &mut std::time::Instant,
-    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
-    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
-    // Created lazily, and rebuilt if the source renegotiates its geometry:
-    // `Vp8Encoder::encode` rejects a frame whose size does not match its configuration, so
-    // a mid-stream resolution change would otherwise fail every frame from then on and
-    // stop the video permanently.
+    // Rebuilt if the source renegotiates its geometry: an encoder rejects a frame whose
+    // size does not match its configuration, so a mid-stream resolution change would
+    // otherwise fail every frame from then on and stop the video permanently.
     if encoder
         .as_ref()
-        .is_none_or(|e| e.size() != (frame.width, frame.height))
+        .is_some_and(|e| e.size() == (frame.width, frame.height))
     {
-        let bitrate = bitrate_for(frame.width, frame.height);
-        let config = EncoderConfig {
-            width: frame.width,
-            height: frame.height,
-            bitrate_kbps: bitrate,
-            max_framerate: u32::try_from(MAX_ENCODE_FPS).unwrap_or(30),
-        };
-        match make_encoder(NEGOTIATED_VIDEO_CODEC, config) {
-            Ok(enc) => {
-                tracing::info!(
-                    width = frame.width,
-                    height = frame.height,
-                    bitrate_kbps = bitrate,
-                    max_fps = MAX_ENCODE_FPS,
-                    codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),
-                    "video encoder created for camera"
-                );
-                *encoder = Some(enc);
-                *last_keyframe = std::time::Instant::now();
-            }
-            Err(e) => tracing::error!(codec = NEGOTIATED_VIDEO_CODEC.sdp_name(), "Failed to create video encoder: {e}"),
-        }
-    } else {
-        // A receiver asking is the urgent case: until it gets a keyframe it displays a
-        // broken picture and keeps asking. The timer is the backstop for a receiver that
-        // subscribes without asking, since libvpx's own keyframe distance is minutes.
-        let asked = keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed);
-        // A receiver that is badly out of sync sends PLIs faster than keyframes can help.
-        // Honouring every one would rebuild the encoder several times a second, throwing
-        // away its rate control and making the picture worse than the fault being
-        // recovered from. One keyframe in flight at a time is the most that can help.
-        let recently = last_keyframe.elapsed() < MIN_KEYFRAME_GAP;
-        if ((asked && !recently) || last_keyframe.elapsed() >= KEYFRAME_INTERVAL)
-            && let Some(enc) = encoder.as_mut()
-        {
-            enc.request_keyframe();
-            *last_keyframe = std::time::Instant::now();
-            tracing::info!(track_id, on_request = asked, "requested a video keyframe");
-        }
+        return;
     }
 
-    let Some(enc) = encoder.as_mut() else {
-        return;
+    let bitrate = bitrate_for(frame.width, frame.height);
+    let config = EncoderConfig {
+        width: frame.width,
+        height: frame.height,
+        bitrate_kbps: bitrate,
+        max_framerate: u32::try_from(MAX_ENCODE_FPS).unwrap_or(30),
     };
+    match NegotiatedEncoder::new(NEGOTIATED_VIDEO_CODEC, config) {
+        Ok(enc) => {
+            tracing::info!(
+                width = frame.width,
+                height = frame.height,
+                bitrate_kbps = bitrate,
+                max_fps = MAX_ENCODE_FPS,
+                codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),
+                "video encoder created for camera"
+            );
+            *encoder = Some(enc);
+            *last_keyframe = std::time::Instant::now();
+        }
+        Err(e) => tracing::error!(
+            codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),
+            "Failed to create video encoder: {e}"
+        ),
+    }
+}
+
+/// Decide whether this frame should be a keyframe, and tell the encoder if so.
+///
+/// Generic over the encoder: nothing here depends on which codec is in use, and stating
+/// that as a bound rather than a concrete type is what keeps it true.
+fn maybe_request_keyframe<E: VideoEncoder>(
+    track_id: &str,
+    encoder: &mut E,
+    last_keyframe: &mut std::time::Instant,
+    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    // A receiver asking is the urgent case: until it gets a keyframe it displays a broken
+    // picture and keeps asking. The timer is the backstop for a receiver that subscribes
+    // without asking, since a codec's own keyframe distance can be minutes.
+    let asked = keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed);
+    // A receiver that is badly out of sync sends requests faster than keyframes can help.
+    // Honouring every one throws away the encoder's rate control and makes the picture
+    // worse than the fault being recovered from. One keyframe in flight is the most that
+    // can help.
+    let recently = last_keyframe.elapsed() < MIN_KEYFRAME_GAP;
+    if (asked && !recently) || last_keyframe.elapsed() >= KEYFRAME_INTERVAL {
+        encoder.request_keyframe();
+        *last_keyframe = std::time::Instant::now();
+        tracing::info!(track_id, on_request = asked, "requested a video keyframe");
+    }
+}
+
+/// Encode one captured frame and hand the packets to the connection.
+///
+/// Generic over the encoder rather than taking a trait object: this runs for every
+/// captured frame for the length of a call, so the calls are statically dispatched and
+/// inlinable, and the bound documents that the body depends on nothing but the interface.
+fn encode_and_send<E: VideoEncoder>(
+    encoder: &mut E,
+    frame: &elementium_types::VideoFrame,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+) {
     let i420 = elementium_codec::rgba_to_i420(frame.width, frame.height, &frame.data);
-    match enc.encode(&i420) {
+    match encoder.encode(&i420) {
         Ok(packets) => {
             if let Ok(guard) = encode_tx.lock()
                 && let Some(tx) = guard.as_ref()
@@ -668,6 +688,29 @@ fn encode_and_send_video_frame(
         }
         Err(e) => tracing::debug!("video encode error: {e}"),
     }
+}
+
+/// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
+fn encode_and_send_video_frame(
+    track_id: &str,
+    frame: &elementium_types::VideoFrame,
+    encoder: &mut Option<NegotiatedEncoder>,
+    last_keyframe: &mut std::time::Instant,
+    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+) {
+    let existed = encoder.is_some();
+    ensure_encoder(encoder, frame, last_keyframe);
+
+    let Some(enc) = encoder.as_mut() else {
+        return;
+    };
+    // A freshly built encoder emits a keyframe on its own, so only ask when it is one we
+    // were already using.
+    if existed {
+        maybe_request_keyframe(track_id, enc, last_keyframe, keyframe_requested);
+    }
+    encode_and_send(enc, frame, encode_tx);
 }
 
 /// Counters for one run of [`audio_capture_loop`], so a silent far end is diagnosable.
