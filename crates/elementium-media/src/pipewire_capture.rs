@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use elementium_types::I420Frame;
 
+use crate::captured_frame::CapturedFrame;
+
 use crate::pipewire_nodes::PipewireError;
 
 /// Frame rate requested when a caller does not ask for one.
@@ -219,6 +221,64 @@ fn negotiated_subtype(pod: &libspa::pod::Pod) -> Option<u32> {
 /// the picture breaks into sliding horizontal bands with rotated colour channels, which
 /// looks like a corrupt encoder and is nothing of the kind.
 #[must_use]
+/// Decode one MJPEG buffer to I420 at half size.
+///
+/// For the self-view, which is displayed at half size anyway. libjpeg-turbo does this for
+/// roughly a quarter of the work of a full decode -- it skips most of each block's
+/// coefficients rather than reconstructing them and discarding them afterwards -- so it is
+/// materially cheaper than decoding and then shrinking.
+///
+/// Falls back to a full decode followed by a halving where the scaled decode is refused,
+/// which some JPEGs provoke; the picture is the same either way.
+pub fn decode_mjpeg_half_scale(jpeg: &[u8]) -> Option<I420Frame> {
+    let full = || decode_mjpeg_to_i420(jpeg).map(|f| elementium_codec::halve_i420(&f).unwrap_or(f));
+
+    let Ok(mut decompressor) = turbojpeg::Decompressor::new() else {
+        return full();
+    };
+    if decompressor
+        .set_scaling_factor(turbojpeg::ScalingFactor::ONE_HALF)
+        .is_err()
+    {
+        return full();
+    }
+    let Ok(header) = decompressor.read_header(jpeg) else {
+        return full();
+    };
+    let (width, height) = (
+        turbojpeg::ScalingFactor::ONE_HALF.scale(header.width),
+        turbojpeg::ScalingFactor::ONE_HALF.scale(header.height),
+    );
+
+    // 4:2:0 output regardless of the source's own subsampling, so the result needs no
+    // resampling afterwards -- the same reason the full-size decode asks for planes.
+    let mut image = turbojpeg::YuvImage {
+        pixels: vec![0_u8; turbojpeg::yuv_pixels_len(width, 4, height, turbojpeg::Subsamp::Sub2x2).ok()?],
+        align: 4,
+        width,
+        height,
+        subsamp: turbojpeg::Subsamp::Sub2x2,
+    };
+    if decompressor.decompress_to_yuv(jpeg, image.as_deref_mut()).is_err() {
+        return full();
+    }
+    planes_from_yuv(&image)
+}
+
+/// Build a frame from a decoded 4:2:0 YUV image, adopting its buffer.
+fn planes_from_yuv(image: &turbojpeg::YuvImage<Vec<u8>>) -> Option<I420Frame> {
+    let (y_stride, _) = image.y_size();
+    let (uv_stride, _) = image.uv_size();
+    I420Frame::from_padded(
+        u32::try_from(image.width).ok()?,
+        u32::try_from(image.height).ok()?,
+        image.pixels.clone(),
+        y_stride,
+        uv_stride,
+        0,
+    )
+}
+
 pub fn decode_mjpeg_to_i420(jpeg: &[u8]) -> Option<I420Frame> {
     let yuv = turbojpeg::decompress_to_yuv(jpeg).ok()?;
     let width = u32::try_from(yuv.width).ok()?;
@@ -503,7 +563,7 @@ impl CaptureTiming {
 
 /// A running `PipeWire` video capture.
 pub struct PipewireCapturer {
-    frame_rx: mpsc::Receiver<I420Frame>,
+    frame_rx: mpsc::Receiver<CapturedFrame>,
     stop_tx: mpsc::Sender<()>,
     negotiated: Arc<Mutex<Negotiated>>,
     /// Set when the stream enters its error state.
@@ -594,7 +654,7 @@ impl PipewireCapturer {
 
     /// The most recent frame, if one is waiting.
     #[must_use]
-    pub fn try_recv(&self) -> Option<I420Frame> {
+    pub fn try_recv(&self) -> Option<CapturedFrame> {
         self.frame_rx.try_recv().ok()
     }
 
@@ -634,7 +694,7 @@ fn run_stream(
     node_id: u32,
     target_fps: u32,
     target: elementium_codec::EncodeTarget,
-    frame_tx: &mpsc::SyncSender<I420Frame>,
+    frame_tx: &mpsc::SyncSender<CapturedFrame>,
     stop_rx: mpsc::Receiver<()>,
     negotiated: &Arc<Mutex<Negotiated>>,
     failed: &Arc<std::sync::atomic::AtomicBool>,
@@ -694,7 +754,7 @@ fn attach_and_connect(
     target: elementium_codec::EncodeTarget,
     negotiated: &Arc<Mutex<Negotiated>>,
     failed: &Arc<std::sync::atomic::AtomicBool>,
-    frame_tx: &mpsc::SyncSender<I420Frame>,
+    frame_tx: &mpsc::SyncSender<CapturedFrame>,
 ) -> Result<(), String> {
     let fmt_state = Arc::clone(negotiated);
     let frame_state = Arc::clone(negotiated);
@@ -831,6 +891,23 @@ fn attach_and_connect(
             // geometry the stream negotiated, because a mismatch between the two is
             // exactly the fault this used to have: the buffer was labelled with the
             // negotiated size regardless of what came out of the decoder.
+            // Handed on undecoded when the negotiated encoder decodes JPEG in hardware.
+            // Decoding here would be the single largest cost on this path and would be
+            // thrown away immediately: the GPU decodes it again, properly, from the
+            // compressed bytes.
+            if n.encoding == Encoding::Mjpeg && target.gpu_jpeg_decode {
+                let frame = CapturedFrame::Mjpeg {
+                    data: bytes.to_vec(),
+                    width: n.width,
+                    height: n.height,
+                };
+                timing.record(std::time::Duration::ZERO, copy_len);
+                if tx.try_send(frame).is_err() {
+                    // Newest dropped when full, as below.
+                }
+                return;
+            }
+
             let decode_started = std::time::Instant::now();
             let converted = match n.encoding {
                 Encoding::Mjpeg => decode_mjpeg_to_i420(bytes),
@@ -873,7 +950,7 @@ fn attach_and_connect(
                 }
                 // Newest frame dropped when full: blocking here would stall the PipeWire
                 // graph, which is far worse than losing a frame.
-                let _ = tx.try_send(frame);
+                let _ = tx.try_send(CapturedFrame::Planar(frame));
             } else {
                 tracing::warn!(
                     len = bytes.len(),

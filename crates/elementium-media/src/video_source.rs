@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use elementium_types::I420Frame;
+use crate::captured_frame::CapturedFrame;
 
 use crate::camera::CameraCapturer;
 use crate::pipewire_capture::PipewireCapturer;
@@ -94,11 +94,15 @@ impl VideoSource {
     }
 
     /// The next frame, if one is waiting.
+    ///
+    /// Not always pixels: see [`CapturedFrame`]. The `V4L2` path always decodes, since
+    /// `nokhwa` does it before we see the buffer, so only the `PipeWire` path can hand back
+    /// compressed frames.
     #[must_use]
-    pub fn try_recv(&self) -> Option<I420Frame> {
+    pub fn try_recv(&self) -> Option<CapturedFrame> {
         match self {
             Self::Pipewire(c) => c.try_recv(),
-            Self::V4l2(c) => c.try_recv(),
+            Self::V4l2(c) => c.try_recv().map(CapturedFrame::Planar),
         }
     }
 

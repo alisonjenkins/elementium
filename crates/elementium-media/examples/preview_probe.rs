@@ -48,14 +48,13 @@ fn main() {
         };
         frames += 1;
 
-        // Exactly what the app does before the frame crosses into the webview: halve in
-        // I420, then convert the smaller frame to RGBA.
-        let preview = elementium_codec::halve_i420(&frame)
-            .as_ref()
-            .map_or_else(
-                || elementium_codec::i420_to_rgba(&frame),
-                elementium_codec::i420_to_rgba,
-            );
+        // Exactly what the app does before the frame crosses into the webview: reach half
+        // size -- by halving a decoded frame or decoding a compressed one at half scale --
+        // then convert to RGBA.
+        let Some(half) = frame.to_preview() else {
+            continue;
+        };
+        let preview = elementium_codec::i420_to_rgba(&half);
         let (rgba, width, height) = (preview.data, preview.width, preview.height);
 
         let expected = (width as usize) * (height as usize) * 4;
@@ -74,7 +73,7 @@ fn main() {
         }
         if let Some(enc) = encoder.as_mut() {
             // No conversion: capture already produces the encoder's input format.
-            let _ = enc.encode(&frame);
+            let _ = enc.encode(&half);
         }
 
         if frames.is_multiple_of(60) {

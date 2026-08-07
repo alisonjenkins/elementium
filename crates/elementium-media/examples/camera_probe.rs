@@ -66,19 +66,22 @@ fn main() {
                                 let now = Instant::now();
                                 started.get_or_insert(now);
                                 latest = Some(now);
-                                sample = Some((f.width(), f.height(), f.y().len()));
+                                sample = Some((f.width(), f.height(), f.mjpeg().map_or(0, <[u8]>::len)));
                                 // Write one frame out so the pixels can be inspected
                                 // directly. A capture that is geometrically or
                                 // chromatically wrong looks identical to a healthy one in
                                 // every scalar we log.
                                 if frames == 30 && std::env::var_os("ELEMENTIUM_DUMP_FRAME").is_some() {
                                     let path = format!("/tmp/elementium_frame_{}.rgba", s.node_id);
-                                    match std::fs::write(&path, elementium_codec::i420_to_rgba(&f).data) {
-                                        Ok(()) => println!(
-                                            "    wrote {path} ({}x{}, {} bytes)",
-                                            f.width(), f.height(), f.y().len()
-                                        ),
-                                        Err(e) => println!("    frame dump failed: {e}"),
+                                    if let Some(planar) = f.to_planar() {
+                                        let rgba = elementium_codec::i420_to_rgba(&planar);
+                                        match std::fs::write(&path, rgba.data) {
+                                            Ok(()) => println!(
+                                                "    wrote {path} ({}x{}, {} luma bytes)",
+                                                planar.width(), planar.height(), planar.y().len()
+                                            ),
+                                            Err(e) => println!("    frame dump failed: {e}"),
+                                        }
                                     }
                                 }
                             } else {

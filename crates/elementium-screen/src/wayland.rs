@@ -115,7 +115,10 @@ impl ScreenCapturer for WaylandCapturer {
             .name("wayland-screencast".to_owned())
             .spawn(move || {
                 while running.load(Ordering::SeqCst) {
-                    if let Some(frame) = capture.try_recv() {
+                    // Screen capture is always pixels: the portal hands back raw buffers,
+                    // never MJPEG, so the compressed variant cannot arise here. Decoding
+                    // rather than asserting keeps that true even if it ever changes.
+                    if let Some(frame) = capture.try_recv().and_then(|f| f.to_planar()) {
                         callback(frame);
                     } else {
                         std::thread::sleep(std::time::Duration::from_millis(2));

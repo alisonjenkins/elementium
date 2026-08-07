@@ -677,7 +677,7 @@ fn camera_pipeline_loop(
                     frame_count,
                     w = frame.width(),
                     h = frame.height(),
-                    luma_len = frame.y().len(),
+                    compressed = frame.mjpeg().is_some(),
                     "Camera frame received"
                 );
             }
@@ -694,13 +694,16 @@ fn camera_pipeline_loop(
             // full-resolution frame -- only the self-view is reduced.
             if last_preview.elapsed() >= MIN_PREVIEW_INTERVAL {
                 last_preview = std::time::Instant::now();
-                let preview = elementium_codec::halve_i420(&frame).as_ref().map_or_else(
-                    || elementium_codec::i420_to_rgba(&frame),
-                    elementium_codec::i420_to_rgba,
-                );
-                maybe_dump_preview(frame_count, &preview.data, preview.width, preview.height);
-                if let Ok(mut buf) = video_frames.lock() {
-                    buf.insert(track_id.to_string(), preview);
+                // `to_preview` halves a decoded frame and decodes a compressed one at half
+                // scale, which is where the rate limit earns its keep: on the accelerated
+                // path most frames reach the encoder without ever being decoded, and only
+                // the ones actually displayed cost anything.
+                if let Some(half) = frame.to_preview() {
+                    let preview = elementium_codec::i420_to_rgba(&half);
+                    maybe_dump_preview(frame_count, &preview.data, preview.width, preview.height);
+                    if let Ok(mut buf) = video_frames.lock() {
+                        buf.insert(track_id.to_string(), preview);
+                    }
                 }
             }
 
@@ -733,7 +736,8 @@ fn camera_pipeline_loop(
 /// named, and it has no business being on the per-frame path.
 fn ensure_encoder(
     encoder: &mut Option<NegotiatedEncoder>,
-    frame: &elementium_types::I420Frame,
+    width: u32,
+    height: u32,
     last_keyframe: &mut std::time::Instant,
     wanted: VideoCodec,
 ) {
@@ -743,23 +747,23 @@ fn ensure_encoder(
     // participant joins who cannot decode what everyone else could.
     if encoder
         .as_ref()
-        .is_some_and(|e| e.size() == (frame.width(), frame.height()) && e.codec() == wanted)
+        .is_some_and(|e| e.size() == (width, height) && e.codec() == wanted)
     {
         return;
     }
 
-    let bitrate = bitrate_for(frame.width(), frame.height());
+    let bitrate = bitrate_for(width, height);
     let config = EncoderConfig {
-        width: frame.width(),
-        height: frame.height(),
+        width,
+        height,
         bitrate_kbps: bitrate,
         max_framerate: u32::try_from(MAX_ENCODE_FPS).unwrap_or(30),
     };
     match NegotiatedEncoder::new(wanted, config) {
         Ok(enc) => {
             tracing::info!(
-                width = frame.width(),
-                height = frame.height(),
+                width,
+                height,
                 bitrate_kbps = bitrate,
                 max_fps = MAX_ENCODE_FPS,
                 codec = wanted.sdp_name(),
@@ -811,13 +815,24 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 /// inlinable, and the bound documents that the body depends on nothing but the interface.
 fn encode_and_send<E: VideoEncoder>(
     encoder: &mut E,
-    frame: &elementium_types::I420Frame,
+    frame: &elementium_media::captured_frame::CapturedFrame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
-    // No conversion: capture already produces the encoder's input format. MJPEG is stored
-    // as YCbCr 4:2:0, which is what this is, so nothing on this path converts colour in
-    // either direction.
-    match encoder.encode(frame) {
+    // The compressed bytes go straight to the encoder where it can take them, which on a
+    // GPU with a JPEG block means the CPU never touches a pixel of this frame. `None` says
+    // it cannot, and then the frame is decoded here as it always was.
+    let fast_path = frame.mjpeg().and_then(|jpeg| encoder.encode_mjpeg(jpeg));
+    let outcome = if let Some(result) = fast_path {
+        result
+    } else {
+        let Some(planar) = frame.to_planar() else {
+            tracing::debug!("captured frame could not be decoded");
+            return;
+        };
+        encoder.encode(&planar)
+    };
+
+    match outcome {
         Ok(packets) => {
             if let Ok(guard) = encode_tx.lock()
                 && let Some(tx) = guard.as_ref()
@@ -834,7 +849,7 @@ fn encode_and_send<E: VideoEncoder>(
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
 fn encode_and_send_video_frame(
     track_id: &str,
-    frame: &elementium_types::I420Frame,
+    frame: &elementium_media::captured_frame::CapturedFrame,
     encoder: &mut Option<NegotiatedEncoder>,
     last_keyframe: &mut std::time::Instant,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
@@ -845,7 +860,7 @@ fn encode_and_send_video_frame(
     let existed = encoder
         .as_ref()
         .is_some_and(|e| e.codec() == wanted);
-    ensure_encoder(encoder, frame, last_keyframe, wanted);
+    ensure_encoder(encoder, frame.width(), frame.height(), last_keyframe, wanted);
 
     let Some(enc) = encoder.as_mut() else {
         return;
