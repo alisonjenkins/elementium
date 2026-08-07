@@ -41,15 +41,24 @@ export interface ElementWebServer {
 }
 
 /**
- * Remove the Elementium shim script from a served page.
+ * Remove everything Elementium injects into the dist from a served page.
  *
  * Applied to every HTML document, not just the entry page: the Element Call widget has its
- * own `index.html` and carries its own copy. Missing that one produced a participant that
+ * own `index.html` and carries its own copies. Missing one produced a participant that
  * reached the call and then failed at `enumerateDevices`, because the shim was asking a
  * Tauri backend that does not exist in a browser.
+ *
+ * The autojoin driver matters just as much and is easier to miss. `just app-join` injects it
+ * into the same `element-web-dist/` this server reads, along with a session for tester1. A
+ * page served with it still present logs itself in as tester1 and drives itself into a call,
+ * silently replacing whatever session this harness seeded -- which presents as every
+ * participant being the same user, in a room they are not in.
  */
 function withoutShims(html: string): string {
-  return html.replace(/<script[^>]*src="[^"]*elementium-shims\.js"[^>]*>\s*<\/script>/g, "");
+  return html
+    .replace(/<script[^>]*src="[^"]*elementium-shims\.js"[^>]*>\s*<\/script>/g, "")
+    .replace(/<script[^>]*src="[^"]*elementium-autojoin\.js"[^>]*>\s*<\/script>/g, "")
+    .replace(/<script>window\.__ELEMENTIUM_AUTOJOIN[\s\S]*?<\/script>/g, "");
 }
 
 /**

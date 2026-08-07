@@ -15,7 +15,7 @@ import { test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { startElementWeb, type Credentials } from "./element-web";
+import { startElementWeb, freshSessions, type Credentials } from "./element-web";
 import { openRoom, joinCall, keysInstalled, inboundAudio, usable } from "./element-call";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -42,11 +42,25 @@ test("hold a call open for Elementium to join", async ({ browser }) => {
   // Everyone except the first: `tester1` is left free for whoever is driving Elementium, and
   // two clients logged in as the same user with different devices is a different situation
   // from two people, which is not the one being set up.
-  const peers = env.participants.slice(1);
+  // Fresh logins, not the fixture's tokens. Those name one device per user for the whole
+  // environment, and a new browser context around an old device id is a device whose keys
+  // the server already holds against a crypto store that no longer has them -- the server
+  // rejects the key upload ("One time key already exists") and the session never works.
+  const all = await freshSessions(env.participants.length);
+  const peers = all.slice(1);
   if (peers.length === 0) throw new Error("provision.sh produced nobody to be the other side");
+  console.log(`  room ${env.room_id}`);
 
   const server = await startElementWeb();
   const contexts = await Promise.all(peers.map(() => browser.newContext()));
+  contexts.forEach((c) =>
+    c.on("page", (pg) =>
+      pg.on("console", (m) => {
+        const t = m.text();
+        if (/error|fail|sync|Unable|crypto/i.test(t)) console.log(`    [page:${m.type()}] ${t.slice(0, 180)}`);
+      }),
+    ),
+  );
   const joined = [];
   for (const [i, who] of peers.entries()) {
     const p = await openRoom(contexts[i]!, server, who, env.room_id);

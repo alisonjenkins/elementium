@@ -90,10 +90,36 @@ function seedSession(cfg: AutoJoinConfig): void {
   log(`session seeded for ${cfg.userId}`);
 }
 
+/**
+ * Click away the "Verify this session" prompt if it appears.
+ *
+ * Polled for a while rather than waited on once: it arrives after the initial sync, which is
+ * some seconds after the page is ready. Dismissed rather than satisfied -- verifying would
+ * test Element Web's verification flow, which is not what this is for.
+ */
+function dismissVerificationPrompt(): void {
+  const deadline = Date.now() + 30_000;
+  const tick = () => {
+    const later = byName(/^(later|skip|dismiss)$/i)();
+    if (later) {
+      later.click();
+      log("dismissed the session verification prompt");
+      return;
+    }
+    if (Date.now() < deadline) setTimeout(tick, 500);
+  };
+  tick();
+}
+
 /** The main window: get into the room, then open the call. */
 async function driveElementWeb(cfg: AutoJoinConfig): Promise<void> {
   seedSession(cfg);
   if (!location.hash.includes(cfg.roomId)) location.hash = `#/room/${cfg.roomId}`;
+
+  // Every provisioned login is a new device, and once any session has set up cross-signing
+  // the rest are asked to verify. The prompt sits over the room, so the call button is never
+  // clickable and it looks as though the room never loaded.
+  dismissVerificationPrompt();
 
   await waitFor("the room view", () =>
     document.querySelector<HTMLElement>(".mx_RoomView, [class*='RoomView']"),

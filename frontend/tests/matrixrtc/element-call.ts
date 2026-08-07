@@ -49,6 +49,32 @@ async function recordPeerConnections(page: Page): Promise<void> {
   });
 }
 
+/**
+ * Get the "Verify this session" prompt out of the way.
+ *
+ * Every provisioned login is a new device, and once any session has set up cross-signing the
+ * others are asked to verify. The prompt is an alert that sits over the room, so the composer
+ * never becomes visible and the failure reads as "the room never loaded".
+ *
+ * Dismissed rather than satisfied: these participants exist to carry media, and verifying
+ * them would test Element Web's verification flow. Best-effort -- when the prompt is absent
+ * there is nothing to do and nothing to fail.
+ */
+async function dismissToasts(page: Page): Promise<void> {
+  // Two of them, and more than once: "Verify this session" arrives after the initial sync,
+  // and "Enable desktop notifications" replaces it. Both are alerts over the room, so the
+  // composer never becomes visible and the failure reads as "the room never loaded".
+  for (let i = 0; i < 4; i++) {
+    const button = page.getByRole("button", { name: /^(later|skip|dismiss)$/i }).first();
+    try {
+      await button.waitFor({ timeout: 8_000 });
+      await button.click();
+    } catch {
+      return;
+    }
+  }
+}
+
 export interface Participant {
   who: Credentials;
   page: Page;
@@ -83,10 +109,11 @@ export async function openRoom(
   await useSession(page, who, HOMESERVER);
   console.log(`  [${who.user_id}] loading the room`);
   await page.goto(`${server.origin}/#/room/${roomId}`);
+  await dismissToasts(page);
   await page
     .getByRole("textbox", { name: /message|send a message/i })
     .first()
-    .waitFor({ timeout: 90_000 });
+    .waitFor({ timeout: 120_000 });
   return { who, page, context, widget: () => widgetFrame(page) };
 }
 
