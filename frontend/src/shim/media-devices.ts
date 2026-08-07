@@ -382,6 +382,7 @@ function startLocalVideoFrameFetch(
   let windowPresentMs = 0;
   let windowMismatches = 0;
   let lastMismatch = "none";
+  let lastGeometry = "none";
 
   const fetchLoop = async () => {
     if (!running) return;
@@ -410,6 +411,16 @@ function startLocalVideoFrameFetch(
             return scheduleNext();
           }
           windowDrawn += 1;
+          lastGeometry = `${width}x${height} into ${canvas.width}x${canvas.height}`;
+          // Paint the whole canvas before drawing the frame. Anything still magenta
+          // afterwards was not covered by this frame, which distinguishes "the frame is
+          // corrupt" from "the frame only covers part of the canvas and the rest is
+          // whatever was there before" -- the two are indistinguishable when the leftover
+          // content is itself a plausible-looking picture.
+          if (videoDebug) {
+            ctx.fillStyle = "#f0f";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+          }
           const rgba = new Uint8ClampedArray(buf.slice(8));
           const imageData = new ImageData(rgba, width, height);
           if (canvas.width === width && canvas.height === height) {
@@ -466,7 +477,7 @@ function startLocalVideoFrameFetch(
           `${(windowFetchMs / windowFrames).toFixed(1)}ms avg per frame ` +
           `(${canvas.width}x${canvas.height}), drawn=${windowDrawn} ` +
           `present=${(windowPresentMs / Math.max(1, windowDrawn)).toFixed(1)}ms ` +
-          `mismatched=${windowMismatches} last=${lastMismatch}`,
+          `mismatched=${windowMismatches} last=${lastMismatch} geom=${lastGeometry}`,
       );
       windowStart = Date.now();
       windowFrames = 0;
