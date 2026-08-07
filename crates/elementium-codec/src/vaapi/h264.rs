@@ -53,6 +53,9 @@ use libva_sys::va_display_drm as va;
 
 use super::display::Display;
 use super::image::SurfaceUpload;
+use super::jpeg::JpegDecoder;
+use super::jpeg_headers::Subsampling;
+use super::vpp::Converter;
 use super::resource::{Buffer, Config, Context, SurfaceId, SurfacePool};
 use super::status::{Status, check};
 use crate::video::{EncodedFrame, PixelLayout, VideoCodec, VideoEncoder};
@@ -150,6 +153,18 @@ pub struct H264Encoder {
     reconstructions: SurfacePool,
     /// One staging image, reused: see [`SurfaceUpload`].
     upload: SurfaceUpload,
+    /// The accelerated MJPEG path, built on first use.
+    ///
+    /// Lazily, because it depends on the JPEG's own subsampling and nothing knows that
+    /// until a frame arrives. Once built it is kept; a camera does not change subsampling
+    /// mid-stream, and one that did is refused rather than silently re-negotiated.
+    mjpeg: Option<MjpegPath>,
+    /// Set once the accelerated path has been tried and found unavailable.
+    ///
+    /// Without this a machine with no JPEG decoder would attempt to build one on every
+    /// single frame, which is a driver round trip thirty times a second to learn the same
+    /// answer.
+    mjpeg_unavailable: bool,
     display: Arc<Display>,
     width: u32,
     height: u32,
@@ -206,6 +221,8 @@ impl H264Encoder {
             inputs,
             reconstructions,
             upload,
+            mjpeg: None,
+            mjpeg_unavailable: false,
             display,
             width,
             height,
@@ -257,6 +274,16 @@ impl H264Encoder {
     }
 }
 
+/// Decoding JPEG on the GPU and getting the result into a surface the encoder reads.
+struct MjpegPath {
+    decoder: JpegDecoder,
+    /// Only present when the JPEG's subsampling is not already what the encoder reads.
+    ///
+    /// A 4:2:0 JPEG decodes straight into NV12 and needs nothing further; 4:2:2, which is
+    /// what most UVC webcams emit, needs a pass through the post-processor.
+    converter: Option<Converter>,
+}
+
 impl VideoEncoder for H264Encoder {
     fn codec(&self) -> VideoCodec {
         VideoCodec::H264
@@ -285,6 +312,29 @@ impl VideoEncoder for H264Encoder {
         self.encode_frame(frame).map_err(|e| e.to_string())
     }
 
+    fn encode_mjpeg(&mut self, jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, String>> {
+        if self.mjpeg_unavailable {
+            return None;
+        }
+        if self.mjpeg.is_none() {
+            match self.build_mjpeg_path(jpeg) {
+                Ok(path) => self.mjpeg = Some(path),
+                Err(reason) => {
+                    // Once, not per frame: the answer will not change, and the caller
+                    // decoding in software from here on is a normal outcome rather than a
+                    // fault.
+                    tracing::info!(
+                        reason = %reason,
+                        "no accelerated MJPEG path; frames will be decoded on the CPU"
+                    );
+                    self.mjpeg_unavailable = true;
+                    return None;
+                }
+            }
+        }
+        Some(self.encode_jpeg(jpeg).map_err(|e| e.to_string()))
+    }
+
     fn request_keyframe(&mut self) {
         self.force_keyframe = true;
     }
@@ -296,19 +346,87 @@ impl VideoEncoder for H264Encoder {
 }
 
 impl H264Encoder {
-    /// Submit one frame and collect what came back.
+    /// Build the accelerated MJPEG path for the kind of JPEG this camera sends.
+    ///
+    /// The display is shared with the encoder's, which is not an optimisation but a
+    /// requirement: surfaces belong to a display, and a decoder that opened its own would
+    /// force every frame back through system memory -- the entire cost being avoided.
+    fn build_mjpeg_path(&self, jpeg: &[u8]) -> Result<MjpegPath, Status> {
+        let headers = super::jpeg_headers::parse(jpeg)
+            .map_err(|_| Status { operation: "not a baseline JPEG", code: -1 })?;
+        if u32::from(headers.width) != self.width || u32::from(headers.height) != self.height {
+            return Err(Status { operation: "JPEG is not the negotiated size", code: -1 });
+        }
+        let subsampling = headers
+            .subsampling()
+            .ok_or(Status { operation: "unrecognised chroma subsampling", code: -1 })?;
+
+        let display = self.context.display();
+        let decoder = JpegDecoder::with_display(display, self.width, self.height, subsampling)?;
+        // 4:2:0 decodes straight into NV12, which is what the encoder reads.
+        let converter = match subsampling {
+            Subsampling::Yuv420 => None,
+            Subsampling::Yuv422 | Subsampling::Yuv444 => {
+                Some(Converter::new_to_nv12(display, self.width, self.height)?)
+            }
+        };
+        tracing::info!(
+            width = self.width,
+            height = self.height,
+            ?subsampling,
+            converting = converter.is_some(),
+            "MJPEG will be decoded on the GPU"
+        );
+        Ok(MjpegPath { decoder, converter })
+    }
+
+    /// Decode a JPEG on the GPU and encode the result, without it leaving the GPU.
+    fn encode_jpeg(&mut self, jpeg: &[u8]) -> Result<Vec<EncodedFrame>, Status> {
+        let mut path = self
+            .mjpeg
+            .take()
+            .ok_or(Status { operation: "no MJPEG path", code: -1 })?;
+        let result = (|| {
+            let decoded = path.decoder.decode(jpeg)?;
+            // 4:2:0 decodes straight into what the encoder reads; anything else needs
+            // the post-processor.
+            path.converter
+                .as_mut()
+                .map_or(Ok(decoded), |converter| converter.to_nv12(decoded))
+        })();
+        self.mjpeg = Some(path);
+
+        let source = result?;
+        self.encode_surface(source)
+    }
+
+    /// Upload one frame and encode it.
     fn encode_frame(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, Status> {
-        let index = self.frame_index;
-        let keyframe = self.wants_keyframe();
         let source = self
-            .input_for(index)
+            .input_for(self.frame_index)
             .ok_or(Status { operation: "no input surface available", code: -1 })?;
-        let reconstruction = self
-            .reconstruction_for(index)
-            .ok_or(Status { operation: "no reconstruction surface available", code: -1 })?;
 
         // Upload first: the surface must hold the picture before the encode is submitted.
         self.upload.upload(frame, source)?;
+
+        self.submit_and_collect(source)
+    }
+
+    /// Encode a picture already sitting in a surface.
+    ///
+    /// The accelerated path's entry point: the frame was decoded on the GPU and never
+    /// existed in ordinary memory, so there is nothing to upload.
+    fn encode_surface(&mut self, source: SurfaceId) -> Result<Vec<EncodedFrame>, Status> {
+        self.submit_and_collect(source)
+    }
+
+    /// Everything after the picture is in a surface: parameters, submit, read back.
+    fn submit_and_collect(&mut self, source: SurfaceId) -> Result<Vec<EncodedFrame>, Status> {
+        let index = self.frame_index;
+        let keyframe = self.wants_keyframe();
+        let reconstruction = self
+            .reconstruction_for(index)
+            .ok_or(Status { operation: "no reconstruction surface available", code: -1 })?;
 
         let coded = Buffer::empty(
             &self.context,
@@ -732,7 +850,12 @@ struct RateControlBuffer {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic
+)]
 mod tests {
     use super::{H264Encoder, coded_buffer_size};
     use crate::video::{VideoCodec, VideoEncoder};
@@ -944,6 +1067,113 @@ mod tests {
                 "frame {n}: background decoded as {background}, encoded as 80"
             );
         }
+    }
+
+    /// The accelerated path end to end: a JPEG goes in, H.264 comes out, and the picture
+    /// survives.
+    ///
+    /// This is the one that proves the whole chain -- GPU JPEG decode, colour conversion
+    /// where the subsampling needs it, and encode -- without the frame ever existing in
+    /// ordinary memory. Every stage reports success independently while producing a black
+    /// or shifted picture, so the only check worth making is what a decoder reconstructs.
+    ///
+    /// Run for both 4:2:0 and 4:2:2 because they take different routes: the first decodes
+    /// straight into NV12, the second needs the post-processor. A camera emits one or the
+    /// other and we do not get to choose.
+    #[test]
+    fn a_jpeg_encodes_without_being_decoded_on_the_cpu() {
+        const FRAMES: usize = 6;
+        const BAR: usize = 40;
+
+        let Some(dir) = scratch_dir() else {
+            return; // No ffmpeg to check against.
+        };
+        for (name, sampling) in [
+            ("4:2:0", jpeg_encoder::SamplingFactor::F_2_2),
+            ("4:2:2", jpeg_encoder::SamplingFactor::F_2_1),
+        ] {
+            let Some(mut encoder) = encoder() else {
+                return;
+            };
+            let mut stream = Vec::new();
+            let mut accelerated = true;
+            for n in 0..FRAMES {
+                let jpeg = jpeg_of_bar(n * BAR, sampling);
+                match encoder.encode_mjpeg(&jpeg) {
+                    Some(Ok(packets)) => {
+                        for packet in &packets {
+                            stream.extend_from_slice(packet.data.as_bytes());
+                        }
+                    }
+                    Some(Err(e)) => panic!("{name}: the accelerated path failed: {e}"),
+                    None => {
+                        accelerated = false;
+                        break;
+                    }
+                }
+            }
+            if !accelerated {
+                continue; // No JPEG decoding here; the software path covers it.
+            }
+
+            let path = dir.join(format!("mjpeg-{}.h264", name.replace(':', "")));
+            let decoded = dir.join(format!("mjpeg-{}.yuv", name.replace(':', "")));
+            std::fs::write(&path, &stream).expect("write");
+            let run = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&path)
+                .args(["-pix_fmt", "yuv420p", "-f", "rawvideo", "-y"])
+                .arg(&decoded)
+                .output()
+                .expect("run ffmpeg");
+            assert!(
+                run.status.success(),
+                "{name}: the decoder rejected the stream: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+
+            let raw = std::fs::read(&decoded).expect("read");
+            let frame_bytes = WIDTH * HEIGHT * 3 / 2;
+            assert_eq!(raw.len() / frame_bytes, FRAMES, "{name}: wrong frame count");
+            for n in 0..FRAMES {
+                let luma = &raw[n * frame_bytes..n * frame_bytes + WIDTH * HEIGHT];
+                let bright: Vec<usize> = (0..HEIGHT)
+                    .filter(|row| luma[row * WIDTH + WIDTH / 2] > 150)
+                    .collect();
+                let expected: Vec<usize> = (n * BAR..(n * BAR + BAR).min(HEIGHT)).collect();
+                assert_eq!(
+                    bright, expected,
+                    "{name}: frame {n}: the bar is not where it was drawn, so the picture \
+                     that came out is not the one that went in"
+                );
+            }
+        }
+    }
+
+    /// A JPEG of the standard test picture, at a chosen subsampling.
+    fn jpeg_of_bar(row: usize, sampling: jpeg_encoder::SamplingFactor) -> Vec<u8> {
+        let mut rgb = vec![0_u8; WIDTH * HEIGHT * 3];
+        for r in 0..HEIGHT {
+            let value = if (row..row + 40).contains(&r) { 230 } else { 60 };
+            for c in 0..WIDTH {
+                let at = (r * WIDTH + c) * 3;
+                rgb[at] = value;
+                rgb[at + 1] = value;
+                rgb[at + 2] = value;
+            }
+        }
+        let mut jpeg = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 92);
+        encoder.set_sampling_factor(sampling);
+        encoder
+            .encode(
+                &rgb,
+                u16::try_from(WIDTH).expect("width"),
+                u16::try_from(HEIGHT).expect("height"),
+                jpeg_encoder::ColorType::Rgb,
+            )
+            .expect("encode");
+        jpeg
     }
 
     /// A frame with a horizontal bar starting at `row`.

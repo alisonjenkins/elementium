@@ -192,6 +192,25 @@ pub trait VideoEncoder: Send {
     /// are too small for its geometry, or if the codec fails.
     fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, String>;
 
+    /// Encode a JPEG directly, without decoding it first, if this encoder can.
+    ///
+    /// `None` means it cannot, and the caller must decode the frame and use
+    /// [`VideoEncoder::encode`]. That is the honest shape: whether the compressed bytes can
+    /// be used depends on the hardware — a GPU with a JPEG block and an encoder can take
+    /// them, and everything else needs pixels — and a caller that assumed either way would
+    /// be wrong on half the machines it runs on.
+    ///
+    /// Returning `Some(Err(..))` is different from returning `None`: it means the fast path
+    /// exists and failed, which is worth reporting rather than silently retrying in
+    /// software on every frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder's error if the fast path exists and failed.
+    fn encode_mjpeg(&mut self, _jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, String>> {
+        None
+    }
+
     /// Ask for the next frame to be a keyframe.
     ///
     /// Called when a receiver sends an RTCP PLI/FIR. A request, not a guarantee: the
@@ -317,6 +336,14 @@ impl VideoEncoder for NegotiatedEncoder {
             Self::Vp8(e) => VideoEncoder::encode(e, frame),
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
             Self::VaapiH264(e) => VideoEncoder::encode(e, frame),
+        }
+    }
+
+    fn encode_mjpeg(&mut self, jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, String>> {
+        match self {
+            Self::Vp8(e) => e.encode_mjpeg(jpeg),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => e.encode_mjpeg(jpeg),
         }
     }
 
