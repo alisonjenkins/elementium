@@ -1,33 +1,42 @@
-//! Getting a frame into a GPU surface.
+//! Getting a frame into a GPU surface, and reading one back out.
 //!
 //! This is the one place on the hardware path where the CPU still touches every pixel, so
 //! how it is done matters more than the line count suggests.
 //!
-//! There are two ways to fill a surface. `vaCreateImage` allocates a separate image in
-//! system memory, which is then copied into the surface by `vaPutImage` — two copies, one
-//! of them inside the driver where it cannot be measured. `vaDeriveImage` instead hands
-//! back an image *backed by the surface itself*, so mapping it gives a pointer to the
-//! memory the encoder will read. Writing through that pointer is one pass, and there is no
-//! second copy at all.
+//! # Why uploads do not use `vaDeriveImage`
 //!
-//! Derivation is not guaranteed. Some drivers refuse it for some formats, so the caller is
-//! told plainly when it is unavailable rather than being silently given the slower path
-//! with the same signature.
+//! There are two ways to fill a surface. `vaCreateImage` allocates an image in system
+//! memory which `vaPutImage` then copies into the surface — two passes, the second inside
+//! the driver. `vaDeriveImage` hands back an image *backed by the surface itself*, so
+//! writing through its mapping should be one pass and no copy at all.
 //!
-//! # Why the conversion happens here
+//! It is not, on this driver. A derived image here is a scratch mapping: bytes written
+//! through it read back correctly while it is still mapped and are gone once it is
+//! unmapped. That was found by encoding a flat grey frame and decoding the result to a
+//! uniformly black picture, then writing, unmapping, re-deriving and reading — 77 before,
+//! 0 after.
+//!
+//! Reads through a derived image are no better here: they return zeroes whatever the
+//! surface holds, which is worse than failing because a read-back built on one agrees with
+//! itself and verifies nothing. So derived images are not used at all. Uploads go through
+//! [`SurfaceUpload`], which creates one image and reuses it, and read-back goes through
+//! `vaGetImage`.
+//!
+//! # Why the conversion happens during the write
 //!
 //! Frames arrive as I420 and encoders read NV12; the difference is only whether the chroma
-//! samples are interleaved. Doing that during the upload means the interleave is free — the
-//! bytes were being written to GPU memory regardless, and they are simply written in a
-//! different order. Converting first, into a staging buffer, would cost a whole extra pass
-//! over the frame to achieve exactly the same result.
+//! samples are interleaved. Interleaving while writing into the staging image makes it free
+//! — those bytes were being written regardless, just in a different order. Converting into
+//! a separate buffer first would cost another whole pass for the same result.
 //!
-//! # The remaining copy
+//! # The remaining copies
 //!
-//! One pass over the frame is what this costs, and it cannot go lower while the frame lives
-//! in ordinary memory. Removing it entirely means never putting it there: importing the
-//! camera's buffer as a DMA-BUF so the GPU reads it where it already lies. That is a
-//! different mechanism, not an optimisation of this one.
+//! Two, then: ours into the staging image, and the driver's into the surface. Removing both
+//! means never putting the frame in ordinary memory at all — importing the camera's buffer
+//! as a DMA-BUF so the GPU reads it where it lies. That is a different mechanism rather
+//! than an optimisation of this one.
+
+use std::sync::Arc;
 
 use elementium_types::I420Frame;
 use libva_sys::va_display_drm as va;
@@ -39,61 +48,204 @@ use super::status::{Status, check};
 /// NV12 as libva spells it.
 const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
 
-/// A surface's own memory, mapped for writing.
+/// A reusable staging image for getting frames into surfaces.
 ///
-/// Unmapped and destroyed on drop, in that order, which is the order libva requires and
-/// does not check.
-pub struct MappedImage<'d> {
-    display: &'d Display,
+/// Created once and reused for the life of the encoder. Creating one per frame would
+/// allocate and free GPU-visible memory thirty times a second to hold the same thing each
+/// time.
+pub struct SurfaceUpload {
+    display: Arc<Display>,
+    image: va::VAImage,
+}
+
+// SAFETY: a `VAImage` is a handle plus geometry, meaningful only against the display it was
+// created on, which is held here and is itself `Send`. The encoder owns both and is not
+// `Sync`, so no two threads reach one at once.
+unsafe impl Send for SurfaceUpload {}
+
+impl SurfaceUpload {
+    /// Create a staging image of this size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Status`] if the driver will not create an NV12 image of this size.
+    pub fn new(display: &Arc<Display>, width: u32, height: u32) -> Result<Self, Status> {
+        let mut format = va::VAImageFormat {
+            fourcc: FOURCC_NV12,
+            byte_order: va::VA_LSB_FIRST,
+            bits_per_pixel: 12,
+            depth: 0,
+            red_mask: 0,
+            green_mask: 0,
+            blue_mask: 0,
+            alpha_mask: 0,
+            va_reserved: [0; 4],
+        };
+        // SAFETY: `VAImage` is a plain C struct; libva fills every field it uses.
+        let mut image: va::VAImage = unsafe { std::mem::zeroed() };
+        // SAFETY: the display outlives the image, which holds it; libva writes only into
+        // `image`, and reads the one format it is given.
+        let status = unsafe {
+            va::vaCreateImage(
+                display.handle(),
+                std::ptr::addr_of_mut!(format),
+                i32::try_from(width).unwrap_or(0),
+                i32::try_from(height).unwrap_or(0),
+                std::ptr::addr_of_mut!(image),
+            )
+        };
+        check(status, "vaCreateImage")?;
+        Ok(Self {
+            display: Arc::clone(display),
+            image,
+        })
+    }
+
+    /// Write `frame` into the staging image and copy it into `surface`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Status`] if the image cannot be mapped, if the frame does not fit, or if
+    /// the driver refuses the copy.
+    pub fn upload(&mut self, frame: &I420Frame, surface: SurfaceId) -> Result<(), Status> {
+        let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `image.buf` belongs to an image created in `new` on this display.
+        check(
+            unsafe {
+                va::vaMapBuffer(self.display.handle(), self.image.buf, std::ptr::addr_of_mut!(data))
+            },
+            "vaMapBuffer",
+        )?;
+
+        let written = {
+            let mut view = ImageView {
+                image: self.image,
+                data: data.cast::<u8>(),
+            };
+            view.write_i420(frame)
+        };
+
+        // SAFETY: mapped immediately above. Unmapped whether or not the write succeeded --
+        // leaving it mapped would fail every later frame.
+        let unmapped = check(
+            unsafe { va::vaUnmapBuffer(self.display.handle(), self.image.buf) },
+            "vaUnmapBuffer",
+        );
+        written?;
+        unmapped?;
+
+        // SAFETY: the image and surface belong to this display, and the rectangle is the
+        // whole image, whose geometry libva itself reported.
+        check(
+            unsafe {
+                va::vaPutImage(
+                    self.display.handle(),
+                    surface.raw(),
+                    self.image.image_id,
+                    0,
+                    0,
+                    u32::from(self.image.width),
+                    u32::from(self.image.height),
+                    0,
+                    0,
+                    u32::from(self.image.width),
+                    u32::from(self.image.height),
+                )
+            },
+            "vaPutImage",
+        )?;
+
+        // Wait for the copy before the caller submits an encode reading this surface.
+        //
+        // `vaPutImage` is allowed to complete asynchronously, and without this the encoder
+        // reads a surface the copy has not reached yet. It showed up as the first two
+        // frames of every stream decoding to black while every later frame was exact --
+        // the pipeline being cold at the start and the copy winning the race thereafter,
+        // which is the shape of a bug that survives casual testing and appears under load.
+        //
+        // SAFETY: the surface belongs to this display and has just been written to.
+        check(
+            unsafe { va::vaSyncSurface(self.display.handle(), surface.raw()) },
+            "vaSyncSurface",
+        )
+    }
+
+    /// Read a surface back into ordinary memory, as NV12.
+    ///
+    /// `vaGetImage` rather than a derived image. A derived image on this driver is a
+    /// scratch mapping in both directions: writes to it are discarded on unmap, and reads
+    /// from it return zeroes regardless of what the surface holds. A read-back built on it
+    /// therefore agrees with itself and says nothing about the surface, which is exactly
+    /// what a verification must not do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Status`] if the driver will not read the surface or map the result.
+    pub fn download(&mut self, surface: SurfaceId) -> Result<Vec<u8>, Status> {
+        // SAFETY: image and surface belong to this display; the rectangle is the whole
+        // image, whose geometry libva reported.
+        check(
+            unsafe {
+                va::vaGetImage(
+                    self.display.handle(),
+                    surface.raw(),
+                    0,
+                    0,
+                    u32::from(self.image.width),
+                    u32::from(self.image.height),
+                    self.image.image_id,
+                )
+            },
+            "vaGetImage",
+        )?;
+
+        let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `image.buf` belongs to an image created in `new` on this display.
+        check(
+            unsafe {
+                va::vaMapBuffer(self.display.handle(), self.image.buf, std::ptr::addr_of_mut!(data))
+            },
+            "vaMapBuffer",
+        )?;
+        let len = usize::try_from(self.image.data_size).unwrap_or(0);
+        let copied = if data.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the driver's mapping of `data_size` bytes, valid until unmapped just
+            // below.
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }.to_vec()
+        };
+        // SAFETY: mapped immediately above, unmapped exactly once.
+        check(
+            unsafe { va::vaUnmapBuffer(self.display.handle(), self.image.buf) },
+            "vaUnmapBuffer",
+        )?;
+        Ok(copied)
+    }
+
+    /// Where each plane sits in what [`SurfaceUpload::download`] returns.
+    #[must_use]
+    pub fn layout(&self) -> Option<PlaneLayout> {
+        PlaneLayout::of(&self.image)
+    }
+}
+
+impl Drop for SurfaceUpload {
+    fn drop(&mut self) {
+        // SAFETY: created in `new` and destroyed exactly once.
+        unsafe {
+            va::vaDestroyImage(self.display.handle(), self.image.image_id);
+        }
+    }
+}
+
+/// A mapped image's bytes, borrowed for the length of one write.
+struct ImageView {
     image: va::VAImage,
     data: *mut u8,
 }
 
-impl<'d> MappedImage<'d> {
-    /// Map the memory behind `surface`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Status`] if the driver will not derive an image from this surface, or will
-    /// not map it. A driver that refuses derivation is not broken — it is telling us the
-    /// surface is in a layout it cannot expose — and the caller's answer is to fall back
-    /// rather than to fail the call.
-    pub fn derive(display: &'d Display, surface: SurfaceId) -> Result<Self, Status> {
-        // Zeroed rather than `Default`: the binding does not derive it, and libva fills
-        // every field it uses.
-        // SAFETY: `VAImage` is a plain C struct of integers and a nested format struct, for
-        // which all-zeroes is a valid bit pattern.
-        let mut image: va::VAImage = unsafe { std::mem::zeroed() };
-        // SAFETY: the display outlives this image by borrow, the surface belongs to it, and
-        // libva writes only into `image`.
-        let status = unsafe {
-            va::vaDeriveImage(display.handle(), surface.raw(), std::ptr::addr_of_mut!(image))
-        };
-        check(status, "vaDeriveImage")?;
-
-        let mut data: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: `image.buf` was just produced by `vaDeriveImage`; libva writes the
-        // mapping address into `data`.
-        let status = unsafe {
-            va::vaMapBuffer(display.handle(), image.buf, std::ptr::addr_of_mut!(data))
-        };
-        if let Err(e) = check(status, "vaMapBuffer") {
-            // The image exists whether or not it could be mapped, and leaking it would
-            // hold GPU memory for the life of the process.
-            // SAFETY: `image` was created above and is destroyed exactly once.
-            unsafe {
-                va::vaDestroyImage(display.handle(), image.image_id);
-            }
-            return Err(e);
-        }
-
-        Ok(Self {
-            display,
-            image,
-            data: data.cast::<u8>(),
-        })
-    }
-
+impl ImageView {
     /// The whole mapping, as bytes.
     ///
     /// One slice rather than one per plane because the planes are offsets into a single
@@ -112,16 +264,16 @@ impl<'d> MappedImage<'d> {
 
     /// Copy an I420 frame in, interleaving its chroma into NV12 as it goes.
     ///
-    /// One pass over the frame. The luma plane is copied row by row because the surface's
+    /// One pass over the frame. The luma plane is copied row by row because the image's
     /// pitch is the driver's choice and rarely equals the frame's width, and the chroma
     /// planes are interleaved during the same pass rather than converted beforehand.
     ///
     /// # Errors
     ///
-    /// Returns [`Status`] if the derived image is not NV12, or if its geometry does not
-    /// admit the frame. Both mean the surface was not the one the caller thought it was,
-    /// which is worth refusing rather than writing past a plane.
-    pub fn write_i420(&mut self, frame: &I420Frame) -> Result<(), Status> {
+    /// Returns [`Status`] if the image is not NV12, or if its geometry does not admit the
+    /// frame. Both mean the image was not the one the caller thought it was, which is worth
+    /// refusing rather than writing past a plane.
+    fn write_i420(&mut self, frame: &I420Frame) -> Result<(), Status> {
         let fail = |what: &'static str| Status { operation: what, code: -1 };
 
         if self.image.format.fourcc != FOURCC_NV12 {
@@ -200,24 +352,9 @@ impl<'d> MappedImage<'d> {
         Ok(())
     }
 
-    /// The mapped bytes, for reading back what was written.
-    ///
-    /// Exists for tests: an upload that silently wrote to the wrong offsets produces a
-    /// picture that is merely wrong rather than an error, so it has to be read back to be
-    /// believed.
-    #[must_use]
-    pub fn as_bytes(&mut self) -> Option<&[u8]> {
-        self.bytes().map(|b| &*b)
-    }
-
-    /// Where each plane starts and how wide its rows are.
-    #[must_use]
-    pub fn layout(&self) -> Option<PlaneLayout> {
-        PlaneLayout::of(&self.image)
-    }
 }
 
-/// Where NV12's two planes sit inside a mapped image.
+/// Where NV12's two planes sit inside an image.
 ///
 /// The driver chooses both the offsets and the pitches, and they are routinely not what the
 /// geometry would suggest — assuming `width` for the pitch, or that chroma follows luma
@@ -245,17 +382,6 @@ impl PlaneLayout {
     }
 }
 
-impl Drop for MappedImage<'_> {
-    fn drop(&mut self) {
-        // SAFETY: mapped and created in `derive`; released exactly once, and in the order
-        // libva requires -- unmapping after destroying the image is undefined.
-        unsafe {
-            va::vaUnmapBuffer(self.display.handle(), self.image.buf);
-            va::vaDestroyImage(self.display.handle(), self.image.image_id);
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -264,7 +390,7 @@ impl Drop for MappedImage<'_> {
     clippy::many_single_char_names
 )]
 mod tests {
-    use super::{MappedImage, PlaneLayout};
+    use super::{PlaneLayout, SurfaceUpload};
     use super::super::display::Display;
     use super::super::resource::SurfacePool;
     use elementium_types::I420Frame;
@@ -279,50 +405,55 @@ mod tests {
     fn test_frame() -> I420Frame {
         let (w, h) = (WIDTH, HEIGHT);
         let y: Vec<u8> = (0..w * h).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect();
-        let u: Vec<u8> = (0..(w / 2) * (h / 2)).map(|i| u8::try_from(100 + i % 50).unwrap_or(0)).collect();
-        let v: Vec<u8> = (0..(w / 2) * (h / 2)).map(|i| u8::try_from(200 + i % 50).unwrap_or(0)).collect();
+        let u: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| u8::try_from(100 + i % 50).unwrap_or(0))
+            .collect();
+        let v: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| u8::try_from(200 + i % 50).unwrap_or(0))
+            .collect();
         I420Frame::from_planes(W, H, &y, &u, &v, 0).expect("planes match the geometry")
     }
 
-    /// The upload must land where the encoder will read, which is not something the call
-    /// succeeding tells you: writing to the wrong offsets or with the wrong pitch produces
-    /// a surface that encodes perfectly into a wrong picture.
+    /// Everything needed for an upload, or `None` where there is no GPU.
+    fn fixture() -> Option<(SurfaceUpload, super::super::resource::SurfaceId, SurfacePool)> {
+        let display = std::sync::Arc::new(Display::open_any()?);
+        let pool = SurfacePool::new_nv12(&display, W, H, 1).ok()?;
+        let surface = pool.surfaces().first().copied()?;
+        let upload = SurfaceUpload::new(&display, W, H).ok()?;
+        Some((upload, surface, pool))
+    }
+
+    /// The upload must land in the surface the encoder reads, which is not something the
+    /// call succeeding tells you: on this driver a write through a derived image is
+    /// discarded on unmap and every status is still success.
     ///
-    /// So the surface is read back and compared sample by sample, including the chroma
-    /// interleave -- swapping U and V is the classic fault here and changes only the
-    /// colour, which no size or status check can catch.
+    /// So the surface is read back with `vaGetImage` -- which reads the surface rather
+    /// than a mapping of our own making -- and compared sample by sample, chroma
+    /// interleave included. Swapping U and V is the classic fault here and changes only
+    /// the colour, which no size or status check can catch.
     #[test]
-    fn an_uploaded_frame_reads_back_as_nv12() {
-        let Some(display) = Display::open_any() else {
+    fn an_uploaded_frame_reads_back_out_of_the_surface() {
+        let Some((mut upload, surface, _pool)) = fixture() else {
             return; // No GPU on this machine; nothing to check.
         };
-        let Ok(pool) = SurfacePool::new_nv12(&display, W, H, 1) else {
-            return;
-        };
-        let surface = pool.surfaces().first().copied().expect("one surface");
-
-        let Ok(mut image) = MappedImage::derive(&display, surface) else {
-            return; // This driver will not derive; the caller falls back.
-        };
         let frame = test_frame();
-        image.write_i420(&frame).expect("upload");
+        upload.upload(&frame, surface).expect("upload");
 
-        let layout = image.layout().expect("two planes");
-        let bytes = image.as_bytes().expect("mapping").to_vec();
-        drop(image);
+        let bytes = upload.download(surface).expect("read back");
+        let layout = upload.layout().expect("two planes");
+        assert!(!bytes.is_empty(), "the surface read back empty");
 
-        let (w, h) = (WIDTH, HEIGHT);
-        for row in 0..h {
+        for row in 0..HEIGHT {
             let start = layout.luma_offset + row * layout.luma_pitch;
             assert_eq!(
-                &bytes[start..start + w],
-                &frame.y()[row * frame.y_stride()..row * frame.y_stride() + w],
-                "luma row {row} did not land where the encoder will read it"
+                &bytes[start..start + WIDTH],
+                &frame.y()[row * frame.y_stride()..row * frame.y_stride() + WIDTH],
+                "luma row {row} is not what was uploaded"
             );
         }
-        for row in 0..h / 2 {
+        for row in 0..HEIGHT / 2 {
             let start = layout.chroma_offset + row * layout.chroma_pitch;
-            for x in 0..w / 2 {
+            for x in 0..WIDTH / 2 {
                 let u = frame.u()[row * frame.uv_stride() + x];
                 let v = frame.v()[row * frame.uv_stride() + x];
                 assert_eq!(bytes[start + x * 2], u, "U at {row},{x}");
@@ -335,21 +466,40 @@ mod tests {
         }
     }
 
-    /// A frame larger than the surface must be refused rather than written past the end of
-    /// a plane, which corrupts whatever the driver put next in the mapping.
+    /// Uploading twice must replace the picture, not leave the first one. A staging image
+    /// that is reused has to be fully overwritten each time.
+    #[test]
+    fn a_second_upload_replaces_the_first() {
+        let Some((mut upload, surface, _pool)) = fixture() else {
+            return;
+        };
+        upload.upload(&test_frame(), surface).expect("first upload");
+
+        let flat = I420Frame::from_planes(
+            W,
+            H,
+            &vec![17; WIDTH * HEIGHT],
+            &vec![33; (WIDTH / 2) * (HEIGHT / 2)],
+            &vec![44; (WIDTH / 2) * (HEIGHT / 2)],
+            0,
+        )
+        .expect("planes match the geometry");
+        upload.upload(&flat, surface).expect("second upload");
+
+        let bytes = upload.download(surface).expect("read back");
+        let layout = upload.layout().expect("two planes");
+        assert_eq!(bytes[layout.luma_offset], 17, "the first frame is still there");
+        assert_eq!(bytes[layout.chroma_offset], 33);
+        assert_eq!(bytes[layout.chroma_offset + 1], 44);
+    }
+
+    /// A frame larger than the staging image must be refused rather than written past the
+    /// end of a plane, which corrupts whatever the driver put next in the mapping.
     #[test]
     fn a_frame_too_large_for_the_surface_is_refused() {
-        let Some(display) = Display::open_any() else {
+        let Some((mut upload, surface, _pool)) = fixture() else {
             return;
         };
-        let Ok(pool) = SurfacePool::new_nv12(&display, W, H, 1) else {
-            return;
-        };
-        let surface = pool.surfaces().first().copied().expect("one surface");
-        let Ok(mut image) = MappedImage::derive(&display, surface) else {
-            return;
-        };
-
         let (w, h) = (256_usize, 128_usize);
         let big = I420Frame::from_planes(
             u32::try_from(w).expect("width"),
@@ -362,7 +512,7 @@ mod tests {
         .expect("planes match the geometry");
 
         assert!(
-            image.write_i420(&big).is_err(),
+            upload.upload(&big, surface).is_err(),
             "a frame larger than the surface must not be written"
         );
     }
@@ -371,21 +521,16 @@ mod tests {
     /// read as zeroes would stack chroma on top of luma and encode a grey picture.
     #[test]
     fn the_driver_describes_both_planes() {
-        let Some(display) = Display::open_any() else {
+        let Some((upload, _surface, _pool)) = fixture() else {
             return;
         };
-        let Ok(pool) = SurfacePool::new_nv12(&display, W, H, 1) else {
-            return;
-        };
-        let surface = pool.surfaces().first().copied().expect("one surface");
-        let Ok(image) = MappedImage::derive(&display, surface) else {
-            return;
-        };
-        let PlaneLayout { luma_pitch, chroma_offset, chroma_pitch, .. } = image
-            .layout()
-            .expect("the driver described fewer than two planes");
+        let PlaneLayout { luma_pitch, chroma_offset, chroma_pitch, .. } =
+            upload.layout().expect("the driver described fewer than two planes");
         assert!(luma_pitch >= WIDTH, "luma pitch {luma_pitch} is narrower than the frame");
-        assert!(chroma_pitch >= WIDTH, "chroma pitch {chroma_pitch} cannot hold interleaved UV");
+        assert!(
+            chroma_pitch >= WIDTH,
+            "chroma pitch {chroma_pitch} cannot hold interleaved UV"
+        );
         assert!(chroma_offset > 0, "chroma cannot start at the same place as luma");
     }
 }
