@@ -13,16 +13,16 @@ anecdote cannot tell a fix from a coincidence.
 
 ## Phase 2: Reproduce, in the environment that now exists
 
-- [ ] T004 [US1] Playwright test in `frontend/tests/matrixrtc/`: three participants join an Element Call room in sequence; assert the third decodes audio from the other two within SC1's bound
-- [ ] T005 [US2] Playwright test: three participants; one leaves; assert the remaining two keep decoding each other's audio within SC2's bound
+- [X] T004 [US1] Playwright test in `frontend/tests/matrixrtc/`: three participants join an Element Call room in sequence; assert the third decodes audio from the other two within SC1's bound
+- [X] T005 [US2] Playwright test: three participants; one leaves; assert the remaining two keep decoding each other's audio within SC2's bound
 - [ ] T006 [US2] Playwright test: three participants; a fourth joins; same assertion (a joiner triggers a rotation only when the key is over ten seconds old, so the test must wait — otherwise it passes for the wrong reason)
-- [ ] T007 [US1][US2] Drive Element Call itself rather than livekit-client directly, so the rotation policy under test is the real one
+- [X] T007 [US1][US2] Drive Element Call itself rather than livekit-client directly, so the rotation policy under test is the real one
 
 ## Phase 3: Fix what the reproductions show
 
 - [X] T008 [US1] Establish whether we honour `useKeyDelay` when adopting a newly distributed key for *encryption*. **We do**, and it is not by design so much as by where we tap in: `e2ee-bridge.ts` intercepts the `setKey` message posted to livekit's worker, which Element Call only sends after its own delay (`delayBeforeUse` → `setTimeout(..., useKeyDelay)`, default **5000ms**, not the 1000ms assumed when this was written). We adopt exactly when livekit-client would. Suspect removed
 - [ ] T012 [US1][US2] Decide what to do about a rotation whose key does not reach a peer within `useKeyDelay`, which is the fault that survives T008. Five seconds is a guess about to-device latency, and when the guess is wrong the peer latches the index and hears nothing until the key lands. A late key does recover the index (see T010), so this is about the length of the gap, not a permanent loss. Options worth costing: raise the delay, defer adoption until distribution is acknowledged, or re-send at a fresh index on suspicion. See the 2026-08-07 finding in `specs/003-call-media-faults/spec.md`
-- [ ] T009 [US2] Fix whatever T005/T006 show, file path unknown until then
+- [ ] T009 [US2] Fix the fault T004/T005 found: **the second call a device takes part in is silent**. ~1,500 packets arrive per remote participant over thirty seconds and `totalSamplesReceived` stays at zero, so the media is delivered and not one frame decrypts. Reproduced on demand by `frontend/tests/matrixrtc/call-faults.spec.ts`, marked `test.fail()`. Carried by the device, not the room
 - [ ] T010 [US3] For any key that dies inside `RTCEncryptionManager`, decide whether it is ours to work around or upstream's to fix, and record which. One answer is already in: livekit's failure-count latch stops retrying a key index after `failureTolerance` failures, but installing a key at that index clears the count, so a late key does revive it. The latch amplifies a persistent failure into permanent silence rather than causing one on its own
 
 ## Phase 4: Confirm

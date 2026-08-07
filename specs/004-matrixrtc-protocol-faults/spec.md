@@ -38,6 +38,50 @@ production logs:
   frames were being misread. `trailer_is_livekit_shaped` now distinguishes the two
   and has not yet been observed in a real call.
 
+
+## Finding — 2026-08-07: one of the two faults is now reproducible on demand
+
+Three real Element Web clients, in a real Element Call, on the local stack. Of the
+three scenarios built, two work and one fails — and the one that fails is the one
+that was reported.
+
+| Scenario | Result |
+|---|---|
+| Three join in sequence; the last hears the other two | works |
+| Three join; one leaves; the other two keep hearing each other | works |
+| **A second call, by devices that have already been in one** | **silent for everyone** |
+
+The failure, from the receiver's own statistics: roughly **1,500 RTP packets** arrive
+from each of the two other participants over thirty seconds, and
+`totalSamplesReceived` stays at **exactly zero** for both. The media is delivered.
+Not one frame of it can be decrypted, for the entire call.
+
+**The device carries it, not the room.** Before each test was given devices of its
+own, the leave scenario failed in exactly this way purely because the test before it
+had run — a different room, the same devices. Fresh devices in the same room work;
+reused devices in a new room do not.
+
+This reframes US1 and US2. The reported symptom is described as following a join or
+a leave, and neither a join nor a leave reproduces it. What reproduces it is a device
+taking part in a second call, which is what a person does after any join or leave
+they were disconnected by — so the anecdote and the measurement agree, while pointing
+somewhere different.
+
+### What this does not yet say
+
+Zero samples against 1,500 packets is "no key ever worked", not "the key was late" or
+"the key was wrong" — those produce samples, of noise. Which of the three possible
+causes it is:
+
+- the second call's key is never sent
+- it is sent and never received
+- it is received at an index livekit has already stopped attempting
+
+is the next question. It wants the key-arrival logging from T001 and the
+derived-versus-forwarded counting from T002 read from a failing run, not another
+browser test. The third possibility is described in the 2026-08-07 finding in
+`specs/003-call-media-faults/spec.md`.
+
 ## User Scenarios
 
 ### US1 (P1) — A participant hears the others promptly after joining
