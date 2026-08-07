@@ -11,10 +11,13 @@
 //! silent when ignored. Each of those is a segfault waiting to happen, and each is
 //! answered by a type here.
 
+pub mod bitstream;
 pub mod display;
+pub mod h264;
 pub mod image;
 pub mod resource;
 pub mod status;
 
 pub use display::Display;
+pub use h264::H264Encoder;
 pub use status::Status;

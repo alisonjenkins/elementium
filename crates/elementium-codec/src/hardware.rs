@@ -43,12 +43,14 @@ impl EncoderBackend {
     /// and then fails to produce a single frame — the far end sees a track that never
     /// starts, with nothing to explain it.
     ///
-    /// Only software today. Each hardware backend flips its arm as its encoder lands.
+    /// VAAPI's encoder exists on Linux builds with the feature enabled; the other two are
+    /// still to come, and each flips its arm as its encoder lands.
     #[must_use]
     pub const fn has_encoder(self) -> bool {
         match self {
             Self::Software => true,
-            Self::Vaapi | Self::VideoToolbox | Self::MediaFoundation => false,
+            Self::Vaapi => cfg!(all(target_os = "linux", feature = "vaapi")),
+            Self::VideoToolbox | Self::MediaFoundation => false,
         }
     }
 
@@ -405,8 +407,13 @@ mod tests {
 
     /// A codec with no encoder must never be offered. The far end would agree to it and
     /// then receive nothing, which is worse than never having offered it.
+    ///
+    /// "Producible" means software support *or* a hardware encoder this build can actually
+    /// reach -- not merely hardware the machine happens to have, which is the distinction
+    /// `selectable_backend_from` exists to draw.
     #[test]
     fn only_codecs_we_can_actually_produce_are_offered() {
+        let caps = available_encoders();
         let order = negotiation_order(1280, 720, &[]);
         assert!(
             order.contains(&VideoCodec::Vp8),
@@ -414,7 +421,8 @@ mod tests {
         );
         for codec in &order {
             assert!(
-                VideoCodec::software_supported().contains(codec),
+                VideoCodec::software_supported().contains(codec)
+                    || selectable_backend_from(caps, *codec, 1280, 720).is_hardware(),
                 "{codec:?} was offered with no encoder available for it"
             );
         }

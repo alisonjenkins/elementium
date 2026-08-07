@@ -237,8 +237,16 @@ pub trait VideoDecoder: Send {
 /// The enum also buys something `dyn` cannot: it is exhaustive. Adding a codec is a
 /// compile error at every site that has to account for it, rather than something that
 /// builds and then behaves oddly at runtime.
+// One variant is a few hundred bytes larger than the other, and boxing to even them out
+// would put a heap indirection on the encode path to save memory that is allocated once per
+// call and freed when it ends. The whole reason this is an enum rather than a `dyn` is to
+// keep that path free of pointer chasing.
+#[allow(clippy::large_enum_variant)]
 pub enum NegotiatedEncoder {
     Vp8(crate::vpx_codec::Vp8Encoder),
+    /// H.264 on the GPU. Only where VAAPI is compiled in and a device offers it.
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    VaapiH264(crate::vaapi::H264Encoder),
 }
 
 impl NegotiatedEncoder {
@@ -254,11 +262,24 @@ impl NegotiatedEncoder {
                 config.height,
                 config.bitrate_kbps,
             )?)),
-            // Negotiable but not yet encodable in software. Reported as an error rather
-            // than silently substituting VP8: a caller that asked for H.264 has told the
-            // far end it will send H.264, and sending something else produces a peer that
-            // receives undecodable video with nothing to explain it.
-            VideoCodec::H264 | VideoCodec::Av1 => Err(format!(
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            VideoCodec::H264 => crate::vaapi::H264Encoder::new(
+                config.width,
+                config.height,
+                config.bitrate_kbps,
+            )
+            .map(Self::VaapiH264)
+            .map_err(|e| e.to_string()),
+            // Negotiable but not encodable here. Reported as an error rather than silently
+            // substituting VP8: a caller that asked for H.264 has told the far end it will
+            // send H.264, and sending something else produces a peer that receives
+            // undecodable video with nothing to explain it.
+            #[cfg(not(all(target_os = "linux", feature = "vaapi")))]
+            VideoCodec::H264 => Err(format!(
+                "no encoder available for {} on this build",
+                codec.sdp_name()
+            )),
+            VideoCodec::Av1 => Err(format!(
                 "no encoder available for {} on this build",
                 codec.sdp_name()
             )),
@@ -270,36 +291,48 @@ impl VideoEncoder for NegotiatedEncoder {
     fn codec(&self) -> VideoCodec {
         match self {
             Self::Vp8(e) => e.codec(),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => e.codec(),
         }
     }
 
     fn size(&self) -> (u32, u32) {
         match self {
             Self::Vp8(e) => VideoEncoder::size(e),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => VideoEncoder::size(e),
         }
     }
 
     fn preferred_input(&self) -> PixelLayout {
         match self {
             Self::Vp8(e) => e.preferred_input(),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => e.preferred_input(),
         }
     }
 
     fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, String> {
         match self {
             Self::Vp8(e) => VideoEncoder::encode(e, frame),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => VideoEncoder::encode(e, frame),
         }
     }
 
     fn request_keyframe(&mut self) {
         match self {
             Self::Vp8(e) => e.request_keyframe(),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => e.request_keyframe(),
         }
     }
 
     fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
         match self {
             Self::Vp8(e) => VideoEncoder::set_bitrate(e, kbps),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(e) => VideoEncoder::set_bitrate(e, kbps),
         }
     }
 }
