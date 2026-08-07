@@ -364,6 +364,7 @@ function startLocalVideoFrameFetch(
   let windowFrames = 0;
   let windowFetchMs = 0;
   let windowDrawn = 0;
+  let windowPresentMs = 0;
   let windowMismatches = 0;
   let lastMismatch = "none";
 
@@ -427,7 +428,13 @@ function startLocalVideoFrameFetch(
           // The draw is complete: publish it as one frame. Doing this instead of letting
           // the track sample on a timer is what stops a half-written canvas reaching the
           // wire.
+          //
+          // Timed separately from the fetch: the preview dropped from 30fps to 6.6fps
+          // when this was introduced, and "the IPC got slower" and "requestFrame blocks"
+          // are indistinguishable from one combined number.
+          const presentStarted = Date.now();
           present();
+          windowPresentMs += Date.now() - presentStarted;
         }
       }
     } catch (err) {
@@ -443,12 +450,14 @@ function startLocalVideoFrameFetch(
         `preview ${trackId}: ${(windowFrames / secs).toFixed(1)} fps, ` +
           `${(windowFetchMs / windowFrames).toFixed(1)}ms avg per frame ` +
           `(${canvas.width}x${canvas.height}), drawn=${windowDrawn} ` +
+          `present=${(windowPresentMs / Math.max(1, windowDrawn)).toFixed(1)}ms ` +
           `mismatched=${windowMismatches} last=${lastMismatch}`,
       );
       windowStart = Date.now();
       windowFrames = 0;
       windowFetchMs = 0;
       windowDrawn = 0;
+      windowPresentMs = 0;
       windowMismatches = 0;
     }
 
