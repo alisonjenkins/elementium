@@ -711,7 +711,7 @@ async fn signal_processing_loop(
                 match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                     Ok(_) => tracing::info!(pc_id = %pc.id, "publisher answer applied"),
                     Err(e) => {
-                        tracing::error!(pc_id = %pc.id, reason = %e, "publisher answer failed")
+                        tracing::error!(pc_id = %pc.id, reason = %e, "publisher answer failed");
                     }
                 }
             }

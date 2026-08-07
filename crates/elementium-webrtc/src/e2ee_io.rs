@@ -71,6 +71,37 @@ pub(crate) fn encrypt_or_drop(
     )
 }
 
+/// Carry a non-media event across the encryption boundary unchanged.
+///
+/// Non-media variants carry no payload. Written out explicitly rather than via a catch-all:
+/// the payload type differs on each side, so the compiler forces every variant to be
+/// considered whenever one is added.
+fn passthrough(event: WirePcEvent) -> Option<PcEvent> {
+    match event {
+        PcEvent::IceConnectionStateChange(s) => Some(PcEvent::IceConnectionStateChange(s)),
+        PcEvent::ConnectionStateChange(s) => Some(PcEvent::ConnectionStateChange(s)),
+        PcEvent::IceCandidate(c) => Some(PcEvent::IceCandidate(c)),
+        PcEvent::IceGatheringComplete => Some(PcEvent::IceGatheringComplete),
+        PcEvent::KeyframeRequested { mid } => Some(PcEvent::KeyframeRequested { mid }),
+        PcEvent::Connected => Some(PcEvent::Connected),
+        PcEvent::RemoteTrackAdded { mid, kind } => Some(PcEvent::RemoteTrackAdded { mid, kind }),
+        PcEvent::EgressStats {
+            mid,
+            loss,
+            rtt_ms,
+            packets,
+            nacks,
+        } => Some(PcEvent::EgressStats {
+            mid,
+            loss,
+            rtt_ms,
+            packets,
+            nacks,
+        }),
+        PcEvent::AudioData { .. } | PcEvent::VideoData { .. } => None,
+    }
+}
+
 /// Attempt to decrypt an inbound audio/video event if E2EE is active.
 ///
 /// Uses `decrypt_frame_any` which tries all known participant keys, since we don't know
@@ -84,37 +115,6 @@ pub(crate) fn maybe_decrypt_event(
     event: WirePcEvent,
     e2ee: Option<&E2eeContext>,
 ) -> Option<PcEvent> {
-    // Non-media variants carry no payload, so they cross the boundary unchanged. Written
-    // out explicitly rather than via a catch-all: the payload type differs on each side,
-    // so the compiler forces every variant to be considered whenever one is added.
-    let passthrough = |event: WirePcEvent| -> Option<PcEvent> {
-        match event {
-            PcEvent::IceConnectionStateChange(s) => Some(PcEvent::IceConnectionStateChange(s)),
-            PcEvent::ConnectionStateChange(s) => Some(PcEvent::ConnectionStateChange(s)),
-            PcEvent::IceCandidate(c) => Some(PcEvent::IceCandidate(c)),
-            PcEvent::IceGatheringComplete => Some(PcEvent::IceGatheringComplete),
-            PcEvent::KeyframeRequested { mid } => Some(PcEvent::KeyframeRequested { mid }),
-            PcEvent::Connected => Some(PcEvent::Connected),
-            PcEvent::RemoteTrackAdded { mid, kind } => {
-                Some(PcEvent::RemoteTrackAdded { mid, kind })
-            }
-            PcEvent::EgressStats {
-                mid,
-                loss,
-                rtt_ms,
-                packets,
-                nacks,
-            } => Some(PcEvent::EgressStats {
-                mid,
-                loss,
-                rtt_ms,
-                packets,
-                nacks,
-            }),
-            PcEvent::AudioData { .. } | PcEvent::VideoData { .. } => None,
-        }
-    };
-
     let Some(ctx) = e2ee else {
         // No E2EE context: media is passed through byte-for-byte. That is correct only if
         // the *remote* is also sending unencrypted. If the remote is encrypting (as

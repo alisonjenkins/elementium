@@ -1133,6 +1133,71 @@ fn note_ice_state(pc: &mut PeerConnectionInner, mapped: IceState) {
     }
 }
 
+/// Turn an inbound RTP frame into the event the rest of the stack consumes.
+///
+/// Split out of [`handle_str0m_event`] because it is the only arm that inspects a
+/// payload, and because every codec it does not recognise has its own reason for
+/// arriving -- RED, RTX and an outright unknown are three different situations that
+/// happen to reach the same place.
+fn media_data_event(
+    pc: &mut PeerConnectionInner,
+    data: str0m::media::MediaData,
+) -> Option<WirePcEvent> {
+    let mid = data.mid.to_string();
+    let contiguous = data.contiguous;
+    let codec = data.params.spec().codec;
+    if codec == Codec::Opus {
+        // Opus frames must reach the decoder in encode order. Out-of-order
+        // delivery still decodes cleanly packet-by-packet but scrambles the audio
+        // in time -- inaudible to every error/amplitude check, so detect it
+        // explicitly here rather than assuming str0m always emits in order.
+        let first_seq: u64 = **data.seq_range.start();
+        let last_seq: u64 = **data.seq_range.end();
+        if let Some(prev) = pc.last_audio_seq.insert(data.mid, last_seq)
+            && first_seq <= prev
+        {
+            tracing::warn!(
+                pc_id = %pc.id,
+                mid,
+                prev_seq = prev,
+                this_seq_start = first_seq,
+                this_seq_end = last_seq,
+                "Inbound audio frame arrived OUT OF ORDER: scrambles decoded audio in time"
+            );
+        }
+        Some(PcEvent::AudioData {
+            mid,
+            data: WireMedia::from_network(data.data),
+            contiguous,
+        })
+    } else if codec == Codec::Vp8 {
+        Some(PcEvent::VideoData {
+            mid,
+            data: WireMedia::from_network(data.data),
+        })
+    } else if codec == Codec::Unknown && pc.remote_mids.get(&data.mid) == Some(&MediaKind::Audio) {
+        // Almost certainly RFC 2198 RED (str0m has no "red" Codec variant, so RED
+        // packets land here as Unknown) -- unwrap it instead of dropping it.
+        if let Some(primary) = unwrap_red_primary(&data.data) {
+            Some(PcEvent::AudioData {
+                mid,
+                data: WireMedia::from_network(primary.to_vec()),
+                contiguous,
+            })
+        } else {
+            tracing::warn!(pc_id = %pc.id, mid, len = data.data.len(), "Unhandled audio codec on inbound media (not RED-decodable), dropping");
+            None
+        }
+    } else if codec == Codec::Rtx {
+        // Expected under any packet loss (retransmission requests); not a bug,
+        // and warning on every one would drown out real signal.
+        None
+    } else {
+        tracing::warn!(pc_id = %pc.id, mid, codec = %codec, "Unhandled codec on inbound media, dropping");
+        None
+    }
+}
+
 fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<WirePcEvent> {
     match event {
         Event::IceConnectionStateChange(state) => {
@@ -1170,63 +1235,7 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
                 },
             })
         }
-        Event::MediaData(data) => {
-            let mid = data.mid.to_string();
-            let contiguous = data.contiguous;
-            let codec = data.params.spec().codec;
-            if codec == Codec::Opus {
-                // Opus frames must reach the decoder in encode order. Out-of-order
-                // delivery still decodes cleanly packet-by-packet but scrambles the audio
-                // in time -- inaudible to every error/amplitude check, so detect it
-                // explicitly here rather than assuming str0m always emits in order.
-                let first_seq: u64 = **data.seq_range.start();
-                let last_seq: u64 = **data.seq_range.end();
-                if let Some(prev) = pc.last_audio_seq.insert(data.mid, last_seq)
-                    && first_seq <= prev
-                {
-                    tracing::warn!(
-                        pc_id = %pc.id,
-                        mid,
-                        prev_seq = prev,
-                        this_seq_start = first_seq,
-                        this_seq_end = last_seq,
-                        "Inbound audio frame arrived OUT OF ORDER: scrambles decoded audio in time"
-                    );
-                }
-                Some(PcEvent::AudioData {
-                    mid,
-                    data: WireMedia::from_network(data.data),
-                    contiguous,
-                })
-            } else if codec == Codec::Vp8 {
-                Some(PcEvent::VideoData {
-                    mid,
-                    data: WireMedia::from_network(data.data),
-                })
-            } else if codec == Codec::Unknown
-                && pc.remote_mids.get(&data.mid) == Some(&MediaKind::Audio)
-            {
-                // Almost certainly RFC 2198 RED (str0m has no "red" Codec variant, so RED
-                // packets land here as Unknown) -- unwrap it instead of dropping it.
-                if let Some(primary) = unwrap_red_primary(&data.data) {
-                    Some(PcEvent::AudioData {
-                        mid,
-                        data: WireMedia::from_network(primary.to_vec()),
-                        contiguous,
-                    })
-                } else {
-                    tracing::warn!(pc_id = %pc.id, mid, len = data.data.len(), "Unhandled audio codec on inbound media (not RED-decodable), dropping");
-                    None
-                }
-            } else if codec == Codec::Rtx {
-                // Expected under any packet loss (retransmission requests); not a bug,
-                // and warning on every one would drown out real signal.
-                None
-            } else {
-                tracing::warn!(pc_id = %pc.id, mid, codec = %codec, "Unhandled codec on inbound media, dropping");
-                None
-            }
-        }
+        Event::MediaData(data) => media_data_event(pc, data),
         Event::MediaEgressStats(stats) => Some(egress_stats_event(&pc.id, &stats)),
         Event::KeyframeRequest(req) => {
             tracing::info!(
