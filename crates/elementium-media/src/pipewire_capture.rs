@@ -881,7 +881,17 @@ fn attach_and_connect(
             move |_, (), old, new| {
                 tracing::info!(?old, ?new, "PipeWire capture stream state");
                 if let pipewire::stream::StreamState::Error(reason) = &new {
-                    tracing::error!(reason = %reason, "PipeWire capture stream failed");
+                    // Warn, not error: one stream failing is a normal step in choosing a
+                    // source. `PipeWire` lists several nodes for one camera, and the ones
+                    // already in use answer "Device or resource busy" -- so a working
+                    // session produces this on the way to a camera that starts. Whether it
+                    // mattered is decided by the caller, which tries the next source and
+                    // reports at error only once every source and the V4L2 fallback have
+                    // been exhausted.
+                    tracing::warn!(
+                        reason = %reason,
+                        "PipeWire capture stream failed; trying the next source if there is one"
+                    );
                     failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
