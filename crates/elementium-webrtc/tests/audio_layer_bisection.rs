@@ -287,16 +287,17 @@ fn layer2_audio_survives_encrypt_decrypt_decode() {
 // Layer 3: key rotation
 // ---------------------------------------------------------------------------
 
-/// Layer 3: a sender whose key index has rotated past the key-ring size must still decrypt.
+/// Layer 3: every rotation index a sender can reach must decrypt with the key held at it.
 ///
-/// Regression for a real field bug: livekit writes the sender's *unreduced* rotation
-/// counter into the frame trailer, so a peer on its 25th key sends `25` while holding the
-/// material at slot `25 % 16 == 9`. Rejecting that byte instead of wrapping it made the
-/// participant completely inaudible while every packet arrived normally and no key was
-/// missing -- indistinguishable, from the inside, from "the audio sounds bad".
+/// Regression for two real field bugs on the same line. livekit writes the sender's
+/// rotation counter into the frame trailer unreduced -- Element Call rotates with
+/// `(prev + 1) % 256` -- so the byte routinely exceeds 15. Rejecting it made a peer
+/// completely inaudible while every packet arrived normally and no key was missing;
+/// reducing it modulo 16 instead then aliased index 19 onto index 3, so one participant's
+/// rotation destroyed another's live key.
 ///
-/// Sweeping the whole range rather than spot-checking 25: the bug only appears past the
-/// ring size, so a test that stopped at 15 would have passed throughout.
+/// Sweeping the whole byte range rather than spot-checking: both faults only appear past
+/// 15, so a test that stopped there would have passed throughout.
 #[test]
 fn layer3_every_rotation_index_decrypts_including_past_the_ring_size() {
     let mut encoder = mono_encoder();
@@ -309,19 +310,22 @@ fn layer3_every_rotation_index_decrypts_including_past_the_ring_size() {
         })
         .expect("encode");
 
-    for rotation in 0u8..64 {
-        let slot = rotation % 16;
-        let ctx = e2ee_ctx(slot);
+    // Every value the trailer byte can hold, each with its key at its own index.
+    for rotation in [0u8, 1, 15, 16, 17, 19, 25, 63, 128, 200, 255] {
+        let ctx = e2ee_ctx(rotation);
         let wire = ctx.encrypt_frame(&packet, MediaKind::Audio).expect("encrypt");
 
-        // Rewrite the trailer's key index to the unreduced counter a real peer sends.
-        let mut bytes = wire.as_bytes().to_vec();
-        *bytes.last_mut().unwrap() = rotation;
+        // The encoder writes the index it was given; a real peer writes the same counter.
+        assert_eq!(
+            wire.as_bytes().last().copied(),
+            Some(rotation),
+            "rotation {rotation} must reach the wire unreduced"
+        );
 
         let back = ctx
-            .decrypt_frame(&WireMedia::from_network(bytes), LOCAL, MediaKind::Audio)
-            .unwrap_or_else(|e| panic!("rotation {rotation} (slot {slot}) must decrypt: {e}"))
-            .unwrap_or_else(|| panic!("rotation {rotation} (slot {slot}) found no key"));
+            .decrypt_frame(&WireMedia::from_network(wire.as_bytes().to_vec()), LOCAL, MediaKind::Audio)
+            .unwrap_or_else(|e| panic!("rotation {rotation} must decrypt: {e}"))
+            .unwrap_or_else(|| panic!("rotation {rotation} found no key"));
         assert_eq!(back.as_bytes(), packet.as_bytes(), "rotation {rotation}");
     }
 }
