@@ -98,3 +98,26 @@ tauri-plugin-store = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-opener = "2"
+
+# Media code is unusable at `opt-level = 0`.
+#
+# `just dev` builds the dev profile, and an unoptimised pixel loop is not slow by a
+# constant factor -- the preview downscale measured 111ms per 720p frame in debug against
+# 1.4ms in release, which capped the camera thread at 4fps and looked exactly like a
+# capture fault. Debugging a media application in a build where the media does not run is
+# not debugging it.
+#
+# Only the crates that touch pixels and samples are optimised, so app logic, the Tauri
+# command layer, and everything worth stepping through keep full debug behaviour.
+[profile.dev.package.elementium-codec]
+opt-level = 3
+
+[profile.dev.package.elementium-media]
+opt-level = 3
+
+[profile.dev.package.elementium-webrtc]
+opt-level = 3
+
+# Dependencies: libvpx, opus, the SIMD colour converters, str0m's crypto.
+[profile.dev.package."*"]
+opt-level = 3
