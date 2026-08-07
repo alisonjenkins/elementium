@@ -35,14 +35,16 @@ fn empty_i420(width: u32, height: u32) -> I420Frame {
     let h = dim(height);
     let uv_w = half(w);
     let uv_h = half(h);
-    I420Frame {
-        width,
-        height,
-        y: vec![0u8; w.saturating_mul(h)],
-        u: vec![0u8; uv_w.saturating_mul(uv_h)],
-        v: vec![0u8; uv_w.saturating_mul(uv_h)],
-        timestamp_us: 0,
-    }
+    // `from_padded` rather than `from_planes`: a zeroed buffer of exactly the right size
+    // is trivially valid at tight strides, so this cannot fail for any geometry that fits
+    // in memory, and expressing it this way avoids needing a fallback that cannot happen.
+    let luma = w.saturating_mul(h);
+    let chroma = uv_w.saturating_mul(uv_h);
+    let bytes = luma.saturating_add(chroma.saturating_mul(2));
+    I420Frame::from_padded(width, height, vec![0u8; bytes], w, uv_w, 0).unwrap_or_else(|| {
+        tracing::error!(width, height, "could not build a blank I420 frame");
+        I420Frame::from_padded(0, 0, Vec::new(), 0, 0, 0).unwrap_or_default()
+    })
 }
 
 /// Shared RGB(A)-family -> I420 conversion, dispatching to the `yuv` crate's SIMD-accelerated
@@ -80,14 +82,8 @@ fn convert_to_i420(
         return empty_i420(width, height);
     }
 
-    I420Frame {
-        width,
-        height,
-        y: y_plane,
-        u: u_plane,
-        v: v_plane,
-        timestamp_us: 0,
-    }
+    I420Frame::from_planes(width, height, &y_plane, &u_plane, &v_plane, 0)
+        .unwrap_or_else(|| empty_i420(width, height))
 }
 
 /// Convert BGRA pixel data to I420 (YUV 4:2:0 planar).
@@ -188,28 +184,28 @@ const fn mean4(a: u8, b: u8, c: u8, d: u8) -> u8 {
 /// Returns `None` for degenerate geometry, or for planes that do not match the frame's
 /// stated size, rather than producing a subtly wrong image from a wrong assumption.
 #[must_use]
+#[allow(clippy::many_single_char_names)]
 pub fn halve_i420(frame: &I420Frame) -> Option<I420Frame> {
-    let (w, h) = (dim(frame.width), dim(frame.height));
+    let (w, h) = (dim(frame.width()), dim(frame.height()));
     if w < 4 || h < 4 {
         return None;
     }
     let (uv_w, uv_h) = (half(w), half(h));
-    if frame.y.len() < w.checked_mul(h)?
-        || frame.u.len() < uv_w.checked_mul(uv_h)?
-        || frame.v.len() < uv_w.checked_mul(uv_h)?
-    {
-        return None;
-    }
 
-    let (out_w, out_h) = (half(w), half(h));
-    Some(I420Frame {
-        width: u32::try_from(out_w).ok()?,
-        height: u32::try_from(out_h).ok()?,
-        y: halve_plane(&frame.y, w, h)?,
-        u: halve_plane(&frame.u, uv_w, uv_h)?,
-        v: halve_plane(&frame.v, uv_w, uv_h)?,
-        timestamp_us: frame.timestamp_us,
-    })
+    // Rows are read at the frame's stride and written tightly packed: the result is ours,
+    // so it has no reason to carry the source's padding.
+    let y = halve_plane(frame.y(), w, h, frame.y_stride())?;
+    let u = halve_plane(frame.u(), uv_w, uv_h, frame.uv_stride())?;
+    let v = halve_plane(frame.v(), uv_w, uv_h, frame.uv_stride())?;
+
+    I420Frame::from_planes(
+        u32::try_from(half(w)).ok()?,
+        u32::try_from(half(h)).ok()?,
+        &y,
+        &u,
+        &v,
+        frame.timestamp_us(),
+    )
 }
 
 /// Halve one 8-bit plane, averaging each 2x2 block.
@@ -217,13 +213,16 @@ pub fn halve_i420(frame: &I420Frame) -> Option<I420Frame> {
 /// Two rows at a time as fixed-size pairs, so the bounds check happens once per pair
 /// rather than once per sample -- the difference measured 7x on the RGBA equivalent in an
 /// unoptimised build, which is what `just dev` produces.
-fn halve_plane(src: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+fn halve_plane(src: &[u8], width: usize, height: usize, stride: usize) -> Option<Vec<u8>> {
+    if stride < width {
+        return None;
+    }
     let (out_w, out_h) = (half(width), half(height));
     let mut out = Vec::with_capacity(out_w.saturating_mul(out_h));
 
     for y in 0..out_h {
-        let top_start = y.checked_mul(2)?.checked_mul(width)?;
-        let bottom_start = top_start.checked_add(width)?;
+        let top_start = y.checked_mul(2)?.checked_mul(stride)?;
+        let bottom_start = top_start.checked_add(stride)?;
         let top = src.get(top_start..top_start.checked_add(width)?)?;
         let bottom = src.get(bottom_start..bottom_start.checked_add(width)?)?;
 
@@ -240,28 +239,29 @@ fn halve_plane(src: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
 /// Convert I420 (YUV 4:2:0 planar) to RGBA pixel data.
 #[must_use]
 pub fn i420_to_rgba(frame: &I420Frame) -> VideoFrame {
-    let img_w = dim(frame.width);
-    let img_h = dim(frame.height);
-    let uv_w = half(img_w);
+    let img_w = dim(frame.width());
+    let img_h = dim(frame.height());
 
     let mut rgba = vec![0u8; img_w.saturating_mul(img_h).saturating_mul(4)];
 
     let source = YuvPlanarImage {
-        y_plane: &frame.y,
-        y_stride: frame.width,
-        u_plane: &frame.u,
-        u_stride: u32::try_from(uv_w).unwrap_or(0),
-        v_plane: &frame.v,
-        v_stride: u32::try_from(uv_w).unwrap_or(0),
-        width: frame.width,
-        height: frame.height,
+        y_plane: frame.y(),
+        // The frame's own strides, not its width: a frame adopted from a decoder has
+        // padded rows, and reading it at width would shear the picture.
+        y_stride: u32::try_from(frame.y_stride()).unwrap_or(0),
+        u_plane: frame.u(),
+        u_stride: u32::try_from(frame.uv_stride()).unwrap_or(0),
+        v_plane: frame.v(),
+        v_stride: u32::try_from(frame.uv_stride()).unwrap_or(0),
+        width: frame.width(),
+        height: frame.height(),
     };
     let rgba_stride = u32::try_from(img_w.saturating_mul(4)).unwrap_or(0);
 
     if let Err(e) = yuv::yuv420_to_rgba(&source, &mut rgba, rgba_stride, RANGE, MATRIX) {
         tracing::error!(
-            width = frame.width,
-            height = frame.height,
+            width = frame.width(),
+            height = frame.height(),
             error = %e,
             "SIMD I420->RGBA conversion failed, returning blank frame"
         );
@@ -269,10 +269,10 @@ pub fn i420_to_rgba(frame: &I420Frame) -> VideoFrame {
     }
 
     VideoFrame {
-        width: frame.width,
-        height: frame.height,
+        width: frame.width(),
+        height: frame.height(),
         data: rgba,
-        timestamp_us: frame.timestamp_us,
+        timestamp_us: frame.timestamp_us(),
     }
 }
 
@@ -300,9 +300,9 @@ mod tests {
         }
 
         let i420 = bgra_to_i420(width, height, &bgra);
-        assert_eq!(i420.y.len(), 16);
-        assert_eq!(i420.u.len(), 4);
-        assert_eq!(i420.v.len(), 4);
+        assert_eq!(i420.y().len(), 16);
+        assert_eq!(i420.u().len(), 4);
+        assert_eq!(i420.v().len(), 4);
 
         let rgba = i420_to_rgba(&i420);
         assert_eq!(rgba.data.len(), pixel_count.saturating_mul(4));
@@ -391,14 +391,7 @@ mod halve_i420_tests {
     fn frame(width: u32, height: u32, y: u8, u: u8, v: u8) -> I420Frame {
         let (w, h) = (width as usize, height as usize);
         let uv = (w / 2) * (h / 2);
-        I420Frame {
-            width,
-            height,
-            y: vec![y; w * h],
-            u: vec![u; uv],
-            v: vec![v; uv],
-            timestamp_us: 7,
-        }
+        I420Frame::from_planes(width, height, &vec![y; w * h], &vec![u; uv], &vec![v; uv], 7).expect("planes match the geometry")
     }
 
     /// Halving must produce a frame whose planes match its stated geometry. A frame whose
@@ -406,41 +399,41 @@ mod halve_i420_tests {
     #[test]
     fn the_result_is_self_consistent() {
         let out = halve_i420(&frame(1280, 720, 100, 110, 120)).expect("halved");
-        assert_eq!((out.width, out.height), (640, 360));
-        assert_eq!(out.y.len(), 640 * 360);
-        assert_eq!(out.u.len(), 320 * 180);
-        assert_eq!(out.v.len(), 320 * 180);
-        assert_eq!(out.timestamp_us, 7, "the frame's time must survive");
+        assert_eq!((out.width(), out.height()), (640, 360));
+        assert_eq!(out.y().len(), 640 * 360);
+        assert_eq!(out.u().len(), 320 * 180);
+        assert_eq!(out.v().len(), 320 * 180);
+        assert_eq!(out.timestamp_us(), 7, "the frame's time must survive");
     }
 
     /// A uniform frame must keep its values: the averaging must not drift.
     #[test]
     fn a_uniform_frame_keeps_its_values() {
         let out = halve_i420(&frame(64, 64, 100, 110, 120)).expect("halved");
-        assert!(out.y.iter().all(|&s| s == 100));
-        assert!(out.u.iter().all(|&s| s == 110));
-        assert!(out.v.iter().all(|&s| s == 120));
+        assert!(out.y().iter().all(|&s| s == 100));
+        assert!(out.u().iter().all(|&s| s == 110));
+        assert!(out.v().iter().all(|&s| s == 120));
     }
 
     /// Each output sample is the mean of its 2x2 source block, not a dropped pixel.
     #[test]
     fn each_sample_averages_its_block() {
-        let mut f = frame(4, 4, 0, 128, 128);
         // Top-left 2x2 of the Y plane: 0, 100, 200, 252 -> mean 138.
-        f.y[0] = 0;
-        f.y[1] = 100;
-        f.y[4] = 200;
-        f.y[5] = 252;
+        let mut y = vec![0_u8; 16];
+        y[0] = 0;
+        y[1] = 100;
+        y[4] = 200;
+        y[5] = 252;
+        let f = I420Frame::from_planes(4, 4, &y, &[128; 4], &[128; 4], 0).expect("frame");
         let out = halve_i420(&f).expect("halved");
-        assert_eq!(out.y.first().copied(), Some(138));
+        assert_eq!(out.y().first().copied(), Some(138));
     }
 
-    /// Planes that do not match the stated geometry are refused, not half-processed.
+    /// Planes that do not match the stated geometry are refused at construction, so a
+    /// frame that could be misread cannot be built in the first place.
     #[test]
-    fn a_frame_with_short_planes_is_refused() {
-        let mut f = frame(64, 64, 0, 0, 0);
-        f.y.truncate(10);
-        assert!(halve_i420(&f).is_none());
+    fn a_frame_with_short_planes_cannot_be_built() {
+        assert!(I420Frame::from_planes(64, 64, &[0; 10], &[0; 1024], &[0; 1024], 0).is_none());
     }
 
     /// Nothing useful to halve.

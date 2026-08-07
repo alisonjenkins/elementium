@@ -68,9 +68,9 @@ fn main() {
 
         if encoder
             .as_ref()
-            .is_none_or(|e| e.size() != (frame.width, frame.height))
+            .is_none_or(|e| e.size() != (frame.width(), frame.height()))
         {
-            encoder = Vp8Encoder::new(frame.width, frame.height, 2764).ok();
+            encoder = Vp8Encoder::new(frame.width(), frame.height(), 2764).ok();
         }
         if let Some(enc) = encoder.as_mut() {
             // No conversion: capture already produces the encoder's input format.
@@ -81,7 +81,7 @@ fn main() {
             let path =
                 format!("/tmp/elementium_preview_probe_{frames}_{width}x{height}.rgba");
             std::fs::write(&path, &rgba).expect("write dump");
-            println!("wrote {path} ({} bytes, source {}x{})", rgba.len(), frame.width, frame.height);
+            println!("wrote {path} ({} bytes, source {}x{})", rgba.len(), frame.width(), frame.height());
             dumped += 1;
         }
     }

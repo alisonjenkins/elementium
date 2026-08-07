@@ -143,17 +143,185 @@ pub struct AudioFrame {
 }
 
 /// Video frame in I420 (YUV 4:2:0 planar) format, used for encoding.
-#[derive(Debug, Clone)]
+///
+/// One allocation holds all three planes, laid out Y then U then V, with each plane's rows
+/// padded to its stride. That shape is not an implementation detail to be tidied away: it
+/// is what a JPEG decoder and a hardware capture buffer already hand over, so a frame can
+/// be adopted from one without copying a megabyte per frame. Requiring tightly-packed
+/// planes forced exactly that copy, thirty times a second, for the length of every call.
+///
+/// The fields are private because a stride that can be ignored will be. Reading a padded
+/// plane as though its rows were `width` bytes shears the picture into sliding horizontal
+/// bands with rotated colour channels -- a fault this codebase has produced more than once
+/// and which looks like a broken camera or a broken encoder rather than a wrong number.
+/// The accessors make it unrepresentable.
+#[derive(Debug, Clone, Default)]
 pub struct I420Frame {
-    pub width: u32,
-    pub height: u32,
-    /// Y plane, length = width * height
-    pub y: Vec<u8>,
-    /// U plane, length = (width/2) * (height/2)
-    pub u: Vec<u8>,
-    /// V plane, length = (width/2) * (height/2)
-    pub v: Vec<u8>,
-    pub timestamp_us: u64,
+    width: u32,
+    height: u32,
+    /// Y, U and V planes, consecutively, each row padded to its plane's stride.
+    data: Vec<u8>,
+    /// Bytes per row of the Y plane. At least `width`.
+    y_stride: usize,
+    /// Bytes per row of each chroma plane. At least `width.div_ceil(2)`.
+    uv_stride: usize,
+    timestamp_us: u64,
+}
+
+impl I420Frame {
+    /// Build a frame from three tightly-packed planes.
+    ///
+    /// For callers that produce planes themselves -- colour converters, tests, synthetic
+    /// sources. A decoder that already has a padded buffer should use
+    /// [`I420Frame::from_padded`] instead and avoid the copy entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` if any plane is too small for `width` x `height`. A frame whose
+    /// planes disagree with its geometry cannot be rendered correctly by anything, so it
+    /// is refused at construction rather than misread later.
+    #[must_use]
+    #[allow(clippy::many_single_char_names)]
+    pub fn from_planes(
+        width: u32,
+        height: u32,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        timestamp_us: u64,
+    ) -> Option<Self> {
+        let w = usize::try_from(width).ok()?;
+        let h = usize::try_from(height).ok()?;
+        let (uv_w, uv_h) = (w.div_ceil(2), h.div_ceil(2));
+        let luma = w.checked_mul(h)?;
+        let chroma = uv_w.checked_mul(uv_h)?;
+        if y.len() < luma || u.len() < chroma || v.len() < chroma {
+            return None;
+        }
+
+        let mut data = Vec::with_capacity(luma.checked_add(chroma)?.checked_add(chroma)?);
+        data.extend_from_slice(y.get(..luma)?);
+        data.extend_from_slice(u.get(..chroma)?);
+        data.extend_from_slice(v.get(..chroma)?);
+
+        Some(Self {
+            width,
+            height,
+            data,
+            y_stride: w,
+            uv_stride: uv_w,
+            timestamp_us,
+        })
+    }
+
+    /// Adopt a buffer that already holds the three planes, rows padded to their strides.
+    ///
+    /// This is the zero-copy path: `data` is taken as-is, so a JPEG decoder's output
+    /// becomes a frame without any pixel being moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` if the strides are narrower than the geometry requires, or if the
+    /// buffer is too small to hold all three planes at those strides.
+    #[must_use]
+    pub fn from_padded(
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        y_stride: usize,
+        uv_stride: usize,
+        timestamp_us: u64,
+    ) -> Option<Self> {
+        let w = usize::try_from(width).ok()?;
+        let h = usize::try_from(height).ok()?;
+        let (uv_w, uv_h) = (w.div_ceil(2), h.div_ceil(2));
+        if y_stride < w || uv_stride < uv_w {
+            return None;
+        }
+        let needed = y_stride
+            .checked_mul(h)?
+            .checked_add(uv_stride.checked_mul(uv_h)?.checked_mul(2)?)?;
+        if data.len() < needed {
+            return None;
+        }
+
+        Some(Self {
+            width,
+            height,
+            data,
+            y_stride,
+            uv_stride,
+            timestamp_us,
+        })
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub const fn timestamp_us(&self) -> u64 {
+        self.timestamp_us
+    }
+
+    /// Bytes per row of the Y plane, which may exceed the width.
+    #[must_use]
+    pub const fn y_stride(&self) -> usize {
+        self.y_stride
+    }
+
+    /// Bytes per row of each chroma plane, which may exceed half the width.
+    #[must_use]
+    pub const fn uv_stride(&self) -> usize {
+        self.uv_stride
+    }
+
+    /// The Y plane, including any row padding. Read it `y_stride` bytes at a time.
+    #[must_use]
+    pub fn y(&self) -> &[u8] {
+        let end = self.y_stride.saturating_mul(self.rows());
+        self.data.get(..end).unwrap_or(&self.data)
+    }
+
+    /// The U plane, including any row padding. Read it `uv_stride` bytes at a time.
+    #[must_use]
+    pub fn u(&self) -> &[u8] {
+        let start = self.y_stride.saturating_mul(self.rows());
+        let end = start.saturating_add(self.chroma_bytes());
+        self.data.get(start..end).unwrap_or_default()
+    }
+
+    /// The V plane, including any row padding. Read it `uv_stride` bytes at a time.
+    #[must_use]
+    pub fn v(&self) -> &[u8] {
+        let start = self
+            .y_stride
+            .saturating_mul(self.rows())
+            .saturating_add(self.chroma_bytes());
+        let end = start.saturating_add(self.chroma_bytes());
+        self.data.get(start..end).unwrap_or_default()
+    }
+
+    /// Rows in the Y plane.
+    fn rows(&self) -> usize {
+        usize::try_from(self.height).unwrap_or(0)
+    }
+
+    /// Rows in each chroma plane.
+    fn chroma_rows(&self) -> usize {
+        self.rows().div_ceil(2)
+    }
+
+    /// Bytes occupied by one chroma plane, padding included.
+    fn chroma_bytes(&self) -> usize {
+        self.uv_stride.saturating_mul(self.chroma_rows())
+    }
 }
 
 /// A media device (microphone, camera, speaker).
@@ -325,5 +493,72 @@ mod media_boundary_tests {
     fn length_reflects_payload() {
         assert!(PlaintextMedia::from_encoder(Vec::new()).is_empty());
         assert_eq!(WireMedia::from_network(vec![0; 42]).len(), 42);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::expect_used, clippy::arithmetic_side_effects)]
+mod i420_frame_tests {
+    use super::I420Frame;
+
+    /// Padded rows must be readable at the frame's own stride, not at its width.
+    ///
+    /// A frame adopted from a decoder has padding; reading it at `width` shifts every row
+    /// progressively and shears the picture into sliding bands. The accessors exist to
+    /// make that unrepresentable, so this checks they return the padded planes intact.
+    #[test]
+    fn a_padded_frame_exposes_whole_padded_planes() {
+        let (w, h) = (4_u32, 4_u32);
+        let (y_stride, uv_stride) = (8_usize, 6_usize);
+        let data = vec![0_u8; y_stride * 4 + uv_stride * 2 * 2];
+
+        let frame =
+            I420Frame::from_padded(w, h, data, y_stride, uv_stride, 0).expect("valid padded frame");
+
+        assert_eq!(frame.y_stride(), y_stride);
+        assert_eq!(frame.uv_stride(), uv_stride);
+        assert_eq!(frame.y().len(), y_stride * 4, "whole padded luma plane");
+        assert_eq!(frame.u().len(), uv_stride * 2);
+        assert_eq!(frame.v().len(), uv_stride * 2);
+    }
+
+    /// The planes must not overlap: U starts where Y ends, V where U ends.
+    #[test]
+    fn the_planes_are_laid_out_consecutively() {
+        let (y_stride, uv_stride) = (4_usize, 2_usize);
+        let mut data = vec![0_u8; y_stride * 4 + uv_stride * 2 * 2];
+        data[..y_stride * 4].fill(1);
+        data[y_stride * 4..y_stride * 4 + uv_stride * 2].fill(2);
+        data[y_stride * 4 + uv_stride * 2..].fill(3);
+
+        let frame = I420Frame::from_padded(4, 4, data, y_stride, uv_stride, 0).expect("frame");
+
+        assert!(frame.y().iter().all(|&s| s == 1), "Y plane");
+        assert!(frame.u().iter().all(|&s| s == 2), "U plane");
+        assert!(frame.v().iter().all(|&s| s == 3), "V plane");
+    }
+
+    /// A buffer too small for its claimed strides is refused, not read past its end.
+    #[test]
+    fn a_buffer_too_small_for_its_strides_is_refused() {
+        assert!(I420Frame::from_padded(64, 64, vec![0; 100], 64, 32, 0).is_none());
+    }
+
+    /// A stride narrower than the geometry is a contradiction, not padding.
+    #[test]
+    fn a_stride_narrower_than_the_width_is_refused() {
+        let data = vec![0_u8; 64 * 64 * 2];
+        assert!(I420Frame::from_padded(64, 64, data.clone(), 32, 32, 0).is_none());
+        assert!(I420Frame::from_padded(64, 64, data, 64, 8, 0).is_none());
+    }
+
+    /// Tightly-packed planes are the degenerate case of padded ones.
+    #[test]
+    fn planes_built_tightly_report_their_width_as_the_stride() {
+        let frame = I420Frame::from_planes(8, 8, &[1; 64], &[2; 16], &[3; 16], 5).expect("frame");
+        assert_eq!(frame.y_stride(), 8);
+        assert_eq!(frame.uv_stride(), 4);
+        assert_eq!(frame.y().len(), 64);
+        assert_eq!(frame.timestamp_us(), 5);
     }
 }

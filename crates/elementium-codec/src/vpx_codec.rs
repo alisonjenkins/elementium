@@ -224,38 +224,41 @@ impl Vp8Encoder {
             VPX_FRAME_IS_KEY,
         };
 
-        if frame.width != self.width || frame.height != self.height {
+        if frame.width() != self.width || frame.height() != self.height {
             tracing::error!(
                 encoder_width = self.width,
                 encoder_height = self.height,
-                frame_width = frame.width,
-                frame_height = frame.height,
+                frame_width = frame.width(),
+                frame_height = frame.height(),
                 error_kind = "frame_size_mismatch",
                 "VP8 encode: frame size does not match encoder configuration"
             );
             return Err(format!(
                 "Frame size mismatch: encoder={}x{}, frame={}x{}",
-                self.width, self.height, frame.width, frame.height
+                self.width, self.height, frame.width(), frame.height()
             ));
         }
 
         // libvpx reads the planes through raw pointers, so short planes are a buffer
-        // overrun, not a bad picture. Checked here rather than trusted.
-        let (w, h) = (frame.width as usize, frame.height as usize);
-        let luma = w.saturating_mul(h);
-        let chroma = w.div_ceil(2).saturating_mul(h.div_ceil(2));
-        if frame.y.len() < luma || frame.u.len() < chroma || frame.v.len() < chroma {
+        // overrun, not a bad picture. Checked here rather than trusted, using the frame's
+        // own strides -- a padded plane is longer than width*height, and comparing against
+        // the tightly-packed size would reject valid frames.
+        let (w, h) = (frame.width() as usize, frame.height() as usize);
+        let luma = frame.y_stride().saturating_mul(h);
+        let chroma = frame.uv_stride().saturating_mul(h.div_ceil(2));
+        if frame.y().len() < luma || frame.u().len() < chroma || frame.v().len() < chroma {
             return Err(format!(
                 "I420 planes too small for {w}x{h}: y={} u={} v={}",
-                frame.y.len(),
-                frame.u.len(),
-                frame.v.len()
+                frame.y().len(),
+                frame.u().len(),
+                frame.v().len()
             ));
         }
 
-        // vpx-encode required a single contiguous Y+U+V buffer, so every frame was copied
-        // into one before encoding -- 1.4MB memcpy per frame at 720p, for nothing. The
-        // planes are pointed at directly instead.
+        // The planes are pointed at directly, padding and all: libvpx takes a stride per
+        // plane, so a decoder's padded output needs no repacking. `vpx-encode` required
+        // one contiguous tightly-packed buffer, which cost a 1.4MB copy per frame at 720p
+        // for nothing.
         let mut image = std::mem::MaybeUninit::<vpx_sys::vpx_image_t>::zeroed();
 
         let flags = if self.force_keyframe {
@@ -275,22 +278,22 @@ impl Vp8Encoder {
             let img = vpx_img_wrap(
                 image.as_mut_ptr(),
                 vpx_img_fmt::VPX_IMG_FMT_I420,
-                frame.width,
-                frame.height,
+                frame.width(),
+                frame.height(),
                 1,
-                frame.y.as_ptr().cast_mut(),
+                frame.y().as_ptr().cast_mut(),
             );
             if img.is_null() {
                 return Err("VP8 encode: could not wrap the I420 frame".to_owned());
             }
 
             let img = &mut *img;
-            img.planes[0] = frame.y.as_ptr().cast_mut();
-            img.planes[1] = frame.u.as_ptr().cast_mut();
-            img.planes[2] = frame.v.as_ptr().cast_mut();
-            img.stride[0] = frame.width as i32;
-            img.stride[1] = frame.width.div_ceil(2) as i32;
-            img.stride[2] = frame.width.div_ceil(2) as i32;
+            img.planes[0] = frame.y().as_ptr().cast_mut();
+            img.planes[1] = frame.u().as_ptr().cast_mut();
+            img.planes[2] = frame.v().as_ptr().cast_mut();
+            img.stride[0] = i32::try_from(frame.y_stride()).unwrap_or(i32::MAX);
+            img.stride[1] = i32::try_from(frame.uv_stride()).unwrap_or(i32::MAX);
+            img.stride[2] = i32::try_from(frame.uv_stride()).unwrap_or(i32::MAX);
 
             let ret = vpx_codec_encode(
                 std::ptr::addr_of_mut!(self.ctx),
@@ -539,14 +542,15 @@ impl Vp8Decoder {
                     v_row.copy_from_slice(src_v);
                 }
 
-                frames.push(I420Frame {
-                    width: img_w,
-                    height: img_h,
-                    y,
-                    u,
-                    v,
-                    timestamp_us: 0,
-                });
+                if let Some(frame) = I420Frame::from_planes(img_w, img_h, &y, &u, &v, 0) {
+                    frames.push(frame);
+                } else {
+                    tracing::warn!(
+                        width = img_w,
+                        height = img_h,
+                        "decoded frame's planes do not match its geometry; dropped"
+                    );
+                }
             }
 
             Ok(frames)
@@ -630,14 +634,7 @@ mod tests {
         let u_plane = vec![128u8; uv_w.saturating_mul(uv_h)];
         let v_plane = vec![128u8; uv_w.saturating_mul(uv_h)];
 
-        let frame = I420Frame {
-            width,
-            height,
-            y: y_plane,
-            u: u_plane,
-            v: v_plane,
-            timestamp_us: 0,
-        };
+        let frame = I420Frame::from_planes(width, height, &y_plane, &u_plane, &v_plane, 0).expect("planes match the geometry");
 
         let mut encoder = Vp8Encoder::new(width, height, 500).expect("encoder creation");
         let mut decoder = Vp8Decoder::new().expect("decoder creation");
@@ -655,17 +652,17 @@ mod tests {
         let out_frame = decoded_frames
             .first()
             .expect("decoded_frames should have exactly one frame (checked above)");
-        assert_eq!(out_frame.width, width);
-        assert_eq!(out_frame.height, height);
-        assert_eq!(out_frame.y.len(), w_usize.saturating_mul(h_usize));
-        assert_eq!(out_frame.u.len(), uv_w.saturating_mul(uv_h));
+        assert_eq!(out_frame.width(), width);
+        assert_eq!(out_frame.height(), height);
+        assert_eq!(out_frame.y().len(), w_usize.saturating_mul(h_usize));
+        assert_eq!(out_frame.u().len(), uv_w.saturating_mul(uv_h));
 
         // Check Y values are approximately correct (lossy codec)
-        let sum: f64 = out_frame.y.iter().map(|&v| f64::from(v)).sum();
+        let sum: f64 = out_frame.y().iter().map(|&v| f64::from(v)).sum();
         // usize -> f64 for a diagnostic average only; precision loss on a
         // pixel count (far below 2^52) is immaterial here.
         #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
-        let len_f64 = out_frame.y.len() as f64;
+        let len_f64 = out_frame.y().len() as f64;
         let avg_y: f64 = sum / len_f64;
         assert!(
             (avg_y - 150.0).abs() < 10.0,
@@ -677,14 +674,15 @@ mod tests {
     #[allow(clippy::expect_used)]
     fn encode_rejects_mismatched_frame_dimensions() {
         let mut encoder = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
-        let frame = I420Frame {
-            width: 640,
-            height: 480,
-            y: vec![0u8; 640 * 480],
-            u: vec![0u8; 320 * 240],
-            v: vec![0u8; 320 * 240],
-            timestamp_us: 0,
-        };
+        let frame = I420Frame::from_planes(
+            640,
+            480,
+            &vec![0u8; 640 * 480],
+            &vec![0u8; 320 * 240],
+            &vec![0u8; 320 * 240],
+            0,
+        )
+        .expect("planes match the geometry");
         let result = encoder.encode(&frame);
         assert!(
             result.is_err_and(|e| e.contains("size mismatch")),
@@ -760,13 +758,6 @@ mod tests {
         let w = usize::try_from(width).expect("bad width");
         let h = usize::try_from(height).expect("bad height");
         let uv = (w / 2).saturating_mul(h / 2);
-        I420Frame {
-            width,
-            height,
-            y: vec![luma; w.saturating_mul(h)],
-            u: vec![128u8; uv],
-            v: vec![128u8; uv],
-            timestamp_us: 0,
-        }
+        I420Frame::from_planes(width, height, &vec![luma; w.saturating_mul(h)], &vec![128u8; uv], &vec![128u8; uv], 0).expect("planes match the geometry")
     }
 }

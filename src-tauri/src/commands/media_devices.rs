@@ -544,9 +544,9 @@ fn camera_pipeline_loop(
                 tracing::info!(
                     track_id = %track_id,
                     frame_count,
-                    w = frame.width,
-                    h = frame.height,
-                    luma_len = frame.y.len(),
+                    w = frame.width(),
+                    h = frame.height(),
+                    luma_len = frame.y().len(),
                     "Camera frame received"
                 );
             }
@@ -607,23 +607,23 @@ fn ensure_encoder(
     // otherwise fail every frame from then on and stop the video permanently.
     if encoder
         .as_ref()
-        .is_some_and(|e| e.size() == (frame.width, frame.height))
+        .is_some_and(|e| e.size() == (frame.width(), frame.height()))
     {
         return;
     }
 
-    let bitrate = bitrate_for(frame.width, frame.height);
+    let bitrate = bitrate_for(frame.width(), frame.height());
     let config = EncoderConfig {
-        width: frame.width,
-        height: frame.height,
+        width: frame.width(),
+        height: frame.height(),
         bitrate_kbps: bitrate,
         max_framerate: u32::try_from(MAX_ENCODE_FPS).unwrap_or(30),
     };
     match NegotiatedEncoder::new(NEGOTIATED_VIDEO_CODEC, config) {
         Ok(enc) => {
             tracing::info!(
-                width = frame.width,
-                height = frame.height,
+                width = frame.width(),
+                height = frame.height(),
                 bitrate_kbps = bitrate,
                 max_fps = MAX_ENCODE_FPS,
                 codec = NEGOTIATED_VIDEO_CODEC.sdp_name(),

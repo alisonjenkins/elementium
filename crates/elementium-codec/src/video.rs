@@ -284,14 +284,7 @@ mod tests {
     fn frame(width: u32, height: u32) -> I420Frame {
         let (w, h) = (width as usize, height as usize);
         let uv = (w / 2) * (h / 2);
-        I420Frame {
-            width,
-            height,
-            y: vec![128; w * h],
-            u: vec![128; uv],
-            v: vec![128; uv],
-            timestamp_us: 0,
-        }
+        I420Frame::from_planes(width, height, &vec![128; w * h], &vec![128; uv], &vec![128; uv], 0).expect("planes match the geometry")
     }
 
     fn config(width: u32, height: u32) -> EncoderConfig {
@@ -349,7 +342,7 @@ mod tests {
         let frames = VideoDecoder::decode(&mut decoder, &keyframe.data).expect("decode");
 
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames.first().map(|f| (f.width, f.height)), Some((320, 240)));
+        assert_eq!(frames.first().map(|f| (f.width(), f.height())), Some((320, 240)));
     }
 
     /// A frame of the wrong size must be refused, not encoded into a corrupt picture.

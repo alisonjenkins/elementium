@@ -283,8 +283,12 @@ fn whole_frame(c: &mut Criterion) {
             let _ = enc.encode(f);
         }
         b.iter(|| {
-            let frame = turbojpeg::decompress_to_yuv(&jpeg).expect("decode");
-            let i420 = yuv_to_i420(&frame);
+            let yuv = turbojpeg::decompress_to_yuv(&jpeg).expect("decode");
+            // Adopted, not repacked: the decoder's buffer becomes the frame.
+            let (w, h) = (yuv.width as u32, yuv.height as u32);
+            let (y_stride, uv_stride) = (yuv.y_size().0, yuv.uv_size().0);
+            let i420 = I420Frame::from_padded(w, h, yuv.pixels, y_stride, uv_stride, 0)
+                .expect("adopt the decoder buffer");
             let _preview = halve_i420(&i420).as_ref().map(i420_to_rgba);
             enc.encode(&i420)
         });
@@ -322,39 +326,6 @@ fn decode_jpeg_as(
         u32::try_from(width).ok()?,
         u32::try_from(height).ok()?,
     ))
-}
-
-/// Split a turbojpeg YUV buffer into I420 planes, as the capture path does.
-///
-/// Duplicated rather than depended on for the same reason as the decode below.
-fn yuv_to_i420(yuv: &turbojpeg::YuvImage<Vec<u8>>) -> I420Frame {
-    let (y_stride, y_rows) = yuv.y_size();
-    let (uv_stride, uv_rows) = yuv.uv_size();
-    let y_bytes = y_stride * y_rows;
-    let uv_bytes = uv_stride * uv_rows;
-    let tight = |src: &[u8], stride: usize, keep: usize, rows: usize| -> Vec<u8> {
-        (0..rows)
-            .flat_map(|r| src[r * stride..r * stride + keep].iter().copied())
-            .collect()
-    };
-    I420Frame {
-        width: yuv.width as u32,
-        height: yuv.height as u32,
-        y: tight(&yuv.pixels[..y_bytes], y_stride, yuv.width, y_rows),
-        u: tight(
-            &yuv.pixels[y_bytes..y_bytes + uv_bytes],
-            uv_stride,
-            yuv.uv_width().min(uv_stride),
-            uv_rows,
-        ),
-        v: tight(
-            &yuv.pixels[y_bytes + uv_bytes..y_bytes + 2 * uv_bytes],
-            uv_stride,
-            yuv.uv_width().min(uv_stride),
-            uv_rows,
-        ),
-        timestamp_us: 0,
-    }
 }
 
 /// Decode a JPEG the way the capture path does.

@@ -220,9 +220,20 @@ pub fn decode_mjpeg_to_i420(jpeg: &[u8]) -> Option<I420Frame> {
 
     let (y_stride, y_rows) = yuv.y_size();
     let (uv_stride, uv_rows) = yuv.uv_size();
+
+    // I420 is 4:2:0. When the JPEG already is, its buffer is exactly the layout a frame
+    // wants and can be adopted whole -- no plane is copied, no row is repacked. That is
+    // the common case for a webcam and the reason this path exists.
+    if yuv.subsamp == turbojpeg::Subsamp::Sub2x2 {
+        return I420Frame::from_padded(width, height, yuv.pixels, y_stride, uv_stride, 0);
+    }
+
+    // Otherwise the chroma planes are the wrong shape and have to be resampled, which
+    // means a copy. UVC cameras commonly emit 4:2:2 and some emit 4:4:4; reading either as
+    // 4:2:0 puts chroma samples where luma is expected, which decodes a solid red image to
+    // a murky green.
     let y_bytes = y_stride.checked_mul(y_rows)?;
     let uv_bytes = uv_stride.checked_mul(uv_rows)?;
-
     let u_start = y_bytes;
     let v_start = u_start.checked_add(uv_bytes)?;
     let end = v_start.checked_add(uv_bytes)?;
@@ -237,37 +248,29 @@ pub fn decode_mjpeg_to_i420(jpeg: &[u8]) -> Option<I420Frame> {
         return None;
     }
 
-    // Strip the row padding: I420 planes are tightly packed.
-    let y = tight_rows(yuv.pixels.get(..y_bytes)?, y_stride, yuv.width, y_rows)?;
-    let u_src = tight_rows(
-        yuv.pixels.get(u_start..v_start)?,
-        uv_stride,
-        yuv.uv_width().min(uv_stride),
-        uv_rows,
-    )?;
-    let v_src = tight_rows(
-        yuv.pixels.get(v_start..end)?,
-        uv_stride,
-        yuv.uv_width().min(uv_stride),
-        uv_rows,
-    )?;
+    let w = usize::try_from(width).ok()?;
+    let h = usize::try_from(height).ok()?;
 
-    // I420 wants chroma at half width and half height. Resample whatever the JPEG used.
-    let (chroma_w, chroma_h) = (
-        usize::try_from(width).ok()?.div_ceil(2),
-        usize::try_from(height).ok()?.div_ceil(2),
-    );
-    let src_w = usize::try_from(width).ok()?.div_ceil(yuv.subsamp.width());
-    let src_h = usize::try_from(height).ok()?.div_ceil(yuv.subsamp.height());
+    let uv_keep = yuv.uv_width().min(uv_stride);
+    let u_src = tight_rows(yuv.pixels.get(u_start..v_start)?, uv_stride, uv_keep, uv_rows)?;
+    let v_src = tight_rows(yuv.pixels.get(v_start..end)?, uv_stride, uv_keep, uv_rows)?;
 
-    Some(I420Frame {
+    let (chroma_w, chroma_h) = (w.div_ceil(2), h.div_ceil(2));
+    let src_w = w.div_ceil(yuv.subsamp.width());
+    let src_h = h.div_ceil(yuv.subsamp.height());
+
+    // The luma plane is padded too, and `from_planes` expects tight packing -- so it has
+    // to be repacked here rather than handed over as-is.
+    let y = tight_rows(yuv.pixels.get(..y_bytes)?, y_stride, w, h)?;
+
+    I420Frame::from_planes(
         width,
         height,
-        y,
-        u: resample_chroma(&u_src, src_w, src_h, chroma_w, chroma_h)?,
-        v: resample_chroma(&v_src, src_w, src_h, chroma_w, chroma_h)?,
-        timestamp_us: 0,
-    })
+        &y,
+        &resample_chroma(&u_src, src_w, src_h, chroma_w, chroma_h)?,
+        &resample_chroma(&v_src, src_w, src_h, chroma_w, chroma_h)?,
+        0,
+    )
 }
 
 /// Copy `rows` rows of `keep` bytes each out of a padded plane.
@@ -617,7 +620,7 @@ fn attach_and_connect(
             timing.record(decode_started.elapsed(), copy_len);
 
             if let Some(frame) = converted {
-                let (frame_width, frame_height) = (frame.width, frame.height);
+                let (frame_width, frame_height) = (frame.width(), frame.height());
                 if frame_width != n.width || frame_height != n.height {
                     // Once per occurrence rather than per frame: a camera that does this
                     // does it every frame, and the interesting fact is that it happens at
@@ -888,10 +891,10 @@ mod tests {
         ))
         .expect("decodes");
 
-        assert_eq!((frame.width, frame.height), (64, 32));
-        assert_eq!(frame.y.len(), 64 * 32, "luma plane matches the geometry");
-        assert_eq!(frame.u.len(), 32 * 16, "chroma is half in each axis");
-        assert_eq!(frame.v.len(), 32 * 16);
+        assert_eq!((frame.width(), frame.height()), (64, 32));
+        assert_eq!(frame.y().len(), 64 * 32, "luma plane matches the geometry");
+        assert_eq!(frame.u().len(), 32 * 16, "chroma is half in each axis");
+        assert_eq!(frame.v().len(), 32 * 16);
     }
 
     /// The decode must produce the colour that went in, not a channel-swapped one.
@@ -935,9 +938,9 @@ mod tests {
                 super::decode_mjpeg_to_i420(&jpeg_fixture(64, 32, [200, 60, 60], sampling))
                     .unwrap_or_else(|| panic!("{name} must decode"));
 
-            assert_eq!(frame.y.len(), 64 * 32, "{name}: luma plane");
-            assert_eq!(frame.u.len(), 32 * 16, "{name}: chroma must end up 4:2:0");
-            assert_eq!(frame.v.len(), 32 * 16, "{name}: chroma must end up 4:2:0");
+            assert_eq!(frame.y().len(), 64 * 32, "{name}: luma plane");
+            assert_eq!(frame.u().len(), 32 * 16, "{name}: chroma must end up 4:2:0");
+            assert_eq!(frame.v().len(), 32 * 16, "{name}: chroma must end up 4:2:0");
 
             let rgba = elementium_codec::i420_to_rgba(&frame);
             let (r, g, b) = (rgba.data[0], rgba.data[1], rgba.data[2]);
