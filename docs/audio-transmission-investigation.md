@@ -71,6 +71,51 @@ a window of destroyed audio. Both are fixed in the harness.
    match-by-kind fallback — which works until ordering or track counts change.
 3. **Re-offering appended duplicate m-lines** for a kind that already had one.
 
+## The actual cause of "nothing gets through" (2026-08-07)
+
+**The capture pipelines were never connected to the SFU transport.**
+
+The microphone and camera threads write encoded frames into an `IoCommand`
+channel. That channel is bound in exactly one place: `create_offer` in
+`src-tauri/src/commands/webrtc.rs`, which runs when a shim `RTCPeerConnection`
+creates an offer. An SFU call never goes through that path — `main.ts` replaces
+livekit-client's `Room` with the native bridge, so signaling goes to
+`livekit_connect`/`livekit_publish_track` and the shim `PeerConnection` is used
+only for legacy 1:1 calls. `LiveKitRoom::write_audio` and `write_video` existed
+and had **no callers anywhere**.
+
+So every encoded audio and video frame of every SFU call was produced, counted,
+logged, and dropped inside the process. Nothing failed: capture ran, the encoder
+logged frames, the local preview updated. This is why every measurement in the
+table above is clean — they all measure stages upstream of the missing link, and
+the Rust-publisher harness has its own transport and never touched this code.
+
+It also explains the earlier "barely any of my audio gets through": what did get
+through was not this path.
+
+Two consequences worth keeping in mind:
+
+- A capture pipeline that starts *after* its track is published (joining muted,
+  then unmuting) has no earlier pipeline to inherit a connection from. The room's
+  sender is now remembered in `MediaState` for the duration of the call.
+- Nothing routes a receiver's keyframe request back to the encoder. libvpx's
+  default keyframe distance is 9999 frames, so a peer subscribing mid-call would
+  see nothing for minutes. The camera thread emits one every three seconds
+  instead; `Event::KeyframeRequest` is logged so the real fix's necessity is
+  measurable.
+
+## Inbound audio quality
+
+Separately from transmission: the mixer played every decoded frame the instant it
+arrived and drained each track's queue to empty on every callback, leaving no
+margin. A frame arriving a few milliseconds late found an empty queue, so the
+callback emitted silence for the rest of the buffer. Ordinary jitter therefore
+punched holes in the output several times a second on a stream being delivered
+whole — heard as low-bitrate, crunchy audio, and invisible to every metric on
+both sides, because the packets did arrive.
+
+There is now a 60ms prefill and a 240ms cap per track.
+
 ## The open lead
 
 `Rust publisher → SFU → Chromium` fails roughly half the time, while
