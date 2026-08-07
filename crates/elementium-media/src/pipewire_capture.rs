@@ -18,6 +18,12 @@ use elementium_types::I420Frame;
 
 use crate::pipewire_nodes::PipewireError;
 
+/// Frame rate requested when a caller does not ask for one.
+///
+/// 30 is what video calls are built around. Streaming and screen capture legitimately want
+/// 60 or more, which is why this is a default rather than a limit.
+pub const DEFAULT_CAPTURE_FPS: u32 = 30;
+
 /// Frames buffered before the oldest is dropped.
 ///
 /// Small on purpose: video is only useful live, and a deep queue converts a slow consumer
@@ -398,6 +404,21 @@ impl PipewireCapturer {
     /// unreachable. A node that exists but never produces frames is *not* an error here —
     /// it surfaces as no frames arriving, which the caller can time out on.
     pub fn start(node_id: u32) -> Result<Self, PipewireError> {
+        Self::start_at(node_id, DEFAULT_CAPTURE_FPS)
+    }
+
+    /// Connect to `node_id`, asking for `target_fps` frames per second.
+    ///
+    /// The rate is requested, not enforced: a source may offer only a fixed rate, and one
+    /// that offers more will be asked for this and may still deliver more. Frames arriving
+    /// faster than this are dropped *before* being decoded -- decoding is the single
+    /// largest cost on this path, and decoding a frame nothing will consume is the most
+    /// expensive way to do nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`PipewireCapturer::start`].
+    pub fn start_at(node_id: u32, target_fps: u32) -> Result<Self, PipewireError> {
         let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let negotiated = Arc::new(Mutex::new(Negotiated::default()));
@@ -407,7 +428,14 @@ impl PipewireCapturer {
         std::thread::Builder::new()
             .name(format!("pw-capture-{node_id}"))
             .spawn(move || {
-                run_stream(node_id, &frame_tx, stop_rx, &thread_negotiated, &ready_tx);
+                run_stream(
+                    node_id,
+                    target_fps,
+                    &frame_tx,
+                    stop_rx,
+                    &thread_negotiated,
+                    &ready_tx,
+                );
             })
             .map_err(|e| PipewireError::Init(e.to_string()))?;
 
@@ -449,6 +477,7 @@ impl Drop for PipewireCapturer {
 #[allow(clippy::needless_pass_by_value)]
 fn run_stream(
     node_id: u32,
+    target_fps: u32,
     frame_tx: &mpsc::SyncSender<I420Frame>,
     stop_rx: mpsc::Receiver<()>,
     negotiated: &Arc<Mutex<Negotiated>>,
@@ -487,7 +516,7 @@ fn run_stream(
         }
     };
 
-    if let Err(e) = attach_and_connect(&stream, node_id, negotiated, frame_tx) {
+    if let Err(e) = attach_and_connect(&stream, node_id, target_fps, negotiated, frame_tx) {
         let _ = ready_tx.send(Err(e));
         return;
     }
@@ -503,6 +532,7 @@ fn run_stream(
 fn attach_and_connect(
     stream: &pipewire::stream::StreamRc,
     node_id: u32,
+    target_fps: u32,
     negotiated: &Arc<Mutex<Negotiated>>,
     frame_tx: &mpsc::SyncSender<I420Frame>,
 ) -> Result<(), String> {
@@ -516,6 +546,17 @@ fn attach_and_connect(
     // user's machine, so its cost is battery on a laptop and frames stolen from whatever
     // else the machine is doing. Guessing which stage dominates has been wrong before.
     let mut timing = CaptureTiming::default();
+    // Shortest gap between frames we will decode. A source may deliver faster than asked --
+    // it negotiates a rate from a range, and some ignore the request entirely -- and a
+    // frame that arrives early is dropped here, before the decode. That ordering is the
+    // whole point: decoding is a third of this path's cost, so decoding a frame nothing
+    // will consume is the most expensive possible way to do nothing.
+    let min_gap = std::time::Duration::from_nanos(
+        1_000_000_000_u64
+            .checked_div(u64::from(target_fps.max(1)))
+            .unwrap_or(0),
+    );
+    let mut last_decoded: Option<std::time::Instant> = None;
 
     let listener = stream
         .add_local_listener::<()>()
@@ -566,6 +607,13 @@ fn attach_and_connect(
             if n.encoding == Encoding::Unsupported {
                 return;
             }
+            // Checked before anything is read out of the buffer, let alone decoded.
+            let now = std::time::Instant::now();
+            if last_decoded.is_some_and(|t| now.saturating_duration_since(t) < min_gap) {
+                return;
+            }
+            last_decoded = Some(now);
+
             let datas = buffer.datas_mut();
             let Some(data) = datas.first_mut() else { return };
             let stride = usize::try_from(data.chunk().stride()).unwrap_or(0);
@@ -646,7 +694,7 @@ fn attach_and_connect(
         })
         .register();
 
-    let mut params = [format_param()];
+    let mut params = [format_param(target_fps)];
     let mut param_refs: Vec<&libspa::pod::Pod> = params
         .iter_mut()
         .filter_map(|p| libspa::pod::Pod::from_bytes(p))
@@ -703,7 +751,7 @@ fn run_until_stopped(
 /// Offering several and letting `PipeWire` choose is deliberate — a source that cannot
 /// produce our first choice would otherwise fail to negotiate at all, and conversion is
 /// cheap next to not having a camera.
-fn format_param() -> Vec<u8> {
+fn format_param(target_fps: u32) -> Vec<u8> {
     use libspa::pod::{object, property, Value};
     let obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
@@ -749,9 +797,9 @@ fn format_param() -> Vec<u8> {
             Choice,
             Range,
             Fraction,
-            libspa::utils::Fraction { num: 30, denom: 1 },
+            libspa::utils::Fraction { num: target_fps, denom: 1 },
             libspa::utils::Fraction { num: 1, denom: 1 },
-            libspa::utils::Fraction { num: 60, denom: 1 }
+            libspa::utils::Fraction { num: target_fps, denom: 1 }
         ),
     };
     libspa::pod::serialize::PodSerializer::serialize(

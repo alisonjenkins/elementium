@@ -279,6 +279,11 @@ pub async fn get_user_media(
 
         let req_width = video_constraints.width;
         let req_height = video_constraints.height;
+        // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
+        // Asking for what will be consumed means the surplus is never decoded.
+        let req_fps = video_constraints
+            .frame_rate
+            .map_or(MAX_ENCODE_FPS_U32, requested_fps);
 
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
             Arc::new(Mutex::new(inherited_connection));
@@ -308,6 +313,7 @@ pub async fn get_user_media(
                 &stop_rx,
                 req_width,
                 req_height,
+                req_fps,
             );
         });
 
@@ -467,6 +473,41 @@ const NEGOTIATED_VIDEO_CODEC: VideoCodec = VideoCodec::Vp8;
 /// can see. The preview still shows every captured frame; only the encoder skips.
 const MAX_ENCODE_FPS: u64 = 30;
 
+/// [`MAX_ENCODE_FPS`] as the width the capture API takes.
+const MAX_ENCODE_FPS_U32: u32 = 30;
+
+/// Turn a `getUserMedia` frame-rate constraint into a rate to ask the camera for.
+///
+/// Clamped rather than trusted: a source asked for zero delivers nothing, and an absurd
+/// rate would have us decoding frames no encoder or display will ever consume. The upper
+/// bound is generous because high-rate capture is a real use -- streaming and screen
+/// capture want more than a call does.
+fn requested_fps(constraint: f64) -> u32 {
+    // The rates worth asking a camera for. Walking these rather than converting the float
+    // avoids a cast the lints reject for good reason, and a camera offers a handful of
+    // rates in any case.
+    const RATES: [u32; 8] = [1, 5, 10, 15, 24, 30, 60, 120];
+
+    if !constraint.is_finite() {
+        return MAX_ENCODE_FPS_U32;
+    }
+    let clamped = constraint.round().clamp(1.0, 240.0);
+    // Nearest offered rate, and on a tie the lower one -- `RATES` is ascending and
+    // `min_by` keeps the first of equal elements. Ties break downwards deliberately:
+    // exceeding what was asked for spends CPU and bitrate nobody requested.
+    RATES
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let (da, db) = (
+                (f64::from(*a) - clamped).abs(),
+                (f64::from(*b) - clamped).abs(),
+            );
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(MAX_ENCODE_FPS_U32)
+}
+
 /// Minimum gap between encoded frames, from [`MAX_ENCODE_FPS`].
 const MIN_ENCODE_INTERVAL: std::time::Duration =
     std::time::Duration::from_nanos(1_000_000_000 / MAX_ENCODE_FPS);
@@ -498,10 +539,15 @@ fn camera_pipeline_loop(
     stop_rx: &std::sync::mpsc::Receiver<()>,
     req_width: Option<u32>,
     req_height: Option<u32>,
+    req_fps: u32,
 ) {
     // Prefers PipeWire, falls back to V4L2. On a desktop where PipeWire holds the camera,
     // V4L2 cannot work at all -- see `VideoSource`.
-    let capturer = match elementium_media::video_source::VideoSource::start(req_width, req_height) {
+    let capturer = match elementium_media::video_source::VideoSource::start_at(
+        req_width,
+        req_height,
+        req_fps,
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(reason = %e, track_id = %track_id, "Failed to start camera");
@@ -1201,5 +1247,42 @@ mod video_bitrate_tests {
             .checked_div(MIN_ENCODE_INTERVAL.as_nanos().try_into().unwrap_or(u64::MAX))
             .unwrap_or(0);
         assert_eq!(per_second, MAX_ENCODE_FPS);
+    }
+}
+
+#[cfg(test)]
+mod requested_fps_tests {
+    use super::{MAX_ENCODE_FPS_U32, requested_fps};
+
+    /// A call asks for 30 and streaming asks for 60; both must reach the camera intact.
+    /// Capping capture at the call rate would silently halve a stream.
+    #[test]
+    fn common_rates_pass_through() {
+        assert_eq!(requested_fps(30.0), 30);
+        assert_eq!(requested_fps(60.0), 60);
+        assert_eq!(requested_fps(120.0), 120);
+        assert_eq!(requested_fps(24.0), 24);
+    }
+
+    /// A rate between the ones a camera offers picks the nearest, not the floor: asking
+    /// for 59 and getting 30 would halve the stream the caller asked for.
+    #[test]
+    fn an_unusual_rate_picks_the_nearest_offered() {
+        assert_eq!(requested_fps(59.0), 60);
+        assert_eq!(requested_fps(29.0), 30);
+        // Equidistant between 60 and 120: the tie breaks downwards, because exceeding
+        // what was asked for spends CPU and bitrate nobody requested.
+        assert_eq!(requested_fps(90.0), 60);
+    }
+
+    /// Nonsense must not reach the camera. Zero would ask for a source that never
+    /// delivers, and an absurd rate would have us decoding frames nothing consumes.
+    #[test]
+    fn nonsense_falls_back_to_the_default() {
+        assert_eq!(requested_fps(f64::NAN), MAX_ENCODE_FPS_U32);
+        assert_eq!(requested_fps(f64::INFINITY), MAX_ENCODE_FPS_U32);
+        assert_eq!(requested_fps(0.0), 1, "clamped, not zero");
+        assert_eq!(requested_fps(-5.0), 1);
+        assert_eq!(requested_fps(100_000.0), 120, "clamped to the highest offered");
     }
 }

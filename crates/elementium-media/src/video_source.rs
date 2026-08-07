@@ -42,7 +42,27 @@ impl VideoSource {
     /// camera did not start" without saying what each path objected to is the exact
     /// unhelpfulness this module exists to remove.
     pub fn start(width: Option<u32>, height: Option<u32>) -> Result<Self, String> {
-        let pipewire_err = match start_pipewire() {
+        Self::start_at(width, height, crate::pipewire_capture::DEFAULT_CAPTURE_FPS)
+    }
+
+    /// Start capturing at a requested frame rate.
+    ///
+    /// The rate is a request: a source may only offer one rate, and one that offers more
+    /// may still deliver more. What it does guarantee is that frames beyond it are dropped
+    /// before being decoded, which is where the cost is.
+    ///
+    /// 30 suits a video call. Streaming and screen capture want 60 or more, which is why
+    /// this exists rather than a constant.
+    ///
+    /// # Errors
+    ///
+    /// As [`VideoSource::start`].
+    pub fn start_at(
+        width: Option<u32>,
+        height: Option<u32>,
+        target_fps: u32,
+    ) -> Result<Self, String> {
+        let pipewire_err = match start_pipewire(target_fps) {
             Ok(source) => return Ok(source),
             Err(e) => e,
         };
@@ -105,7 +125,7 @@ impl VideoSource {
 /// layouts we cannot decode does exactly that -- so "connected" is not enough to call it
 /// working. Each candidate is given until [`NEGOTIATION_TIMEOUT`] to report a size, and the
 /// next is tried otherwise.
-fn start_pipewire() -> Result<VideoSource, String> {
+fn start_pipewire(target_fps: u32) -> Result<VideoSource, String> {
     let sources = crate::pipewire_nodes::list_video_sources().map_err(|e| e.to_string())?;
     if sources.is_empty() {
         return Err("PipeWire offered no video sources".to_owned());
@@ -113,7 +133,7 @@ fn start_pipewire() -> Result<VideoSource, String> {
 
     let mut last_error = String::new();
     for source in &sources {
-        match PipewireCapturer::start(source.node_id) {
+        match PipewireCapturer::start_at(source.node_id, target_fps) {
             Ok(capturer) => {
                 let deadline = Instant::now().checked_add(NEGOTIATION_TIMEOUT);
                 while deadline.is_some_and(|d| Instant::now() < d) {

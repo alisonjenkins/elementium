@@ -20,7 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use elementium_codec::Vp8Encoder;
+use elementium_codec::{Vp8Encoder, halve_i420, i420_to_rgba};
 use elementium_types::I420Frame;
 
 fn main() {

@@ -34,3 +34,8 @@ zune-jpeg = "0.5.15"
 [[bench]]
 name = "media_pipeline"
 harness = false
+
+[[example]]
+name = "pipeline_profile"
+# Needs the JPEG encoder to build its fixture, which is a dev-dependency.
+required-features = []
