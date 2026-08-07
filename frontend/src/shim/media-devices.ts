@@ -269,9 +269,14 @@ function extractConstraintValue(value: unknown): number | undefined {
 /// Target preview period: 30fps is plenty for a self-view and halves the IPC volume of 60.
 const TARGET_FRAME_MS = 33;
 
+// Measured on this machine: PipeWire negotiated the camera 3.35s after getUserMedia was
+// called, so a 3s probe missed the first frame by 350ms and fell back to 640x480 for the
+// whole session. The camera cannot be hurried; the probe can wait.
+const GEOMETRY_PROBE_MS = 8000;
+
 async function firstFrameGeometry(
   trackId: string,
-  timeoutMs = 3000,
+  timeoutMs = GEOMETRY_PROBE_MS,
 ): Promise<{ width: number; height: number } | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -338,7 +343,16 @@ function startLocalVideoFrameFetch(canvas: HTMLCanvasElement, trackId: string): 
             const sctx = scratch.getContext("2d");
             if (sctx) {
               sctx.putImageData(imageData, 0, 0);
-              ctx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
+              // Letterbox rather than stretch: the fallback canvas is 4:3 and the camera
+              // is 16:9, so filling the canvas would make everyone look short and wide.
+              const scale = Math.min(canvas.width / width, canvas.height / height);
+              const drawW = Math.round(width * scale);
+              const drawH = Math.round(height * scale);
+              const dx = Math.round((canvas.width - drawW) / 2);
+              const dy = Math.round((canvas.height - drawH) / 2);
+              ctx.fillStyle = "#000";
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(scratch, dx, dy, drawW, drawH);
             }
           }
         }
