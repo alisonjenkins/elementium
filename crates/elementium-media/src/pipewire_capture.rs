@@ -922,31 +922,73 @@ const fn spa_video_format(
     }
 }
 
-/// Every format we will accept, best first for the encoder the frames are headed to.
+/// Every format we will accept, ordered for the encoder the frames are headed to.
 ///
-/// One parameter per format rather than one parameter listing them all. `PipeWire` takes
-/// the first that the source can satisfy, so separate parameters are what make the
-/// preference order actually mean something — a single parameter with an enumerated list
-/// lets the source pick from it on its own terms, which is how a camera offering both
-/// MJPEG and YUY2 can hand back whichever it prefers regardless of which costs us more.
+/// Two parameters, not one per format. The raw layouts go in a single parameter as an
+/// enumerated choice with our preferred one first, and MJPEG goes in its own because it is
+/// a different media subtype; which of the two comes first is what the policy decided.
 ///
-/// Every format is still offered. A camera that cannot produce the first choice at the
-/// requested size and rate must be able to fall through to something, and a working call
-/// in a worse format beats no camera at all.
+/// One parameter per format was tried against a real camera and is wrong. It expresses the
+/// preference exactly — `PipeWire` takes the first parameter the source can satisfy — but
+/// "can satisfy" is judged against what the node advertises rather than what the device
+/// will do, and an OBSBOT Tiny 2 advertising a layout its driver then refuses failed the
+/// whole connection with `error set output format: -22 (Invalid argument)`. No frames at
+/// all, from a camera that works. Inside one parameter the source negotiates the
+/// intersection itself and settles on something that exists.
+///
+/// The proper fix is to read the node's own `EnumFormat` first and rank what it actually
+/// offers. That is worth doing and is not this.
 fn format_params(target_fps: u32, target: elementium_codec::EncodeTarget) -> Vec<Vec<u8>> {
-    elementium_codec::capture_format::preference(target)
-        .into_iter()
-        .map(|format| {
-            spa_video_format(format).map_or_else(
-                || mjpeg_format_param(target_fps),
-                |raw| raw_format_param(target_fps, raw),
-            )
-        })
-        .collect()
+    let preference = elementium_codec::capture_format::preference(target);
+    let raw: Vec<libspa::param::video::VideoFormat> =
+        preference.iter().copied().filter_map(spa_video_format).collect();
+    // Where MJPEG sits relative to every raw layout is the whole decision: first when the
+    // GPU decodes it, last when the CPU has to.
+    let mjpeg_first = preference
+        .first()
+        .is_some_and(|f| *f == elementium_codec::CaptureFormat::Mjpeg);
+
+    let mut params = Vec::with_capacity(2);
+    if mjpeg_first {
+        params.push(mjpeg_format_param(target_fps));
+    }
+    if !raw.is_empty() {
+        params.push(raw_format_param(target_fps, &raw));
+    }
+    if !mjpeg_first {
+        params.push(mjpeg_format_param(target_fps));
+    }
+    params
 }
 
-/// Ask for one raw pixel layout.
-fn raw_format_param(target_fps: u32, format: libspa::param::video::VideoFormat) -> Vec<u8> {
+/// A `VideoFormat` property offering several layouts, the first being preferred.
+///
+/// Built by hand rather than with `property!`, which takes its alternatives as literals and
+/// so cannot express a list decided at run time — which is the point here, since the order
+/// comes from whichever encoder was negotiated.
+fn format_choice(formats: &[libspa::param::video::VideoFormat]) -> libspa::pod::Property {
+    use libspa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
+
+    let default = formats
+        .first()
+        .copied()
+        .unwrap_or(libspa::param::video::VideoFormat::YUY2);
+    Property {
+        key: libspa::param::format::FormatProperties::VideoFormat.as_raw(),
+        flags: PropertyFlags::empty(),
+        value: Value::Choice(ChoiceValue::Id(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                default: Id(default.as_raw()),
+                alternatives: formats.iter().map(|f| Id(f.as_raw())).collect(),
+            },
+        ))),
+    }
+}
+
+/// Ask for any of these raw pixel layouts, preferring the first.
+fn raw_format_param(target_fps: u32, formats: &[libspa::param::video::VideoFormat]) -> Vec<u8> {
     use libspa::pod::{object, property};
     let obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
@@ -961,11 +1003,10 @@ fn raw_format_param(target_fps: u32, format: libspa::param::video::VideoFormat) 
             Id,
             libspa::param::format::MediaSubtype::Raw
         ),
-        property!(
-            libspa::param::format::FormatProperties::VideoFormat,
-            Id,
-            format
-        ),
+        // A choice rather than a single value: the source picks from these, which is what
+        // lets it settle on one the device will actually accept. The first is the default
+        // and is taken when the device can manage it.
+        format_choice(formats),
         // Size and framerate are not optional in practice: without them the source
         // fixates a format whose pixel layout comes back as `Unknown`, and every frame is
         // then dropped for want of a conversion. Offered as wide ranges so the source
