@@ -92,11 +92,27 @@ if [[ "${ELEMENTIUM_AUTOJOIN:-}" == "1" ]]; then
     # Participant index 0 by default; `just call-peers` uses the rest, so the app takes
     # tester1 and meets them.
     AUTOJOIN_JSON=$(ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-0}" python3 - "$FIXTURE" <<'PYEOF'
-import json, os, sys
+import json, os, sys, urllib.request
+
 env = json.load(open(sys.argv[1]))
-who = env["participants"][0]
+hs = env.get("homeserver", "http://localhost:8008")
+
+# A fresh login rather than the fixture's token. The fixture names one device per
+# provision, and `just app-join` wipes the application's profile on every run -- so reusing
+# it means a device the homeserver holds keys for against a crypto store that no longer has
+# them. The key upload is then rejected ("One time key already exists") and the client never
+# finishes starting, which shows up as the room never appearing.
+body = json.dumps({
+    "type": "m.login.password",
+    "identifier": {"type": "m.id.user", "user": "tester1"},
+    "password": "test-password-1",
+}).encode()
+req = urllib.request.Request(f"{hs}/_matrix/client/v3/login", data=body,
+                             headers={"Content-Type": "application/json"})
+who = json.load(urllib.request.urlopen(req))
+
 print(json.dumps({
-    "homeserver": env.get("homeserver", "http://localhost:8008"),
+    "homeserver": hs,
     "userId": who["user_id"],
     "accessToken": who["access_token"],
     "deviceId": who["device_id"],

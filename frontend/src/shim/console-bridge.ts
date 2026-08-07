@@ -4,6 +4,45 @@
  * Uses __TAURI_INTERNALS__ directly (available before npm packages load).
  * Works in both the main window and Element Call iframe (after IPC bridge is set up).
  */
+/**
+ * Render one console argument as text worth reading.
+ *
+ * `JSON.stringify` on an Error yields `{}`, because name, message and stack are all
+ * non-enumerable. Every error logged through this bridge therefore reached the log as
+ * "something went wrong {}" -- which is how a failing `/sync` was recorded as
+ * `sync /sync error %s {}`, and cost an evening of guessing at what the error was.
+ *
+ * Matrix errors carry the part that identifies them (`errcode`, `httpStatus`) as ordinary
+ * properties, so those are pulled out explicitly rather than left to a stringify that skips
+ * the inherited ones.
+ */
+function describe(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) {
+    const extra = value as unknown as Record<string, unknown>;
+    const parts = [`${value.name}: ${value.message}`];
+    for (const key of ["errcode", "httpStatus", "data"]) {
+      if (extra[key] !== undefined) parts.push(`${key}=${safeJson(extra[key])}`);
+    }
+    const stack = value.stack?.split("\n")[1]?.trim();
+    if (stack) parts.push(`at ${stack}`);
+    return parts.join(" ");
+  }
+  return safeJson(value);
+}
+
+function safeJson(value: unknown): string {
+  try {
+    const json = JSON.stringify(value);
+    // `undefined` stringifies to undefined, and a bare `{}` for an object with only
+    // non-enumerable properties is worse than saying what it was.
+    if (json === undefined || json === "{}") return String(value);
+    return json;
+  } catch {
+    return String(value);
+  }
+}
+
 export function setupConsoleBridge(): void {
   const w = window as unknown as Record<string, unknown>;
   if (w.__elementium_console_bridged) return;
@@ -21,11 +60,7 @@ export function setupConsoleBridge(): void {
     try {
       const strs: string[] = [];
       for (let i = 0; i < args.length; i++) {
-        try {
-          strs.push(typeof args[i] === "string" ? args[i] : JSON.stringify(args[i]));
-        } catch {
-          strs.push(String(args[i]));
-        }
+        strs.push(describe(args[i]));
       }
       const t = w.__TAURI_INTERNALS__ as { invoke?: (cmd: string, args: unknown) => Promise<void> } | undefined;
       if (t?.invoke) {

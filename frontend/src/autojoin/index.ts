@@ -125,7 +125,18 @@ async function driveElementWeb(cfg: AutoJoinConfig): Promise<void> {
   // exists once the room is open, it is what this needs next, and it does not depend on a
   // class name that changes when Element Web is restyled.
   log("waiting for the room");
-  (await waitFor("the video call button", byName(/^video call$/i))).click();
+  // One reload if the room does not appear. The homeserver can report this account joined
+  // while the client still shows "There's no preview, would you like to join?" -- the room
+  // reaches it through sync, and a client that started mid-sync sometimes settles only on a
+  // second load. Clicking the offered join button is not the answer: it joins by room id
+  // with no via-servers and fails.
+  try {
+    (await waitFor("the video call button", byName(/^video call$/i), 60_000)).click();
+  } catch {
+    log("room did not appear; reloading once");
+    location.reload();
+    return;
+  }
   log("call opened");
 }
 
