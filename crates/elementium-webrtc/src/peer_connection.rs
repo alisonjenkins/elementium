@@ -94,6 +94,11 @@ pub struct PeerConnectionInner {
     /// [`audio_wallclock`].
     pub audio_epoch: Option<Instant>,
     pub video_frame_count: u64,
+    /// Instant corresponding to video RTP timestamp 0 on this connection.
+    ///
+    /// Video timestamps are measured from this rather than counted, because the capture
+    /// rate is neither fixed nor known in advance -- see [`write_video`].
+    pub video_epoch: Option<Instant>,
     /// Last RTP sequence number emitted per audio `mid`, for out-of-order detection.
     ///
     /// Opus frames must reach the decoder in the order they were encoded. If str0m emits
@@ -172,6 +177,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         remote_mids: HashMap::new(),
         audio_frame_count: 0,
         audio_epoch: None,
+        video_epoch: None,
         video_frame_count: 0,
         last_audio_seq: HashMap::new(),
         alive: true,
@@ -626,18 +632,31 @@ pub fn write_video(pc: &mut PeerConnectionInner, vp8_data: &WireMedia) -> Result
         .map(str0m::format::PayloadParams::pt)
         .ok_or("No VP8 payload type negotiated")?;
 
-    // VP8 at 90kHz clock, 30fps = 3000 ticks per frame
-    let ticks_per_frame: u64 = 3000;
-    let rtp_offset = pc
-        .video_frame_count
-        .checked_mul(ticks_per_frame)
-        .ok_or("video frame offset overflow")?;
+    // The RTP timestamp must describe when the frame was *captured*, on the 90kHz clock.
+    //
+    // This used to be `frame_count * 3000`, i.e. an assumption of exactly 30fps. The
+    // camera runs at 60, so the timestamps advanced at half the rate the frames actually
+    // arrived: the receiver is told a second of video every two seconds it receives. Its
+    // jitter buffer and render clock both work from that number, so it either stalls
+    // waiting for a future it has already been sent, or displays frames at the wrong time
+    // relative to audio. Nothing on our side notices, because we are simply counting.
+    //
+    // Measuring elapsed time instead makes the timestamps true at any capture rate, and
+    // at a variable one -- which a webcam under changing light very much is.
+    let now = Instant::now();
+    let epoch = *pc.video_epoch.get_or_insert(now);
+    let elapsed = now.saturating_duration_since(epoch);
+    let rtp_offset = u64::from(elapsed.subsec_nanos())
+        .saturating_mul(90_000)
+        .checked_div(1_000_000_000)
+        .unwrap_or(0)
+        .saturating_add(elapsed.as_secs().saturating_mul(90_000));
     // 90_000 is a non-zero literal, so this NonZeroU32 construction is infallible.
     #[allow(clippy::unwrap_used)]
     let rtp_time = MediaTime::new(rtp_offset, NonZeroU32::new(90_000).unwrap().into());
 
     writer
-        .write(pt, Instant::now(), rtp_time, vp8_data)
+        .write(pt, now, rtp_time, vp8_data)
         .map_err(|e| format!("Failed to write video: {e}"))?;
 
     pc.video_frame_count = pc
