@@ -29,6 +29,24 @@ services:
       - ./synapse:/data
     command: run
 
+  # Everything a client sends to the homeserver goes through here first.
+  #
+  # Element Web decides whether Element Call is usable by asking the homeserver for its RTC
+  # transports over MSC4143. Synapse has no such endpoint, and Element Web does not fall back
+  # to the `.well-known` entry that carries the same information -- so without this every
+  # call in this environment silently became a Jitsi call, and no MatrixRTC code ran at all.
+  #
+  # In front of synapse rather than beside it, so the homeserver is still
+  # `http://localhost:8008` to clients, to `public_baseurl` and to `.well-known`.
+  rtc-transports:
+    image: nginx:alpine
+    container_name: elementium-test-rtc-transports
+    network_mode: host
+    volumes:
+      - ./rtc-transports.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - synapse
+
   # The SFU itself. `--dev` gives it the well-known devkey/secret pair, which
   # lk-jwt-service is configured with below.
   livekit:

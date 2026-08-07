@@ -12,7 +12,8 @@
     "show_labs_settings": true,
     "features": {
         "feature_video_rooms": true,
-        "feature_element_call_video_rooms": true
+        "feature_element_call_video_rooms": true,
+        "feature_group_calls": true
     },
     "element_call": {
         "url": "./widgets/element-call",

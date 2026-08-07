@@ -76,6 +76,11 @@ export default async function globalSetup(): Promise<void> {
   if (alreadyUp) {
     console.log("[test-env] stack already running; leaving it alone afterwards");
   } else {
+    // Before `up`, not after: synapse reads its config at startup, and the settings this
+    // applies are the difference between a homeserver the stack can use and a default one
+    // that looks healthy while no call can connect. Idempotent, so this costs a second on
+    // a warm environment.
+    await run("./configure-synapse.sh", [], { cwd: TEST_ENV });
     console.log("[test-env] starting synapse, livekit and lk-jwt-service...");
     await run("docker", ["compose", "up", "-d"], { cwd: TEST_ENV });
     await waitForStack(90_000);

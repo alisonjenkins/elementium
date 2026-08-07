@@ -16,6 +16,7 @@ dev:
 #
 # The stack is left running afterwards -- `just test-env-down` stops it.
 dev-test-env:
+    cd test-env && ./configure-synapse.sh
     cd test-env && docker compose up -d
     cd test-env && ./provision.sh
     ELEMENTIUM_TEST_ENV=1 cargo tauri dev

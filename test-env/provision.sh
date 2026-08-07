@@ -43,9 +43,27 @@ token_of() { python3 -c 'import sys,json; print(json.load(sys.stdin)["access_tok
 OWNER_TOKEN=$(token_of "${USERS[0]}")
 
 # One room shared by every participant, created by the first and joined by the rest.
+#
+# The power-level override is what lets anyone but the creator join a call. Call membership
+# is a *state* event, and state events default to power level 50 while ordinary members are
+# 0 -- so without this every participant after the first is told "You do not have permission
+# to start video call", which reads like a client bug and is a room configuration.
+#
+# Named per event rather than by promoting everyone: a participant needs exactly the right to
+# join calls, and a room full of moderators would hide any fault that depends on privilege.
+#
+# The room is encrypted, and that is not optional here. Element Call only performs frame
+# encryption -- key generation, distribution over to-device messages, rotation on every
+# leaver -- in an encrypted room. In a plain one it skips all of it, so a call test in an
+# unencrypted room exercises none of the machinery the faults live in and passes for a reason
+# that has nothing to do with what it claims to check.
 ROOM=$(curl -s -X POST "$HS/_matrix/client/v3/createRoom" \
   -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"preset":"public_chat","name":"Elementium call test"}' \
+  -d '{"preset":"public_chat","name":"Elementium call test",
+       "initial_state":[{"type":"m.room.encryption","state_key":"",
+                         "content":{"algorithm":"m.megolm.v1.aes-sha2"}}],
+       "power_level_content_override":{"events":{
+         "org.matrix.msc3401.call.member":0,"m.call.member":0,"m.rtc.member":0}}}' \
   | python3 -c 'import sys,json; print(json.load(sys.stdin)["room_id"])')
 
 for u in "${USERS[@]:1}"; do

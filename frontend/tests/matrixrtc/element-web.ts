@@ -40,11 +40,16 @@ export interface ElementWebServer {
   close: () => Promise<void>;
 }
 
-/** Remove the Elementium shim script tag from Element Web's entry page. */
+/**
+ * Remove the Elementium shim script from a served page.
+ *
+ * Applied to every HTML document, not just the entry page: the Element Call widget has its
+ * own `index.html` and carries its own copy. Missing that one produced a participant that
+ * reached the call and then failed at `enumerateDevices`, because the shim was asking a
+ * Tauri backend that does not exist in a browser.
+ */
 function withoutShims(html: string): string {
-  return html
-    .replace(/<script src="elementium-shims\.js"[^>]*><\/script>/g, "")
-    .replace(/<script src="elementium-shims\.js"[^>]*>[\s\S]*?<\/script>/g, "");
+  return html.replace(/<script[^>]*src="[^"]*elementium-shims\.js"[^>]*>\s*<\/script>/g, "");
 }
 
 /**
@@ -81,7 +86,7 @@ export async function startElementWeb(): Promise<ElementWebServer> {
       }
 
       try {
-        if (pathname === "/index.html") {
+        if (pathname.endsWith(".html")) {
           const html = await readFile(file, "utf8");
           res.writeHead(200, { "content-type": MIME[".html"]! });
           res.end(withoutShims(html));
@@ -126,6 +131,7 @@ export interface Credentials {
  * come from `provision.sh`, so they are real sessions on the real homeserver.
  */
 export async function useSession(page: Page, who: Credentials, homeserver: string): Promise<void> {
+  await serveWellKnownOverHttps(page);
   await page.addInitScript(
     ([hs, userId, token, deviceId]) => {
       window.localStorage.setItem("mx_hs_url", hs as string);
@@ -140,4 +146,127 @@ export async function useSession(page: Page, who: Credentials, homeserver: strin
     },
     [homeserver, who.user_id, who.access_token, who.device_id] as const,
   );
+}
+
+/**
+ * Answer `https://localhost/.well-known/matrix/client`, which nothing can serve here.
+ *
+ * matrix-js-sdk discovers well-known from the *server name*, not the homeserver URL, and it
+ * builds `https://<server_name>/.well-known/matrix/client` with the scheme hardcoded. This
+ * homeserver's name is `localhost`, so that is `https://localhost/` on port 443 -- which no
+ * part of this stack listens on and could not, without root and a certificate.
+ *
+ * The request therefore fails, the client caches an empty well-known, and Element Call
+ * refuses to start with `MISSING_MATRIX_RTC_FOCUS` -- the focus is advertised there and
+ * nowhere else it looks. That presents as "the server is not configured to work with Element
+ * Call", which sends you to the server config, where everything is correct.
+ *
+ * Fulfilled from the homeserver's own copy, so there is one source of truth: if `test-env`
+ * changes its focus, this follows without being edited.
+ */
+async function serveWellKnownOverHttps(page: Page): Promise<void> {
+  await page.route("https://localhost/.well-known/matrix/client", async (route) => {
+    try {
+      const upstream = await fetch("http://localhost:8008/.well-known/matrix/client");
+      route.fulfill({
+        status: upstream.status,
+        contentType: "application/json",
+        body: await upstream.text(),
+      });
+    } catch {
+      route.fulfill({ status: 404, body: "" });
+    }
+  });
+}
+
+/**
+ * Create a room configured the way a call needs, and put everyone in it.
+ *
+ * A room per test, rather than the shared one from `provision.sh`, because a call leaves
+ * state behind -- membership, keys, and whatever the previous participants' devices believe
+ * -- and a test that inherits it is measuring the test before it. Where that carry-over is
+ * the subject, a test reuses a room deliberately and says so.
+ *
+ * The two settings are the ones without which a call cannot happen at all; both are
+ * explained where `provision.sh` does the same thing.
+ */
+export async function createCallRoom(
+  participants: Credentials[],
+  name: string,
+): Promise<string> {
+  const [owner, ...rest] = participants;
+  if (!owner) throw new Error("a room needs at least one participant");
+
+  const created = (await (
+    await fetch("http://localhost:8008/_matrix/client/v3/createRoom", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${owner.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        preset: "public_chat",
+        name,
+        initial_state: [
+          {
+            type: "m.room.encryption",
+            state_key: "",
+            content: { algorithm: "m.megolm.v1.aes-sha2" },
+          },
+        ],
+        power_level_content_override: {
+          events: {
+            "org.matrix.msc3401.call.member": 0,
+            "m.call.member": 0,
+            "m.rtc.member": 0,
+          },
+        },
+      }),
+    })
+  ).json()) as { room_id?: string; error?: string };
+
+  if (!created.room_id) throw new Error(`could not create a room: ${created.error ?? "?"}`);
+
+  for (const who of rest) {
+    await fetch(
+      `http://localhost:8008/_matrix/client/v3/join/${encodeURIComponent(created.room_id)}`,
+      { method: "POST", headers: { Authorization: `Bearer ${who.access_token}` } },
+    );
+  }
+  return created.room_id;
+}
+
+/**
+ * Log each test participant in again, producing a device that has never been in a call.
+ *
+ * The tokens from `provision.sh` name one device per user for the whole run, and a device
+ * carries state a call leaves behind. Sharing them across tests made each test depend on the
+ * one before it -- a failure that looked exactly like the fault under investigation and was
+ * not. Where reusing a device is the point, a test does it deliberately and says so.
+ *
+ * Users are `testerN` / `test-password-N`, as `provision.sh` creates them.
+ */
+export async function freshSessions(count: number): Promise<Credentials[]> {
+  const out: Credentials[] = [];
+  for (let i = 1; i <= count; i++) {
+    const res = await fetch("http://localhost:8008/_matrix/client/v3/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "m.login.password",
+        identifier: { type: "m.id.user", user: `tester${i}` },
+        password: `test-password-${i}`,
+      }),
+    });
+    const body = (await res.json()) as Partial<Credentials> & { error?: string };
+    if (!body.user_id || !body.access_token || !body.device_id) {
+      throw new Error(`could not log tester${i} in: ${body.error ?? res.status}`);
+    }
+    out.push({
+      user_id: body.user_id,
+      access_token: body.access_token,
+      device_id: body.device_id,
+    });
+  }
+  return out;
 }
