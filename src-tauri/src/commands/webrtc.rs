@@ -141,6 +141,13 @@ pub struct JsDataChannelInfo {
 pub struct JsTransceiverInfo {
     pub kind: String,
     pub direction: Option<String>,
+    /// The `MediaStreamTrack.id` of the track this transceiver sends, when there is one.
+    ///
+    /// livekit-client sends this same value as the `cid` in its `AddTrackRequest`, and the
+    /// SFU pairs a published track with an m-line by matching the two. Without it str0m
+    /// invents an msid track id the SFU has never seen, and the association falls back to
+    /// the server's guess by media kind.
+    pub track_id: Option<String>,
 }
 
 #[command]
@@ -205,7 +212,9 @@ pub async fn create_offer(
     let tc_infos: Vec<peer_connection::TransceiverInfo> = transceivers
         .unwrap_or_default()
         .into_iter()
-        .map(|tc| peer_connection::TransceiverInfo::from_js(&tc.kind, tc.direction.as_deref()))
+        .map(|tc| {
+            peer_connection::TransceiverInfo::from_js(&tc.kind, tc.direction.as_deref(), tc.track_id)
+        })
         .collect();
 
     let mut pc = handle.lock_str()?;

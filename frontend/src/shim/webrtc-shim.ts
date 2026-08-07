@@ -61,7 +61,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
   private _hasVideo = false;
   // Tracked for passing to create_offer so the SDP includes the right m-lines
   private _pendingDataChannels: { label: string; ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number; protocol?: string }[] = [];
-  private _pendingTransceivers: { kind: string; direction: string }[] = [];
+  private _pendingTransceivers: { kind: string; direction: string; trackId?: string }[] = [];
 
   // Event handler properties (on* style)
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;
@@ -427,7 +427,11 @@ class ElementiumRTCPeerConnection extends EventTarget {
       this._hasVideo = true;
     }
     // Track for passing to create_offer
-    this._pendingTransceivers.push({ kind, direction });
+    // The track's id must reach the SDP as the msid track id: livekit-client sends this
+    // same value as the `cid` of its AddTrackRequest, and the SFU pairs a published track
+    // with an m-line by matching the two. Without it the SFU falls back to guessing by
+    // media kind.
+    this._pendingTransceivers.push({ kind, direction, trackId: track?.id });
 
     const mid = String(this._transceivers.length);
 

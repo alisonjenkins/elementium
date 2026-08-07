@@ -310,7 +310,7 @@ pub struct TransceiverInfo {
 impl TransceiverInfo {
     /// Create from JS string values.
     #[must_use]
-    pub fn from_js(kind: &str, direction: Option<&str>) -> Self {
+    pub fn from_js(kind: &str, direction: Option<&str>, track_id: Option<String>) -> Self {
         let kind = match kind {
             "video" => MediaKind::Video,
             _ => MediaKind::Audio,
@@ -321,7 +321,7 @@ impl TransceiverInfo {
             Some("inactive") => Direction::Inactive,
             _ => Direction::SendRecv,
         };
-        Self { kind, direction, track_id: None }
+        Self { kind, direction, track_id }
     }
 }
 
@@ -1582,6 +1582,30 @@ mod audio_send_pacing_tests {
 mod offer_track_id_tests {
     use super::{TransceiverInfo, create_offer, create_peer_connection};
     use str0m::media::{Direction, MediaKind};
+
+    /// The shim path must carry the track id through too.
+    ///
+    /// This is the same defect as the one below, on the code path that is actually used
+    /// for SFU calls: `create_offer` builds transceivers from what the JS shim sends, and
+    /// it sent only kind and direction. The audio m-line therefore advertised an msid the
+    /// SFU had never seen, matching no `AddTrackRequest`, so our audio RTP arrived and was
+    /// forwarded to nobody -- while every counter on our side showed frames being sent and
+    /// RTCP reporting zero loss.
+    #[test]
+    fn a_transceiver_built_from_js_keeps_the_tracks_id() {
+        let tc = TransceiverInfo::from_js("audio", Some("sendrecv"), Some("abc-123".to_owned()));
+        assert_eq!(tc.track_id.as_deref(), Some("abc-123"));
+        assert_eq!(tc.kind, MediaKind::Audio);
+        assert_eq!(tc.direction, Direction::SendRecv);
+    }
+
+    /// A transceiver with no track (a recvonly one, say) is still valid.
+    #[test]
+    fn a_transceiver_with_no_track_is_still_accepted() {
+        let tc = TransceiverInfo::from_js("video", Some("recvonly"), None);
+        assert!(tc.track_id.is_none());
+        assert_eq!(tc.direction, Direction::RecvOnly);
+    }
 
     /// `LiveKit`'s SFU pairs an `AddTrackRequest` with an m-line by matching the request's
     /// `cid` against the offer's msid track id. livekit-client gets this for free because
