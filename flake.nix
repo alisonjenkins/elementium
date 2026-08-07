@@ -76,6 +76,12 @@
           libva
           libva-utils
 
+          # A reference decoder, for checking what our own encoder produces. Asserting the
+          # NAL types in a bitstream proves it is shaped like H.264; only a decoder that
+          # reconstructs the picture proves it *is* H.264. Not linked against -- it is used
+          # by tests as a command.
+          ffmpeg
+
           # GStreamer (needed by WebKitGTK for media playback)
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
