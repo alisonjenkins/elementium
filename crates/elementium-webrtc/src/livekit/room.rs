@@ -841,7 +841,13 @@ fn send_room_event(tx: &mpsc::UnboundedSender<RoomEvent>, event: RoomEvent) {
             tracing::debug!(room_id = %room_id, speakers = ?speakers, "active speakers changed");
         }
     }
-    let _ = tx.send(event);
+    // A failed send means the receiver has been dropped, so the frontend is no longer
+    // being told anything about this room -- participants joining and leaving, active
+    // speakers, track publications. The UI then freezes on whatever it last knew, which
+    // looks like a call where nobody else is doing anything.
+    if tx.send(event).is_err() {
+        tracing::warn!("room events have nowhere to go; the UI will not see this one");
+    }
 }
 
 /// Wait for the `JoinResponse` from the signaling channel.
