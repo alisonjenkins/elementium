@@ -143,6 +143,7 @@ fn wrong_key(base: &[u8]) -> Vec<u8> {
 /// Moving, not static: a receiver that decodes only the keyframe and then repeats it looks
 /// identical to a working one on a still picture. The pattern is high-contrast so a frame
 /// that arrives half-decrypted is visibly wrong rather than merely noisy.
+#[allow(clippy::expect_used)]
 fn checkerboard(width: u32, height: u32, step: u32) -> elementium_types::I420Frame {
     let cols = usize::try_from(width).unwrap_or(0);
     let rows = usize::try_from(height).unwrap_or(0);
@@ -151,7 +152,11 @@ fn checkerboard(width: u32, height: u32, step: u32) -> elementium_types::I420Fra
     for (i, px) in luma.iter_mut().enumerate() {
         let col = i.checked_rem(cols.max(1)).unwrap_or(0);
         let row = i.checked_div(cols.max(1)).unwrap_or(0);
-        let block = col.saturating_add(shift) / 16 + row / 16;
+        let block = col
+            .saturating_add(shift)
+            .checked_div(16)
+            .unwrap_or(0)
+            .saturating_add(row.checked_div(16).unwrap_or(0));
         *px = if block.is_multiple_of(2) { 210 } else { 30 };
     }
     let chroma = cols.div_ceil(2).saturating_mul(rows.div_ceil(2));
@@ -163,10 +168,96 @@ fn checkerboard(width: u32, height: u32, step: u32) -> elementium_types::I420Fra
         &vec![150_u8; chroma],
         0,
     )
-    .unwrap_or_else(|| {
-        elementium_types::I420Frame::from_planes(16, 16, &[0; 256], &[0; 64], &[0; 64], 0)
-            .unwrap_or_else(|| unreachable!("a 16x16 frame is always valid"))
-    })
+    .expect("the planes are sized from the geometry, so this cannot fail")
+}
+
+/// Announce the tracks this publisher will send, and let each negotiation settle.
+///
+/// Spaced rather than issued back to back: each publish triggers its own offer/answer, and
+/// two in flight at once left the second answer describing mids the first offer never had.
+#[allow(clippy::expect_used)]
+async fn publish_tracks(room: &mut LiveKitRoom, video: bool) {
+    room.publish_track("audio", "microphone")
+        .expect("publish the audio track");
+    if video {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        room.publish_track("video", "camera")
+            .expect("publish the video track");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+/// The E2EE context this publisher encrypts with, seeded with its starting key.
+fn build_e2ee_context(
+    identity: &str,
+    material: &[u8],
+    bad_frames: u64,
+) -> elementium_e2ee::E2eeContext {
+    let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
+    ctx.set_local_identity(identity);
+    // Start on a key the far end does not have, if asked: `--bad-frames` needs the first
+    // frames to be undecryptable, and encrypting with the wrong key is exactly what the
+    // receiver sees when it has not yet been given the right one.
+    let start = if bad_frames > 0 {
+        wrong_key(material)
+    } else {
+        rotated_key(material, 0)
+    };
+    ctx.set_key(identity, 0, &start);
+    ctx
+}
+
+/// The H.264 encoder for the published video track.
+///
+/// Panics rather than degrading if there is none: a run asked for video, and publishing
+/// silence in its place would make the test report a framing failure it never tested.
+#[allow(clippy::expect_used)]
+fn build_video_encoder() -> elementium_codec::NegotiatedEncoder {
+    elementium_codec::NegotiatedEncoder::new(
+        elementium_codec::VideoCodec::H264,
+        elementium_codec::EncoderConfig {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+            bitrate_kbps: 1_000,
+            max_framerate: 25,
+        },
+    )
+    .expect("an H.264 encoder")
+}
+
+/// Encode and send one video frame, on every second audio tick.
+///
+/// 25fps against the tone's 50: enough to show motion without making the encoder the
+/// pacing bottleneck for the audio, which is what the rest of this harness measures.
+///
+/// Returns how many packets reached the wire, so the caller's counter stays a count of what
+/// was actually sent rather than what was offered.
+async fn send_video_frame(
+    encoder: &mut elementium_codec::NegotiatedEncoder,
+    room: &LiveKitRoom,
+    tick: u64,
+) -> u64 {
+    if !tick.is_multiple_of(2) {
+        return 0;
+    }
+    let step = u32::try_from(tick.checked_div(2).unwrap_or(0)).unwrap_or(0);
+    let Ok(packets) = elementium_codec::VideoEncoder::encode(
+        encoder,
+        &checkerboard(VIDEO_WIDTH, VIDEO_HEIGHT, step),
+    ) else {
+        return 0;
+    };
+    let mut sent: u64 = 0;
+    for packet in packets {
+        if room
+            .write_video(packet.data, elementium_codec::VideoCodec::H264)
+            .await
+            .is_ok()
+        {
+            sent = sent.saturating_add(1);
+        }
+    }
+    sent
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -220,20 +311,9 @@ async fn main() {
 
     let base_key =
         arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
-    let ctx = base_key.as_ref().map(|material| {
-        let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
-        ctx.set_local_identity(&identity);
-        // Start on a key the far end does not have, if asked: `--bad-frames` needs the
-        // first frames to be undecryptable, and encrypting with the wrong key is exactly
-        // what the receiver sees when it has not yet been given the right one.
-        let start = if bad_frames > 0 {
-            wrong_key(material)
-        } else {
-            rotated_key(material, 0)
-        };
-        ctx.set_key(&identity, 0, &start);
-        ctx
-    });
+    let ctx = base_key
+        .as_ref()
+        .map(|material| build_e2ee_context(&identity, material, bad_frames));
     let policy = ctx.clone().map_or(
         EncryptionPolicy::ExplicitlyUnencrypted,
         EncryptionPolicy::Encrypted,
@@ -255,19 +335,7 @@ async fn main() {
     // Settle signaling before publishing: SignalSender::send is fire-and-forget, so an
     // AddTrack sent too early can be lost with no error surfaced.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    room_conn
-        .publish_track("audio", "microphone")
-        .expect("publish the audio track");
-    if video {
-        // Spaced from the audio publish rather than issued back to back. Each publish
-        // triggers its own offer/answer, and two in flight at once left the second answer
-        // describing mids the first offer never had -- "Mid in answer is not in offer".
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        room_conn
-            .publish_track("video", "camera")
-            .expect("publish the video track");
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    publish_tracks(&mut room_conn, video).await;
 
     // Tell the driving test we are live, so it can stop guessing at timing.
     println!("PUBLISHING");
@@ -291,24 +359,7 @@ async fn main() {
     let mut ticker = tokio::time::interval(Duration::from_millis(20));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
 
-    // Built only when asked for: a machine with no VAAPI H.264 encoder should fail here,
-    // loudly, rather than run the test as though video were being published.
-    let mut video_encoder = if video {
-        Some(
-            elementium_codec::NegotiatedEncoder::new(
-                elementium_codec::VideoCodec::H264,
-                elementium_codec::EncoderConfig {
-                    width: VIDEO_WIDTH,
-                    height: VIDEO_HEIGHT,
-                    bitrate_kbps: 1_000,
-                    max_framerate: 25,
-                },
-            )
-            .expect("an H.264 encoder"),
-        )
-    } else {
-        None
-    };
+    let mut video_encoder = video.then(build_video_encoder);
     let mut video_sent: u64 = 0;
 
     let mut key_index: u8 = 0;
@@ -336,22 +387,8 @@ async fn main() {
         }
 
         if let Some(encoder) = video_encoder.as_mut() {
-            // One video frame per two audio frames: 25fps against the tone's 50, which is
-            // enough to show motion without making the encoder the pacing bottleneck.
-            if i.is_multiple_of(2) {
-                let step = u32::try_from(i / 2).unwrap_or(0);
-                if let Ok(packets) = elementium_codec::VideoEncoder::encode(
-                    encoder,
-                    &checkerboard(VIDEO_WIDTH, VIDEO_HEIGHT, step),
-                ) {
-                    for packet in packets {
-                        let _ = room_conn
-                            .write_video(packet.data, elementium_codec::VideoCodec::H264)
-                            .await;
-                        video_sent = video_sent.saturating_add(1);
-                    }
-                }
-            }
+            video_sent =
+                video_sent.saturating_add(send_video_frame(encoder, &room_conn, i).await);
         }
 
         let frame = tone_frame(sample_index);
