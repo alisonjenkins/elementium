@@ -84,6 +84,28 @@ struct Measurement {
     cpu_used: f64,
 }
 
+/// Write the first frame's luma plane to `$CAPTURE_DUMP` as a binary PGM, if that is set.
+///
+/// PGM because it is eight lines of code with no image dependency, and every viewer and
+/// `feh`/`display`/GIMP opens it. Off unless the variable is set: this example's normal job
+/// is timing, and writing eleven megabytes per run would distort the thing it measures.
+#[allow(clippy::print_stdout)]
+fn dump_first_frame(frame: &elementium_media::captured_frame::CapturedFrame) {
+    let Ok(path) = std::env::var("CAPTURE_DUMP") else {
+        return;
+    };
+    let elementium_media::captured_frame::CapturedFrame::Planar(planar) = frame else {
+        println!("  (first frame is undecoded JPEG; not dumping)");
+        return;
+    };
+    let mut out = format!("P5\n{} {}\n255\n", planar.width(), planar.height()).into_bytes();
+    out.extend_from_slice(planar.y());
+    match std::fs::write(&path, &out) {
+        Ok(()) => println!("  wrote the first frame's luma plane to {path}"),
+        Err(e) => println!("  could not write {path}: {e}"),
+    }
+}
+
 #[allow(clippy::arithmetic_side_effects)]
 /// Run the same receive loop the camera path uses, against anything that hands back frames.
 ///
@@ -96,7 +118,19 @@ fn measure(try_recv: impl Fn() -> Option<elementium_media::captured_frame::Captu
     let mut first_at: Option<Instant> = None;
     let mut last_at: Option<Instant> = None;
     while Instant::now() < deadline {
-        if try_recv().is_some() {
+        if let Some(frame) = try_recv() {
+            if received == 0 {
+                // The first frame, written out as a greyscale image when asked for.
+                //
+                // Counters cannot tell a real picture from well-shaped noise, and the
+                // difference matters most on the paths where it is easiest to get wrong:
+                // a DMA-BUF read with the wrong stride, or a tiled buffer read as if it
+                // were linear, both produce frames at the right rate and the right size,
+                // full of garbage. This feature already has one such fault in its history
+                // -- frames counted, published, and decodable by nobody. Looking is the
+                // only check that catches it.
+                dump_first_frame(&frame);
+            }
             received = received.saturating_add(1);
             let now = Instant::now();
             first_at.get_or_insert(now);
