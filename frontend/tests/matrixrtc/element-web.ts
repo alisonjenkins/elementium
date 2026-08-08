@@ -261,6 +261,21 @@ export async function createCallRoom(
  * being investigated -- packets arriving, not one frame decrypting -- and is entirely an
  * artefact. An earlier version of this suite reported it as a reproduction of the fault.
  */
+/** Create `testerN` on the local homeserver, matching `provision.sh`'s naming. */
+async function registerTester(i: number): Promise<Partial<Credentials> & { error?: string }> {
+  const res = await fetch("http://localhost:8008/_matrix/client/v3/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: `tester${i}`,
+      password: `test-password-${i}`,
+      auth: { type: "m.login.dummy" },
+      inhibit_login: false,
+    }),
+  });
+  return (await res.json()) as Partial<Credentials> & { error?: string };
+}
+
 export async function freshSessions(count: number): Promise<Credentials[]> {
   const out: Credentials[] = [];
   for (let i = 1; i <= count; i++) {
@@ -273,7 +288,11 @@ export async function freshSessions(count: number): Promise<Credentials[]> {
         password: `test-password-${i}`,
       }),
     });
-    const body = (await res.json()) as Partial<Credentials> & { error?: string };
+    let body = (await res.json()) as Partial<Credentials> & { error?: string };
+    // `provision.sh` registers three participants, and a test that needs a fourth should
+    // not have to change the shared fixture to get one. Registration is open on this
+    // homeserver, so the user is simply created on first use.
+    if (!body.access_token) body = await registerTester(i);
     if (!body.user_id || !body.access_token || !body.device_id) {
       throw new Error(`could not log tester${i} in: ${body.error ?? res.status}`);
     }
