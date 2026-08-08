@@ -152,13 +152,23 @@
       room.on(p, (...a) => console.log(`${p}: ${a.map((x) => String(x?.message ?? x)).join(",")}`));
     }
 
-    room.on("trackSubscribed", (track) => {
+    room.on("trackSubscribed", (track, publication) => {
       if (track.kind === "audio") {
         // Attaching matters: an unattached track is not pulled through the jitter buffer,
         // so concealment counters would stay at zero regardless of what arrived.
         const el = track.attach();
         el.muted = true;
         document.body.appendChild(el);
+        // A share can carry two independent audio tracks at once -- the microphone and
+        // share audio (SC-004) -- and `publication.source` is how livekit tells them apart
+        // (our Rust side sets it from `TrackSource` when it calls AddTrack; see
+        // `MediaTrackKey::source()`). `__audioTrack`/`__subscribed` stay pointed at
+        // whichever track a plain microphone-only test expects, so every existing test
+        // that only ever subscribes one audio track keeps seeing exactly what it saw
+        // before. `__audioTracksBySource` is additive, so a share-audio test can read its
+        // own track without the microphone (if present) overwriting it, or vice versa.
+        window.__audioTracksBySource ??= {};
+        window.__audioTracksBySource[publication.source] = track;
         window.__audioTrack = track;
         window.__subscribed = true;
         setState("subscribed");
@@ -262,11 +272,36 @@
      * sender whose clock runs off. All of those stay invisible to RTCP, which is why the
      * sending side kept reporting a healthy stream while listeners heard a robot.
      */
-    window.__stats = async () => {
+    // `source` disambiguates which audio track to read when more than one is subscribed --
+    // a share can carry both the microphone and share audio (SC-004) over the same peer
+    // connection, and "the first inbound-rtp audio stats found" no longer identifies one
+    // once there are two. Omitted, this keeps every existing single-track test's behaviour
+    // exactly as it was.
+    //
+    // Matched by the raw `MediaStreamTrack` id on an `RTCRtpReceiver`, not by
+    // `track.receiver` (unset under E2EE, see the comment above `window.__pcs`) and not by
+    // `inbound-rtp.trackIdentifier` (removed from the stats spec). The id survives E2EE
+    // because insertable streams transform encoded frames in place; they do not replace the
+    // `MediaStreamTrack` the receiver holds.
+    window.__stats = async (source) => {
       if (!window.__subscribed) return { error: "no audio track was subscribed" };
 
+      let wantTrackId = null;
+      if (source) {
+        const track = window.__audioTracksBySource?.[source];
+        if (!track) return { error: `no audio track subscribed for source "${source}"` };
+        wantTrackId = track.mediaStreamTrack?.id ?? null;
+      }
+
       for (const pc of window.__pcs) {
-        const report = await pc.getStats();
+        let report;
+        if (wantTrackId) {
+          const receiver = pc.getReceivers().find((r) => r.track && r.track.id === wantTrackId);
+          if (!receiver) continue;
+          report = await receiver.getStats();
+        } else {
+          report = await pc.getStats();
+        }
         let inbound = null;
         report.forEach((s) => {
           if (s.type === "inbound-rtp" && s.kind === "audio") inbound = s;

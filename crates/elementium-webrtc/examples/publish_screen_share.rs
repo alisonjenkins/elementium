@@ -15,13 +15,23 @@
 //! Usage:
 //!
 //! ```bash
-//! publish_screen_share --room <name> --identity <id> --seconds <n> [--key-hex <hex>]
+//! publish_screen_share --room <name> --identity <id> --seconds <n> [--key-hex <hex>] [--audio]
 //! ```
 //!
 //! **This shows the portal picker and blocks until a person chooses.** That is not a defect
 //! to be worked around here: the portal exists so that no application can start capturing a
 //! screen without the user knowing, and a test binary that bypassed it would be testing a
 //! path no user ever takes. Runs driven by this are attended by design.
+//!
+//! `--audio` additionally captures share audio -- the publisher half of SC-004: "with share
+//! audio enabled, a tone played by the shared source is present in the receiver's audio
+//! while the microphone remains independently audible and independently mutable." The XDG
+//! portal carries no audio in any backend, so this reads it the only way it can be read: a
+//! direct `PipeWire` connection to a desktop sink's monitor, exactly as
+//! `src-tauri/src/commands/media_devices.rs`'s `screen_share_audio_capture_loop` does for
+//! the real app. It picks the first `Audio/Sink` node `list_audio_sources()` reports rather
+//! than a named one, because this binary is a harness proving the path works at all, not a
+//! device picker -- that UI is what feeds the real `list_audio_sources()` call.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +45,10 @@ use serde::Serialize;
 
 const DEV_API_KEY: &str = "devkey";
 const DEV_API_SECRET: &str = "secret";
+
+/// Share audio is always encoded mono, matching the app's own capture pipeline (see
+/// `OUTBOUND_CHANNELS` in `src-tauri/src/commands/media_devices.rs`).
+const AUDIO_CHANNELS: u16 = 1;
 
 /// How long to wait for the first captured frame before giving up.
 ///
@@ -169,6 +183,55 @@ async fn send_frame(
     sent
 }
 
+/// The first `PipeWire` desktop sink `list_audio_sources()` reports, whose monitor carries
+/// the desktop mix -- share audio, on this machine.
+///
+/// Not "the default sink": there is no such concept in what `PipeWire` reports, and picking
+/// by name would tie this harness to one machine's device names. A real caller has a picker
+/// UI built on the same enumeration; this binary proves the capture-and-publish path works
+/// at all, which needs *a* sink, not a specific one.
+fn find_share_audio_sink() -> Option<u32> {
+    elementium_media::pipewire_nodes::list_audio_sources()
+        .ok()?
+        .into_iter()
+        .find(|s| s.class == elementium_media::pipewire_nodes::AudioSourceClass::Sink)
+        .map(|s| s.node_id)
+}
+
+/// Encode every complete 20ms frame currently sitting in `accumulator` and write each to the
+/// share's audio track, draining what it consumes.
+///
+/// Returns how many packets reached the wire, matching [`send_frame`]'s video counterpart:
+/// the driving test computes a delivery ratio against what was actually sent, not against
+/// how much PCM was captured.
+async fn send_audio_chunk(
+    encoder: &mut elementium_codec::OpusEncoder,
+    room: &LiveKitRoom,
+    accumulator: &mut Vec<f32>,
+    frame_samples: usize,
+    sample_rate: u32,
+) -> u64 {
+    let mut sent: u64 = 0;
+    while accumulator.len() >= frame_samples {
+        let frame_data: Vec<f32> = accumulator.drain(..frame_samples).collect();
+        let audio_frame = elementium_types::AudioFrame {
+            sample_rate,
+            channels: AUDIO_CHANNELS,
+            data: frame_data,
+            timestamp_us: 0,
+        };
+        if let Ok(packet) = encoder.encode(&audio_frame)
+            && room
+                .write_audio(MediaTrackKey::screen_share_audio(), packet)
+                .await
+                .is_ok()
+        {
+            sent = sent.saturating_add(1);
+        }
+    }
+    sent
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::expect_used, clippy::print_stdout, clippy::too_many_lines)]
 async fn main() {
@@ -184,6 +247,7 @@ async fn main() {
     let identity = arg("--identity").unwrap_or_else(|| "rust-screen-publisher".to_owned());
     let seconds: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(35);
     let codec = elementium_codec::VideoCodec::Vp8;
+    let audio = std::env::args().any(|a| a == "--audio");
 
     // The portal first, before the SFU connection: it blocks on a person, and holding a
     // room connection open across that wait would have the publisher time out in the SFU
@@ -212,6 +276,25 @@ async fn main() {
     let first = await_first_frame(&source).expect("a frame must arrive from the granted node");
     let (width, height) = (first.width(), first.height());
     println!("CAPTURING {width}x{height}");
+
+    // Opened here, ahead of the SFU connection, for the same reason the video source is:
+    // nothing about `PipeWire` capture depends on the room, and a delay in the connection
+    // steps below should not push out when the audio graph first hears this stream.
+    let audio_capture = if audio {
+        let node = find_share_audio_sink().expect(
+            "--audio requires at least one PipeWire Audio/Sink node; list_audio_sources() reported none",
+        );
+        println!("AUDIO_SINK {node}");
+        Some(
+            elementium_media::pipewire_audio::PipewireAudioCapture::start(
+                node,
+                elementium_media::pipewire_audio::AudioSourceKind::SinkMonitor,
+            )
+            .expect("open the share-audio sink monitor"),
+        )
+    } else {
+        None
+    };
 
     let base_key = arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
     let ctx = base_key.as_ref().map(|material| {
@@ -244,6 +327,30 @@ async fn main() {
         .publish_video_track(MediaTrackKey::screen_share(), codec, width, height)
         .expect("publish the screen share track");
     tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A second, spaced-out publish, mirroring `publish_tracks` in `publish_test_tone.rs`:
+    // two AddTrack requests issued back to back raced an in-flight offer there, and the
+    // second answer described m-lines the first offer never had.
+    if audio_capture.is_some() {
+        room_conn
+            .publish_track(MediaTrackKey::screen_share_audio())
+            .expect("publish the share audio track");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let opus_rate = elementium_media::pipewire_audio::TARGET_SAMPLE_RATE;
+    let mut audio_encoder = audio_capture.is_some().then(|| {
+        elementium_codec::OpusEncoder::with_config(
+            opus_rate,
+            AUDIO_CHANNELS,
+            elementium_codec::OpusEncoderConfig::default(),
+        )
+        .expect("Opus encoder for share audio")
+    });
+    // 20ms at the negotiated rate, matching every other Opus frame this codebase sends.
+    let frame_samples = usize::try_from(opus_rate).unwrap_or(48_000).saturating_mul(20) / 1000;
+    let mut audio_accum: Vec<f32> = Vec::with_capacity(frame_samples.saturating_mul(2));
+    let mut audio_sent: u64 = 0;
 
     let mut encoder = elementium_codec::NegotiatedEncoder::new(
         codec,
@@ -281,7 +388,7 @@ async fn main() {
         .checked_add(Duration::from_secs(seconds))
         .expect("deadline fits");
     while std::time::Instant::now() < deadline {
-        if let Some(frame) = source.try_recv() {
+        let got_video = if let Some(frame) = source.try_recv() {
             let now = std::time::Instant::now();
             if now.duration_since(last_keyframe) >= keyframe_interval {
                 elementium_codec::VideoEncoder::request_keyframe(&mut encoder);
@@ -289,7 +396,29 @@ async fn main() {
             }
             sent = sent.saturating_add(send_frame(&mut encoder, &room_conn, &frame, codec).await);
             frames = frames.saturating_add(1);
+            true
         } else {
+            false
+        };
+
+        // Polled the same way the video source is, and for the same reason: `PipeWire`
+        // delivers on its own quantum, not on a cadence this loop should impose.
+        let got_audio = if let Some(capture) = audio_capture.as_ref()
+            && let Some(aframe) = capture.try_recv()
+        {
+            let mono = elementium_media::audio_capture::downmix_to_mono(&aframe.data, aframe.channels);
+            audio_accum.extend_from_slice(&mono);
+            if let Some(enc) = audio_encoder.as_mut() {
+                audio_sent = audio_sent.saturating_add(
+                    send_audio_chunk(enc, &room_conn, &mut audio_accum, frame_samples, opus_rate).await,
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        if !got_video && !got_audio {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -298,6 +427,9 @@ async fn main() {
     // put on the wire, rather than against what it hoped would be.
     println!("CAPTURED {frames}");
     println!("VIDEO_SENT {sent}");
+    if audio_capture.is_some() {
+        println!("AUDIO_SENT {audio_sent}");
+    }
     room_conn.disconnect().await;
     session.close().await;
 }

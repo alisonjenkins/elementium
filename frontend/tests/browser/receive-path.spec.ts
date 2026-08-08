@@ -217,13 +217,33 @@ function startPublisher(
  * dialog. Folding that into the flag-driven publisher would give every other test a
  * timeout that means something different.
  */
-function startScreenPublisher(room: string, seconds: number, keyHex?: string): Publisher {
+/**
+ * Spawn the real screen-share publisher and resolve once it is actually sending.
+ *
+ * `audio` adds `--audio`, which additionally captures share audio from a PipeWire desktop
+ * sink monitor and publishes it as `MediaTrackKey::screen_share_audio()` -- the publisher
+ * half of SC-004. `audioSent()` reads the `AUDIO_SENT <n>` marker the binary prints
+ * alongside `VIDEO_SENT`, following the same convention.
+ *
+ * Separate from `startPublisher` rather than another flag on it: this one shows the XDG
+ * ScreenCast portal's picker and blocks on a person choosing, so its "live" promise has no
+ * useful timeout — a run is attended, and the wait is however long someone takes to read a
+ * dialog. Folding that into the flag-driven publisher would give every other test a
+ * timeout that means something different.
+ */
+function startScreenPublisher(
+  room: string,
+  seconds: number,
+  keyHex?: string,
+  audio = false,
+): Publisher & { audioSent: () => number | null } {
   const args = [
     "--sfu", SFU_HTTP,
     "--room", room,
     "--identity", "rust-screen-publisher",
     "--seconds", String(seconds),
     ...(keyHex ? ["--key-hex", keyHex] : []),
+    ...(audio ? ["--audio"] : []),
   ];
   const proc = spawn(PUBLISHER_SCREEN, args, {
     stdio: "pipe",
@@ -231,13 +251,14 @@ function startScreenPublisher(room: string, seconds: number, keyHex?: string): P
   });
   const echo = (c: Buffer) => {
     for (const line of c.toString().split("\n")) {
-      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |CAPTURED )/.test(line)) {
+      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |AUDIO_SENT |CAPTURED |AUDIO_SINK )/.test(line)) {
         console.log(`  [screen-publisher] ${line}`);
       }
     }
   };
   proc.stderr.on("data", echo);
   let sent: number | null = null;
+  let audioSent: number | null = null;
   let out = "";
   const live = new Promise<void>((resolve, reject) => {
     proc.stdout.on("data", (chunk: Buffer) => {
@@ -250,6 +271,8 @@ function startScreenPublisher(room: string, seconds: number, keyHex?: string): P
       if (out.includes("PUBLISHING")) resolve();
       const m = /VIDEO_SENT (\d+)/.exec(out);
       if (m) sent = Number(m[1]);
+      const am = /AUDIO_SENT (\d+)/.exec(out);
+      if (am) audioSent = Number(am[1]);
     });
     proc.on("exit", (code) => {
       if (!out.includes("PUBLISHING")) {
@@ -257,7 +280,13 @@ function startScreenPublisher(room: string, seconds: number, keyHex?: string): P
       }
     });
   });
-  return { proc, live, sent: () => sent, stop: () => proc.kill() };
+  return {
+    proc,
+    live,
+    sent: () => sent,
+    audioSent: () => audioSent,
+    stop: () => proc.kill(),
+  };
 }
 
 interface InboundStats {
@@ -1161,6 +1190,139 @@ test.describe("screen share (spec 008)", () => {
             `before/after pair spanning the same 30s cannot distinguish from healthy`,
         ).toBeGreaterThan(samples[i - 1]);
       }
+    } finally {
+      publisher.stop();
+      server.close();
+    }
+  });
+
+  /**
+   * SC-004: "With share audio enabled, a tone played by the shared source is present in the
+   * receiver's audio while the microphone remains independently audible and independently
+   * mutable."
+   *
+   * The receiver-side half of that claim is exactly what `RTCPeerConnection.getStats()`
+   * already answers for every microphone test above: does audio on this track arrive and
+   * get reconstructed, or does it show up as concealment -- a decrypt failure, a stalled
+   * jitter buffer, a malformed payload -- while RTCP keeps reporting a healthy stream. The
+   * "independently audible and independently mutable" half is a statement about the
+   * microphone and share-audio tracks being two distinct, separately controllable tracks;
+   * `receiver.html`'s `__audioTracksBySource` map (keyed by `publication.source`, so a
+   * second subscribed audio track no longer silently overwrites `__audioTrack`) is what a
+   * test would read to check that, but this harness has no independently-driven microphone
+   * publisher running at the same time as the screen-share publisher to pair it with --
+   * `startPublisher`'s tone is a separate process nothing here starts alongside this one.
+   * So this proves the provable half: the share-audio track itself is received and decoded
+   * cleanly, sampled repeatedly across the window for the reason SC-001's video assertion
+   * samples repeatedly -- a source that delivers one burst and then stalls would still read
+   * as "some packets arrived" in a single before/after pair.
+   */
+  test("share audio is received and reconstructed at the receiver", async ({ page }) => {
+    // Attended for the same reason SC-001 is: the publisher blocks on the portal picker.
+    test.skip(
+      !process.env.ATTENDED,
+      "needs a person to choose a source in the portal picker; run with ATTENDED=1",
+    );
+    test.setTimeout(420_000);
+
+    const roomName = `elementium-screenshare-audio-${Date.now()}`;
+    console.log(`  room: ${roomName}`);
+    const server = await startPageServer();
+
+    page.on("console", (m) => console.log(`  [page:${m.type()}] ${m.text()}`));
+    page.on("pageerror", (e) => console.log(`  [page:error] ${e.message}`));
+
+    // Encrypted, per FR-011, matching SC-001: share audio must be protected on the same
+    // terms as the video, so this exercises the real E2EE receive path, not a shortcut.
+    const query = new URLSearchParams({
+      url: SFU_WS,
+      token: mintToken("browser-subscriber", roomName),
+      key: KEY_HEX,
+    });
+    await page.goto(`${server.origin}/?${query.toString()}`);
+    await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
+
+    // 40s of real capture: enough for the 5s settle plus a 10s steady-state window below,
+    // with headroom the way SC-001's 45s gives its own 30s window.
+    const publisher = startScreenPublisher(roomName, 40, KEY_HEX, true);
+
+    try {
+      await publisher.live;
+
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              () =>
+                (window as never as {
+                  __audioTracksBySource?: Record<string, unknown>;
+                }).__audioTracksBySource?.["screen_share_audio"] !== undefined,
+            ),
+          { timeout: 30_000, message: "the browser never subscribed to the shared audio" },
+        )
+        .toBe(true);
+
+      const read = async (): Promise<InboundStats> => {
+        let last = "not attempted";
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const s = await page.evaluate(() =>
+            (window as never as {
+              __stats: (source?: string) => Promise<InboundStats | { error: string }>;
+            }).__stats("screen_share_audio"),
+          );
+          if (!("error" in s)) return s;
+          last = s.error;
+          await page.waitForTimeout(500);
+        }
+        throw new Error(`could not read share-audio stats after 10s: ${last}`);
+      };
+
+      // Let the jitter buffer settle, take a baseline, then measure a steady-state window,
+      // exactly as `measure()` does for the microphone tests above.
+      await page.waitForTimeout(5_000);
+      const before = await read();
+      await page.waitForTimeout(10_000);
+      const after = await read();
+      console.log(`  before: ${JSON.stringify(before)}`);
+      console.log(`  after:  ${JSON.stringify(after)}`);
+
+      if (before.ssrc !== after.ssrc) {
+        throw new Error(
+          `the share-audio stream changed SSRC mid-measurement (${before.ssrc} -> ${after.ssrc}); ` +
+            `the track restarted, so a delta across it is meaningless`,
+        );
+      }
+
+      const stats: InboundStats = {
+        ssrc: after.ssrc,
+        mimeType: after.mimeType,
+        jitter: after.jitter,
+        packetsReceived: after.packetsReceived - before.packetsReceived,
+        packetsLost: after.packetsLost - before.packetsLost,
+        concealedSamples: after.concealedSamples - before.concealedSamples,
+        silentConcealedSamples: after.silentConcealedSamples - before.silentConcealedSamples,
+        concealmentEvents: after.concealmentEvents - before.concealmentEvents,
+        totalSamplesReceived: after.totalSamplesReceived - before.totalSamplesReceived,
+        insertedSamplesForDeceleration:
+          after.insertedSamplesForDeceleration - before.insertedSamplesForDeceleration,
+        removedSamplesForAcceleration:
+          after.removedSamplesForAcceleration - before.removedSamplesForAcceleration,
+      };
+      assertHealthy(stats, "share audio");
+
+      // The publisher's own count of what it actually put on the wire, so a healthy
+      // `packetsReceived` can be read against it rather than against a guess -- the same
+      // delivery-ratio idea `VIDEO_SENT`/`SENT` already give the video and tone tests.
+      const audioSent = publisher.audioSent();
+      console.log(`  publisher reported AUDIO_SENT ${audioSent}`);
+      expect(
+        audioSent,
+        "the publisher must report an AUDIO_SENT count; --audio never captured or encoded anything",
+      ).not.toBeNull();
+      expect(
+        audioSent,
+        "the publisher must have actually sent share-audio packets",
+      ).toBeGreaterThan(0);
     } finally {
       publisher.stop();
       server.close();
