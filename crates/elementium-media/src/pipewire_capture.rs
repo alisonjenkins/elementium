@@ -871,16 +871,44 @@ fn run_stream(
         let context =
             pipewire::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
         let core = context.connect_rc(None).map_err(|e| e.to_string())?;
-        Ok((mainloop, core))
+        let registry = core.get_registry_rc().map_err(|e| e.to_string())?;
+        Ok((mainloop, core, registry))
     };
 
-    let (mainloop, core) = match setup() {
+    let (mainloop, core, registry) = match setup() {
         Ok(v) => v,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
+
+    // Notice the source disappearing, which the stream itself will not tell us.
+    //
+    // Measured, because the obvious assumptions are both wrong: when a shared window is
+    // closed, the stream does *not* error. It goes Streaming -> Paused -> Streaming and
+    // then simply never delivers another frame -- which is also exactly what a healthy
+    // screencast of a static window does, since a compositor emits on damage. So neither
+    // the stream's error state nor a frame-stall timeout can tell "the window is gone"
+    // from "nothing has changed on screen", and a timeout would end perfectly good shares
+    // of a still document.
+    //
+    // What does change is the registry: the node is destroyed, and its id is recycled
+    // (observed being reused for an unrelated Link object seconds later). That removal is
+    // the signal, and it is unambiguous.
+    let source_gone = Arc::clone(failed);
+    let _registry_listener = registry
+        .add_listener_local()
+        .global_remove(move |id| {
+            if id == node_id {
+                tracing::warn!(
+                    node_id,
+                    "the captured PipeWire node was removed; the shared source is gone"
+                );
+                source_gone.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .register();
 
     let props = pipewire::properties::properties! {
         *pipewire::keys::MEDIA_TYPE => "Video",

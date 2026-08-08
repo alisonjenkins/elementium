@@ -256,6 +256,26 @@ impl VideoSource {
         }
     }
 
+    /// Whether the source has failed and will not produce another frame.
+    ///
+    /// Distinct from "no frame is waiting", which is the normal state of a screencast
+    /// between damage events. A consumer that cannot tell the two apart waits forever on a
+    /// source that is already dead -- which is what a shared window being closed looks
+    /// like: the stream errors, `try_recv` keeps returning `None`, and the pipeline goes on
+    /// delivering nothing with nothing logged.
+    ///
+    /// `false` for the pull-from-`V4L2` and push paths rather than a guess: `nokhwa` has no
+    /// equivalent signal, and a dropped push sender is indistinguishable from an idle one
+    /// here. Reporting a failure those paths cannot actually detect would be worse than
+    /// reporting none.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        match self {
+            Self::Pipewire(c) => c.failed(),
+            Self::V4l2(_) | Self::Push(_) => false,
+        }
+    }
+
     /// Stop capturing.
     pub fn stop(&self) {
         match self {

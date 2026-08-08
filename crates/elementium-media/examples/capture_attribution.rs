@@ -288,6 +288,12 @@ fn run_screen(target: elementium_codec::EncodeTarget) {
     };
     let m = measure(|| source.try_recv());
     report(&m);
+    // Whether the source *died* during the run, as opposed to simply having had nothing to
+    // send. A shared window that gets closed mid-share errors the stream, after which
+    // `try_recv` returns `None` forever -- which is exactly what a healthy screencast of a
+    // static window looks like. Printing the distinction here is how that can be checked
+    // by hand: start a share of a window, close the window, and this must say `true`.
+    println!("  source failed during the run: {}", source.failed());
 }
 
 #[cfg(not(target_os = "linux"))]
