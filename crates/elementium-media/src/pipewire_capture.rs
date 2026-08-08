@@ -924,6 +924,9 @@ fn attach_and_connect(
     // Owned by the process callback and reused every frame, so taking a snapshot of the
     // mapped buffer costs no allocation.
     let mut snapshot: Vec<u8> = Vec::new();
+    // A dma-buf this process cannot read fails the same way on every frame; the warning is
+    // worth exactly once per stream.
+    let mut dma_warned = false;
     // Per-stage cost, reported periodically. This runs on every captured frame on every
     // user's machine, so its cost is battery on a laptop and frames stolen from whatever
     // else the machine is doing. Guessing which stage dominates has been wrong before.
@@ -1082,8 +1085,61 @@ fn attach_and_connect(
                 return;
             };
             let stride = usize::try_from(data.chunk().stride()).unwrap_or(0);
-            let size = usize::try_from(data.chunk().size()).unwrap_or(0);
-            let Some(mapped) = data.data() else { return };
+            let mut size = usize::try_from(data.chunk().size()).unwrap_or(0);
+            let chunk_offset = usize::try_from(data.chunk().offset()).unwrap_or(0);
+            let max_size = usize::try_from(data.as_raw().maxsize).unwrap_or(0);
+            let data_type = data.type_().as_raw();
+
+            // Two ways a buffer can arrive, and only one of them is already mapped.
+            //
+            // A camera hands over MemPtr/MemFd, which `MAP_BUFFERS` mapped for us on the
+            // way in. A screencast on this compositor hands over a DMA-BUF: a DRM PRIME
+            // file descriptor that `MAP_BUFFERS` leaves alone, so `data()` is `None` and
+            // the frame has to be mapped here. See `DmaBufMapping`.
+            let dma_map;
+            let mapped: &[u8] = if data.type_().as_raw() == libspa::sys::SPA_DATA_DmaBuf {
+                // A DMA-BUF does not describe its own extent the way a mapped buffer does.
+                // Measured on this compositor: `chunk.size` and `maxsize` are *both* 1 --
+                // a "there is a frame here" marker, not a byte count, because the memory
+                // belongs to the GPU and its size is implied by the format. Taking either
+                // literally maps a single byte and every frame is then rejected as too
+                // short for its geometry, which is exactly what happened before this ran.
+                //
+                // The extent that is real is the one the format implies: `stride` bytes
+                // per row for the negotiated height. That is only true for a linear
+                // layout, which is the only one offered (see `video_modifier_property`).
+                if size <= 1 {
+                    let rows = usize::try_from(n.height).unwrap_or(0);
+                    size = stride.checked_mul(rows).unwrap_or(0).max(max_size);
+                }
+                match DmaBufMapping::map(data.fd(), chunk_offset, size) {
+                    Ok(m) => {
+                        dma_map = m;
+                        dma_map.bytes()
+                    }
+                    Err(reason) => {
+                        timing.dropped(DropReason::Unusable);
+                        // Once per stream, not once per frame: this fails identically
+                        // thirty times a second, and the first one says everything the
+                        // three-hundredth would.
+                        if !dma_warned {
+                            dma_warned = true;
+                            tracing::warn!(
+                                %reason,
+                                fd = data.fd(),
+                                chunk_offset,
+                                size,
+                                stride,
+                                "a screencast dma-buf could not be read on the CPU"
+                            );
+                        }
+                        return;
+                    }
+                }
+            } else {
+                let Some(m) = data.data() else { return };
+                m
+            };
 
             // Snapshot the buffer before *decoding* it.
             //
@@ -1191,6 +1247,9 @@ fn attach_and_connect(
                 timing.dropped(DropReason::Unusable);
                 tracing::warn!(
                     len = bytes.len(),
+                    // The buffer's own description of itself, because "too short" says
+                    // nothing about which of the three lengths involved was wrong.
+                    data_type, max_size, chunk_size = size,
                     width, height, stride,
                     encoding = ?n.encoding,
                     reason = unusable_reason(n.encoding),
@@ -1203,7 +1262,7 @@ fn attach_and_connect(
     let mut params = format_params(request);
     // Appended after the formats: the source reads both when the stream connects, and the
     // buffer constraint applies whichever format it settles on.
-    params.push(buffers_param());
+    params.push(buffers_param(request.profile));
     let mut param_refs: Vec<&libspa::pod::Pod> = params
         .iter_mut()
         .filter_map(|p| libspa::pod::Pod::from_bytes(p))
@@ -1329,14 +1388,23 @@ fn format_params(request: CaptureRequest) -> Vec<Vec<u8>> {
 /// than agreeing and then failing, which is the better of the two failures because it says
 /// so before a call starts.
 ///
-/// Importing DMA-BUF directly is the real answer for the hardware path, since it would let
-/// the camera's buffer reach the GPU without the CPU touching it. That is a different piece
-/// of work; this is what makes the CPU path correct.
-fn buffers_param() -> Vec<u8> {
+/// A screencast is the exception, and has to be: measured against a real node, this
+/// compositor allocates DMA-BUF whatever else is offered, and a client that declines it
+/// gets `error alloc buffers: Invalid argument` and no frames at all (research R10). So
+/// `DmaBuf` is added to the mask for that profile only, and `read_dma_buf` below does the
+/// import by hand. The camera keeps the narrower mask: it has a working mappable path, and
+/// widening it would let a camera pick a route that exists for a different reason.
+fn buffers_param(profile: SourceProfile) -> Vec<u8> {
     use libspa::pod::{ChoiceValue, Property, PropertyFlags, Value};
     use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
     const MAPPABLE: i32 = (1 << libspa::sys::SPA_DATA_MemPtr) | (1 << libspa::sys::SPA_DATA_MemFd);
+    const WITH_DMA_BUF: i32 = MAPPABLE | (1 << libspa::sys::SPA_DATA_DmaBuf);
+
+    let accepted = match profile {
+        SourceProfile::Camera => MAPPABLE,
+        SourceProfile::Screencast => WITH_DMA_BUF,
+    };
 
     let obj = libspa::pod::Object {
         type_: libspa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
@@ -1349,8 +1417,8 @@ fn buffers_param() -> Vec<u8> {
             value: Value::Choice(ChoiceValue::Int(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Flags {
-                    default: MAPPABLE,
-                    flags: vec![MAPPABLE],
+                    default: accepted,
+                    flags: vec![accepted],
                 },
             ))),
         }],
@@ -1381,6 +1449,122 @@ fn format_choice(formats: &[libspa::param::video::VideoFormat]) -> libspa::pod::
                 alternatives: formats.iter().map(|f| Id(f.as_raw())).collect(),
             },
         ))),
+    }
+}
+
+/// One captured DMA-BUF, mapped into this process for the length of a single callback.
+///
+/// A DMA-BUF is a file descriptor naming memory another device owns, not memory this
+/// process has. Reading it means three steps, all of which have to happen and in this
+/// order: map it, tell the exporting driver a CPU read is starting so it can flush or
+/// invalidate whatever caches it needs to, and tell it the read has finished so it can
+/// take ownership back. Skipping the sync ioctls is the failure that produces a picture
+/// which is *mostly* right -- stale cache lines show up as patches of a previous frame,
+/// intermittently, on some GPUs and not others -- which is far worse to diagnose than not
+/// working at all. The `Drop` impl is what guarantees the closing half runs even on the
+/// early returns above it.
+///
+/// Only sound for a linear layout, which is why `video_modifier_property` offers exactly
+/// `MOD_LINEAR` and `MOD_INVALID` and no vendor tiling: those bytes are read as rows, and
+/// a tiled buffer's bytes are not in row order. A tiled buffer would need a GPU-side
+/// import (EGL/vaapi) rather than a CPU mapping, and would come out as visible noise here.
+struct DmaBufMapping {
+    ptr: *mut libc::c_void,
+    /// The whole mapping, from offset 0 -- `mmap`'s own offset must be page-aligned and the
+    /// chunk's need not be, so the chunk offset is applied when slicing instead.
+    len: usize,
+    fd: std::os::fd::RawFd,
+    offset: usize,
+    size: usize,
+}
+
+/// `DMA_BUF_IOCTL_SYNC`, i.e. `_IOW('b', 0, struct dma_buf_sync)`, from `linux/dma-buf.h`.
+/// Spelled out rather than computed because the `_IOW` macro is C and the value is stable
+/// ABI: `0x4000_0000 | (8 << 16) | (0x62 << 8)`.
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
+const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+const DMA_BUF_SYNC_START: u64 = 0;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+
+/// The `struct dma_buf_sync` the ioctl above takes.
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
+impl DmaBufMapping {
+    /// Map a DMA-BUF fd for reading, or return `None` if it cannot be read on the CPU.
+    ///
+    /// `None` rather than an error because the caller's only useful response is to drop the
+    /// frame and count it: a buffer this process cannot map is not a fault it can fix
+    /// mid-stream, and one that logged per frame would log thirty times a second.
+    fn map(fd: std::os::fd::RawFd, offset: usize, size: usize) -> Result<Self, String> {
+        if fd < 0 {
+            return Err("the buffer carried no dma-buf descriptor".to_owned());
+        }
+        if size == 0 {
+            return Err("the chunk reported a size of zero".to_owned());
+        }
+        let Some(len) = offset.checked_add(size) else {
+            return Err(format!("chunk offset {offset} plus size {size} overflows"));
+        };
+
+        // SAFETY: `fd` is a DMA-BUF descriptor owned by the buffer PipeWire just handed us
+        // and valid for this callback; a null address asks the kernel to choose one; and a
+        // failed mapping is reported as MAP_FAILED rather than by trapping.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if std::ptr::eq(ptr, libc::MAP_FAILED) {
+            let err = std::io::Error::last_os_error();
+            return Err(format!("mmap of {len} bytes from the dma-buf fd failed: {err}"));
+        }
+
+        let mapping = Self { ptr, len, fd, offset, size };
+        mapping.sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        Ok(mapping)
+    }
+
+    /// Announce the start or end of a CPU read to the exporting driver.
+    ///
+    /// A failure is deliberately not fatal: the ioctl is unsupported on some exporters, and
+    /// on those the mapping is coherent without it. Refusing the frame here would turn a
+    /// working configuration into a black screen for the sake of a call that had nothing to
+    /// do.
+    fn sync(&self, flags: u64) {
+        let arg = DmaBufSync { flags };
+        // SAFETY: `self.fd` is the descriptor this mapping was made from, and the ioctl
+        // reads one `dma_buf_sync` through the pointer, which is what is passed.
+        let rc = unsafe { libc::ioctl(self.fd, DMA_BUF_IOCTL_SYNC, std::ptr::from_ref(&arg)) };
+        if rc != 0 {
+            tracing::trace!(flags, "dma-buf sync ioctl was refused; reading the mapping anyway");
+        }
+    }
+
+    /// The frame's bytes: the chunk's own window into the mapping, not the whole thing.
+    const fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapping covers `offset + size` bytes (checked in `map`), is read-only
+        // and lives until this value is dropped, so the slice is in bounds and outlived by
+        // its backing memory.
+        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>().add(self.offset), self.size) }
+    }
+}
+
+impl Drop for DmaBufMapping {
+    fn drop(&mut self) {
+        self.sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        // SAFETY: `ptr`/`len` are exactly what `mmap` returned and was asked for, and no
+        // slice handed out by `bytes` can outlive `self`.
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
     }
 }
 

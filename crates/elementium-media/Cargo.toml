@@ -20,6 +20,10 @@ tracing = { workspace = true }
 yuv = "0.8"
 pipewire = "0.10.0"
 libspa = "0.10.0"
+# For DMA-BUF import: a screencast buffer arrives as a DRM PRIME file descriptor, which
+# has to be mmap'd and cache-synchronised by hand. `pipewire`'s MAP_BUFFERS only maps the
+# MemPtr/MemFd types, and there is no safe wrapper in `libspa` for the dma-buf sync ioctl.
+libc = "0.2"
 zune-jpeg = "0.5.15"
 zune-core = "0.5.1"
 
