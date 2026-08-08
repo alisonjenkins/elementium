@@ -92,8 +92,25 @@ pub type WirePcEvent = PcEvent<WireMedia>;
 pub struct PeerConnectionInner {
     pub id: String,
     pub rtc: Rtc,
+    /// The mid we *send* audio on: the first audio transceiver offered.
+    ///
+    /// Not "the audio m-line". A connection can carry several, and since livekit protocol
+    /// 17 it usually does -- one `recvonly` section per remote participant, on this same
+    /// connection. Only the first is ours to write to.
     pub audio_mid: Option<Mid>,
+    /// The mid we *send* video on. See [`PeerConnectionInner::audio_mid`].
     pub video_mid: Option<Mid>,
+    /// `(kind, track_id)` of every transceiver already offered, to recognise a re-offer.
+    ///
+    /// Keyed on the track rather than on the kind. A caller that re-offers a transceiver
+    /// it already has must not be given a second m-line for it; a caller that asks for
+    /// another transceiver of the same kind must be. Keying on the kind alone cannot tell
+    /// those apart, and answered the second case with the first -- which is how a client
+    /// asking for three receive sections got one, and heard nobody.
+    ///
+    /// A transceiver with no track is always new: `recvonly` placeholders have no track by
+    /// construction, and there is nothing to distinguish two of them by.
+    pub offered_tracks: Vec<(MediaKind, String)>,
     pub pending_offer: Option<SdpPendingOffer>,
     pub remote_mids: HashMap<Mid, MediaKind>,
     pub audio_frame_count: u64,
@@ -183,6 +200,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         rtc,
         audio_mid: None,
         video_mid: None,
+        offered_tracks: Vec::new(),
         pending_offer: None,
         remote_mids: HashMap::new(),
         audio_frame_count: 0,
@@ -377,16 +395,15 @@ pub fn create_offer(
 
     // Add media transceivers (m=audio, m=video).
     //
-    // Skip a kind that already has an m-line: `add_media` unconditionally appends a new
-    // one, so re-offering (publishing video after audio, say) would otherwise emit a
-    // second audio m-line describing a track that already exists.
+    // `add_media` appends unconditionally, so a transceiver we have already offered has to
+    // be recognised and skipped -- otherwise re-offering (publishing video after audio,
+    // say) emits a second audio m-line for a track that already has one, and orphans the
+    // first. The identity is the *track*, not the kind; see `offered_tracks`.
     for tc in transceivers {
-        let existing = match tc.kind {
-            MediaKind::Audio => pc.audio_mid,
-            MediaKind::Video => pc.video_mid,
-        };
-        if let Some(mid) = existing {
-            tracing::debug!(pc_id = %pc.id, %mid, kind = ?tc.kind, "Transceiver already present, not re-adding");
+        if let Some(track) = &tc.track_id
+            && pc.offered_tracks.contains(&(tc.kind, track.clone()))
+        {
+            tracing::debug!(pc_id = %pc.id, kind = ?tc.kind, %track, "Transceiver already offered, not re-adding");
             continue;
         }
         let mid = api.add_media(tc.kind, tc.direction, None, tc.track_id.clone(), None);
@@ -394,12 +411,20 @@ pub fn create_offer(
             pc_id = %pc.id,
             %mid,
             kind = ?tc.kind,
+            direction = ?tc.direction,
             track_id = tc.track_id.as_deref().unwrap_or("<generated>"),
             "Added transceiver"
         );
+        if let Some(track) = &tc.track_id {
+            pc.offered_tracks.push((tc.kind, track.clone()));
+        }
+        // The first of each kind is the one we send on, and it keeps that role for the
+        // life of the connection. Later sections of the same kind are the receive
+        // sections protocol 17 asks for; writing to one would send our microphone down a
+        // slot the SFU has allocated to somebody else.
         match tc.kind {
-            MediaKind::Audio => pc.audio_mid = Some(mid),
-            MediaKind::Video => pc.video_mid = Some(mid),
+            MediaKind::Audio => pc.audio_mid = pc.audio_mid.or(Some(mid)),
+            MediaKind::Video => pc.video_mid = pc.video_mid.or(Some(mid)),
         }
     }
 
@@ -1753,6 +1778,75 @@ mod offer_track_id_tests {
             "the new video transceiver must be added"
         );
         assert_ne!(pc.video_mid, pc.audio_mid);
+    }
+
+    /// livekit protocol 17 receives on the publisher connection: `onMediaSectionsRequirement`
+    /// adds one `recvonly` transceiver per remote track and re-offers. Each is a separate
+    /// m-line, and dropping any of them leaves the SFU with nowhere to send that stream.
+    ///
+    /// This failed before the identity check was keyed on the track: the first section was
+    /// added, every later one of the same kind was skipped as "already present", the offer
+    /// carried a single audio m-line, and no inbound audio was ever decoded while every
+    /// outbound counter looked healthy.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn every_receive_section_asked_for_gets_its_own_m_line() {
+        let mut pc = create_peer_connection("test".to_owned());
+        let recv = || TransceiverInfo {
+            kind: MediaKind::Audio,
+            direction: Direction::RecvOnly,
+            track_id: None,
+        };
+        let offer = create_offer(&mut pc, &[], &[recv(), recv(), recv()]).expect("offer");
+
+        let audio_lines = offer
+            .sdp
+            .lines()
+            .filter(|l| l.starts_with("m=audio"))
+            .count();
+        assert_eq!(
+            audio_lines, 3,
+            "three receive sections were asked for; the offer must carry three"
+        );
+    }
+
+    /// Adding a receive section must not move where we send.
+    ///
+    /// `audio_mid` is the mid `write_audio` publishes on. If a later `recvonly` section
+    /// took it over, the microphone would go down a slot the SFU has allocated to another
+    /// participant's stream.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_later_receive_section_does_not_take_over_the_send_mid() {
+        let mut pc = create_peer_connection("test".to_owned());
+        create_offer(
+            &mut pc,
+            &[],
+            &[TransceiverInfo {
+                kind: MediaKind::Audio,
+                direction: Direction::SendRecv,
+                track_id: Some("cid-audio".to_owned()),
+            }],
+        )
+        .expect("first offer");
+        let send_mid = pc.audio_mid.expect("audio mid recorded");
+
+        create_offer(
+            &mut pc,
+            &[],
+            &[TransceiverInfo {
+                kind: MediaKind::Audio,
+                direction: Direction::RecvOnly,
+                track_id: None,
+            }],
+        )
+        .expect("second offer");
+
+        assert_eq!(
+            pc.audio_mid,
+            Some(send_mid),
+            "the send mid must not move when a receive section is added"
+        );
     }
 }
 
