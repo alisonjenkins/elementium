@@ -28,4 +28,4 @@ anecdote cannot tell a fix from a coincidence.
 
 ## Phase 4: Confirm
 
-- [ ] T011 [US1][US2] Both reproductions pass against the fix, and still fail against the commit before it
+- [X] T011 [US1][US2] **Vacuous, and worth saying so rather than leaving open.** This task assumes a fix to confirm. There is none, because nothing reproduced: five Element Call scenarios pass, Elementium in a call with two of them passes, and the one change made in this feature is a decision not to change anything (T012). The nearest thing to what T011 asks for was done inside T006 — the rotation assertion was checked by deleting the wait that makes rotation happen, and it fails without it

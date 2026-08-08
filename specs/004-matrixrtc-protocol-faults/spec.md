@@ -1,7 +1,9 @@
 # Feature Specification: MatrixRTC protocol faults
 
 **Created**: 2026-08-07
-**Status**: Environment built; faults not yet reproduced under it
+**Status**: Complete. Every task closed; neither fault reproduces on this stack, with
+Element Call alone or with Elementium as a participant. What remains is the difference
+between this stack and the user's — delegated auth, a hosted SFU, federation
 
 ## Why this exists
 
