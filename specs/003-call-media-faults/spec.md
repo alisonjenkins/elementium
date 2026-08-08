@@ -241,6 +241,32 @@ federation. None of those exist locally. Which of those differences matters is t
 question -- and the local stack cannot answer it, but it can now serve as the control,
 which it could not before today.
 
+## Finding — 2026-08-08: a healthy call, measured against SC3 and SC4
+
+Three minutes, Elementium plus two Element Web peers, Elementium publishing audio only.
+
+| Measured | Result |
+|---|---|
+| Outbound | 7,250 captured, 7,250 encoded, **7,250 sent**, 24 kbps |
+| `dropped_channel_closed` / `dropped_channel_full` / `encode_errors` | **0 / 0 / 0** |
+| Inbound | **14,500 Opus frames decoded**, peak amplitude 0.054, 0 clipped |
+| Decrypt failures | **none, of any kind** |
+| The peers | 2/2 usable streams each for the whole call, holding all three keys |
+
+So SC3 and SC4 are met on this stack. Two things in the log are worth keeping rather
+than rounding to zero:
+
+**One outbound frame was dropped before it could be written**, on a second peer
+connection, with `error: "No audio mid configured"` and `failures: 1`. A frame produced
+between the connection existing and its transceiver being negotiated. One frame is 20ms
+and nobody can hear it, but the counter is the right place to notice if it ever becomes
+many.
+
+**`useRoomCall: Element Call is configured to be used exclusively, but the server is not
+configured with a transport`** is still logged even though the call then works, because
+the MSC4143 answer arrives after that check runs. Harmless here; misleading if anyone
+ever debugs a real "no transport" fault by searching for this line.
+
 ## Finding — 2026-08-08: the hanging test was hanging on the way out
 
 `livekit_local_roundtrip` was recorded as a broken instrument: a ten-second test that
