@@ -10,7 +10,11 @@ is answering a question nobody asked.
 - [X] T001 [US1] Read the SDP from a real call and record whether H.264 is offered and negotiated — the log already contains the offer and answer, so this needs reading rather than instrumenting. **Answered: it is not offered.** See the Finding in spec.md
 - [X] T002 [US1] Log the selected encoder backend and codec once per call in `src-tauri/src/commands/media_devices.rs`, so "is the GPU being used" is answerable from a log rather than by reasoning about the policy
 - [X] T003 [US1] If H.264 is not negotiated, establish whether that is Element Call's choice, the SFU's `enabled_publish_codecs`, or our own offer being wrong — the three have different owners. **Answered: ours.** `clear_codecs().enable_opus(true).enable_vp8(true)` at `peer_connection.rs:159` never offers H.264, so the other two were never consulted
-- [ ] T012 [US1] Make the offered codec set include H.264 and make the send path follow the negotiated codec instead of assuming VP8 (payload selection at `peer_connection.rs:637`, and the packetiser). Blocked on feature 003: changing the offer while remote video does not work at all would confound the two
+- [ ] T012 [US1] Make the offered codec set include H.264 and make the send path follow the negotiated codec instead of assuming VP8 (payload selection at `peer_connection.rs:637`, and the packetiser). ~~Blocked on feature 003~~ — **unblocked 2026-08-08**, 003 is closed and remote video works. Split into T013–T016 below, because reading it through found a fourth part that is not in this description and that breaks peers rather than us
+- [ ] T013 [US1] Offer H.264 alongside VP8 at `crates/elementium-webrtc/src/peer_connection.rs:159`
+- [ ] T014 [US1] Select the payload type from the codec of the frame being written rather than `Codec::Vp8`, in `write_video` (`peer_connection.rs:637`), and packetise accordingly
+- [ ] T015 [US1] Make `unencrypted_header_size` in `crates/elementium-e2ee/src/lib.rs` codec-aware and match livekit's H.264 rule. **Do this first of the three**: it currently reads the VP8 frame tag on every video frame, so an H.264 frame would have its clear-text header sized from an unrelated bit and no peer could authenticate it — silently, and only at the receiver
+- [ ] T016 [US1] Confirm against a real peer that H.264 video is decrypted and displayed, not merely negotiated — the failure mode T015 describes is invisible from the sending side
 
 ## Phase 2: Prove the saving
 

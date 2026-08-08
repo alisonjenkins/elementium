@@ -85,6 +85,37 @@ Deliberately not done yet: video is currently not received at all (feature 003),
 changing the offered codec set while that is unexplained would confound the two.
 H.264 goes in after remote video works, not before.
 
+## Finding — 2026-08-08: T012 is unblocked, and larger than it is written
+
+Feature 003 is closed and remote video works, so the reason to hold H.264 back is gone.
+Reading the work through before starting it turns up a fourth part the task does not
+mention, and it is the one that can break other people's calls rather than ours.
+
+**E2EE frame framing is VP8-specific.** `unencrypted_header_size` in
+`elementium-e2ee` decides how much of a video frame travels in the clear by reading the
+VP8 frame tag: 10 bytes for a key frame, 3 for a delta. That is livekit's VP8 rule, and
+it is applied to every `MediaKind::Video` frame unconditionally. An H.264 frame has no
+VP8 frame tag; bit 0 of its first byte is part of a NAL header and means something else
+entirely. So the header size would be chosen by reading an unrelated bit, and the peer —
+which computes its own header size from its own knowledge of the codec — would slice the
+frame somewhere else and fail authentication on every frame.
+
+That fails *silently and only for the receiver*, which is the same shape as the fault
+this repository has spent two features chasing.
+
+So T012 is four things, and only the first three are in the task text:
+
+1. Offer H.264 alongside VP8 (`peer_connection.rs:159`).
+2. Choose the payload type from the codec of the frame being sent, not `Codec::Vp8`
+   (`peer_connection.rs:637`).
+3. Packetise per negotiated codec.
+4. **Make `unencrypted_header_size` codec-aware, matching livekit's H.264 rule.** Without
+   this the other three produce video no peer can decrypt.
+
+The encoder side needs nothing new: `VideoCodec`, `VideoEncoder::VaapiH264` and
+`ActiveCodec` already exist, and the SFU can already move the pipeline between codecs
+mid-call. This is wiring plus one correctness gap, not new capability.
+
 ## Success Criteria
 
 - **SC1**: A real call on this machine logs `backend=vaapi` for video, or logs why
