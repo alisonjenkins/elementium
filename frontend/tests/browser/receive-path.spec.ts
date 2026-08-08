@@ -58,6 +58,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../../..");
 const LK_DIST = path.join(REPO, "frontend/node_modules/livekit-client/dist");
 const PUBLISHER = path.join(REPO, "target/debug/examples/publish_test_tone");
+/** The real screen-share publisher: portal, PipeWire node, DMA-BUF import, encode, publish. */
+const PUBLISHER_SCREEN = path.join(REPO, "target/debug/examples/publish_screen_share");
 
 const SFU_HTTP = "http://127.0.0.1:7880";
 const SFU_WS = "ws://127.0.0.1:7880";
@@ -198,6 +200,58 @@ function startPublisher(
     proc.on("exit", (code) => {
       if (!out.includes("PUBLISHING")) {
         reject(new Error(`publisher exited (${code}) before publishing: ${out}`));
+      }
+    });
+  });
+  return { proc, live, sent: () => sent, stop: () => proc.kill() };
+}
+
+/**
+ * Spawn the real screen-share publisher and resolve once it is actually sending.
+ *
+ * Separate from `startPublisher` rather than another flag on it: this one shows the XDG
+ * ScreenCast portal's picker and blocks on a person choosing, so its "live" promise has no
+ * useful timeout — a run is attended, and the wait is however long someone takes to read a
+ * dialog. Folding that into the flag-driven publisher would give every other test a
+ * timeout that means something different.
+ */
+function startScreenPublisher(room: string, seconds: number, keyHex?: string): Publisher {
+  const args = [
+    "--sfu", SFU_HTTP,
+    "--room", room,
+    "--identity", "rust-screen-publisher",
+    "--seconds", String(seconds),
+    ...(keyHex ? ["--key-hex", keyHex] : []),
+  ];
+  const proc = spawn(PUBLISHER_SCREEN, args, {
+    stdio: "pipe",
+    env: { ...process.env, RUST_LOG: process.env.PUBLISHER_LOG ?? "warn" },
+  });
+  const echo = (c: Buffer) => {
+    for (const line of c.toString().split("\n")) {
+      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |CAPTURED )/.test(line)) {
+        console.log(`  [screen-publisher] ${line}`);
+      }
+    }
+  };
+  proc.stderr.on("data", echo);
+  let sent: number | null = null;
+  let out = "";
+  const live = new Promise<void>((resolve, reject) => {
+    proc.stdout.on("data", (chunk: Buffer) => {
+      echo(chunk);
+      out += chunk.toString();
+      // Surfaced so an attended run knows it is being waited on, rather than looking hung.
+      if (out.includes("WAITING_FOR_PICKER") && !out.includes("PORTAL_GRANTED")) {
+        console.log("  >>> choose a screen or window in the portal dialog <<<");
+      }
+      if (out.includes("PUBLISHING")) resolve();
+      const m = /VIDEO_SENT (\d+)/.exec(out);
+      if (m) sent = Number(m[1]);
+    });
+    proc.on("exit", (code) => {
+      if (!out.includes("PUBLISHING")) {
+        reject(new Error(`screen publisher exited (${code}) before publishing: ${out}`));
       }
     });
   });
@@ -988,8 +1042,6 @@ test.describe("browser receive path", () => {
 test.describe("screen share (spec 008)", () => {
   test.describe.configure({ mode: "serial", timeout: 180_000 });
 
-  /** The publisher this describe block needs and does not have. See the block comment. */
-  const PUBLISHER_SCREEN = path.join(REPO, "target/debug/examples/publish_screen_share");
 
   /**
    * SC-001: "A screen share started in a call produces a steadily increasing decoded frame
@@ -1012,19 +1064,20 @@ test.describe("screen share (spec 008)", () => {
   test("a screen share produces a sustained, increasing decoded frame count", async ({
     page,
   }) => {
-    test.fixme(
-      true,
-      "Blocked on two things, neither fixable from frontend/tests/browser/: (1) no " +
-        "publish-side example drives the real screen-capture path -- publish_test_tone " +
-        "only ever sources a synthetic checkerboard frame from MediaTrackKey::camera(), " +
-        "never from elementium_screen::start_share() -- so PUBLISHER_SCREEN above names a " +
-        "binary that does not exist; (2) even once it does, start_share() shows the XDG " +
-        "ScreenCast portal's picker and blocks on a human clicking it, which cannot happen " +
-        "in an unattended run. See the block comment above for exactly what would unblock " +
-        "each half. Left in this shape -- real assertions against a named, missing binary " +
-        "-- rather than as a bare todo, so it is ready to run the moment that binary and a " +
-        "restore-token or mock-portal path both exist.",
+    // Attended by design, and skipped unless a run says it has someone present.
+    //
+    // The publisher shows the XDG ScreenCast portal's picker and blocks until a person
+    // chooses. That is not an obstacle to route around: the portal exists so no application
+    // can start capturing a screen without the user knowing, and a test that bypassed it
+    // would be exercising a path no user ever takes. So this runs when asked for, and is
+    // skipped rather than failed in CI, where nobody is there to click.
+    test.skip(
+      !process.env.ATTENDED,
+      "needs a person to choose a source in the portal picker; run with ATTENDED=1",
     );
+    // Well beyond the block's 180s: the clock starts at a dialog a person has to read, and
+    // only then does the 45s publish and 30s measured window begin.
+    test.setTimeout(420_000);
 
     const roomName = `elementium-screenshare-${Date.now()}`;
     console.log(`  room: ${roomName}`);
@@ -1046,12 +1099,7 @@ test.describe("screen share (spec 008)", () => {
     // 45s of real capture: the 30s SC-001 asks for, plus room for the 5s settle window
     // below so the measured span is at least 30s of steady state, not 30s including
     // jitter-buffer priming.
-    const publisher = startPublisher(roomName, 45, KEY_HEX);
-    // startPublisher assumes PUBLISHER (publish_test_tone); a real version of this test
-    // needs its own spawn against PUBLISHER_SCREEN with a --screen flag, requesting a
-    // monitor source non-interactively via a persisted portal choice. Sketched here rather
-    // than built, since PUBLISHER_SCREEN does not exist to spawn.
-    void PUBLISHER_SCREEN;
+    const publisher = startScreenPublisher(roomName, 45, KEY_HEX);
 
     try {
       await publisher.live;
