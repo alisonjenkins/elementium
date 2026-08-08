@@ -277,6 +277,31 @@ key is known.
 works; receiving does not. That is the remaining blocker on the upgrade, and it is a
 different problem from the one this finding closes — the negotiation now succeeds.
 
+Counting the inbound signalling kinds says where to look next:
+
+| kind | count |
+|---|---|
+| `subscription_response` | 420 |
+| `pong` / `pong_resp` | 69 each |
+| `trickle` | 39 |
+| `media_sections_requirement` | 6 |
+| `answer` | 3 |
+| **`offer`** | **0** |
+
+**The SFU never sends a subscriber offer.** On protocol 16 that offer is how the remote
+tracks get their `m=` sections; here it never comes, so no receive section is ever
+negotiated and there is nothing for inbound RTP to arrive on. The 420 `subscription_response`
+messages are the client asking again and again for tracks it has nowhere to put.
+
+`media_sections_requirement` is almost certainly the replacement: the SFU tells the client
+how many sections to carry, and the client is expected to put them in its *own* offer rather
+than be offered them. That is the next thing to establish, and unlike the last question it
+is answerable from livekit-client's source, because the message is named and the handler
+will be reachable from it.
+
+Routing is not the problem: inbound media is dispatched by `mid`, not by SSRC, so the
+missing `a=ssrc` lines in the protocol-17 answers are a red herring.
+
 The pin is back at v1.12.11 until inbound audio works, because a pinned version whose calls
 are half-deaf is worse than one that is known to work.
 
