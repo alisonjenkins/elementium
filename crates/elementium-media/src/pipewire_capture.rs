@@ -594,6 +594,11 @@ enum Encoding {
 /// single message describing every failure as one sends a reader to check geometry that was
 /// never in question -- for MJPEG the geometry is inside the JPEG, and a decode that failed
 /// says nothing about how many bytes arrived.
+/// How many unconvertible frames are logged in full before the stream falls back to
+/// counting them. Three, because the diagnostic they carry is identical after the first
+/// couple and the failure rate makes them a recurring warning otherwise.
+const UNUSABLE_LOG_LIMIT: u32 = 3;
+
 const fn unusable_reason(encoding: Encoding) -> &'static str {
     match encoding {
         Encoding::Mjpeg => "mjpeg_decode_failed",
@@ -964,6 +969,14 @@ fn attach_and_connect(
     // A dma-buf this process cannot read fails the same way on every frame; the warning is
     // worth exactly once per stream.
     let mut dma_warned = false;
+    // How many conversion failures have been logged in full for this stream.
+    //
+    // These are ~0.5% of buffers on a camera that is otherwise working, which at 30fps is a
+    // warning every few seconds, for a fault the user cannot act on and the periodic
+    // `capture decode cost` line already counts. The first few carry the diagnostic that
+    // matters -- sizes, SOI/EOI, the bytes at each end -- and the hundredth carries nothing
+    // the third did not. So the detail is kept and the repetition is not.
+    let mut unusable_logged: u32 = 0;
     // Per-stage cost, reported periodically. This runs on every captured frame on every
     // user's machine, so its cost is battery on a laptop and frames stolen from whatever
     // else the machine is doing. Guessing which stage dominates has been wrong before.
@@ -1023,8 +1036,21 @@ fn attach_and_connect(
                     // mattered is decided by the caller, which tries the next source and
                     // reports at error only once every source and the V4L2 fallback have
                     // been exhausted.
+                    // The accepted buffer types are named alongside the failure, because
+                    // the message the library gives for the commonest cause is
+                    // `error alloc buffers: Invalid argument`, which does not hint at
+                    // buffers at all, let alone at a negotiation mismatch. That exact line
+                    // cost this project an afternoon: the compositor allocates DMA-BUF and
+                    // the client was accepting only mapped memory, and nothing in the log
+                    // said either half of that sentence.
+                    let accepted = match request.profile {
+                        SourceProfile::Camera => "MemPtr|MemFd",
+                        SourceProfile::Screencast => "MemPtr|MemFd|DmaBuf",
+                    };
                     tracing::warn!(
                         reason = %reason,
+                        profile = ?request.profile,
+                        accepted_buffer_types = accepted,
                         "PipeWire capture stream failed; trying the next source if there is one"
                     );
                     failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1334,6 +1360,19 @@ fn attach_and_connect(
                 } else {
                     (None, None, None, None)
                 };
+                unusable_logged = unusable_logged.saturating_add(1);
+                if unusable_logged > UNUSABLE_LOG_LIMIT {
+                    // Counted, not logged. `unusable` in the periodic report is the number
+                    // that matters once the shape of the failure is known.
+                    return;
+                }
+                if unusable_logged == UNUSABLE_LOG_LIMIT {
+                    tracing::warn!(
+                        limit = UNUSABLE_LOG_LIMIT,
+                        "further unconvertible frames on this stream will be counted in \
+                         `capture decode cost` rather than logged individually"
+                    );
+                }
                 tracing::warn!(
                     len = bytes.len(),
                     // The buffer's own description of itself, because "too short" says
