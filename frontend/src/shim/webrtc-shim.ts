@@ -93,6 +93,25 @@ function getTopWindow(): Record<string, unknown> {
 const __pcRegistry = new Map<string, (event: WebRtcEvent) => void>();
 
 /**
+ * Events that arrived before their peer connection registered a handler.
+ *
+ * Rust begins forwarding as soon as the connection exists; this side registers only after
+ * the creating `invoke()` resolves. The events that fall in that window are the earliest
+ * ones, which are also the ones that cannot be recovered later: ICE candidates nothing
+ * re-announces, and the first connection-state change.
+ */
+const __pendingEvents = new Map<string, WebRtcEvent[]>();
+
+/**
+ * How many events to hold for a connection that has not registered yet.
+ *
+ * A cap rather than an unbounded queue: a connection closed before it finished opening
+ * never registers, and its events would otherwise accumulate for the life of the page.
+ * Generous enough for a normal startup burst of candidates.
+ */
+const MAX_HELD_EVENTS = 64;
+
+/**
  * Shape of the `get_transport_stats` Tauri command's result -- the Rust side of
  * `TransportStatsResult` in `src-tauri/src/commands/webrtc.rs`, field-for-field. Every
  * `| null` here is a real "not measured", not a stand-in for zero: see
@@ -297,6 +316,13 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
       // Register in global PC registry (Rust pushes events via webview.eval())
       __pcRegistry.set(this.pcId, (event: WebRtcEvent) => this.handleBackendEvent(event));
+      // Anything that arrived while this connection was being created, in arrival order.
+      const held = __pendingEvents.get(this.pcId);
+      if (held) {
+        __pendingEvents.delete(this.pcId);
+        console.log(`[Elementium] replaying ${held.length} held event(s) for ${this.pcId}`);
+        for (const event of held) this.handleBackendEvent(event);
+      }
     } catch (e) {
       console.error("[Elementium] Failed to create peer connection:", e);
     }
@@ -1078,6 +1104,28 @@ export function setupWebRtcShim(): void {
     const handler = __pcRegistry.get(payload.pcId);
     if (handler) {
       handler(payload);
+      return;
+    }
+    // Held rather than dropped.
+    //
+    // Rust starts forwarding events the moment the connection exists, while this side only
+    // registers its handler once the `invoke()` that created it has resolved. Anything in
+    // that window used to vanish — and what arrives first is exactly what matters most:
+    // the initial ICE candidates and the first connection-state change. Losing a candidate
+    // costs connectivity that nothing later re-announces, and each state change is the only
+    // notification of a transition that will not repeat.
+    //
+    // Replayed in arrival order when the handler appears, and capped so a pcId that never
+    // registers — a connection closed before it finished opening — cannot grow forever.
+    const held = __pendingEvents.get(payload.pcId) ?? [];
+    if (held.length < MAX_HELD_EVENTS) {
+      held.push(payload);
+      __pendingEvents.set(payload.pcId, held);
+    } else {
+      console.warn(
+        `[Elementium] dropping an event for unregistered pc ${payload.pcId}: ` +
+          `${MAX_HELD_EVENTS} already held`,
+      );
     }
   };
 
