@@ -18,6 +18,69 @@
 
 use std::time::{Duration, Instant};
 
+#[allow(clippy::arithmetic_side_effects)]
+/// The first enumerated source that actually delivers a frame.
+///
+/// Not simply the first source: this machine enumerates a virtual V4L2 node ahead of the
+/// real camera which negotiates a format and then delivers nothing, and measuring that one
+/// looks exactly like a camera producing no frames. Starting is not delivering -- the
+/// failure is reported asynchronously, a moment after `start_at` returns -- so waiting for
+/// a frame is the only test that tells them apart.
+fn first_delivering_source(
+    sources: &[elementium_media::pipewire_nodes::PipewireVideoSource],
+    target: elementium_codec::EncodeTarget,
+) -> Option<elementium_media::pipewire_capture::PipewireCapturer> {
+    for source in sources {
+        println!("trying node {} ({})", source.node_id, source.description);
+        match elementium_media::pipewire_capture::PipewireCapturer::start_at(
+            source.node_id,
+            TARGET_FPS,
+            target,
+        ) {
+            Ok(capturer) => {
+                let wait = Instant::now() + Duration::from_secs(2);
+                let mut first = None;
+                while Instant::now() < wait && first.is_none() {
+                    first = capturer.try_recv();
+                    if first.is_none() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                if first.is_some() {
+                    println!("  delivering; measuring this one");
+                    return Some(capturer);
+                }
+                println!("  started but delivered nothing in 2s; trying the next");
+            }
+            Err(e) => println!("  could not start: {e}"),
+        }
+    }
+    None
+}
+
+#[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+/// CPU time this process has used, user plus system, in seconds.
+///
+/// Read from `/proc/self/stat` because the interesting number is what the whole capture
+/// costs the machine, not what one timed step costs. `mean_ms` in the capture log measures
+/// the decode call alone; a path that moves work to the GPU could still spend it elsewhere,
+/// and only total CPU would show that.
+fn cpu_seconds() -> f64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    // Fields after the executable name, which may itself contain spaces inside parentheses.
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // utime and stime are fields 14 and 15 of the full line; the first two are consumed by
+    // the pid and the name, so they sit at 11 and 12 here.
+    let ticks = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
+    let clock_ticks = 100.0;
+    ticks(11).saturating_add(ticks(12)) as f64 / clock_ticks
+}
+
 const TARGET_FPS: u32 = 30;
 const SECONDS: u64 = 15;
 
@@ -29,6 +92,18 @@ const SECONDS: u64 = 15;
     clippy::as_conversions
 )]
 fn main() {
+    // Which capture target to measure. The two differ in what the CPU does per frame: the
+    // software path decodes MJPEG on the CPU and converts to I420, the hardware path hands
+    // the JPEG to the GPU and asks for NV12 back. The claim this checks is that the second
+    // costs materially less CPU per frame -- which is the whole reason for the hardware
+    // path, and which nothing had measured.
+    let hardware = std::env::args().any(|a| a == "--hardware");
+    let target = if hardware {
+        elementium_codec::EncodeTarget::negotiated(elementium_codec::VideoCodec::H264, 1280, 720)
+    } else {
+        elementium_codec::EncodeTarget::software()
+    };
+
     // `info`, because the attribution this exists to read is logged at info by the capture
     // path itself -- the example's own numbers are only the consumer's half of it.
     tracing_subscriber::fmt()
@@ -49,48 +124,11 @@ fn main() {
             return;
         }
     };
-    // Every source in turn, not just the first. This machine enumerates a virtual V4L2
-    // node ahead of the real camera and it fails to negotiate a format -- taking the first
-    // one measured nothing at all, which looked exactly like a camera delivering no frames.
-    let mut capturer = None;
-    for source in &sources {
-        println!(
-            "trying node {} ({})",
-            source.node_id, source.description
-        );
-        match elementium_media::pipewire_capture::PipewireCapturer::start_at(
-            source.node_id,
-            TARGET_FPS,
-            elementium_codec::EncodeTarget::software(),
-        ) {
-            Ok(c) => {
-                // Started is not delivering: this stack reports a negotiation failure
-                // asynchronously, a moment after `start_at` returns. Waiting for a frame is
-                // the only test that distinguishes them.
-                let wait = Instant::now() + Duration::from_secs(2);
-                let mut first = None;
-                while Instant::now() < wait && first.is_none() {
-                    first = c.try_recv();
-                    if first.is_none() {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                }
-                if first.is_some() {
-                    println!("  delivering; measuring this one");
-                    capturer = Some(c);
-                    break;
-                }
-                println!("  started but delivered nothing in 2s; trying the next");
-            }
-            Err(e) => println!("  could not start: {e}"),
-        }
-    }
-    let Some(capturer) = capturer else {
+    let Some(capturer) = first_delivering_source(&sources, target) else {
         println!("no source delivered a frame; nothing to measure");
         return;
     };
-    println!("capturing for {SECONDS}s at {TARGET_FPS}fps");
-
+    let cpu_before = cpu_seconds();
     let deadline = Instant::now() + Duration::from_secs(SECONDS);
     let mut received = 0_u64;
     let mut first_at: Option<Instant> = None;
@@ -118,8 +156,14 @@ fn main() {
     };
     let expected = f64::from(TARGET_FPS) * span;
 
+    let cpu_used = cpu_seconds() - cpu_before;
     println!();
     println!("  frames the consumer received: {received}");
+    println!("  process CPU during capture: {cpu_used:.2}s");
+    if received > 0 {
+        let per_frame_ms = cpu_used * 1000.0 / received as f64;
+        println!("  process CPU per frame: {per_frame_ms:.2}ms");
+    }
     println!("  over: {span:.1}s");
     println!("  delivered rate: {delivered_fps:.1}fps against {TARGET_FPS} requested");
     println!("  expected at the requested rate: {expected:.0}");

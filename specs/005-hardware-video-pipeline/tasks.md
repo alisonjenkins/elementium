@@ -23,9 +23,9 @@ is answering a question nobody asked.
 
 ## Phase 2: Prove the saving
 
-- [ ] T004 [US2] Measure CPU per frame on the software path with a real camera, as a baseline (the capture counters added for the frame-rate work already report decode cost)
-- [ ] T005 [US2] Measure the same on the hardware path and record both, so the claim about 37.6% is checked rather than repeated
-- [ ] T006 [US3] Confirm no CPU JPEG decode happens on the hardware path beyond the rate-limited self-view, using the `offered`/`rate_limited` counters
+- [X] T004 [US2] **Measured on an OBSBOT Tiny 2 Lite at 1280x720 MJPEG.** Software path: **5.1-5.3ms of process CPU per frame**, 2.28-2.39s over a 15s capture — about 16% of one core, for capture alone. The capture path's own decode timer agrees at 4.5-4.7ms, so nearly all of it is the MJPEG decode and colour conversion. `cargo run -p elementium-media --example capture_attribution`
+- [X] T005 [US2] **Hardware path: 0.11-0.16ms of process CPU per frame**, 0.05-0.07s over the same 15s — about 0.4% of one core, against 16% for software. Roughly a thirtyfold reduction in capture CPU, and the capture decode timer reads 0.0ms because no CPU decode happens at all. `--hardware` selects it. **What this does not check**: the 37.6% figure was about something wider than the capture stage, and this measures capture only — the hardware path defers the JPEG decode to the GPU at encode time, so neither number includes encoding. The comparison is fair for the stage it covers and should not be quoted for the pipeline.
+- [X] T006 [US3] **Confirmed.** On the hardware path the capture decode timer reads `mean_ms=0.0 worst_ms=0.0` across 300 frames and `unusable=0` — there is no CPU decode to fail. The software path over the same camera reads 4.5-4.7ms and drops 1-2 buffers to failed MJPEG decodes. Both paths show `queue_full=0` and the same `offered` count, so the difference is the decode and not the delivery.
 
 ## Phase 3: The rest of the hardware
 
