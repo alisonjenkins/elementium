@@ -869,6 +869,21 @@ impl Drop for PipewireCapturer {
 /// Body of the capture thread: build the stream, run the loop until stopped.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
+/// Tell the caller why capture could not start, and say so in the log if even that fails.
+///
+/// The second failure is the one worth catching. If the caller has already given up and
+/// dropped the receiver, the reason for the *first* failure disappears with it: the caller
+/// sees a capture that never started and no explanation exists anywhere. That is a
+/// two-line fix for a fault that would otherwise be unexplainable from the outside.
+fn report_startup_failure(ready_tx: &std::sync::mpsc::Sender<Result<(), String>>, reason: String) {
+    if ready_tx.send(Err(reason.clone())).is_err() {
+        tracing::error!(
+            reason = %reason,
+            "capture failed to start, and the caller was no longer listening for the reason"
+        );
+    }
+}
+
 fn run_stream(
     node_id: u32,
     request: CaptureRequest,
@@ -892,7 +907,7 @@ fn run_stream(
     let (mainloop, core, registry) = match setup() {
         Ok(v) => v,
         Err(e) => {
-            let _ = ready_tx.send(Err(e));
+            report_startup_failure(ready_tx, e);
             return;
         }
     };
@@ -933,15 +948,18 @@ fn run_stream(
     let stream = match pipewire::stream::StreamRc::new(core, "elementium-capture", props) {
         Ok(s) => s,
         Err(e) => {
-            let _ = ready_tx.send(Err(e.to_string()));
+            report_startup_failure(ready_tx, e.to_string());
             return;
         }
     };
 
     if let Err(e) = attach_and_connect(&stream, node_id, request, negotiated, failed, frame_tx) {
-        let _ = ready_tx.send(Err(e));
+        report_startup_failure(ready_tx, e);
         return;
     }
+    // A dropped receiver here is not a fault: the caller may have given up while the
+    // portal or the device was still negotiating, and a successful start it no longer wants
+    // is torn down by the stop path rather than reported to nobody.
     let _ = ready_tx.send(Ok(()));
     run_until_stopped(&mainloop, stop_rx, node_id);
 }
