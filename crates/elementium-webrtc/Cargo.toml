@@ -25,6 +25,11 @@ if-addrs = "0.15.0"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# `unversioned` exposes str0m's H264Packetizer/H264Depacketizer directly (str0m does not
+# consider this API covered by semver). Used only by
+# tests/h264_packetization_mode.rs to inspect what str0m actually emits on the wire for
+# H.264, independent of any network or SFU -- see that file for why.
+str0m = { workspace = true, features = ["unversioned"] }
 # For the publish_screen_share example only: it drives the real capture path -- portal,
 # PipeWire node, DMA-BUF import -- rather than a synthetic frame source, which is the whole
 # point of it. A dev-dependency, so nothing in the shipping crate gains a screen dependency.
