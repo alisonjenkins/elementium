@@ -15,8 +15,8 @@ sequencing question from the spec and the one decision here that is not mine to 
 Nothing in this phase depends on the upgrade, and all of it is worth having regardless.
 
 - [ ] T001 Make every step of `scripts/patch-element-web.sh` assert its own effect: the CSP `sed` must confirm the meta tag is gone, each `awk` injection must confirm the marker is present in the output, and each copy must confirm the destination exists. Exit non-zero with the step name when an assertion fails. Today all of them exit 0 having done nothing, which is how an upstream `index.html` change becomes a successful build and a broken application
-- [ ] T002 [P] Fail loudly when `element-web-dist/widgets/element-call` is missing rather than skipping the widget injection with a message, in `scripts/patch-element-web.sh` — a release that stopped bundling Element Call must not produce an app that starts and cannot call
-- [ ] T003 [P] Write the Element Web version, source (release or git), and the list of applied patches into `element-web-dist/.elementium-build.json` at patch time, and log it once at startup from `src-tauri/`. A bug report that does not say what was running costs a round trip to find out
+- [ ] T002 Fail loudly when `element-web-dist/widgets/element-call` is missing rather than skipping the widget injection with a message, in `scripts/patch-element-web.sh` — a release that stopped bundling Element Call must not produce an app that starts and cannot call
+- [ ] T003 Write a build record to `element-web-dist/.elementium-build.json` at patch time, and log it once at startup from `src-tauri/`: the Element Web version, the source (release or git), an ISO8601 UTC build timestamp, the list of applied patches, a fingerprint of `widgets/element-call/assets` (its Element Call version is not pinned separately and would otherwise drift unobserved — see the Assumptions in `spec.md`), and **whether the autojoin driver was injected**. That last field is not diagnostics: the injection carries a live access token and dials a call on startup, so a release build must refuse to proceed when it is set. A bug report that does not say what was running costs a round trip to find out
 
 ## Phase 2: Prove the shims install (US2)
 
@@ -26,7 +26,7 @@ attributed.
 - [ ] T004 [US2] Have each shim record that it installed, in `frontend/src/shim/index.ts` and each module: a `window.__elementium_shims` map of name to `{installed, detail}`. `detail` names what it replaced (for example `RTCPeerConnection`, `navigator.mediaDevices.getUserMedia`), so a shim that ran but attached to nothing is distinguishable from one that did not run
 - [ ] T005 [US2] Playwright test in `frontend/tests/matrixrtc/shim-contract.spec.ts`: load the patched Element Web, assert every shim reports installed, in the main window **and** in the Element Call widget frame — the widget is a separate document with its own injection, and it is the half that carries the media
 - [ ] T006 [US2] Assert the contracts the shims depend on, not just that they installed: the E2EE bridge sees a `setKey` worker message with `participantIdentity`/`key`/`keyIndex` during a real call, and `mxMatrixClientPeg` is reachable. These are upstream's internals and are what an upgrade actually threatens. Extend `frontend/tests/matrixrtc/shim-contract.spec.ts`
-- [ ] T007 [US2] Negative control: with the injection deliberately removed from `index.html`, T005 must fail and name the missing shim. Run it once by hand and record the output in this file — a test that has never failed is not known to be able to
+- [ ] T007 [US2] Negative control: with the injection deliberately removed from `index.html`, T005 must fail and name the missing shim. Run it once by hand and record the output as a finding in `spec.md`, where this repository keeps its evidence — a test that has never failed is not known to be able to
 
 ## Phase 3: The upgrade itself (US1)
 
@@ -39,7 +39,7 @@ attributed.
 
 - [ ] T012 [US3] `just element-web-sync <version>` in `justfile`: fetch the named release, re-apply patches and config, run the Phase 2 shim contract checks, and print a verdict. One command, and a report that names what broke rather than a build log to read
 - [ ] T013 [US3] Have the sync report the upstream release notes range between the pinned version and the target, so the person running it can see what changed without leaving the terminal. Fourteen releases of blind diff is why this one waited so long
-- [ ] T014 [P] [US3] Document the upgrade procedure in `docs/element-web.md`: how to bump, what to run, what to do when a shim contract fails, and which failures mean "upstream moved" rather than "we broke it"
+- [ ] T014 [P] [US3] Document in `docs/element-web.md`: how to bump a version, what to run, what to do when a shim contract fails, which failures mean "upstream moved" rather than "we broke it", and how to revert the pin when an upgrade cannot be fixed quickly (`fetch-element-web.sh` wipes `element-web-dist`, so the revert is a re-fetch rather than an undo). **Include the rule for where a change belongs** — host integration stays a runtime shim, a product change becomes a commit on the patch branch, packaging stays in the patch script — with the test for each, from `spec.md`. That rule is what makes the patch set stay small, and it is the first thing to be forgotten if it lives only in a spec
 
 ## Phase 5: Carrying patches, and giving them back (US4, US5)
 
@@ -49,15 +49,16 @@ it, which is the argument on the other side.
 
 - [ ] T015 [US4] Repair `fetch_git()` in `scripts/fetch-element-web.sh` for the current upstream: pnpm rather than yarn, `nx build` from `apps/web` rather than a root `build` script, and the new output directory rather than `webapp/`. All three lines are wrong today, and this is the path both carrying and contributing need
 - [ ] T016 [US4] Settle the Node version question by building: upstream's `.node-version` says 24, the dev shell provides 22.23.2, and `engines` says `>=22.18`. If 22 does not build it, add node 24 to `flake.nix` for the Element Web build only, so the rest of the workspace is undisturbed
-- [ ] T017 [US4] Add fork and patch-branch settings to `elementium.config.sh`: the fork remote, the patch branch name, and the upstream tag it is currently rebased onto. The pinned upstream tag stays the single source of truth for what we are building against, whether or not a patch is applied
+- [ ] T017 [US4] **Blocked on T023.** Add fork and patch-branch settings to `elementium.config.sh`: the fork remote, the patch branch name, and the upstream tag it is currently rebased onto. The pinned upstream tag stays the single source of truth for what we are building against, whether or not a patch is applied
 - [ ] T018 [US4] `just element-web-rebase <version>` in `justfile`: fetch the upstream tag into the source cache, rebase the patch branch onto it, and report per commit whether it applied, conflicted, or became empty. An empty commit means upstream took it — that is the signal a contribution landed, and it should be stated as such rather than left as a silent drop
 - [ ] T019 [US5] `element-web-patches.md` at the repo root, generated from the patch branch rather than written by hand: one row per commit with its subject, why it exists, whether it is meant to go upstream, and the pull request link if it has been offered. Hand-written lists of patches stop being true
 - [ ] T020 [US4] `just element-web-pr <commit>`: produce a branch from the current upstream tag with that one commit cherry-picked, ready to push and open as a pull request. The point of the whole arrangement is that this needs no translation step
-- [ ] T021 [US4] Exercise the mechanism end to end with a real change rather than a placeholder — carry it, generate a PR branch from it, simulate upstream taking it, and confirm it drops out of the set on the next rebase without anyone editing anything. A patch workflow nobody has run is a patch workflow that does not work
+- [ ] T021 [US4] Exercise the mechanism end to end with a real change rather than a placeholder: carry it on the patch branch, generate a PR branch from it with T020, then **simulate upstream taking it by committing the same change onto a local branch standing in for the upstream tag, and rebasing onto that** — confirming the commit drops out by patch-id with nobody editing anything. A patch workflow nobody has run is a patch workflow that does not work
 
 ## Phase 6: Close
 
 - [ ] T022 Record in `spec.md` what the upgrade actually cost, against the three blockers predicted from reading. The value of that comparison is in the places the reading was wrong
+- [ ] T023 [US4] Agree with the user where the Element Web fork lives before anything in Phase 5 assumes it. It is a repository under their account, which makes it an external system we do not create unprompted, and it decides where CI for the patch branch runs. `spec.md` open question 1; nothing downstream of it can be settled here
 
 ## The decision this ordering assumes
 
@@ -70,5 +71,5 @@ The argument against, from the spec's open question 3: a mechanism nobody has ex
 a mechanism that does not work, and the first time it is needed will be the worst time to
 find that out. T021 exists to answer that, but only once Phase 5 is reached.
 
-Two things are still the user's to decide: where the fork lives (open question 1), and
-whether Phase 5 moves ahead of Phase 3.
+Two things are still the user's to decide: where the fork lives — now T023, rather than an
+assumption Phase 5 makes quietly — and whether Phase 5 moves ahead of Phase 3.
