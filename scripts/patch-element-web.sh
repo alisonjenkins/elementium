@@ -255,3 +255,56 @@ assert_contains "$EC_INDEX" "elementium-shims.js" "shims script tag missing from
 assert_contains "$EC_INDEX" "__TAURI_INTERNALS__" "IPC bridge missing from $EC_INDEX"
 INJECTIONS=$((INJECTIONS + 1))
 
+# 6. The build record.
+#
+# Answers "what was actually running", which a bug report otherwise costs a round trip to
+# find out. Written last, so it describes a tree every step above has already asserted.
+#
+# `autojoinInjected` is not diagnostics. The injection carries a live access token and dials
+# a call on startup, so a release build refuses to proceed when it is set -- see
+# `scripts/prepare-build.sh`. Recording it is what makes that refusal possible.
+BUILD_RECORD="$DIST_DIR/.elementium-build.json"
+SOURCE_INFO_FILE="$DIST_DIR/.source-info"
+SOURCE_INFO=$(cat "$SOURCE_INFO_FILE" 2>/dev/null || echo "unknown")
+
+# Element Call is not pinned separately from Element Web, so nothing else would notice it
+# moving. Its asset filenames are content-hashed by its own build, which makes a hash over
+# the listing a serviceable fingerprint without reading a hundred megabytes.
+EC_FINGERPRINT=$(find "$EC_DIR/assets" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null |
+    LC_ALL=C sort | sha256sum | cut -c1-16)
+
+python3 - "$BUILD_RECORD" "$SOURCE_INFO" "$EC_FINGERPRINT" "${AUTOJOIN_INJECTED:-false}" \
+    "$CONFIG_SRC" "$INJECTIONS" <<'PYEOF'
+import json, sys, datetime
+
+record_path, source_info, ec_fingerprint, autojoin, config_src, injections = sys.argv[1:7]
+
+# `.source-info` is written by fetch-element-web.sh as `release:<repo>:<version>` or
+# `git:<repo>:<branch>:<sha>`.
+parts = source_info.split(":")
+kind = parts[0] if parts else "unknown"
+if kind == "release":
+    version, source_ref = parts[-1], None
+elif kind == "git":
+    version, source_ref = parts[-2], parts[-1]
+else:
+    kind, version, source_ref = "unknown", "unknown", None
+
+json.dump({
+    "elementWebVersion": version,
+    "source": kind,
+    "sourceRef": source_ref,
+    "builtAt": datetime.datetime.now(datetime.timezone.utc)
+                   .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    # Empty until a patch is carried. Present rather than omitted: an absent field and an
+    # empty list mean different things.
+    "patches": [],
+    "elementCallFingerprint": ec_fingerprint,
+    "autojoinInjected": autojoin == "true",
+    "configSource": config_src,
+    "injectionsAsserted": int(injections),
+}, open(record_path, "w"), indent=2)
+PYEOF
+
+assert_file "$BUILD_RECORD" "build record was not written"
+echo "[patch] Wrote build record to $BUILD_RECORD ($INJECTIONS injections asserted)"

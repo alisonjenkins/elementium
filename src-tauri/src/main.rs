@@ -257,6 +257,57 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     guard
 }
 
+/// Log which Element Web build the webview is about to load.
+///
+/// A bug report that does not say what was running costs a round trip to find out, and
+/// "the latest" is not an answer once a version can be pinned, patched, or built from a
+/// fork. Written by `scripts/patch-element-web.sh`; see `specs/007-element-web-upgrade`.
+///
+/// Absence is logged rather than ignored: a missing record means the patch script did not
+/// finish, which is worth knowing before the first call fails instead of after.
+fn log_element_web_build() {
+    // Dev runs from the repository root; a bundled app carries the frontend beside the
+    // executable. Neither is guaranteed, so both are tried and the miss is reported.
+    let candidates = [
+        std::path::PathBuf::from("element-web-dist/.elementium-build.json"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_default()
+            .join("element-web-dist/.elementium-build.json"),
+    ];
+
+    for path in &candidates {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(record) => {
+                let field = |key: &str| record.get(key).cloned().unwrap_or(serde_json::Value::Null);
+                tracing::info!(
+                    element_web_version = %field("elementWebVersion"),
+                    source = %field("source"),
+                    built_at = %field("builtAt"),
+                    element_call_fingerprint = %field("elementCallFingerprint"),
+                    autojoin_injected = %field("autojoinInjected"),
+                    patches = %field("patches"),
+                    "Element Web build record"
+                );
+            }
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Element Web build record is present but unreadable"
+            ),
+        }
+        return;
+    }
+
+    tracing::warn!(
+        "no Element Web build record found; scripts/patch-element-web.sh may not have run"
+    );
+}
+
 fn main() -> tauri::Result<()> {
     // Held for the whole of main: dropping it flushes and stops the writer thread.
     let _log_guard = init_logging();
@@ -268,6 +319,8 @@ fn main() -> tauri::Result<()> {
     let app_instance_id = CorrelationId::new();
     let _app_span =
         tracing::info_span!("app_instance", correlation_id = %app_instance_id).entered();
+
+    log_element_web_build();
 
     // Initialize secret storage backend
     let backend = create_backend();
