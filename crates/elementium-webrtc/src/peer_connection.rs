@@ -740,6 +740,34 @@ const fn str0m_codec(codec: elementium_codec::VideoCodec) -> Codec {
     }
 }
 
+/// Log the first bytes of a video frame at the packetiser boundary, when asked.
+///
+/// Off unless `ELEMENTIUM_FRAME_DUMP` is set, because it runs on every frame and the
+/// question it answers is asked rarely. It exists for one comparison that nothing else can
+/// make: our encrypted H.264 is forwarded correctly by the SFU and decoded by our own
+/// client, and rejected by Chrome's depacketiser. A wire capture cannot settle it -- SRTP
+/// hides the payload -- and the SFU's stats only say the stream parsed. What is left is
+/// what each sender hands to its packetiser, and this is that byte string.
+///
+/// Sixteen bytes: an H.264 NAL header is one byte, an FU indicator two, a start code four,
+/// and livekit's clear-header prefix for a slice is 27 -- so sixteen shows which convention
+/// is in use without dumping ciphertext into a log.
+fn dump_frame_head(direction: &str, codec: &str, len: usize, bytes: &[u8]) {
+    if std::env::var_os("ELEMENTIUM_FRAME_DUMP").is_none() {
+        return;
+    }
+    let head: String = bytes
+        .iter()
+        .take(16)
+        .fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(&mut acc, "{b:02x}");
+            acc
+        });
+    tracing::info!(direction, codec, len, head, "frame at the packetiser boundary");
+}
+
+
 /// Write an encoded video frame to the peer connection.
 ///
 /// # Errors
@@ -759,6 +787,7 @@ pub fn write_video(
     codec: elementium_codec::VideoCodec,
 ) -> Result<(), crate::error::WebRtcError> {
     let frame_data = frame.as_bytes();
+    dump_frame_head("outbound", codec.sdp_name(), frame_data.len(), frame_data);
     let mid = send_mid_for(pc, key)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
@@ -1327,6 +1356,11 @@ fn media_data_event(
         } else {
             elementium_codec::VideoCodec::H264
         };
+        // The other half of the comparison: a frame str0m has just reassembled from a
+        // *remote* sender. Subscribed to a browser, this is what libwebrtc's packetiser was
+        // given, recovered by depacketising it -- the reference our own outbound bytes are
+        // measured against.
+        dump_frame_head("inbound", video.sdp_name(), data.data.len(), &data.data);
         Some(PcEvent::VideoData {
             mid,
             data: WireMedia::from_network(data.data),
