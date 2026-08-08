@@ -716,6 +716,122 @@ const KEYFRAME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// one before the first has arrived. Roughly one round trip on a poor link.
 const MIN_KEYFRAME_GAP: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a keyframe request may go unanswered before it is a fault worth a log line
+/// rather than ordinary scheduling jitter.
+///
+/// Set above [`KEYFRAME_INTERVAL`] on purpose: a healthy encoder emits a keyframe of its
+/// own accord at least that often, so if this much time passes with a request outstanding
+/// and still nothing decodable has left the encoder, the periodic backstop did not save it
+/// either. That is no longer "the request hasn't been serviced yet" -- it is the shape of
+/// the incident this exists for, where the SFU sent 27 PLIs over the length of a call and
+/// never got a keyframe back while every counter on the sending side read healthy.
+const KEYFRAME_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a keyframe requested from the encoder has actually left it.
+///
+/// The request itself was already visible in the logs: `Receiver requested a keyframe` in
+/// `elementium-webrtc`, once per RTCP PLI. What was missing was the other half of that
+/// story -- an encoder can be asked and simply never answer, and every existing counter
+/// (packets sent, loss, RTT) stays green throughout, because none of them look at whether
+/// an encoded frame was decodable on its own. `is_keyframe` on the encoder's own output
+/// (`EncodedFrame::is_keyframe`) is the only place that is known, so this watches it rather
+/// than inferring health from anything downstream.
+///
+/// One episode is one continuous stretch of "asked and not yet answered". It is tracked
+/// rather than logged eagerly because a stuck receiver resends its PLI several times a
+/// second: logging each arrival would reproduce the exact noise problem the per-request log
+/// already has, just one level deeper in the pipeline. Instead this accumulates a count and
+/// speaks once when [`KEYFRAME_ANSWER_TIMEOUT`] proves the episode is a real fault, then
+/// stays quiet until it either resolves or is asked again.
+#[derive(Default)]
+struct KeyframeAnswerWatch {
+    /// When the current run of unanswered requests began. `None` means the last request
+    /// (if any) was already answered, so there is nothing outstanding to time out.
+    pending_since: Option<std::time::Instant>,
+    /// Requests folded into the current episode, including the one that opened it.
+    unanswered_requests: u32,
+    /// Set once this episode has already logged, so a stuck encoder gets one line, not one
+    /// every frame for as long as it stays stuck.
+    warned: bool,
+}
+
+impl KeyframeAnswerWatch {
+    /// Record that a receiver's request was just forwarded to the encoder.
+    fn requested(&mut self) {
+        if self.pending_since.is_none() {
+            self.pending_since = Some(std::time::Instant::now());
+            self.unanswered_requests = 1;
+            self.warned = false;
+        } else {
+            self.unanswered_requests = self.unanswered_requests.saturating_add(1);
+        }
+    }
+
+    /// Record that the encoder actually produced a keyframe, closing out any open episode.
+    ///
+    /// Closes on any keyframe, not just ones that followed a request: the periodic timer in
+    /// `maybe_request_keyframe` proves the encoder is answerable just as well as a request
+    /// does, and a request that arrived just before a scheduled keyframe was going to fire
+    /// anyway is not a fault.
+    const fn observed_keyframe(&mut self) {
+        self.pending_since = None;
+        self.unanswered_requests = 0;
+        self.warned = false;
+    }
+
+    /// Speak once if the open episode has run past [`KEYFRAME_ANSWER_TIMEOUT`].
+    /// Whether this episode is now due a warning, given how long it has been open.
+    ///
+    /// Split from the logging so the decision can be tested at an arbitrary age. The
+    /// alternative -- sleeping past a five-second constant in a unit test -- buys the same
+    /// assurance at the cost of a slow test, and slow tests get marked ignored and then
+    /// stop being run at all.
+    const fn is_due(&self, open_for: std::time::Duration) -> bool {
+        self.pending_since.is_some()
+            && !self.warned
+            && open_for.as_millis() >= KEYFRAME_ANSWER_TIMEOUT.as_millis()
+    }
+
+    fn check_timeout(&mut self, track_id: &str) {
+        let Some(since) = self.pending_since else {
+            return;
+        };
+        if !self.is_due(since.elapsed()) {
+            return;
+        }
+        self.warned = true;
+        tracing::warn!(
+            track_id,
+            unanswered_requests = self.unanswered_requests,
+            waited_secs = since.elapsed().as_secs_f64(),
+            "keyframe requests are arriving but no keyframe has left the encoder; the far \
+             end is decoding nothing and will keep asking until this resolves"
+        );
+    }
+}
+
+/// Timing state for one encoder's keyframes: when the last one left it, and whether a
+/// request for the next one is overdue an answer.
+///
+/// Bundled with [`KeyframeAnswerWatch`] rather than passed alongside it because the two are
+/// updated together at every call site that touches either -- a keyframe leaving resets
+/// both the cadence timer and the watch, and a request checks both the rate limit and the
+/// watch -- and keeping them as one parameter is what keeps the encode functions under the
+/// workspace's argument-count limit.
+struct KeyframeState {
+    last_keyframe: std::time::Instant,
+    watch: KeyframeAnswerWatch,
+}
+
+impl KeyframeState {
+    fn new() -> Self {
+        Self {
+            last_keyframe: std::time::Instant::now(),
+            watch: KeyframeAnswerWatch::default(),
+        }
+    }
+}
+
 /// The codec used for outbound video until negotiation says otherwise.
 ///
 /// VP8 because it is the one every peer speaks. The live value is carried by
@@ -1046,7 +1162,7 @@ fn video_pipeline_loop(
     // that runs thirty times a second. See `elementium_codec::video`.
     let mut encoder: Option<NegotiatedEncoder> = None;
     let mut frame_count: u64 = 0;
-    let mut last_keyframe = std::time::Instant::now();
+    let mut keyframe = KeyframeState::new();
     let mut last_preview = std::time::Instant::now()
         .checked_sub(MIN_PREVIEW_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
@@ -1130,13 +1246,20 @@ fn video_pipeline_loop(
                     PipelineId { key, track_id },
                     &frame,
                     &mut encoder,
-                    &mut last_keyframe,
+                    &mut keyframe,
                     keyframe_requested,
                     active_codec,
                     encode_tx,
                 );
             }
         } else {
+            // The unanswered-keyframe clock runs here too, not only where frames are
+            // encoded, because the case it exists for is precisely the one with no frames.
+            // A screen share emits on damage: a still window can go many seconds without
+            // producing anything, and a receiver asking during that window gets nothing and
+            // would never be warned about, since every other check sits on the per-frame
+            // path. That is the exact shape of the failure this watch was added for.
+            keyframe.watch.check_timeout(track_id);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
@@ -1151,7 +1274,7 @@ fn ensure_encoder(
     encoder: &mut Option<NegotiatedEncoder>,
     width: u32,
     height: u32,
-    last_keyframe: &mut std::time::Instant,
+    keyframe: &mut KeyframeState,
     wanted: VideoCodec,
 ) {
     // Rebuilt when the geometry changes, because an encoder rejects a frame whose size
@@ -1213,7 +1336,7 @@ fn ensure_encoder(
                 "video encoder created for camera"
             );
             *encoder = Some(enc);
-            *last_keyframe = std::time::Instant::now();
+            keyframe.last_keyframe = std::time::Instant::now();
         }
         // Left as-is on failure rather than cleared: an encoder that already works is
         // better than none, and a codec we cannot build is a negotiation fault to report,
@@ -1232,7 +1355,7 @@ fn ensure_encoder(
 fn maybe_request_keyframe<E: VideoEncoder>(
     track_id: &str,
     encoder: &mut E,
-    last_keyframe: &mut std::time::Instant,
+    keyframe: &mut KeyframeState,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     // A receiver asking is the urgent case: until it gets a keyframe it displays a broken
@@ -1243,12 +1366,22 @@ fn maybe_request_keyframe<E: VideoEncoder>(
     // Honouring every one throws away the encoder's rate control and makes the picture
     // worse than the fault being recovered from. One keyframe in flight is the most that
     // can help.
-    let recently = last_keyframe.elapsed() < MIN_KEYFRAME_GAP;
-    if (asked && !recently) || last_keyframe.elapsed() >= KEYFRAME_INTERVAL {
+    let recently = keyframe.last_keyframe.elapsed() < MIN_KEYFRAME_GAP;
+    if (asked && !recently) || keyframe.last_keyframe.elapsed() >= KEYFRAME_INTERVAL {
         encoder.request_keyframe();
-        *last_keyframe = std::time::Instant::now();
+        keyframe.last_keyframe = std::time::Instant::now();
         tracing::info!(track_id, on_request = asked, "requested a video keyframe");
+        // Only a real receiver request opens a watch episode -- the periodic branch above
+        // asks the encoder proactively, on our own schedule, and has no requester waiting
+        // on it that could go unanswered.
+        if asked {
+            keyframe.watch.requested();
+        }
     }
+    // Checked every call, not only when a request was just forwarded: a request rate-
+    // limited by `recently` above still leaves an earlier episode open, and that episode's
+    // clock needs to keep running even on the frames where nothing new happens.
+    keyframe.watch.check_timeout(track_id);
 }
 
 /// Encode one captured frame and hand the packets to the connection.
@@ -1256,12 +1389,17 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 /// Generic over the encoder rather than taking a trait object: this runs for every
 /// captured frame for the length of a call, so the calls are statically dispatched and
 /// inlinable, and the bound documents that the body depends on nothing but the interface.
+/// Encode one frame and hand its packets to the connection.
+///
+/// Returns whether any packet in this batch was a keyframe, which is the one fact
+/// [`KeyframeAnswerWatch`] needs and the only place it is known -- the encoder's own
+/// `EncodedFrame::is_keyframe`, not anything inferred from bytes sent or acked downstream.
 fn encode_and_send<E: VideoEncoder>(
     key: MediaTrackKey,
     encoder: &mut E,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
-) {
+) -> bool {
     // Asked of the encoder rather than of `ActiveCodec`: the encoder is what produced these
     // bytes, and it may still be the previous one for a frame or two after the SFU asks for
     // a change. The payload type and the E2EE framing both follow from this, and both are
@@ -1276,13 +1414,14 @@ fn encode_and_send<E: VideoEncoder>(
     } else {
         let Some(planar) = frame.to_planar() else {
             tracing::debug!("captured frame could not be decoded");
-            return;
+            return false;
         };
         encoder.encode(&planar)
     };
 
     match outcome {
         Ok(packets) => {
+            let produced_keyframe = packets.iter().any(|p| p.is_keyframe);
             if let Ok(guard) = encode_tx.lock()
                 && let Some(tx) = guard.as_ref()
             {
@@ -1290,8 +1429,12 @@ fn encode_and_send<E: VideoEncoder>(
                     let _ = tx.try_send(IoCommand::WriteVideo(key, packet.data, codec));
                 }
             }
+            produced_keyframe
         }
-        Err(e) => tracing::debug!("video encode error: {e}"),
+        Err(e) => {
+            tracing::debug!("video encode error: {e}");
+            false
+        }
     }
 }
 
@@ -1311,20 +1454,14 @@ fn encode_and_send_video_frame(
     id: PipelineId<'_>,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encoder: &mut Option<NegotiatedEncoder>,
-    last_keyframe: &mut std::time::Instant,
+    keyframe: &mut KeyframeState,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
     active_codec: &Arc<ActiveCodec>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
     let wanted = active_codec.get();
     let existed = encoder.as_ref().is_some_and(|e| e.codec() == wanted);
-    ensure_encoder(
-        encoder,
-        frame.width(),
-        frame.height(),
-        last_keyframe,
-        wanted,
-    );
+    ensure_encoder(encoder, frame.width(), frame.height(), keyframe, wanted);
 
     let Some(enc) = encoder.as_mut() else {
         return;
@@ -1332,9 +1469,11 @@ fn encode_and_send_video_frame(
     // A freshly built encoder emits a keyframe on its own, so only ask when it is one we
     // were already using.
     if existed {
-        maybe_request_keyframe(id.track_id, enc, last_keyframe, keyframe_requested);
+        maybe_request_keyframe(id.track_id, enc, keyframe, keyframe_requested);
     }
-    encode_and_send(id.key, enc, frame, encode_tx);
+    if encode_and_send(id.key, enc, frame, encode_tx) {
+        keyframe.watch.observed_keyframe();
+    }
 }
 
 /// Counters for one run of [`audio_capture_loop`], so a silent far end is diagnosable.
@@ -1944,6 +2083,110 @@ fn generate_track_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{t:x}")
+}
+
+#[cfg(test)]
+mod keyframe_answer_watch_tests {
+    use std::time::Duration;
+
+    use super::{KEYFRAME_ANSWER_TIMEOUT, KeyframeAnswerWatch};
+
+    /// The failure this exists for: requests keep arriving and nothing answers them. The
+    /// watch must not speak on the first one -- that is indistinguishable from a keyframe
+    /// that is merely late -- but it must accumulate a count so that when it does speak,
+    /// the log says how many requests were folded into the episode rather than just "one
+    /// happened, eventually".
+    #[test]
+    fn repeated_requests_without_an_answer_accumulate_into_one_episode() {
+        let mut watch = KeyframeAnswerWatch::default();
+        assert!(watch.pending_since.is_none(), "starts with nothing open");
+
+        watch.requested();
+        assert_eq!(watch.unanswered_requests, 1);
+        let opened_at = watch.pending_since;
+        assert!(opened_at.is_some());
+
+        // Three more requests arrive before anything answers them -- the shape of a
+        // receiver resending PLIs several times a second into a stuck encoder.
+        watch.requested();
+        watch.requested();
+        watch.requested();
+        assert_eq!(
+            watch.unanswered_requests, 4,
+            "every request in the open episode must be counted"
+        );
+        assert_eq!(
+            watch.pending_since, opened_at,
+            "the episode's start time must not move just because more requests arrived"
+        );
+    }
+
+    /// A keyframe actually leaving the encoder is the only thing that should close an
+    /// episode -- that is the fact the incident's logs never recorded, so it is the one
+    /// the watch treats as authoritative.
+    #[test]
+    fn an_observed_keyframe_closes_the_episode() {
+        let mut watch = KeyframeAnswerWatch::default();
+        watch.requested();
+        watch.requested();
+        assert_eq!(watch.unanswered_requests, 2);
+
+        watch.observed_keyframe();
+
+        assert!(
+            watch.pending_since.is_none(),
+            "a produced keyframe must clear the open episode"
+        );
+        assert_eq!(watch.unanswered_requests, 0);
+        assert!(!watch.warned, "closing an episode must not leave it warned");
+    }
+
+    /// The warning must actually fire once the episode has been open long enough, and then
+    /// stay quiet.
+    ///
+    /// The agent-written tests covered accumulating, closing and *not* warning early, which
+    /// together can all pass while the warning never fires at all -- the one behaviour the
+    /// watch exists for.
+    #[test]
+    fn an_episode_open_past_the_timeout_is_due_exactly_once() {
+        let mut watch = KeyframeAnswerWatch::default();
+        assert!(!watch.is_due(KEYFRAME_ANSWER_TIMEOUT), "nothing is due with no episode open");
+
+        watch.requested();
+        assert!(
+            !watch.is_due(KEYFRAME_ANSWER_TIMEOUT.saturating_sub(Duration::from_millis(1))),
+            "a fresh episode must not warn"
+        );
+        assert!(watch.is_due(KEYFRAME_ANSWER_TIMEOUT), "an episode at the timeout is due");
+
+        // `check_timeout` sets `warned`; simulate that, since the real call needs a clock.
+        watch.warned = true;
+        assert!(
+            !watch.is_due(KEYFRAME_ANSWER_TIMEOUT.saturating_mul(10)),
+            "an episode that already warned must not warn again, however long it stays open"
+        );
+
+        watch.observed_keyframe();
+        watch.requested();
+        assert!(
+            watch.is_due(KEYFRAME_ANSWER_TIMEOUT),
+            "a new episode after a keyframe must be able to warn again"
+        );
+    }
+
+    /// `check_timeout` before [`super::KEYFRAME_ANSWER_TIMEOUT`] has elapsed must not fire:
+    /// most requests are answered well inside it, and warning on every one would be the
+    /// exact per-request noise this design avoids.
+    #[test]
+    fn a_fresh_request_does_not_warn_immediately() {
+        let mut watch = KeyframeAnswerWatch::default();
+        watch.requested();
+        watch.check_timeout("track-1");
+        assert!(
+            !watch.warned,
+            "a request that just arrived has not had time to prove it is unanswered"
+        );
+    }
 }
 
 #[cfg(test)]
