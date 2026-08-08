@@ -1,9 +1,37 @@
 #!/usr/bin/env bash
 # Patches Element Web's index.html to inject Elementium shims and config.
 # Idempotent — skips injection if the marker comment is already present.
+#
+# Every step asserts its own effect. That is not defensive habit: `sed` that matches
+# nothing and `awk` that finds no `<script>` both exit 0, so before this an upstream change
+# to `index.html` produced a build that succeeded and an application that was broken with
+# nothing anywhere reporting it. A patch step that cannot verify what it did is a patch step
+# that will one day quietly do nothing.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# Fail with the step that failed, rather than with a shell trace.
+fail() {
+    echo "[patch] FAILED: $*" >&2
+    exit 1
+}
+
+# Assert a file exists after we claim to have produced it.
+assert_file() {
+    [[ -f "$1" ]] || fail "$2 (expected $1)"
+}
+
+# Assert `$2` appears in file `$1`.
+assert_contains() {
+    grep -qF -- "$2" "$1" || fail "$3"
+}
+
+# Assert `$2` does *not* appear in file `$1`.
+assert_absent() {
+    grep -qF -- "$2" "$1" && fail "$3"
+    return 0
+}
 
 DIST_DIR="element-web-dist"
 SHIMS_SRC="frontend/dist-shims/elementium-shims.js"
@@ -34,17 +62,28 @@ if [[ ! -f "$INDEX" ]]; then
     exit 1
 fi
 
+# How many injections we asserted, reported at the end so a silent zero is visible.
+INJECTIONS=0
+
 # 1. Copy shims bundle
 cp "$SHIMS_SRC" "$DIST_DIR/elementium-shims.js"
+assert_file "$DIST_DIR/elementium-shims.js" "shims bundle was not copied"
 echo "[patch] Copied shims to $DIST_DIR/elementium-shims.js"
 
 # 2. Copy config
 cp "$CONFIG_SRC" "$DIST_DIR/config.json"
+assert_file "$DIST_DIR/config.json" "config was not copied"
 echo "[patch] Copied config ($CONFIG_SRC) to $DIST_DIR/config.json"
 
 # 3. Remove Element Web's CSP meta tag (Tauri's CSP is the security boundary)
+#
+# Asserted rather than assumed: if upstream reformats the tag onto one line, or renames the
+# attribute, this `sed` matches nothing and every later script is blocked by a CSP nobody
+# meant to keep.
 if grep -q 'http-equiv="Content-Security-Policy"' "$INDEX"; then
     sed -i '/<meta http-equiv="Content-Security-Policy"/,/>/d' "$INDEX"
+    assert_absent "$INDEX" 'http-equiv="Content-Security-Policy"' \
+        "the CSP meta tag survived removal -- upstream's markup has changed shape"
     echo "[patch] Removed Element Web CSP meta tag (Tauri CSP is active)"
 fi
 
@@ -62,8 +101,14 @@ else
         { print }
     ' "$INDEX" > "$INDEX.tmp"
     mv "$INDEX.tmp" "$INDEX"
+    # An `index.html` with no `<script>` leaves this awk a no-op, and the app then runs
+    # with no shims at all: no native audio, no native camera, no key bridge.
+    assert_contains "$INDEX" "$MARKER" \
+        "shims were not injected into $INDEX -- it has no <script> tag to inject before"
     echo "[patch] Injected shims script tag into $INDEX"
 fi
+assert_contains "$INDEX" "elementium-shims.js" "shims script tag missing from $INDEX"
+INJECTIONS=$((INJECTIONS + 1))
 
 # 4b. Autojoin driver, for testing only.
 #
@@ -139,8 +184,13 @@ PYEOF
             { print }
         ' "$f" > "$f.tmp"
         mv "$f.tmp" "$f"
+        assert_contains "$f" "__ELEMENTIUM_AUTOJOIN" \
+            "autojoin config was not injected into $f"
+        assert_contains "$f" "elementium-autojoin.js" \
+            "autojoin driver was not injected into $f"
         echo "[patch] Injected autojoin driver into $f"
     done
+    AUTOJOIN_INJECTED=true
 else
     # Symmetric removal. The injection carries a real access token and joins a call on
     # startup, so leaving it behind would make an ordinary `just dev` log in as a test user
@@ -150,9 +200,13 @@ else
         [[ -f "$f" ]] || continue
         grep -qF "elementium-autojoin" "$f" || continue
         sed -i '/__ELEMENTIUM_AUTOJOIN/d; /elementium-autojoin\.js/d' "$f"
+        # A removal that silently fails leaves a live access token and a call that dials
+        # itself in an ordinary build, which is the whole reason the removal is symmetric.
+        assert_absent "$f" "elementium-autojoin" "autojoin driver survived removal from $f"
         echo "[patch] Removed autojoin driver from $f"
     done
     rm -f "$DIST_DIR/elementium-autojoin.js"
+    AUTOJOIN_INJECTED=false
 fi
 
 # 5. Patch Element Call widget (if present) to inject IPC bridge + shims
@@ -160,33 +214,44 @@ EC_DIR="$DIST_DIR/widgets/element-call"
 EC_INDEX="$EC_DIR/index.html"
 EC_MARKER="<!-- elementium-ec-shims-injected -->"
 
-if [[ -d "$EC_DIR" && -f "$EC_INDEX" ]]; then
-    # Copy shims into widget directory
-    cp "$SHIMS_SRC" "$EC_DIR/elementium-shims.js"
-    echo "[patch] Copied shims to $EC_DIR/elementium-shims.js"
+# Missing is a failure, not a thing to skip past. Element Call is how this application makes
+# a call at all, so a release that stopped bundling it must not produce an app that starts
+# and cannot call -- which is exactly what "skipping widget patch" used to produce.
+[[ -d "$EC_DIR" ]] || fail "Element Call widget missing at $EC_DIR. Either the Element Web \
+release stopped bundling it, or the fetch was incomplete. Calls cannot work without it."
+assert_file "$EC_INDEX" "Element Call widget has no index.html"
 
-    if grep -qF "$EC_MARKER" "$EC_INDEX"; then
-        echo "[patch] Element Call shims already injected, skipping."
-    else
-        # Inject IPC bridge + shims before the first <script> tag
-        awk -v marker="$EC_MARKER" '
-            !done && /<script/ {
-                print "    " marker
-                print "    <script>"
-                print "      // Bridge Tauri IPC from parent frame into Element Call iframe"
-                print "      if (window.parent && window.parent.__TAURI_INTERNALS__ && !window.__TAURI_INTERNALS__) {"
-                print "        window.__TAURI_INTERNALS__ = window.parent.__TAURI_INTERNALS__;"
-                print "        console.log(\"[Elementium] Bridged __TAURI_INTERNALS__ from parent into Element Call iframe\");"
-                print "      }"
-                print "    </script>"
-                print "    <script src=\"elementium-shims.js\"></script>"
-                done = 1
-            }
-            { print }
-        ' "$EC_INDEX" > "$EC_INDEX.tmp"
-        mv "$EC_INDEX.tmp" "$EC_INDEX"
-        echo "[patch] Injected IPC bridge + shims into $EC_INDEX"
-    fi
+# Copy shims into widget directory
+cp "$SHIMS_SRC" "$EC_DIR/elementium-shims.js"
+assert_file "$EC_DIR/elementium-shims.js" "shims were not copied into the widget"
+echo "[patch] Copied shims to $EC_DIR/elementium-shims.js"
+
+if grep -qF "$EC_MARKER" "$EC_INDEX"; then
+    echo "[patch] Element Call shims already injected, skipping."
 else
-    echo "[patch] Element Call widget not found at $EC_DIR, skipping widget patch."
+    # Inject IPC bridge + shims before the first <script> tag
+    awk -v marker="$EC_MARKER" '
+        !done && /<script/ {
+            print "    " marker
+            print "    <script>"
+            print "      // Bridge Tauri IPC from parent frame into Element Call iframe"
+            print "      if (window.parent && window.parent.__TAURI_INTERNALS__ && !window.__TAURI_INTERNALS__) {"
+            print "        window.__TAURI_INTERNALS__ = window.parent.__TAURI_INTERNALS__;"
+            print "        console.log(\"[Elementium] Bridged __TAURI_INTERNALS__ from parent into Element Call iframe\");"
+            print "      }"
+            print "    </script>"
+            print "    <script src=\"elementium-shims.js\"></script>"
+            done = 1
+        }
+        { print }
+    ' "$EC_INDEX" > "$EC_INDEX.tmp"
+    mv "$EC_INDEX.tmp" "$EC_INDEX"
+    assert_contains "$EC_INDEX" "$EC_MARKER" \
+        "shims were not injected into the Element Call widget -- it has no <script> tag to \
+inject before. The widget carries the media, so this is a silent call with no error."
+    echo "[patch] Injected IPC bridge + shims into $EC_INDEX"
 fi
+assert_contains "$EC_INDEX" "elementium-shims.js" "shims script tag missing from $EC_INDEX"
+assert_contains "$EC_INDEX" "__TAURI_INTERNALS__" "IPC bridge missing from $EC_INDEX"
+INJECTIONS=$((INJECTIONS + 1))
+
