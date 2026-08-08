@@ -142,6 +142,13 @@ struct PublishState {
     /// would reshuffle them on every renegotiation. Each answer would then describe
     /// different m-lines than the offer it replies to.
     published: Vec<(MediaTrackKey, String)>,
+    /// The server-assigned track sid for each published track, once the SFU confirms it.
+    ///
+    /// Kept because muting is addressed by sid, not by cid: the cid is ours and means
+    /// nothing to the SFU after publication. Without this a user muting their microphone
+    /// changed nothing anyone else could see -- the mute stayed local, every other
+    /// participant's UI kept showing them unmuted, and the SFU kept forwarding.
+    sids: HashMap<MediaTrackKey, String>,
     /// An offer has been sent and its answer has not been applied.
     ///
     /// str0m keeps exactly one pending offer. Creating a second one while the first is
@@ -479,6 +486,46 @@ impl LiveKitRoom {
     /// Audio only, in practice: video needs [`LiveKitRoom::publish_video_track`], because a
     /// video track the SFU is not told the codec of is registered as VP8.
     ///
+    /// Tell the SFU that one of our published tracks is muted, or is muted no longer.
+    ///
+    /// Muting is a signalling fact, not a local one. A client that simply stops sending
+    /// leaves every other participant's UI showing it unmuted, and leaves the SFU expecting
+    /// media that never comes -- so the far end shows a live camera tile that has quietly
+    /// frozen, which is indistinguishable from a network stall. `MuteTrackRequest` is how
+    /// every other `LiveKit` client says it, and the SFU relays it to the room.
+    ///
+    /// Addressed by the server-assigned sid rather than our `cid`: the cid identifies the
+    /// track only in the `AddTrack` exchange that created it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::WebRtcError::NoMidForTrack`] if the track was never
+    /// published, or has not yet been confirmed by the SFU -- there is nothing to mute and
+    /// silently succeeding would be a lie the caller would act on.
+    pub fn set_track_muted(
+        &self,
+        key: MediaTrackKey,
+        muted: bool,
+    ) -> Result<(), crate::error::WebRtcError> {
+        let sid = {
+            let state = self
+                .publish_state
+                .lock()
+                .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
+            state.sids.get(&key).cloned()
+        };
+        let Some(sid) = sid else {
+            return Err(crate::error::WebRtcError::NoMidForTrack(key.to_string()));
+        };
+
+        tracing::info!(track = %key, sid = %sid, muted, "telling the SFU a track's mute state");
+        self.signal_sender
+            .send(signal_request::Message::Mute(
+                livekit_protocol::MuteTrackRequest { sid, muted },
+            ))
+            .map_err(|e| crate::error::WebRtcError::Signaling(e.to_string()))
+    }
+
     /// # Errors
     ///
     /// Returns an error if the `AddTrack` request or the offer cannot be sent.
@@ -1047,6 +1094,26 @@ async fn signal_processing_loop(
                     track = ?track_published.track,
                     "Track published confirmed by SFU"
                 );
+                // Matched back to our key by the cid we announced, which is the only thing
+                // the request and this response have in common.
+                if let Some(info) = track_published.track.as_ref()
+                    && let Ok(mut state) = publish_state.lock()
+                {
+                    let key = state
+                        .published
+                        .iter()
+                        .find(|(_, cid)| *cid == track_published.cid)
+                        .map(|(k, _)| *k);
+                    if let Some(key) = key {
+                        state.sids.insert(key, info.sid.clone());
+                    } else {
+                        tracing::warn!(
+                            cid = %track_published.cid,
+                            "the SFU confirmed a track whose cid we do not recognise; \
+                             muting it later will not be possible"
+                        );
+                    }
+                }
             }
             signal_response::Message::SpeakersChanged(speakers) => {
                 let identities: Vec<String> = speakers

@@ -229,9 +229,46 @@ export class LocalParticipant extends Participant {
     });
   }
 
-  /** Unpublish a local track. */
-  async unpublishTrack(_track: MediaStreamTrack | LocalTrack): Promise<void> {
-    // TODO: invoke livekit_unpublish_track
+  /**
+   * Stop sending a local track, and tell the SFU so.
+   *
+   * Muting rather than unpublishing, because that is what this protocol offers and what
+   * every other LiveKit client does for the same gesture: `MuteTrackRequest` is relayed to
+   * the room, so other participants' UIs update. Unpublishing outright would mean removing
+   * the transceiver and renegotiating, which costs an offer/answer for something the user
+   * is likely to undo a moment later.
+   *
+   * Previously this did nothing at all, so a track stopped in the UI stayed live for
+   * everyone else — a camera tile frozen on its last frame, indistinguishable from a
+   * network stall.
+   */
+  async unpublishTrack(track: MediaStreamTrack | LocalTrack): Promise<void> {
+    await this.setTrackMuted(track, true);
+  }
+
+  /** Tell the SFU a published track is muted, or is muted no longer. */
+  async setTrackMuted(
+    track: MediaStreamTrack | LocalTrack,
+    muted: boolean,
+    options?: { source?: string },
+  ): Promise<void> {
+    const kind = track instanceof LocalTrack ? track.kind : (track.kind as string);
+    const source =
+      options?.source ?? (track instanceof LocalTrack ? track.source : "microphone");
+    try {
+      await invoke("livekit_set_track_muted", {
+        roomId: this._roomId,
+        kind,
+        source,
+        muted,
+      });
+    } catch (e) {
+      // Surfaced rather than swallowed: a mute that did not reach the SFU is exactly the
+      // failure this method was added to remove, and a silent catch here would recreate it
+      // one layer up.
+      console.warn(`livekit: could not set ${kind}/${source} muted=${muted}: ${String(e)}`);
+      throw e;
+    }
   }
 }
 

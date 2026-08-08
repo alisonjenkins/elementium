@@ -165,13 +165,39 @@ pub async fn livekit_publish_track(
     Ok(())
 }
 
+/// Tell the SFU that a published track is muted, or unmuted.
+///
+/// The page stopping or disabling a track is a local fact until someone says so on the
+/// wire. Without this, every other participant's UI keeps showing the track live, and what
+/// they see is a camera tile frozen on its last frame — which looks exactly like a network
+/// stall rather than a person switching their camera off.
+///
+/// # Errors
+///
+/// Returns an error if the room is unknown, the kind/source pair is not one we publish, or
+/// the track was never published — muting something that was never announced cannot be
+/// reported as success, because the caller would take it as done.
+#[command]
+pub async fn livekit_set_track_muted(
+    state: State<'_, LiveKitState>,
+    room_id: String,
+    kind: String,
+    source: String,
+    muted: bool,
+) -> Result<(), String> {
+    let key = track_key(&kind, &source)?;
+    let room = get_room(&state, &room_id)?;
+    let room = room.lock().await;
+    room.set_track_muted(key, muted).map_err(|e| e.to_string())
+}
+
 /// Resolve the kind/source pair the frontend sends into a track identity.
 ///
 /// Rejected rather than defaulted when the pair is not one we publish. The old code mapped
 /// an unrecognised source to `TrackSource::Unknown` and carried on, which produces a track
 /// the SFU accepts and every other client renders as an unlabelled stream -- a failure that
 /// only shows up in somebody else's UI.
-fn track_key(kind: &str, source: &str) -> Result<MediaTrackKey, String> {
+pub(super) fn track_key(kind: &str, source: &str) -> Result<MediaTrackKey, String> {
     let key = match (kind, source) {
         ("audio", "microphone") => MediaTrackKey::microphone(),
         ("video", "camera") => MediaTrackKey::camera(),
