@@ -96,6 +96,35 @@ const JOIN_REQUEST_FIELDS: Record<number, string> = {
 /** `livekit.WrappedJoinRequest.Compression`. */
 const COMPRESSION = ["NONE", "GZIP"];
 
+/** `livekit.LeaveRequest.Action` — what the SFU is asking the client to do. */
+const LEAVE_ACTION = ["DISCONNECT", "RESUME", "RECONNECT"];
+
+/**
+ * `livekit.DisconnectReason`. Worth naming because a `leave` from the SFU is otherwise
+ * indistinguishable from a call that simply ended, and the reason is the whole finding:
+ * `STATE_MISMATCH` says it rejected the negotiation, `JOIN_FAILURE` says it never got that
+ * far. Neither is secret.
+ */
+const DISCONNECT_REASON = [
+  "UNKNOWN_REASON",
+  "CLIENT_INITIATED",
+  "DUPLICATE_IDENTITY",
+  "SERVER_SHUTDOWN",
+  "PARTICIPANT_REMOVED",
+  "ROOM_DELETED",
+  "STATE_MISMATCH",
+  "JOIN_FAILURE",
+  "MIGRATION",
+  "SIGNAL_CLOSE",
+  "ROOM_CLOSED",
+  "USER_UNAVAILABLE",
+  "USER_REJECTED",
+  "SIP_TRUNK_FAILURE",
+  "CONNECTION_TIMEOUT",
+  "MEDIA_FAILURE",
+  "AGENT_ERROR",
+];
+
 interface Varint {
   value: number;
   bytesRead: number;
@@ -176,11 +205,37 @@ function topLevelFields(bytes: Uint8Array): Field[] {
   return fields;
 }
 
+/**
+ * The reason and action inside a `LeaveRequest`, named.
+ *
+ * `leave` is the one message whose kind alone is not enough. It is how the SFU reports that
+ * it is ending the session, and "why" is the difference between a call that finished and a
+ * negotiation it refused.
+ */
+function leaveDetail(bytes: Uint8Array, leave: Field): string {
+  const body = bytes.subarray(leave.start, leave.start + leave.length);
+  const parts: string[] = [];
+  for (const f of topLevelFields(body)) {
+    // reason (2) and action (3); can_reconnect (1) and regions (4) say less than these do.
+    if (f.number === 2 || f.number === 3) {
+      const value = readVarint(body, f.start).value;
+      const names = f.number === 2 ? DISCONNECT_REASON : LEAVE_ACTION;
+      parts.push(`${f.number === 2 ? "reason" : "action"}=${names[value] ?? value}`);
+    }
+  }
+  return parts.length === 0 ? "" : ` ${parts.join(" ")}`;
+}
+
 /** The name of the oneof case set in a signalling message, e.g. `offer`, `join`. */
 export function describeSignal(bytes: Uint8Array, names: Record<number, string>): string {
   const fields = topLevelFields(bytes);
   if (fields.length === 0) return "empty";
-  return fields.map((f) => names[f.number] ?? `field ${f.number}`).join("+");
+  return fields
+    .map((f) => {
+      const name = names[f.number] ?? `field ${f.number}`;
+      return name === "leave" ? `leave${leaveDetail(bytes, f)}` : name;
+    })
+    .join("+");
 }
 
 export function describeRequest(bytes: Uint8Array): string {

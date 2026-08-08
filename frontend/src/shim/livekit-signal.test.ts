@@ -144,3 +144,18 @@ describe("the protocol-17 join request", () => {
     expect(described).not.toContain("rtpmap");
   });
 });
+
+describe("a leave from the SFU", () => {
+  it("names the reason and the action, which is the whole finding", () => {
+    // SignalResponse.leave (field 8) holding reason=STATE_MISMATCH, action=RECONNECT.
+    // The kind alone cannot distinguish a refused negotiation from a call that ended.
+    const leave = [/* reason */ 2 * 8, 6, /* action */ 3 * 8, 2];
+    expect(describeResponse(new Uint8Array(field(8, leave)))).toBe(
+      "leave reason=STATE_MISMATCH action=RECONNECT",
+    );
+  });
+
+  it("still names the message when the leave carries no reason", () => {
+    expect(describeResponse(new Uint8Array(field(8, [])))).toBe("leave");
+  });
+});
