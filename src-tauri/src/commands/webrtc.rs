@@ -426,8 +426,10 @@ fn route_pc_event(
             }
             None
         }
-        PcEvent::VideoData { mid, data } => {
-            let _ = routing.video_tx.try_send(PcEvent::VideoData { mid, data });
+        PcEvent::VideoData { mid, data, codec } => {
+            let _ = routing
+                .video_tx
+                .try_send(PcEvent::VideoData { mid, data, codec });
             None
         }
         PcEvent::EgressStats {

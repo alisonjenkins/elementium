@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use elementium_codec::Vp8Decoder;
+use elementium_codec::{NegotiatedDecoder, VideoCodec, VideoDecoder};
 
 use crate::engine::VideoFrameBuffer;
 use crate::peer_connection::PcEvent;
@@ -56,7 +56,10 @@ impl VideoPipeline {
             // (keyframe/interframe references), so interleaving two tracks' packets
             // through one decoder would corrupt both. Same class of bug as the audio
             // pipeline's per-mid Opus decoder fix.
-            let mut decoders: HashMap<String, Vp8Decoder> = HashMap::new();
+            // Keyed by mid *and* codec. A remote track that switches codec mid-call gets a
+            // fresh decoder rather than feeding H.264 to a VP8 decoder, which produces
+            // nothing and says nothing.
+            let mut decoders: HashMap<(String, VideoCodec), NegotiatedDecoder> = HashMap::new();
 
             tracing::info!(pc_id = %pc_id, "Video playback pipeline started");
 
@@ -71,18 +74,20 @@ impl VideoPipeline {
                 match event {
                     Some(PcEvent::VideoData {
                         mid,
-                        data: vp8_packet,
+                        data: packet,
+                        codec,
                     }) => {
-                        let decoder = match decoders.entry(mid.clone()) {
+                        let decoder = match decoders.entry((mid.clone(), codec)) {
                             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(v) => match Vp8Decoder::new()
-                            {
-                                Ok(d) => v.insert(d),
-                                Err(e) => {
-                                    tracing::error!(mid, error = %e, "Failed to create VP8 decoder for track");
-                                    continue;
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                match NegotiatedDecoder::new(codec) {
+                                    Ok(d) => v.insert(d),
+                                    Err(e) => {
+                                        tracing::error!(mid, ?codec, error = %e, "Failed to create decoder for track");
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                         };
 
                         // One display slot per track, not per connection.
@@ -94,7 +99,7 @@ impl VideoPipeline {
                         // two people, and no way to show the second at all. The decoders were
                         // already split per mid; only the display key was not.
                         let track_key = format!("{pc_id}-{mid}");
-                        match decoder.decode(&vp8_packet) {
+                        match VideoDecoder::decode(decoder, &packet) {
                             Ok(frames) => {
                                 for i420_frame in frames {
                                     // Convert I420 to RGBA for display
@@ -111,7 +116,7 @@ impl VideoPipeline {
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!(mid, "VP8 decode error: {e}");
+                                tracing::debug!(mid, ?codec, "video decode error: {e}");
                             }
                         }
                     }

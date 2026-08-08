@@ -988,7 +988,13 @@ fn process_transport_events(
     // native WebRTC path -- see `audio_pipeline.rs` -- and the same risk existed here
     // under an earlier, incorrect "only ever one subscriber stream" assumption).
     let mut opus_decoders: HashMap<String, elementium_codec::OpusDecoder> = HashMap::new();
-    let mut vp8_decoders: HashMap<String, elementium_codec::Vp8Decoder> = HashMap::new();
+    // Keyed by mid *and* codec: two remote participants on one subscriber connection can
+    // publish different codecs, and a decoder built for the wrong one silently decodes
+    // nothing.
+    let mut video_decoders: HashMap<
+        (String, elementium_codec::VideoCodec),
+        elementium_codec::NegotiatedDecoder,
+    > = HashMap::new();
     // Process-wide shared output stream, not a stream of its own -- see
     // `elementium_media::audio_playback::shared_sink` for why: this room's subscriber PC
     // is exactly the kind of second concurrent audio source (alongside the native WebRTC
@@ -1040,18 +1046,20 @@ fn process_transport_events(
             }
             Some(TransportEvent::SubscriberEvent(PcEvent::VideoData {
                 mid,
-                data: vp8_data,
+                data: video_data,
+                codec,
             })) => {
-                let decoder = match vp8_decoders.entry(mid.clone()) {
+                let decoder = match video_decoders.entry((mid.clone(), codec)) {
                     std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
                     std::collections::hash_map::Entry::Vacant(v) => {
-                        elementium_codec::Vp8Decoder::new()
+                        elementium_codec::NegotiatedDecoder::new(codec)
                             .ok()
                             .map(|d| v.insert(d))
                     }
                 };
                 if let Some(decoder) = decoder
-                    && let Ok(frames) = decoder.decode(&vp8_data)
+                    && let Ok(frames) =
+                        elementium_codec::VideoDecoder::decode(decoder, &video_data)
                 {
                     for i420_frame in frames {
                         let rgba = elementium_codec::i420_to_rgba(&i420_frame);

@@ -65,9 +65,18 @@ pub enum PcEvent<P = PlaintextMedia> {
         data: P,
         contiguous: bool,
     },
-    /// Received video data (VP8 packet) on a specific remote track. See `AudioData` for
-    /// why `mid` is required.
-    VideoData { mid: String, data: P },
+    /// Received video data on a specific remote track. See `AudioData` for why `mid` is
+    /// required.
+    ///
+    /// `codec` travels with the packet because the receive path cannot infer it. A remote
+    /// track's codec is whatever that peer chose to publish, so two tracks on one
+    /// connection can differ, and a decoder built for the wrong one produces nothing while
+    /// reporting nothing. It used to be assumed VP8 everywhere.
+    VideoData {
+        mid: String,
+        data: P,
+        codec: elementium_codec::VideoCodec,
+    },
     /// Aggregated outbound stats for one of our sending tracks, from RTCP receiver
     /// reports sent back by the peers.
     ///
@@ -181,6 +190,16 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         .clear_codecs()
         .enable_opus(true)
         .enable_vp8(true)
+        // H.264 as well as VP8. Not a preference between them -- an offer is not
+        // per-direction, so offering H.264 also says we will *receive* it, and until there
+        // was a decoder that was a promise we could not keep: a peer taking us up on it
+        // became a black tile with nothing to explain it. `NegotiatedDecoder` handles H.264
+        // now, and the receive path chooses the decoder and the E2EE framing from the codec
+        // that actually arrived rather than assuming VP8.
+        //
+        // VP8 stays enabled and stays first. Every peer supports it, and this changes what
+        // is *available*, not what is chosen.
+        .enable_h264(true)
         // Off by default in str0m, which means `Event::MediaEgressStats` never fires and
         // the RTCP receiver reports the peers are already sending us are parsed and then
         // thrown away. Those reports carry the fraction of our packets each peer failed
@@ -1210,10 +1229,20 @@ fn media_data_event(
             data: WireMedia::from_network(data.data),
             contiguous,
         })
-    } else if codec == Codec::Vp8 {
+    } else if codec == Codec::Vp8 || codec == Codec::H264 {
+        // H.264 arrives here as well as VP8, and the codec goes with it. Before this it
+        // fell through to "Unhandled codec ... dropping": a peer publishing H.264 was a
+        // black tile with a debug line nobody was reading, which is the same failure the
+        // decoder was added to remove and would have survived it.
+        let video = if codec == Codec::Vp8 {
+            elementium_codec::VideoCodec::Vp8
+        } else {
+            elementium_codec::VideoCodec::H264
+        };
         Some(PcEvent::VideoData {
             mid,
             data: WireMedia::from_network(data.data),
+            codec: video,
         })
     } else if codec == Codec::Unknown && pc.remote_mids.get(&data.mid) == Some(&MediaKind::Audio) {
         // Almost certainly RFC 2198 RED (str0m has no "red" Codec variant, so RED
@@ -1778,6 +1807,42 @@ mod offer_track_id_tests {
             "the new video transceiver must be added"
         );
         assert_ne!(pc.video_mid, pc.audio_mid);
+    }
+
+    /// The offer has to advertise H.264, or none of the H.264 work is reachable.
+    ///
+    /// Asserted on the SDP rather than on the config, because `enable_h264` returning a
+    /// builder proves nothing about what the far end is told. This is the one line that
+    /// decides whether a peer may publish H.264 to us at all.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_offer_advertises_both_video_codecs() {
+        let mut pc = create_peer_connection("test".to_owned());
+        let offer = create_offer(
+            &mut pc,
+            &[],
+            &[TransceiverInfo {
+                kind: MediaKind::Video,
+                direction: Direction::SendRecv,
+                track_id: Some("cid-video".to_owned()),
+            }],
+        )
+        .expect("offer");
+
+        let rtpmaps: Vec<&str> = offer
+            .sdp
+            .lines()
+            .filter(|l| l.starts_with("a=rtpmap:"))
+            .collect();
+        let joined = rtpmaps.join("\n");
+        assert!(
+            joined.contains("VP8/90000"),
+            "VP8 must stay offered; every peer supports it. got:\n{joined}"
+        );
+        assert!(
+            joined.contains("H264/90000"),
+            "H.264 must be offered now there is a decoder for it. got:\n{joined}"
+        );
     }
 
     /// livekit protocol 17 receives on the publisher connection: `onMediaSectionsRequirement`

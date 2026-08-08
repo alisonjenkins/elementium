@@ -157,9 +157,10 @@ pub(crate) fn maybe_decrypt_event(
                     contiguous,
                 })
             }
-            PcEvent::VideoData { mid, data } => Some(PcEvent::VideoData {
+            PcEvent::VideoData { mid, data, codec } => Some(PcEvent::VideoData {
                 mid,
                 data: PlaintextMedia::assume_peer_sends_unencrypted(data),
+                codec,
             }),
             other => passthrough(other),
         };
@@ -194,11 +195,27 @@ pub(crate) fn maybe_decrypt_event(
                 }
             }
         }
-        PcEvent::VideoData { mid, data } => {
-            match ctx.decrypt_frame_any(&data, E2eeMediaKind::VideoVp8) {
+        PcEvent::VideoData { mid, data, codec } => {
+            // The framing has to match the codec that was sent, not the one we usually
+            // send. VP8 and H.264 size their clear-text header differently and H.264
+            // RBSP-escapes its ciphertext, so decrypting an H.264 frame as VP8 authenticates
+            // against the wrong bytes and fails every time -- at the receiver only, which is
+            // precisely the failure the sending side cannot see.
+            let Some(kind) = video_media_kind(codec) else {
+                if should_report_drop() {
+                    tracing::warn!(
+                        %mid,
+                        ?codec,
+                        "E2EE dropping inbound video frame: no framing defined for this codec"
+                    );
+                }
+                return None;
+            };
+            match ctx.decrypt_frame_any(&data, kind) {
                 Ok(Some(decrypted)) => Some(PcEvent::VideoData {
                     mid,
                     data: decrypted,
+                    codec,
                 }),
                 Ok(None) => None,
                 Err(e) => {
