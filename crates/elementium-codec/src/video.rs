@@ -366,6 +366,8 @@ impl VideoEncoder for NegotiatedEncoder {
 pub enum NegotiatedDecoder {
     Vp8(crate::vpx_codec::Vp8Decoder),
     H264(crate::h264_codec::H264Decoder),
+    #[cfg(all(target_os = "linux", feature = "vaapi"))]
+    VaapiH264(crate::vaapi::h264_decode::H264Decoder),
 }
 
 impl NegotiatedDecoder {
@@ -377,7 +379,19 @@ impl NegotiatedDecoder {
     pub fn new(codec: VideoCodec) -> Result<Self, String> {
         match codec {
             VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Decoder::new()?)),
-            VideoCodec::H264 => Ok(Self::H264(crate::h264_codec::H264Decoder::new()?)),
+            VideoCodec::H264 => {
+                // Hardware first, software if it is not there. Decode is the side that
+                // must never fail, so the fallback is not a fallback in name only: a
+                // machine with no GPU, or a driver that encodes H.264 but will not decode
+                // it, gets a working picture rather than a black tile.
+                #[cfg(all(target_os = "linux", feature = "vaapi"))]
+                if let Ok(hw) = crate::vaapi::h264_decode::H264Decoder::new() {
+                    tracing::info!("H.264 will be decoded on the GPU");
+                    return Ok(Self::VaapiH264(hw));
+                }
+                tracing::info!("H.264 will be decoded in software");
+                Ok(Self::H264(crate::h264_codec::H264Decoder::new()?))
+            }
             VideoCodec::Av1 => Err(format!(
                 "no decoder available for {} on this build",
                 codec.sdp_name()
@@ -391,6 +405,8 @@ impl VideoDecoder for NegotiatedDecoder {
         match self {
             Self::Vp8(d) => d.codec(),
             Self::H264(d) => VideoDecoder::codec(d),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(d) => VideoDecoder::codec(d),
         }
     }
 
@@ -398,6 +414,8 @@ impl VideoDecoder for NegotiatedDecoder {
         match self {
             Self::Vp8(d) => VideoDecoder::decode(d, data),
             Self::H264(d) => VideoDecoder::decode(d, data),
+            #[cfg(all(target_os = "linux", feature = "vaapi"))]
+            Self::VaapiH264(d) => VideoDecoder::decode(d, data),
         }
     }
 }
@@ -518,5 +536,34 @@ mod tests {
         assert_eq!(VideoCodec::from_mime("VP8"), Some(VideoCodec::Vp8));
         assert_eq!(VideoCodec::from_mime("audio/opus"), None);
         assert_eq!(VideoCodec::from_mime(""), None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod decoder_selection_tests {
+    use super::{NegotiatedDecoder, VideoCodec, VideoDecoder};
+
+    /// Whichever backend is chosen, it must decode the codec that was asked for.
+    ///
+    /// The selection is by availability, so this is one of the few places where the answer
+    /// legitimately differs between machines -- which is exactly why the *contract* is
+    /// asserted rather than the branch taken.
+    #[test]
+    fn the_chosen_h264_decoder_decodes_h264() {
+        let decoder = NegotiatedDecoder::new(VideoCodec::H264).expect("some H.264 decoder");
+        assert_eq!(VideoDecoder::codec(&decoder), VideoCodec::H264);
+    }
+
+    #[test]
+    fn vp8_is_still_available() {
+        let decoder = NegotiatedDecoder::new(VideoCodec::Vp8).expect("VP8 decoder");
+        assert_eq!(VideoDecoder::codec(&decoder), VideoCodec::Vp8);
+    }
+
+    /// AV1 has no decoder on any path, and must say so rather than pick a wrong one.
+    #[test]
+    fn av1_is_refused_rather_than_substituted() {
+        assert!(NegotiatedDecoder::new(VideoCodec::Av1).is_err());
     }
 }

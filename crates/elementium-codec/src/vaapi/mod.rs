@@ -14,6 +14,7 @@
 pub mod bitstream;
 pub mod display;
 pub mod h264;
+pub mod h264_decode;
 pub mod h264_params;
 pub mod image;
 pub mod jpeg;

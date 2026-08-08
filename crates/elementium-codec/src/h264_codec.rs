@@ -59,24 +59,49 @@ impl H264Decoder {
             match self.inner.decode(nal) {
                 Ok(Some(yuv)) => {
                     let (width, height) = yuv.dimensions();
-                    let (w, h) = (
+                    let (pic_w, pic_h) = (
                         u32::try_from(width).map_err(|_| "H264 decode: implausible width")?,
                         u32::try_from(height).map_err(|_| "H264 decode: implausible height")?,
                     );
                     if !self.reported {
                         self.reported = true;
-                        tracing::info!(width = w, height = h, "H264 decoder produced its first frame");
+                        tracing::info!(width = pic_w, height = pic_h, "H264 decoder produced its first frame");
                     }
-                    // `from_padded` would avoid a copy, but openh264 hands back three
-                    // separately-allocated planes rather than one padded buffer, so there is
-                    // no single allocation to adopt. Copying into packed planes is the
-                    // honest option; pretending otherwise would mean fabricating strides.
+                    // Copied row by row, honouring openh264's strides.
+                    //
+                    // Its planes are padded: the stride is the allocation's width, which is
+                    // wider than the picture. Handing those slices straight to
+                    // `from_planes`, which packs rows at exactly `width`, skews every row
+                    // after the first by the padding -- a picture that is the right size,
+                    // the right colours and the wrong shape. Found by decoding the same
+                    // stream in hardware and comparing, which is the only reason it was
+                    // ever noticed: the frame looked entirely plausible on its own.
+                    let (y_stride, u_stride, v_stride) = yuv.strides();
+                    let packed = |plane: &[u8], stride: usize, width: usize, rows: usize| {
+                        let mut out = Vec::with_capacity(width.saturating_mul(rows));
+                        for row in 0..rows {
+                            let start = row.saturating_mul(stride);
+                            match plane.get(start..start.saturating_add(width)) {
+                                Some(line) => out.extend_from_slice(line),
+                                None => return None,
+                            }
+                        }
+                        Some(out)
+                    };
+                    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+                    let (Some(luma), Some(chroma_b), Some(chroma_r)) = (
+                        packed(yuv.y(), y_stride, width, height),
+                        packed(yuv.u(), u_stride, cw, ch),
+                        packed(yuv.v(), v_stride, cw, ch),
+                    ) else {
+                        return Err("H264 decode: a plane is smaller than its stride implies".to_owned());
+                    };
                     let frame = I420Frame::from_planes(
-                        w,
-                        h,
-                        yuv.y(),
-                        yuv.u(),
-                        yuv.v(),
+                        pic_w,
+                        pic_h,
+                        &luma,
+                        &chroma_b,
+                        &chroma_r,
                         // Zero, as the VP8 decoder does. A decoded frame's presentation
                         // time comes from the RTP timestamp on the receive path, not from
                         // the codec, and inventing one here would put a second, disagreeing
@@ -84,7 +109,7 @@ impl H264Decoder {
                         0,
                     )
                     .ok_or_else(|| {
-                        format!("H264 decode: {w}x{h} planes too small for the stated geometry")
+                        format!("H264 decode: {pic_w}x{pic_h} planes too small for the stated geometry")
                     })?;
                     frames.push(frame);
                 }

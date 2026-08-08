@@ -17,6 +17,8 @@ is answering a question nobody asked.
 - [X] T017 [US1] **Done** — software openh264, wired into `NegotiatedDecoder`. Software rather than VAAPI on purpose: decode is the side that must not fail, and a decoder available only where the encoder is would leave the black tile on exactly the machines least able to diagnose it. Proved by a round trip against the real VAAPI encoder, which fails when the decoder returns no picture. **Unblocks T013 and T016.** Original task follows. An H.264 decoder, so a peer publishing H.264 is not a black tile. `NegotiatedDecoder` has only `Vp8`, and the inbound path decodes every video frame with a `Vp8Decoder`. Prerequisite for T013
 - [ ] T016 [US1] Confirm against a real peer that H.264 video is decrypted and displayed, not merely negotiated — the failure mode T015 describes is invisible from the sending side
 
+- [X] T018 [US1] **Hardware H.264 decode through VAAPI**, chosen when the driver has it and falling back to software when it does not. Proved by decoding the same stream both ways and comparing pixels — which immediately found that the *software* decoder had been ignoring openh264's plane strides and skewing every row after the first. Neither decoder alone could have shown that: each produced a plausible picture on its own.
+
 ## Phase 2: Prove the saving
 
 - [ ] T004 [US2] Measure CPU per frame on the software path with a real camera, as a baseline (the capture counters added for the frame-rate work already report decode cost)
