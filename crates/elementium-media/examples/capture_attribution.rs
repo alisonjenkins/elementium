@@ -18,6 +18,138 @@
 
 use std::time::{Duration, Instant};
 
+/// Ask the `XDG` desktop portal for a screencast `PipeWire` node id.
+///
+/// The same call `elementium-screen`'s Wayland capturer makes (see
+/// `crates/elementium-screen/src/wayland.rs`), duplicated here rather than depended on:
+/// `elementium-screen` depends on `elementium-media`, so pulling it in from this side would
+/// be circular. Shows a picker dialog and blocks until a person chooses -- deliberately
+/// unbounded, since a timeout would cancel a dialog someone was still reading.
+#[cfg(target_os = "linux")]
+async fn request_screencast_node() -> Result<u32, String> {
+    use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+
+    let proxy = Screencast::new().await.map_err(|e| e.to_string())?;
+    let session = proxy.create_session().await.map_err(|e| e.to_string())?;
+
+    proxy
+        .select_sources(
+            &session,
+            CursorMode::Embedded,
+            SourceType::Monitor | SourceType::Window,
+            false,
+            None,
+            ashpd::desktop::PersistMode::DoNot,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let response = proxy
+        .start(&session, None)
+        .await
+        .map_err(|e| e.to_string())?
+        .response()
+        .map_err(|e| e.to_string())?;
+
+    response
+        .streams()
+        .first()
+        .map(ashpd::desktop::screencast::Stream::pipe_wire_node_id)
+        .ok_or_else(|| "the portal returned no streams; the picker was probably cancelled".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::print_stdout)]
+/// Block on the portal exchange and open the granted node as a `VideoSource`.
+///
+/// Synchronous on purpose, like the rest of this example: a short-lived runtime runs just
+/// the async portal call, matching how `WaylandCapturer::start` does it, so the measurement
+/// loop below never has to know `async` was involved.
+fn open_screencast_source(
+    target: elementium_codec::EncodeTarget,
+) -> Result<elementium_media::video_source::VideoSource, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("runtime: {e}"))?;
+    let node_id = runtime.block_on(request_screencast_node())?;
+    println!("portal granted node {node_id}; opening it directly");
+    elementium_media::video_source::VideoSource::start_screencast(node_id, target)
+}
+
+/// Counters produced by running the measurement loop for [`SECONDS`].
+struct Measurement {
+    received: u64,
+    span: f64,
+    cpu_used: f64,
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+/// Run the same receive loop the camera path uses, against anything that hands back frames.
+///
+/// Pulled out so `--screen` and the camera paths measure identically -- the point of this
+/// example is comparing the two, which is only valid if both are timed the same way.
+fn measure(try_recv: impl Fn() -> Option<elementium_media::captured_frame::CapturedFrame>) -> Measurement {
+    let cpu_before = cpu_seconds();
+    let deadline = Instant::now().checked_add(Duration::from_secs(SECONDS)).unwrap_or_else(Instant::now);
+    let mut received = 0_u64;
+    let mut first_at: Option<Instant> = None;
+    let mut last_at: Option<Instant> = None;
+    while Instant::now() < deadline {
+        if try_recv().is_some() {
+            received = received.saturating_add(1);
+            let now = Instant::now();
+            first_at.get_or_insert(now);
+            last_at = Some(now);
+        } else {
+            // Short enough not to be the reason a frame is late, long enough not to spin.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let span = match (first_at, last_at) {
+        (Some(first), Some(last)) => last.saturating_duration_since(first).as_secs_f64(),
+        _ => 0.0,
+    };
+    Measurement { received, span, cpu_used: cpu_seconds() - cpu_before }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    clippy::print_stdout,
+    clippy::arithmetic_side_effects
+)]
+/// Print the counters shared by every capture path, so screen and camera runs read the same.
+fn report(m: &Measurement) {
+    let delivered_fps = if m.span > 0.0 {
+        (m.received.saturating_sub(1)) as f64 / m.span
+    } else {
+        0.0
+    };
+    let expected = f64::from(TARGET_FPS) * m.span;
+
+    println!();
+    println!("  frames the consumer received: {}", m.received);
+    println!("  process CPU during capture: {:.2}s", m.cpu_used);
+    if m.received > 0 {
+        let per_frame_ms = m.cpu_used * 1000.0 / m.received as f64;
+        println!("  process CPU per frame: {per_frame_ms:.2}ms");
+    }
+    println!("  over: {:.1}s", m.span);
+    println!("  delivered rate: {delivered_fps:.1}fps against {TARGET_FPS} requested");
+    println!("  expected at the requested rate: {expected:.0}");
+    println!();
+    println!("The `capture decode cost` lines above carry the attribution:");
+    println!("  offered      -- buffers the camera actually handed us");
+    println!("  rate_limited -- dropped by us to hold {TARGET_FPS}fps");
+    println!("  queue_full   -- dropped because this consumer was too slow");
+    println!("  unusable     -- dropped because the buffer could not be decoded");
+    println!();
+    println!("If offered is near {expected:.0} and rate_limited is most of the gap, the");
+    println!("camera is fine and the limiter is doing its job. If offered is far below it,");
+    println!("the camera does not sustain {TARGET_FPS}fps and no fix on our side changes that.");
+}
+
 #[allow(clippy::arithmetic_side_effects)]
 /// The first enumerated source that actually delivers a frame.
 ///
@@ -84,35 +216,12 @@ fn cpu_seconds() -> f64 {
 const TARGET_FPS: u32 = 30;
 const SECONDS: u64 = 15;
 
-#[allow(
-    clippy::print_stdout,
-    clippy::expect_used,
-    clippy::arithmetic_side_effects,
-    clippy::cast_precision_loss,
-    clippy::as_conversions
-)]
-fn main() {
-    // Which capture target to measure. The two differ in what the CPU does per frame: the
-    // software path decodes MJPEG on the CPU and converts to I420, the hardware path hands
-    // the JPEG to the GPU and asks for NV12 back. The claim this checks is that the second
-    // costs materially less CPU per frame -- which is the whole reason for the hardware
-    // path, and which nothing had measured.
-    let hardware = std::env::args().any(|a| a == "--hardware");
-    let target = if hardware {
-        elementium_codec::EncodeTarget::negotiated(elementium_codec::VideoCodec::H264, 1280, 720)
-    } else {
-        elementium_codec::EncodeTarget::software()
-    };
-
-    // `info`, because the attribution this exists to read is logged at info by the capture
-    // path itself -- the example's own numbers are only the consumer's half of it.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+#[allow(clippy::print_stdout)]
+/// Enumerate cameras, pick a delivering one, and measure it.
+///
+/// Split out of `main` so the camera and `--screen` paths are two short, parallel branches
+/// rather than one function that decides half-way through which source it is measuring.
+fn run_camera(target: elementium_codec::EncodeTarget) {
     let sources = match elementium_media::pipewire_nodes::list_video_sources() {
         Ok(list) if !list.is_empty() => list,
         Ok(_) => {
@@ -128,53 +237,66 @@ fn main() {
         println!("no source delivered a frame; nothing to measure");
         return;
     };
-    let cpu_before = cpu_seconds();
-    let deadline = Instant::now() + Duration::from_secs(SECONDS);
-    let mut received = 0_u64;
-    let mut first_at: Option<Instant> = None;
-    let mut last_at: Option<Instant> = None;
-    while Instant::now() < deadline {
-        if let Some(_frame) = capturer.try_recv() {
-            received += 1;
-            let now = Instant::now();
-            first_at.get_or_insert(now);
-            last_at = Some(now);
-        } else {
-            // Short enough not to be the reason a frame is late, long enough not to spin.
-            std::thread::sleep(Duration::from_millis(1));
+    let m = measure(|| capturer.try_recv());
+    report(&m);
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::print_stdout)]
+/// Ask the portal for a screencast node, open it, and measure it the same way.
+fn run_screen(target: elementium_codec::EncodeTarget) {
+    let source = match open_screencast_source(target) {
+        Ok(source) => source,
+        Err(e) => {
+            println!("could not start screencast capture: {e}");
+            return;
         }
-    }
-
-    let span = match (first_at, last_at) {
-        (Some(first), Some(last)) => last.saturating_duration_since(first).as_secs_f64(),
-        _ => 0.0,
     };
-    let delivered_fps = if span > 0.0 {
-        (received.saturating_sub(1)) as f64 / span
+    let m = measure(|| source.try_recv());
+    report(&m);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::print_stdout)]
+/// The portal this relies on is Linux-only (`org.freedesktop.portal.ScreenCast`).
+fn run_screen(_target: elementium_codec::EncodeTarget) {
+    println!("--screen needs the XDG desktop portal, which this platform does not have");
+}
+
+#[allow(
+    clippy::print_stdout,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    clippy::cast_precision_loss,
+    clippy::as_conversions
+)]
+fn main() {
+    // Which capture target to measure. The two differ in what the CPU does per frame: the
+    // software path decodes MJPEG on the CPU and converts to I420, the hardware path hands
+    // the JPEG to the GPU and asks for NV12 back. The claim this checks is that the second
+    // costs materially less CPU per frame -- which is the whole reason for the hardware
+    // path, and which nothing had measured.
+    let args: Vec<String> = std::env::args().collect();
+    let hardware = args.iter().any(|a| a == "--hardware");
+    let screen = args.iter().any(|a| a == "--screen");
+    let target = if hardware {
+        elementium_codec::EncodeTarget::negotiated(elementium_codec::VideoCodec::H264, 1280, 720)
     } else {
-        0.0
+        elementium_codec::EncodeTarget::software()
     };
-    let expected = f64::from(TARGET_FPS) * span;
 
-    let cpu_used = cpu_seconds() - cpu_before;
-    println!();
-    println!("  frames the consumer received: {received}");
-    println!("  process CPU during capture: {cpu_used:.2}s");
-    if received > 0 {
-        let per_frame_ms = cpu_used * 1000.0 / received as f64;
-        println!("  process CPU per frame: {per_frame_ms:.2}ms");
+    // `info`, because the attribution this exists to read is logged at info by the capture
+    // path itself -- the example's own numbers are only the consumer's half of it.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    if screen {
+        run_screen(target);
+    } else {
+        run_camera(target);
     }
-    println!("  over: {span:.1}s");
-    println!("  delivered rate: {delivered_fps:.1}fps against {TARGET_FPS} requested");
-    println!("  expected at the requested rate: {expected:.0}");
-    println!();
-    println!("The `capture decode cost` lines above carry the attribution:");
-    println!("  offered      -- buffers the camera actually handed us");
-    println!("  rate_limited -- dropped by us to hold {TARGET_FPS}fps");
-    println!("  queue_full   -- dropped because this consumer was too slow");
-    println!("  unusable     -- dropped because the buffer could not be decoded");
-    println!();
-    println!("If offered is near {expected:.0} and rate_limited is most of the gap, the");
-    println!("camera is fine and the limiter is doing its job. If offered is far below it,");
-    println!("the camera does not sustain {TARGET_FPS}fps and no fix on our side changes that.");
 }

@@ -27,6 +27,12 @@ zune-core = "0.5.1"
 tracing-subscriber = { workspace = true }
 elementium-observability-test = { workspace = true }
 jpeg-encoder = "0.7.1"
+# For the capture_attribution example's --screen mode: it needs the same portal call
+# elementium-screen already makes, but depending on that crate from here would be a
+# dependency in the wrong direction (elementium-screen depends on elementium-media, not the
+# other way round), so the example makes the portal call directly instead.
+ashpd = { version = "0.11", features = ["tokio"] }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

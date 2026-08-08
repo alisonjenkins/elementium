@@ -99,6 +99,35 @@ impl VideoSource {
         }
     }
 
+    /// Start capturing a screen the `XDG` desktop portal has already granted.
+    ///
+    /// The camera paths above exist because *which* device to open is unknown until it is
+    /// discovered by enumeration. Screen capture has no such question: the portal's picker
+    /// dialog is the discovery step, and by the time it returns, `node_id` is the one and
+    /// only source the user chose. Enumerating again here would be pointless -- there is
+    /// nothing else to compare it against -- and would also be wrong, since a screencast
+    /// node is not a camera and would not appear in [`crate::pipewire_nodes::list_video_sources`]
+    /// in the first place.
+    ///
+    /// Everything below the node id is identical to the camera path: it is the same
+    /// `PipeWire` variant, opened directly instead of found by search, because frames from a
+    /// portal-granted node arrive over `PipeWire` exactly as camera frames do.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of why the `PipeWire` connection to `node_id` failed. There is
+    /// no fallback to try, unlike [`VideoSource::start_at`] -- `V4L2` cannot open a node the
+    /// portal handed out, so there is nothing a second attempt could do differently.
+    pub fn start_screencast(
+        node_id: u32,
+        target: elementium_codec::EncodeTarget,
+    ) -> Result<Self, String> {
+        let capturer =
+            PipewireCapturer::start_at(node_id, crate::pipewire_capture::DEFAULT_CAPTURE_FPS, target)
+                .map_err(|e| e.to_string())?;
+        Ok(Self::Pipewire(capturer))
+    }
+
     /// The next frame, if one is waiting.
     ///
     /// Not always pixels: see [`CapturedFrame`]. The `V4L2` path always decodes, since
