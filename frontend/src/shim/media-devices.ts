@@ -6,6 +6,71 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvasTrack } from "./canvas-track";
 
+/**
+ * Notice devices appearing and disappearing, and tell listeners.
+ *
+ * The shim used to forward `devicechange` to the real `navigator.mediaDevices`, which in
+ * this webview never sees the devices the app actually uses — those are enumerated in Rust.
+ * So plugging in a headset mid-call changed nothing the picker could see, and the user had
+ * to leave and rejoin to select it.
+ *
+ * Polled rather than pushed, and only while somebody is listening. PipeWire and cpal both
+ * have hotplug signals and forwarding them would be better, but that is a Rust-side change
+ * of its own; this closes the user-visible gap without pretending to be event-driven.
+ * Nothing polls when no listener is registered, so the cost is zero in the normal case.
+ */
+class DeviceWatcher extends EventTarget {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private fingerprint: string | null = null;
+  private listeners = 0;
+
+  /** Compare device lists by identity and label, not by count. */
+  static fingerprintOf(devices: NativeMediaDevice[]): string {
+    return devices
+      .map((d) => `${d.kind}:${d.id}:${d.label}`)
+      .sort()
+      .join("|");
+  }
+
+  start(): void {
+    this.listeners += 1;
+    if (this.timer !== null) return;
+    // Four seconds: fast enough that plugging something in feels responsive, slow enough
+    // that an idle call is not enumerating audio devices constantly.
+    this.timer = setInterval(() => void this.poll(), 4_000);
+  }
+
+  stop(): void {
+    this.listeners = Math.max(0, this.listeners - 1);
+    if (this.listeners > 0 || this.timer === null) return;
+    clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  private async poll(): Promise<void> {
+    let devices: NativeMediaDevice[];
+    try {
+      devices = await invoke<NativeMediaDevice[]>("enumerate_devices");
+    } catch (e) {
+      // An enumeration that failed says nothing about what is plugged in. Treating it as
+      // "no devices" would fire a spurious change and blank the picker.
+      debugLog(`device watch: enumeration failed: ${String(e)}`);
+      return;
+    }
+    const next = DeviceWatcher.fingerprintOf(devices);
+    const previous = this.fingerprint;
+    this.fingerprint = next;
+    if (previous !== null && previous !== next) {
+      this.dispatchEvent(new Event("devicechange"));
+    }
+  }
+}
+
+const deviceWatcher = new DeviceWatcher();
+
+/** The single `ondevicechange` property handler, kept apart from `addEventListener` ones. */
+let ondevicechangeHandler: EventListener | null = null;
+
 interface NativeMediaDevice {
   id: string;
   label: string;
@@ -261,11 +326,34 @@ export function setupMediaDevicesShim(): void {
       }
     },
 
-    // Forward events
-    ondevicechange: original?.ondevicechange ?? null,
-    addEventListener: original?.addEventListener?.bind(original) ?? (() => {}),
-    removeEventListener: original?.removeEventListener?.bind(original) ?? (() => {}),
-    dispatchEvent: original?.dispatchEvent?.bind(original) ?? (() => false),
+    // Events come from this shim's own watcher, not from the real `navigator.mediaDevices`.
+    // The real one enumerates the webview's devices, which are not the ones this app uses,
+    // so it could never fire for a device the user actually plugged in.
+    set ondevicechange(handler: ((ev: Event) => unknown) | null) {
+      if (ondevicechangeHandler) {
+        deviceWatcher.removeEventListener("devicechange", ondevicechangeHandler);
+        deviceWatcher.stop();
+      }
+      ondevicechangeHandler = handler as EventListener | null;
+      if (ondevicechangeHandler) {
+        deviceWatcher.addEventListener("devicechange", ondevicechangeHandler);
+        deviceWatcher.start();
+      }
+    },
+    get ondevicechange(): ((ev: Event) => unknown) | null {
+      return ondevicechangeHandler as ((ev: Event) => unknown) | null;
+    },
+    addEventListener: (type: string, listener: EventListenerOrEventListenerObject | null) => {
+      if (type !== "devicechange" || !listener) return;
+      deviceWatcher.addEventListener(type, listener);
+      deviceWatcher.start();
+    },
+    removeEventListener: (type: string, listener: EventListenerOrEventListenerObject | null) => {
+      if (type !== "devicechange" || !listener) return;
+      deviceWatcher.removeEventListener(type, listener);
+      deviceWatcher.stop();
+    },
+    dispatchEvent: (event: Event) => deviceWatcher.dispatchEvent(event),
   };
 
   Object.defineProperty(navigator, "mediaDevices", {
