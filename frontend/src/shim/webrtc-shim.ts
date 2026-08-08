@@ -762,6 +762,22 @@ class ElementiumRTCPeerConnection extends EventTarget {
       dtmf: null,
       transport: null,
       transform: null as unknown,
+      /**
+       * Swap the track this sender reports, which is all it has to do here.
+       *
+       * In a browser this re-points an encoder at a different source. In this app the
+       * encoder lives in Rust, keyed by track identity (camera, screen share) rather than
+       * by the `MediaStreamTrack` object the page holds — and a caller only reaches this
+       * having already obtained the replacement from `getUserMedia`, which restarts the
+       * capture pipeline for that key and inherits its peer connection. The media on the
+       * wire has therefore already changed by the time this runs.
+       *
+       * It looked like the reason device switching did not work, and it was not: the cause
+       * was `getUserMedia` ignoring `device_id`, so the "new" track came from the same
+       * camera as the old one. That is fixed in the Rust capture path. Left as a field
+       * assignment deliberately, with this note, so the next person does not add a second
+       * mechanism for something that already happened.
+       */
       replaceTrack: async (newTrack: MediaStreamTrack | null) => {
         (sender as unknown as Record<string, unknown>).track = newTrack;
       },

@@ -270,17 +270,32 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
         );
     };
 
+    // Reported once rather than per callback: the condition is permanent and this runs in a
+    // real-time audio thread.
+    let consumer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream = device
         .build_input_stream(
             config,
             move |data: &[T], _info: &cpal::InputCallbackInfo| {
                 let samples: Vec<f32> = data.iter().map(|&s| s.into()).collect();
-                let _ = tx.send(AudioFrame {
-                    sample_rate,
-                    channels,
-                    data: samples,
-                    timestamp_us: 0,
-                });
+                // A failed send means the consumer is gone while cpal keeps calling this
+                // every few milliseconds: the microphone is live and nothing is listening.
+                // Reported once — this is a real-time audio callback, and logging per frame
+                // from inside one is its own fault.
+                if tx
+                    .send(AudioFrame {
+                        sample_rate,
+                        channels,
+                        data: samples,
+                        timestamp_us: 0,
+                    })
+                    .is_err()
+                    && !consumer_gone.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        "the microphone's consumer is gone; captured audio is being discarded"
+                    );
+                }
             },
             err_fn,
             None,
