@@ -73,6 +73,34 @@ function byName(pattern: RegExp): () => HTMLElement | null {
 }
 
 /**
+ * Answer `https://localhost/.well-known/matrix/client` from the homeserver's own copy.
+ *
+ * matrix-js-sdk discovers well-known from the *server name*, not the homeserver URL, and
+ * builds `https://<server_name>/.well-known/matrix/client` with the scheme hardcoded. This
+ * homeserver is named `localhost`, so that is port 443 -- which nothing in this stack serves
+ * and could not without root and a certificate.
+ *
+ * The request fails, the client caches an empty well-known, and Element Call refuses to
+ * start with "Call is not supported. The server is not configured to work with Element Call"
+ * -- which sends you to the server configuration, where the focus is present and correct.
+ *
+ * The Playwright harness solves this with `page.route`; the application has no equivalent,
+ * so the fetch is patched here. Test-only, like the rest of this file.
+ */
+function serveWellKnown(cfg: AutoJoinConfig): void {
+  const target = "https://localhost/.well-known/matrix/client";
+  const original = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.startsWith(target)) {
+      log("answering well-known discovery from the local homeserver");
+      return original(`${cfg.homeserver}/.well-known/matrix/client`, init);
+    }
+    return original(input, init);
+  };
+}
+
+/**
  * Put the session into storage before Element Web reads it.
  *
  * The same approach the Playwright harness uses, and for the same reason: driving the login
@@ -113,6 +141,7 @@ function dismissVerificationPrompt(): void {
 
 /** The main window: get into the room, then open the call. */
 async function driveElementWeb(cfg: AutoJoinConfig): Promise<void> {
+  serveWellKnown(cfg);
   seedSession(cfg);
   if (!location.hash.includes(cfg.roomId)) location.hash = `#/room/${cfg.roomId}`;
 
@@ -169,13 +198,19 @@ function refuseVideo(): void {
  * webcam -- only `video: false` in the config, which refuses it at the request.
  */
 async function driveElementCall(cfg: AutoJoinConfig): Promise<void> {
+  // The widget is a separate document with its own client, so it repeats the discovery the
+  // main window just did and needs the same answer.
+  serveWellKnown(cfg);
   if (!cfg.video) refuseVideo();
   await waitFor("the lobby", byName(/^join call$/i));
 
   (await waitFor("the join button", byName(/^join call$/i))).click();
   log("join clicked");
 
-  await waitFor("the in-call controls", byName(/end call|leave/i));
+  // Joined is "the lobby is gone", not "a hang-up button matching some name appeared".
+  // Matching a control by name made this report failure while the call was up and
+  // publishing, because the name differs between Element Call builds.
+  await waitFor("the lobby to close", () => (byName(/^join call$/i)() ? null : document.body));
   log("in the call");
 }
 
