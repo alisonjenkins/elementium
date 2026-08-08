@@ -10,6 +10,12 @@
 //! second device node for metadata, which enumerates as a camera but has no usable format.
 //! `PipeWire` only advertises real sources, so the list it gives is the list a user would
 //! recognise.
+//!
+//! This module also enumerates audio sources suitable for *share audio* -- the sound of a
+//! shared screen or application, as distinct from the microphone. Two `media.class` values
+//! matter: `Audio/Sink`, a device sink whose monitor carries the whole desktop mix, and
+//! `Stream/Output/Audio`, one application's own playback. Confirmed against a real `pw-dump`
+//! on this machine (see [`AudioSourceClass`]) rather than assumed from documentation.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -137,9 +143,139 @@ pub fn is_video_source_class(media_class: &str) -> bool {
     media_class == "Video/Source" || media_class.starts_with("Video/Source/")
 }
 
+/// A `PipeWire` audio node offered as a possible source of *share audio*: the sound of a
+/// shared screen or application, captured separately from the microphone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipewireAudioSource {
+    /// Global id, used to connect a stream to this node.
+    pub node_id: u32,
+    /// Stable machine name, e.g. `alsa_output.pci-0000_00_1f.3.analog-stereo` or `Zen`.
+    pub name: String,
+    /// Human-readable name, when the node advertises one. Application streams commonly do
+    /// not -- `node.description` was empty for every `Stream/Output/Audio` node observed on
+    /// this machine, leaving `name` (the browser's own `node.name`, e.g. `Zen`) as the only
+    /// human-legible label.
+    pub description: String,
+    /// Which relationship this node has to the audio graph, and so how it must be captured.
+    pub class: AudioSourceClass,
+    /// The PID of the process that owns this node, when `PipeWire` reports one.
+    ///
+    /// Only ever present on application streams, never on a device sink -- a sink is not
+    /// owned by any one process. This is the candidate handle for correlating a shared
+    /// window (which the XDG portal identifies, but never with audio) to the application
+    /// whose audio should follow it; nothing consumes it yet, but capturing it here is what
+    /// makes that matching possible later.
+    pub application_pid: Option<u32>,
+}
+
+/// Which relationship a `PipeWire` audio node has to the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSourceClass {
+    /// `Audio/Sink`: a device sink. Not itself readable -- capturing it means capturing its
+    /// *monitor*, which mirrors the whole mix being played to it.
+    Sink,
+    /// `Stream/Output/Audio`: one running application's own playback.
+    AppStream,
+}
+
+impl AudioSourceClass {
+    /// Map a `media.class` string onto a share-audio source category, or `None` if it names
+    /// something else -- a microphone (`Audio/Source`), a capture-side stream
+    /// (`Stream/Input/Audio`, which is what something *recording* looks like, not what is
+    /// playing), or an unrelated class entirely.
+    #[must_use]
+    pub fn from_media_class(media_class: &str) -> Option<Self> {
+        match media_class {
+            "Audio/Sink" => Some(Self::Sink),
+            "Stream/Output/Audio" => Some(Self::AppStream),
+            _ => None,
+        }
+    }
+}
+
+/// List every `PipeWire` audio node suitable as a share-audio source: device sinks (captured
+/// via their monitor) and individual application playback streams.
+///
+/// # Errors
+///
+/// Returns [`PipewireError`] if the `PipeWire` library cannot be initialised or no
+/// connection to the daemon can be made.
+pub fn list_audio_sources() -> Result<Vec<PipewireAudioSource>, PipewireError> {
+    pipewire::init();
+
+    let mainloop = pipewire::main_loop::MainLoopRc::new(None)
+        .map_err(|e| PipewireError::Init(e.to_string()))?;
+    let context = pipewire::context::ContextRc::new(&mainloop, None)
+        .map_err(|e| PipewireError::Init(e.to_string()))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| PipewireError::Connect(e.to_string()))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| PipewireError::Connect(e.to_string()))?;
+
+    let found: Arc<Mutex<Vec<PipewireAudioSource>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&found);
+
+    let _listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if let Some(source) = audio_source_from_global(global)
+                && let Ok(mut list) = sink.lock()
+            {
+                list.push(source);
+            }
+        })
+        .register();
+
+    // Same settle-and-collect approach as video enumeration: globals are announced
+    // asynchronously with no completion event.
+    let timer_loop = mainloop.clone();
+    let timer = mainloop.loop_().add_timer(move |_| {
+        timer_loop.quit();
+    });
+    let _ = timer.update_timer(Some(ENUMERATION_SETTLE), None);
+    mainloop.run();
+
+    let sources = found.lock().map(|g| g.clone()).unwrap_or_default();
+    tracing::info!(count = sources.len(), "PipeWire audio sources enumerated");
+    for s in &sources {
+        tracing::info!(
+            node_id = s.node_id,
+            name = %s.name,
+            description = %s.description,
+            class = ?s.class,
+            application_pid = s.application_pid,
+            "PipeWire audio source"
+        );
+    }
+    Ok(sources)
+}
+
+/// Interpret a registry global as a share-audio source, or `None` if it is something else.
+fn audio_source_from_global(
+    global: &pipewire::registry::GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+) -> Option<PipewireAudioSource> {
+    let props = global.props?;
+    let class = AudioSourceClass::from_media_class(props.get("media.class")?)?;
+    Some(PipewireAudioSource {
+        node_id: global.id,
+        name: props.get("node.name").unwrap_or_default().to_owned(),
+        description: props
+            .get("node.description")
+            .or_else(|| props.get("node.nick"))
+            .unwrap_or_default()
+            .to_owned(),
+        class,
+        application_pid: props
+            .get("application.process.id")
+            .and_then(|pid| pid.parse().ok()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_video_source_class;
+    use super::{AudioSourceClass, is_video_source_class};
 
     #[test]
     fn recognises_camera_and_virtual_video_sources() {
@@ -161,5 +297,35 @@ mod tests {
     #[test]
     fn requires_a_separator_before_a_subclass() {
         assert!(!is_video_source_class("Video/SourceLike"));
+    }
+
+    /// The two classes confirmed against a real `pw-dump` on this machine: `Audio/Sink`
+    /// nodes (e.g. `alsa_output...analog-stereo`) and `Stream/Output/Audio` nodes for
+    /// individual applications (e.g. a browser tab named `Zen`, or `OBS: Game Audio`).
+    #[test]
+    fn recognises_sinks_and_app_streams() {
+        assert_eq!(
+            AudioSourceClass::from_media_class("Audio/Sink"),
+            Some(AudioSourceClass::Sink)
+        );
+        assert_eq!(
+            AudioSourceClass::from_media_class("Stream/Output/Audio"),
+            Some(AudioSourceClass::AppStream)
+        );
+    }
+
+    /// The microphone and anything actively *recording* must not be offered as a share-audio
+    /// source: `Audio/Source` is a microphone, and `Stream/Input/Audio` is something
+    /// consuming audio (as `pw-dump` showed OBS's own capture streams doing), not producing
+    /// it.
+    #[test]
+    fn rejects_microphones_and_recording_streams() {
+        assert_eq!(AudioSourceClass::from_media_class("Audio/Source"), None);
+        assert_eq!(
+            AudioSourceClass::from_media_class("Stream/Input/Audio"),
+            None
+        );
+        assert_eq!(AudioSourceClass::from_media_class("Video/Source"), None);
+        assert_eq!(AudioSourceClass::from_media_class(""), None);
     }
 }
