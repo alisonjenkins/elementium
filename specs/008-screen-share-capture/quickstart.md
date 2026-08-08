@@ -165,6 +165,30 @@ is why the criterion is ten cycles rather than one.
 
 **Proves**: US1, and it is the only thing that does.
 
+**Passed 2026-08-08**, attended, on niri / `xdg-desktop-portal-gnome`, E2EE on:
+
+```sh
+ATTENDED=1 pnpm exec playwright test -g "sustained, increasing decoded frame count"
+```
+
+`framesDecoded` at the browser, sampled every 5s across 30s:
+
+```text
+[6, 14, 22, 30, 38, 46, 54]
+```
+
+Attended by design — the portal picker needs a person, and the test skips rather than fails
+without `ATTENDED=1`, because a red test nobody can make green in CI gets ignored and then
+protects nothing.
+
+**The failure this found, worth knowing before the next one:** the first run had the
+publisher sending 900 packets with 0% loss while the receiver decoded nothing, because the
+SFU was sending PLIs (27 of them) and never got a keyframe back. Every counter on the
+sending side looked healthy. The app handles PLI properly — the event reaches
+`src-tauri/src/commands/webrtc.rs`, which sets the pipeline's keyframe flag — but a caller
+driving `LiveKitRoom` directly does not get that event, so the publisher example asks for a
+keyframe on a timer instead.
+
 ```sh
 just test-browser
 ```

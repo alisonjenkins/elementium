@@ -84,7 +84,7 @@ negotiate on this machine. See research R9 for the measured evidence.
 
 - [X] T027 [US2] Record the portal's returned source kind (monitor vs window) on the `ShareSession` in `crates/elementium-screen/src/wayland.rs`, since the audio scoping in Phase 5 and the diagnostics both need to know which was chosen
 - [ ] T028 [US2] Handle the shared window disappearing mid-share in `crates/elementium-screen/src/wayland.rs` — end the share cleanly and report why, rather than pumping a dead node
-- [ ] T029 [US2] Add a browser test to `frontend/tests/browser/` asserting that content changed outside the shared window produces no change at the receiver (SC-003)
+- [ ] T029 [US2] (SC-003; SC-001 is now covered by the attended browser test — see quickstart Level 4) Add a browser test to `frontend/tests/browser/` asserting that content changed outside the shared window produces no change at the receiver (SC-003)
 
 ---
 
@@ -110,7 +110,7 @@ negotiate on this machine. See research R9 for the measured evidence.
 
 ## Phase 6: US4 — X11 parity (P3)
 
-- [ ] T041 [US4] Wire the X11 path in `crates/elementium-screen/src/x11.rs` through `ShareSession` and the shared video pipeline, so an X11 session gets the same outcome as Wayland. **Seam located 2026-08-08 and it is not inside `x11.rs`**: `ShareSession` carries only a `PipeWire` node id for the media layer to *pull* from, while `X11Capturer` *pushes* through a callback it drives from its own thread. There is no X11 node id and no callback slot on the session. Closing this needs an X11 variant of `ShareSession` in `crates/elementium-screen/src/share.rs` carrying a source id, plus a consumer in `crates/elementium-media/` that drives a callback source rather than assuming every source is a node to pull
+- [X] T041 [US4] **Wired 2026-08-08, untested against a real X11 display** (this machine is Wayland). Wire the X11 path in `crates/elementium-screen/src/x11.rs` through `ShareSession` and the shared video pipeline, so an X11 session gets the same outcome as Wayland. **Seam located 2026-08-08 and it is not inside `x11.rs`**: `ShareSession` carries only a `PipeWire` node id for the media layer to *pull* from, while `X11Capturer` *pushes* through a callback it drives from its own thread. There is no X11 node id and no callback slot on the session. Closing this needs an X11 variant of `ShareSession` in `crates/elementium-screen/src/share.rs` carrying a source id, plus a consumer in `crates/elementium-media/` that drives a callback source rather than assuming every source is a node to pull
 - [X] T042 [US4] Report a specific, accurate failure when neither a portal nor an X11 display is available. **Landed in `crates/elementium-screen/src/x11.rs`, not `lib.rs` as planned** — the silent path was `X11Capturer::start`, which parsed the source id and looked up the target *inside* the spawned thread after already returning `Ok(())`, so a bad id or missing display produced a capturer that succeeded and never called back. Both checks now run before the thread is spawned, and the four faults (no display, unknown target, malformed id, backend failure) are four distinct messages
 
 ---
