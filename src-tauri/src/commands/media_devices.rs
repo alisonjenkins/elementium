@@ -949,6 +949,17 @@ const fn unwrap_or_const(value: Option<u32>, fallback: u32) -> u32 {
     }
 }
 
+/// Drop this pipeline's self-view entry, so a stopped or dead source stops feeding it.
+///
+/// Shared by the stop path and the capture-failure path below, which have to leave exactly
+/// the same state behind: a preview that outlives its source shows a frozen last frame,
+/// which reads as "the share is still running" to anyone looking at it.
+fn release_preview(video_frames: &VideoFrameBuffer, track_id: &str) {
+    if let Ok(mut buf) = video_frames.lock() {
+        buf.remove(track_id);
+    }
+}
+
 /// Background thread: reads frames from a video source, writes RGBA to `VideoFrameBuffer`
 /// for preview, and optionally encodes + sends them to a peer connection.
 ///
@@ -1024,10 +1035,23 @@ fn video_pipeline_loop(
     loop {
         if stop_rx.try_recv().is_ok() {
             tracing::info!(track_id = %track_id, "video pipeline stopping");
-            // Clean up the frame buffer entry
-            if let Ok(mut buf) = video_frames.lock() {
-                buf.remove(track_id);
-            }
+            release_preview(video_frames, track_id);
+            break;
+        }
+
+        // A shared window closing, or a monitor being unplugged, errors the stream rather
+        // than ending it: `try_recv` simply keeps returning `None`, which is also what a
+        // perfectly healthy screencast of a static window does between damage events.
+        // Without this check the pipeline spins forever on a dead source, publishing
+        // nothing, logging nothing, and looking to every counter like an idle share.
+        if capturer.failed() {
+            tracing::error!(
+                track_id = %track_id,
+                source = source.label(),
+                frame_count,
+                "video capture failed; the source is gone and the pipeline is stopping"
+            );
+            release_preview(video_frames, track_id);
             break;
         }
 
