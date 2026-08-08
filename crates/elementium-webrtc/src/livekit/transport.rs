@@ -41,7 +41,10 @@ pub enum TransportCommand {
     WriteAudio(elementium_types::PlaintextMedia),
     /// Write an encoded video frame to the Publisher PC, in the codec named alongside it.
     /// See [`TransportCommand::WriteAudio`] and [`crate::engine::IoCommand::WriteVideo`].
-    WriteVideo(elementium_types::PlaintextMedia, elementium_codec::VideoCodec),
+    WriteVideo(
+        elementium_types::PlaintextMedia,
+        elementium_codec::VideoCodec,
+    ),
     /// Shut down the transport.
     Shutdown,
 }
@@ -280,7 +283,10 @@ enum WriteKind {
 /// Internal command for the Publisher I/O loop.
 enum PcCommand {
     WriteAudio(elementium_types::PlaintextMedia),
-    WriteVideo(elementium_types::PlaintextMedia, elementium_codec::VideoCodec),
+    WriteVideo(
+        elementium_types::PlaintextMedia,
+        elementium_codec::VideoCodec,
+    ),
     Shutdown,
 }
 
