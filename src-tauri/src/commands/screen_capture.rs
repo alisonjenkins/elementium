@@ -10,7 +10,9 @@ use tauri::{State, command};
 
 use elementium_types::CaptureSource;
 
-use super::media_devices::{MediaState, ShareHandle, start_screen_share_pipeline};
+use super::media_devices::{
+    MediaState, ShareHandle, start_screen_share_audio_pipeline, start_screen_share_pipeline,
+};
 use super::webrtc::WebRtcState;
 
 /// What starting a share produced.
@@ -97,17 +99,18 @@ pub async fn get_display_media(
         engine.video_frames.clone()
     };
 
-    // Audio is deliberately not started yet: capturing the sound of a shared application is
-    // a separate PipeWire stream with its own lifetime (the screencast portal offers no
-    // audio at all, in any backend), and it is sequenced after the video path is provably
-    // working. Requesting it today is honoured by capturing nothing rather than by
-    // capturing the desktop mix, because sending audio a user did not get a chance to
-    // review is worse than sending none.
-    if audio {
-        tracing::warn!("share audio was requested but is not implemented yet; sharing video only");
-    }
-
     let track_id = start_screen_share_pipeline(&media_state, &video_frames, &session)?;
+
+    // Audio is a separate PipeWire stream from the video the portal just granted -- the
+    // screencast portal carries no audio in any backend, so this connects directly to the
+    // desktop audio graph instead. Gated here rather than merely left uncalled: FR-008/SC-005
+    // require that a user who did not opt in gets no new input stream at all, and the only way
+    // to guarantee that is to never reach the code that would open one.
+    let (audio_track_id, audio_scope, audio_scope_fallback) = if audio {
+        start_share_audio(&media_state)
+    } else {
+        (None, None, false)
+    };
 
     let node_id = session.node_id();
     let source_kind = session.source_kind();
@@ -142,8 +145,58 @@ pub async fn get_display_media(
 
     Ok(DisplayMediaResult {
         video_track_id: track_id,
-        audio_track_id: None,
-        audio_scope: None,
-        audio_scope_fallback: false,
+        audio_track_id,
+        audio_scope,
+        audio_scope_fallback,
     })
+}
+
+/// Pick a share-audio source and start capturing it, returning the track id, the scope
+/// that was actually captured, and whether that scope is a fallback from what was asked
+/// for.
+///
+/// Only ever returns the desktop-mix fallback today. Real per-application scoping would
+/// need to correlate the window the portal granted to the `PipeWire` node carrying that
+/// application's audio, and `ShareSession` has nothing to correlate with -- the portal
+/// reports whether a monitor or a window was chosen (see `source_kind`) but never a PID,
+/// and `list_audio_sources` only has one to offer on native `PipeWire` clients, never on
+/// ALSA-compatibility streams (research R8 / tasks.md T038). Writing an application-scoping
+/// branch that can never be taken would be dead code, not a feature; the honest
+/// implementation is the fallback, taken unconditionally and disclosed via the returned
+/// `audio_scope_fallback`.
+///
+/// A source-enumeration or pipeline-start failure degrades to "no audio" rather than
+/// failing the whole share: the user asked to see the screen shared, and a `PipeWire`
+/// hiccup on the audio side should not take that down with it.
+fn start_share_audio(media_state: &MediaState) -> (Option<String>, Option<&'static str>, bool) {
+    use elementium_media::pipewire_audio::AudioSourceKind;
+    use elementium_media::pipewire_nodes::{AudioSourceClass, list_audio_sources};
+
+    let sink = match list_audio_sources() {
+        Ok(sources) => sources.into_iter().find(|s| s.class == AudioSourceClass::Sink),
+        Err(e) => {
+            tracing::warn!(reason = %e, "could not enumerate PipeWire audio sources; sharing video only");
+            return (None, None, false);
+        }
+    };
+    let Some(sink) = sink else {
+        tracing::warn!("no desktop audio sink found to capture; sharing video only");
+        return (None, None, false);
+    };
+
+    match start_screen_share_audio_pipeline(media_state, sink.node_id, AudioSourceKind::SinkMonitor)
+    {
+        Ok(audio_track_id) => {
+            tracing::info!(
+                node_id = sink.node_id,
+                track_id = %audio_track_id,
+                "share audio started, scoped to the desktop mix"
+            );
+            (Some(audio_track_id), Some("desktop_mix"), true)
+        }
+        Err(e) => {
+            tracing::warn!(reason = %e, node_id = sink.node_id, "could not start share audio pipeline; sharing video only");
+            (None, None, false)
+        }
+    }
 }

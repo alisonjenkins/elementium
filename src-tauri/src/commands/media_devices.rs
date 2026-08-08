@@ -205,6 +205,68 @@ pub fn start_screen_share_pipeline(
     Ok(track_id)
 }
 
+/// Start a pipeline capturing share audio from a specific `PipeWire` node, keyed
+/// `MediaTrackKey::screen_share_audio()`.
+///
+/// The audio counterpart to [`start_screen_share_pipeline`]: same registration in
+/// [`MediaState::pipelines`], same connection-inheriting restart as every other capture
+/// pipeline here (see [`stop_pipeline_inheriting_connection`]), but reading from a node the
+/// caller has already chosen rather than one this function discovers -- node selection is
+/// [`super::screen_capture::start_share_audio`]'s job, since it is the one with the fallback
+/// policy to apply.
+///
+/// # Errors
+///
+/// Returns a description if the pipeline could not be recorded in [`MediaState`].
+pub fn start_screen_share_audio_pipeline(
+    media_state: &MediaState,
+    node_id: u32,
+    source_kind: elementium_media::pipewire_audio::AudioSourceKind,
+) -> Result<String, String> {
+    let key = MediaTrackKey::screen_share_audio();
+    let track_id = format!("audio-{}", generate_track_id());
+
+    let previous = stop_pipeline_inheriting_connection(&media_state.pipelines, key);
+    let connection = connection_for_new_pipeline(previous.connection, media_state);
+
+    let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
+        Arc::new(Mutex::new(connection));
+    let encode_tx_clone = encode_tx.clone();
+    // Seeded the same way the microphone's is; nothing here retunes it from RTCP, so it
+    // stays at the configured default for the pipeline's lifetime rather than drifting.
+    let loss_estimate = Arc::new(NetworkLossEstimate::new(
+        OpusEncoderConfig::default().expected_packet_loss_perc,
+    ));
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+    let span = tracing::Span::current();
+    std::thread::spawn(move || {
+        let _guard = span.enter();
+        screen_share_audio_capture_loop(key, node_id, source_kind, &encode_tx_clone, &stop_rx);
+    });
+
+    media_state
+        .pipelines
+        .lock()
+        .map_err(|_| "pipeline map lock poisoned".to_owned())?
+        .insert(
+            key,
+            PipelineHandle {
+                key,
+                track_id: track_id.clone(),
+                stop_tx,
+                encode_tx,
+                extras: PipelineExtras::Audio { loss_estimate },
+            },
+        );
+
+    if let Ok(mut tracks) = media_state.active_tracks.lock() {
+        tracks.push(TrackId(track_id.clone()));
+    }
+
+    Ok(track_id)
+}
+
 #[command]
 pub async fn enumerate_devices() -> Result<Vec<MediaDevice>, String> {
     tracing::info!("Enumerating media devices");
@@ -503,6 +565,19 @@ pub async fn stop_track(
         .ok()
         .and_then(|mut slot| slot.take_if(|s| s.track_id == track_id.0));
     if let Some(share) = ended_share {
+        // The share's audio pipeline is stopped by key, not by hunting for its track id: the
+        // page may only ever have called stop() on the video track (the contract requires
+        // that alone to be enough), so the audio pipeline the loop above searched for by
+        // `track_id` a moment ago may still be sitting in the map under its own id.
+        if let Ok(mut pipelines) = media_state.pipelines.lock()
+            && let Some(audio_handle) = pipelines.remove(&MediaTrackKey::screen_share_audio())
+        {
+            let _ = audio_handle.stop_tx.send(());
+            tracing::info!(
+                audio_track_id = %audio_handle.track_id,
+                "share audio pipeline stopped with its share"
+            );
+        }
         share.session.close().await;
         tracing::info!(%track_id, "screen share torn down");
     }
@@ -1606,6 +1681,108 @@ fn audio_capture_loop(
         } else {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+/// Background thread: captures share audio from one `PipeWire` node, `Opus`-encodes, and
+/// sends to a peer connection when `encode_tx` is connected.
+///
+/// The audio-source twin of [`audio_capture_loop`], not a reuse of it: the microphone goes
+/// through `cpal`, which cannot address a specific `PipeWire` node (see the module docs on
+/// [`elementium_media::pipewire_audio`]), so this reads from [`PipewireAudioCapture`]
+/// instead. Encoding is otherwise the same shape -- mono, 20ms Opus frames -- deliberately,
+/// so nothing downstream of the encoder needs to know which source produced the audio.
+///
+/// Kept without the microphone loop's full `OutboundAudioStats` machinery: that scaffolding
+/// exists to diagnose a live human's voice sounding wrong, and share audio has had no
+/// reports to diagnose yet. Frame and drop counts are still logged periodically, which is
+/// enough to tell "capturing nothing" from "capturing and sending" without carrying the
+/// microphone path's per-symptom counters for a symptom nobody has seen here.
+fn screen_share_audio_capture_loop(
+    key: MediaTrackKey,
+    node_id: u32,
+    source_kind: elementium_media::pipewire_audio::AudioSourceKind,
+    encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
+) {
+    use elementium_media::pipewire_audio::{PipewireAudioCapture, TARGET_SAMPLE_RATE};
+
+    let capturer = match PipewireAudioCapture::start(node_id, source_kind) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(node_id, reason = %e, "failed to start share audio capture");
+            return;
+        }
+    };
+
+    // The capture always negotiates TARGET_SAMPLE_RATE (see PipewireAudioCapture::start):
+    // PipeWire's own converting adapter guarantees it, so there is no format to wait for the
+    // way the microphone path waits on cpal's device negotiation.
+    let opus_rate = TARGET_SAMPLE_RATE;
+    let mut encoder = match OpusEncoder::with_config(
+        opus_rate,
+        OUTBOUND_CHANNELS,
+        OpusEncoderConfig::default(),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(node_id, "failed to create share-audio Opus encoder: {e}");
+            return;
+        }
+    };
+
+    let frame_samples = usize::try_from(opus_rate)
+        .unwrap_or(48_000)
+        .saturating_mul(20)
+        / 1000;
+    let mut accumulator: Vec<f32> = Vec::with_capacity(frame_samples.saturating_mul(2));
+    let mut frames_in: u64 = 0;
+    let mut frames_out: u64 = 0;
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            tracing::info!(node_id, frames_in, frames_out, "share audio pipeline stopping");
+            break;
+        }
+        if capturer.failed() {
+            tracing::warn!(node_id, frames_in, frames_out, "share audio stream failed; stopping");
+            break;
+        }
+
+        let Some(frame) = capturer.try_recv() else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        };
+        frames_in = frames_in.saturating_add(1);
+
+        // Folded to mono for the same reason the microphone is: Opus here is always
+        // negotiated mono (OUTBOUND_CHANNELS), so a stereo source has to be reduced before
+        // framing regardless of how many channels PipeWire negotiated for it.
+        let mono = elementium_media::audio_capture::downmix_to_mono(&frame.data, frame.channels);
+        accumulator.extend_from_slice(&mono);
+
+        while accumulator.len() >= frame_samples {
+            let frame_data: Vec<f32> = accumulator.drain(..frame_samples).collect();
+            let audio_frame = AudioFrame {
+                sample_rate: opus_rate,
+                channels: OUTBOUND_CHANNELS,
+                data: frame_data,
+                timestamp_us: 0,
+            };
+            match encoder.encode(&audio_frame) {
+                Ok(packet) => {
+                    if deliver(encode_tx, IoCommand::WriteAudio(key, packet)) == Delivery::Sent {
+                        frames_out = frames_out.saturating_add(1);
+                    }
+                }
+                Err(e) => tracing::debug!(node_id, "share audio Opus encode error: {e}"),
+            }
+        }
+    }
+
+    let dropped = capturer.dropped();
+    if dropped > 0 {
+        tracing::info!(node_id, dropped, "share audio buffers dropped over the pipeline's life");
     }
 }
 
