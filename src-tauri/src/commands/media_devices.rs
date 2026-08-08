@@ -1251,6 +1251,20 @@ fn source_died(
     true
 }
 
+/// The encode target for this source, given the codec currently negotiated.
+///
+/// Which format is worth asking the source for depends on where the frames will be
+/// encoded, and the answer is not a small difference: MJPEG is the most expensive format on
+/// offer when the CPU decodes it and the cheapest when the GPU does.
+fn negotiated_target(
+    source: &VideoCaptureSource,
+    active_codec: &Arc<ActiveCodec>,
+) -> elementium_codec::EncodeTarget {
+    let (neg_width, neg_height) = source.negotiation_geometry();
+    elementium_codec::EncodeTarget::negotiated(active_codec.get(), neg_width, neg_height)
+}
+
+
 
 
 /// Background thread: reads frames from a video source, writes RGBA to `VideoFrameBuffer`
@@ -1274,8 +1288,7 @@ fn video_pipeline_loop(
     // Which format is worth asking the source for depends on where the frames will be
     // encoded, and the answer is not a small difference: MJPEG is the most expensive format
     // on offer when the CPU decodes it and the cheapest when the GPU does.
-    let (neg_width, neg_height) = source.negotiation_geometry();
-    let target = elementium_codec::EncodeTarget::negotiated(active_codec.get(), neg_width, neg_height);
+    let target = negotiated_target(source, active_codec);
     // Once per pipeline, so "is the GPU doing this" is answerable by reading a log rather
     // than by re-deriving the selection policy from the codec, the geometry and what the
     // driver reported. The three fields are what the policy actually decided on, and
@@ -1317,6 +1330,10 @@ fn video_pipeline_loop(
     // as `NegotiatedEncoder` rather than a trait object: dispatch stays static on a path
     // that runs thirty times a second. See `elementium_codec::video`.
     let mut encoder: Option<NegotiatedEncoder> = None;
+    let mut out = VideoOutState {
+        keyframe: KeyframeState::new(),
+        stats: OutboundVideoStats::default(),
+    };
     let mut frame_count: u64 = 0;
     let mut keyframe = KeyframeState::new();
     let mut last_preview = std::time::Instant::now()
@@ -1343,6 +1360,7 @@ fn video_pipeline_loop(
             if dropped_because_muted(muted) {
                 continue;
             }
+            out.count_captured(track_id, active_codec.get());
             if frame_count <= 3 || frame_count.is_multiple_of(100) {
                 // Named by source, not "Camera": this loop serves the screen share too, and
                 // this is the one line that says frames are flowing. Calling a share's
@@ -1394,7 +1412,7 @@ fn video_pipeline_loop(
                     PipelineId { key, track_id },
                     &frame,
                     &mut encoder,
-                    &mut keyframe,
+                    &mut out,
                     keyframe_requested,
                     active_codec,
                     encode_tx,
@@ -1542,11 +1560,64 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 /// Returns whether any packet in this batch was a keyframe, which is the one fact
 /// [`KeyframeAnswerWatch`] needs and the only place it is known -- the encoder's own
 /// `EncodedFrame::is_keyframe`, not anything inferred from bytes sent or acked downstream.
+/// What happened to each captured video frame between the encoder and the wire.
+///
+/// Audio has had this for a while, and video did not, which is why a frozen remote picture
+/// has been so much harder to explain than silent audio: an undecodable frame, an encoder
+/// error and a dropped `try_send` all vanished into `tracing::debug!` or a discarded
+/// `Result`, so "the picture stopped" had no counter anywhere behind it.
+///
+/// The three send failures are counted separately because they need opposite responses. A
+/// full channel is back-pressure -- the consumer is alive and behind. A closed one means
+/// the peer connection went away and nothing re-attached this pipeline, so every later
+/// frame is wasted. Not connected at all is the ordinary state before a call starts, and
+/// counting it with the others would make a healthy idle pipeline look broken.
+#[derive(Default)]
+struct OutboundVideoStats {
+    captured: u64,
+    sent: u64,
+    skipped_not_connected: u64,
+    dropped_channel_closed: u64,
+    dropped_channel_full: u64,
+    encode_errors: u64,
+    undecodable: u64,
+    bytes_since_report: u64,
+}
+
+impl OutboundVideoStats {
+    /// Every 300 frames: ten seconds at 30fps, and the same cadence the capture path's own
+    /// cost report uses, so the two line up in a log.
+    const REPORT_EVERY: u64 = 300;
+
+    fn report_if_due(&mut self, track_id: &str, codec: elementium_codec::VideoCodec) {
+        if !self.captured.is_multiple_of(Self::REPORT_EVERY) || self.captured == 0 {
+            return;
+        }
+        // At info even when everything is fine: a healthy line is what makes an unhealthy
+        // one legible, and the absence of a log is not evidence of anything.
+        tracing::info!(
+            track_id,
+            codec = codec.sdp_name(),
+            captured = self.captured,
+            sent = self.sent,
+            skipped_not_connected = self.skipped_not_connected,
+            dropped_channel_closed = self.dropped_channel_closed,
+            dropped_channel_full = self.dropped_channel_full,
+            encode_errors = self.encode_errors,
+            undecodable = self.undecodable,
+            kbytes = self.bytes_since_report.saturating_div(1024),
+            "outbound video"
+        );
+        self.bytes_since_report = 0;
+    }
+}
+
 fn encode_and_send<E: VideoEncoder>(
     key: MediaTrackKey,
     encoder: &mut E,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    stats: &mut OutboundVideoStats,
 ) -> bool {
     // Asked of the encoder rather than of `ActiveCodec`: the encoder is what produced these
     // bytes, and it may still be the previous one for a frame or two after the SFU asks for
@@ -1561,6 +1632,7 @@ fn encode_and_send<E: VideoEncoder>(
         result
     } else {
         let Some(planar) = frame.to_planar() else {
+            stats.undecodable = stats.undecodable.saturating_add(1);
             tracing::debug!("captured frame could not be decoded");
             return false;
         };
@@ -1570,16 +1642,37 @@ fn encode_and_send<E: VideoEncoder>(
     match outcome {
         Ok(packets) => {
             let produced_keyframe = packets.iter().any(|p| p.is_keyframe);
-            if let Ok(guard) = encode_tx.lock()
-                && let Some(tx) = guard.as_ref()
-            {
-                for packet in packets {
-                    let _ = tx.try_send(IoCommand::WriteVideo(key, packet.data, codec));
+            let connected = encode_tx.lock().ok().and_then(|g| g.clone());
+            match connected {
+                None => {
+                    stats.skipped_not_connected =
+                        stats.skipped_not_connected.saturating_add(u64::try_from(packets.len()).unwrap_or(0));
+                }
+                Some(tx) => {
+                    for packet in packets {
+                        let len = u64::try_from(packet.data.as_bytes().len()).unwrap_or(0);
+                        match tx.try_send(IoCommand::WriteVideo(key, packet.data, codec)) {
+                            Ok(()) => {
+                                stats.sent = stats.sent.saturating_add(1);
+                                stats.bytes_since_report =
+                                    stats.bytes_since_report.saturating_add(len);
+                            }
+                            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                                stats.dropped_channel_full =
+                                    stats.dropped_channel_full.saturating_add(1);
+                            }
+                            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                                stats.dropped_channel_closed =
+                                    stats.dropped_channel_closed.saturating_add(1);
+                            }
+                        }
+                    }
                 }
             }
             produced_keyframe
         }
         Err(e) => {
+            stats.encode_errors = stats.encode_errors.saturating_add(1);
             tracing::debug!("video encode error: {e}");
             false
         }
@@ -1597,19 +1690,39 @@ struct PipelineId<'a> {
     track_id: &'a str,
 }
 
+/// The per-frame state a video pipeline carries between frames.
+///
+/// Bundled rather than passed as two parameters because they are always used together and
+/// the alternative was an eighth argument, which the workspace's own lint refuses -- for
+/// the good reason that a call site with eight positional arguments is one transposition
+/// away from a bug nothing catches.
+struct VideoOutState {
+    keyframe: KeyframeState,
+    stats: OutboundVideoStats,
+}
+
+impl VideoOutState {
+    /// Count a frame that survived the mute check, and report the window if it is due.
+    fn count_captured(&mut self, track_id: &str, codec: elementium_codec::VideoCodec) {
+        self.stats.captured = self.stats.captured.saturating_add(1);
+        self.stats.report_if_due(track_id, codec);
+    }
+}
+
+
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
 fn encode_and_send_video_frame(
     id: PipelineId<'_>,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encoder: &mut Option<NegotiatedEncoder>,
-    keyframe: &mut KeyframeState,
+    out: &mut VideoOutState,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
     active_codec: &Arc<ActiveCodec>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
     let wanted = active_codec.get();
     let existed = encoder.as_ref().is_some_and(|e| e.codec() == wanted);
-    ensure_encoder(encoder, frame.width(), frame.height(), keyframe, wanted);
+    ensure_encoder(encoder, frame.width(), frame.height(), &mut out.keyframe, wanted);
 
     let Some(enc) = encoder.as_mut() else {
         return;
@@ -1617,10 +1730,10 @@ fn encode_and_send_video_frame(
     // A freshly built encoder emits a keyframe on its own, so only ask when it is one we
     // were already using.
     if existed {
-        maybe_request_keyframe(id.track_id, enc, keyframe, keyframe_requested);
+        maybe_request_keyframe(id.track_id, enc, &mut out.keyframe, keyframe_requested);
     }
-    if encode_and_send(id.key, enc, frame, encode_tx) {
-        keyframe.watch.observed_keyframe();
+    if encode_and_send(id.key, enc, frame, encode_tx, &mut out.stats) {
+        out.keyframe.watch.observed_keyframe();
     }
 }
 
