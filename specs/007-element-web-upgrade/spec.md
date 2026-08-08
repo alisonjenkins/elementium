@@ -1,7 +1,7 @@
 # Feature Specification: Element Web upgrade and patch maintenance
 
 **Created**: 2026-08-08
-**Status**: Draft — upstream probed, three blockers measured
+**Status**: Upgrade landed on v1.12.25; patch-set machinery outstanding
 **Input**: "Spec out the upgrade to the latest version of Element Web. We need to be
 careful not to break our project, and that the shims successfully install on the new
 version. Make it easy to stay in sync. I want to contribute back to Element Web, but also
@@ -368,9 +368,6 @@ regression has a guard rather than a note.
 Routing is not the problem: inbound media is dispatched by `mid`, not by SSRC, so the
 missing `a=ssrc` lines in the protocol-17 answers are a red herring.
 
-The pin is back at v1.12.11 until inbound audio works, because a pinned version whose calls
-are half-deaf is worse than one that is known to work.
-
 ### Two things this cost, that are worth naming
 
 The trace was logging the full WebSocket URL on open, opened, close and error — four times
@@ -380,6 +377,45 @@ That predates this work; it was visible because reading the trace put it in fron
 And the previous session's `[LKSignal]` predecessor dumped whole message bodies as byte
 arrays for the first five messages in each direction. Kinds and sizes answered the question
 in one run; the bytes never did.
+
+## Finding — 2026-08-08: what the upgrade cost, against what was predicted
+
+Three blockers were predicted from reading the v1.12.25 tree before anything was run. The
+value of the comparison is entirely in where the reading was wrong.
+
+| Predicted | What happened |
+|---|---|
+| The dist layout and every shim contract survive | **Right.** Every patch assertion, all four shim contract checks, and the whole Playwright suite passed on v1.12.25 at the first attempt |
+| `fetch_git()` cannot build the nx/pnpm monorepo | **Right**, and fixed — but irrelevant to the upgrade, which uses the release tarball |
+| Node 22 may be too old; upstream builds with 24 | **Wrong.** Node 22.23.2 builds v1.12.25 cleanly. Withdrawn rather than left standing |
+
+And the two things that actually blocked it were in neither list, because neither was
+visible from reading Element Web at all:
+
+| Actual blocker | Where reading would never have found it |
+|---|---|
+| `desc.sdpType` on an IPC response whose field is `type` | In our own shim, and it type-checked. Only the SFU's `{"type":"unknown"}` said otherwise |
+| Receive sections dropped by a kind-keyed dedupe | In our own Rust, and it had a passing test asserting the behaviour that was wrong |
+
+**Both blockers were ours, and both predated the upgrade.** Neither was an upstream
+breaking change. Protocol 17 did not break us; it removed the cover from two defects that
+had been there the whole time — the first hidden by a WebSocket shim that injected the
+missing field back in, the second by never having more than one remote track's worth of
+sections to allocate.
+
+That is the lesson worth keeping from this feature, and it inverts the premise it started
+from. The question "will upstream's changes break us" was the wrong one to spend the
+reading on. What fourteen releases of drift actually cost was fourteen releases' worth of
+our own latent defects becoming visible at once, with no way to attribute any of them.
+
+The instrumentation ordering paid for itself exactly as intended. Phases 1 and 2 went in
+before the pin moved, so each failure was localised from a log in one run rather than
+bisected across fourteen releases. The signalling trace in particular turned "could not
+establish pc connection" into `leave reason=STATE_MISMATCH` and then into a named property,
+in a single call.
+
+What the reading was for was the *other* half of the feature — where patches live, how to
+stay in sync — and that part it got right.
 
 ## The shape of the answer
 

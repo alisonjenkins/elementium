@@ -60,7 +60,7 @@ it, which is the argument on the other side.
 
 ## Phase 6: Close
 
-- [ ] T022 Record in `spec.md` what the upgrade actually cost, against the three blockers predicted from reading. The value of that comparison is in the places the reading was wrong
+- [X] T022 Record in `spec.md` what the upgrade actually cost, against the three blockers predicted from reading. The value of that comparison is in the places the reading was wrong
 - [X] T023 [US4] **Answered: a public fork on the user's account** — `alisonjenkins/element-web`, branch `elementium`. Public is not a preference: Element Web is AGPL-3.0 and this project declares AGPL-3.0-or-later, so a shipped source patch is a modified AGPL work whose source has to be available to whoever receives it. Two things follow that no tooling can arrange: upstream requires a **CLA** rather than a DCO, signed once and personally; and this repository has no `LICENSE` file despite declaring one in `Cargo.toml`. Original task follows. Agree with the user where the Element Web fork lives before anything in Phase 5 assumes it. It is a repository under their account, which makes it an external system we do not create unprompted, and it decides where CI for the patch branch runs. `spec.md` open question 1; nothing downstream of it can be settled here
 
 ## The decision this ordering assumes
