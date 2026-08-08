@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
-use str0m::channel::{ChannelConfig, Reliability};
+use str0m::channel::{ChannelConfig, ChannelId, Reliability};
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid};
 use str0m::net::{Protocol, Receive};
@@ -96,6 +96,37 @@ pub enum PcEvent<P = PlaintextMedia> {
 /// A [`PcEvent`] whose media payload came straight off the network and may still be
 /// encrypted. Cannot reach a decoder: decoders only accept [`PlaintextMedia`].
 pub type WirePcEvent = PcEvent<WireMedia>;
+
+/// One data-channel event, queued for the Tauri command layer to drain and forward to
+/// the page.
+///
+/// Deliberately not folded into [`PcEvent`], even though both ultimately reach the
+/// frontend. `PcEvent<P>` exists to make the E2EE boundary visible in the type, and every
+/// `WirePcEvent` the I/O loop produces is pushed through
+/// [`crate::e2ee_io::maybe_decrypt_event`], whose `passthrough` match is written out
+/// arm-by-arm on purpose so the compiler catches a forgotten variant. Data-channel bytes
+/// are SCTP payload, not RTP media -- there is no decoder to feed and nothing for that
+/// boundary to mean for them. Routing them through it anyway would mean either silently
+/// dropping them in `passthrough` (repeating the exact bug this feature exists to fix, one
+/// layer further down) or teaching that unrelated module about data channels for a
+/// distinction that does not apply to them.
+#[derive(Debug, Clone)]
+pub enum DataChannelEvent {
+    /// The DCEP handshake for the channel named `label` completed; str0m will now hand
+    /// back a writable [`str0m::channel::Channel`] for it (see
+    /// [`PeerConnectionInner::data_channels`] for why not sooner).
+    Open { label: String },
+    /// A message arrived on the channel named `label`. `binary` distinguishes the DOM
+    /// `ArrayBuffer` case from the string case, which `RTCDataChannel.onmessage` must
+    /// reconstruct differently.
+    Message {
+        label: String,
+        binary: bool,
+        data: Vec<u8>,
+    },
+    /// The channel named `label` closed, locally or by the remote peer.
+    Close { label: String },
+}
 
 /// Shared state for a single peer connection.
 pub struct PeerConnectionInner {
@@ -200,6 +231,24 @@ pub struct PeerConnectionInner {
     /// Latest connection-level stats (RTT, selected ICE candidate pair), from
     /// `Event::PeerStats`. See `egress_stats` for why this is a snapshot.
     pub peer_stats: Option<str0m::stats::PeerStats>,
+    /// Label -> `ChannelId` of every data channel this side has seen open, i.e. every
+    /// channel `Event::ChannelOpen` has fired for.
+    ///
+    /// Populated only from that event, on both the offering and answering side. str0m's
+    /// own docs for `Rtc::channel()` say it returns `None` for a `ChannelId` fresh out of
+    /// `SdpApi::add_channel_with_config()` -- "This is first available when a `ChannelId`
+    /// is advertised via `Event::ChannelOpen`" -- so there is no shortcut that lets the
+    /// side which called `add_channel_with_config` start writing immediately; it has to
+    /// wait for the DCEP handshake to complete like the far end does.
+    pub data_channels: HashMap<String, ChannelId>,
+    /// Reverse of `data_channels`. `Event::ChannelData` and `Event::ChannelClose` carry
+    /// only a `ChannelId`, not the label, so this is what turns one back into the name the
+    /// application (and the shim's `RTCDataChannel` objects) actually key on.
+    data_channel_labels: HashMap<ChannelId, String>,
+    /// Data-channel events queued since the last drain, for the Tauri command layer to
+    /// forward to the page. See [`DataChannelEvent`] for why this is a separate queue
+    /// rather than more `PcEvent` variants.
+    pub data_channel_events: Vec<DataChannelEvent>,
 }
 
 /// Thread-safe handle to a peer connection.
@@ -263,6 +312,9 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         egress_stats: HashMap::new(),
         ingress_stats: HashMap::new(),
         peer_stats: None,
+        data_channels: HashMap::new(),
+        data_channel_labels: HashMap::new(),
+        data_channel_events: Vec::new(),
     }
 }
 
@@ -881,6 +933,44 @@ pub fn write_video(
     Ok(())
 }
 
+/// Write one message to a negotiated data channel, identified by the label it was created
+/// with.
+///
+/// Returns `Ok(true)`/`Ok(false)` exactly as str0m's own `Channel::write` does: `false`
+/// means the message was rejected because it would not fit in the SCTP send buffer right
+/// now (not an error -- the caller can retry once `bufferedAmountLowThreshold` semantics
+/// say there is room), while `Ok(true)` means str0m accepted the whole buffer.
+///
+/// # Errors
+///
+/// Returns an error if no channel named `label` has completed its DCEP handshake yet (see
+/// [`PeerConnectionInner::data_channels`]), if it has since closed, or if str0m's SCTP
+/// layer rejects the write outright.
+pub fn write_data_channel(
+    pc: &mut PeerConnectionInner,
+    label: &str,
+    binary: bool,
+    data: &[u8],
+) -> Result<bool, crate::error::WebRtcError> {
+    let id = *pc
+        .data_channels
+        .get(label)
+        .ok_or_else(|| format!("Data channel '{label}' has not completed its handshake yet"))?;
+    let mut channel = pc.rtc.channel(id).ok_or_else(|| {
+        format!("Data channel '{label}' has no writable SCTP stream (closed or not yet open)")
+    })?;
+    channel
+        .write(binary, data)
+        .map_err(|e| format!("Failed to write to data channel '{label}': {e}").into())
+}
+
+/// Take every data-channel event queued since the last call, for the Tauri command layer
+/// to forward to the page. See [`DataChannelEvent`].
+#[must_use]
+pub fn drain_data_channel_events(pc: &mut PeerConnectionInner) -> Vec<DataChannelEvent> {
+    std::mem::take(&mut pc.data_channel_events)
+}
+
 /// Run one iteration of the I/O loop. Returns events and next deadline.
 ///
 /// # Errors
@@ -1478,6 +1568,40 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
                 mid: req.mid.to_string(),
             })
         }
+        // Data-channel events are queued on `pc.data_channel_events` rather than
+        // returned as a `PcEvent` -- see `DataChannelEvent` for why. `None` here means
+        // "handled", not "unhandled".
+        Event::ChannelOpen(id, label) => {
+            tracing::info!(pc_id = %pc.id, %label, "Data channel open");
+            pc.data_channels.insert(label.clone(), id);
+            pc.data_channel_labels.insert(id, label.clone());
+            pc.data_channel_events.push(DataChannelEvent::Open { label });
+            None
+        }
+        Event::ChannelData(data) => {
+            if let Some(label) = pc.data_channel_labels.get(&data.id).cloned() {
+                pc.data_channel_events.push(DataChannelEvent::Message {
+                    label,
+                    binary: data.binary,
+                    data: data.data,
+                });
+            } else {
+                tracing::warn!(
+                    pc_id = %pc.id,
+                    id = ?data.id,
+                    "Data channel message for an unrecognised channel id, dropping"
+                );
+            }
+            None
+        }
+        Event::ChannelClose(id) => {
+            if let Some(label) = pc.data_channel_labels.remove(&id) {
+                pc.data_channels.remove(&label);
+                tracing::info!(pc_id = %pc.id, %label, "Data channel closed");
+                pc.data_channel_events.push(DataChannelEvent::Close { label });
+            }
+            None
+        }
         _ => {
             tracing::info!(pc_id = %pc.id, ?event, "Unhandled str0m event");
             None
@@ -1970,6 +2094,51 @@ mod tests {
         // No `Event::PeerStats` has arrived: the candidate pair must be absent, not a
         // default-constructed stand-in with fabricated zeros.
         assert!(snapshot.candidate_pair.is_none());
+    }
+
+    /// `write_data_channel` must fail closed for a label whose DCEP handshake never
+    /// completed, rather than silently accepting (and dropping) the write. This is the
+    /// exact shape of bug this feature exists to fix, one layer down: a `send()` that
+    /// resolves as if it worked while nothing actually left the machine. There is no
+    /// `str0m::channel::ChannelId` constructible outside `str0m` itself (its only field is
+    /// private to that crate), so this cannot go further and assert a real handshake
+    /// without a live peer -- that part is exercised by manual/E2E testing instead.
+    #[test]
+    fn write_data_channel_rejects_an_unopened_label() {
+        let mut pc = create_peer_connection("dc-test-pc".to_string());
+        let result = write_data_channel(&mut pc, "matrix", false, b"hello");
+        assert!(
+            result.is_err(),
+            "writing to a label with no completed DCEP handshake must error, not silently \
+             succeed"
+        );
+    }
+
+    /// `drain_data_channel_events` must hand back everything queued and leave the queue
+    /// empty, so the Tauri forwarding loop's next poll does not re-deliver the same
+    /// message twice.
+    #[test]
+    fn drain_data_channel_events_takes_and_clears_the_queue() {
+        let mut pc = create_peer_connection("dc-drain-test-pc".to_string());
+        pc.data_channel_events.push(DataChannelEvent::Open {
+            label: "matrix".to_string(),
+        });
+        pc.data_channel_events.push(DataChannelEvent::Message {
+            label: "matrix".to_string(),
+            binary: false,
+            data: b"hi".to_vec(),
+        });
+
+        let drained = drain_data_channel_events(&mut pc);
+        assert_eq!(drained.len(), 2);
+        assert!(
+            pc.data_channel_events.is_empty(),
+            "the queue must be empty after draining, or the next poll re-delivers stale events"
+        );
+
+        // A second drain with nothing new queued must come back empty, not repeat the
+        // first drain's contents.
+        assert!(drain_data_channel_events(&mut pc).is_empty());
     }
 }
 

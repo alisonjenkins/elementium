@@ -68,6 +68,52 @@ pub enum WebRtcEvent {
         mid: String,
         kind: String,
     },
+    /// A data channel's DCEP handshake completed; the shim's `RTCDataChannel` for `label`
+    /// should flip to `readyState: "open"` and fire `onopen`.
+    #[serde(rename_all = "camelCase")]
+    DataChannelOpen { pc_id: String, label: String },
+    /// A message arrived on the data channel named `label`. `binary` distinguishes the DOM
+    /// `ArrayBuffer` case from the string case for the shim's `onmessage` to reconstruct;
+    /// `data` is the raw bytes either way.
+    #[serde(rename_all = "camelCase")]
+    DataChannelMessage {
+        pc_id: String,
+        label: String,
+        binary: bool,
+        data: Vec<u8>,
+    },
+    /// The data channel named `label` closed, locally or by the remote peer.
+    #[serde(rename_all = "camelCase")]
+    DataChannelClose { pc_id: String, label: String },
+}
+
+/// Convert one Rust-side [`peer_connection::DataChannelEvent`] into the JSON shape the
+/// shim expects, tagging it with the connection it came from.
+///
+/// Split out of the forwarding loop because it has nothing to do with polling or locking
+/// -- it is pure data massaging, and keeping it separate is what makes that loop's own
+/// logic (which fires only when there is something new) readable on its own.
+fn data_channel_event_to_webrtc(pc_id: &str, event: peer_connection::DataChannelEvent) -> WebRtcEvent {
+    match event {
+        peer_connection::DataChannelEvent::Open { label } => WebRtcEvent::DataChannelOpen {
+            pc_id: pc_id.to_string(),
+            label,
+        },
+        peer_connection::DataChannelEvent::Message {
+            label,
+            binary,
+            data,
+        } => WebRtcEvent::DataChannelMessage {
+            pc_id: pc_id.to_string(),
+            label,
+            binary,
+            data,
+        },
+        peer_connection::DataChannelEvent::Close { label } => WebRtcEvent::DataChannelClose {
+            pc_id: pc_id.to_string(),
+            label,
+        },
+    }
 }
 
 #[command]
@@ -358,6 +404,36 @@ pub async fn add_ice_candidate(
     Ok(peer_connection::add_ice_candidate(
         &mut pc,
         &candidate.candidate,
+    )?)
+}
+
+/// Write one message to a negotiated data channel.
+///
+/// This is the send half of `RTCDataChannel.send()`: before this command existed the
+/// shim's `send()` was a no-op (`(_data) => {}`), so anything Element Call or
+/// livekit-client wrote to a data channel silently vanished. `data` carries the payload as
+/// raw bytes regardless of whether the page sent a string or an `ArrayBuffer`/typed array
+/// -- `binary` is what tells the shim (and, on the wire, the far end's DCEP framing)
+/// which one it originally was. `Blob` is not supported: the DOM allows it as a `send()`
+/// argument, but nothing in this call chain (Tauri IPC, str0m's `Channel::write`) has a
+/// notion of a `Blob`, and the shim converts it to bytes before this command is ever
+/// invoked -- see `webrtc-shim.ts`.
+///
+/// Returns `Ok(false)` (not an error) when str0m's SCTP layer declines to accept the
+/// buffer right now because it would not fit in the send window -- the caller can retry.
+#[command]
+pub async fn send_data_channel_message(
+    state: State<'_, WebRtcState>,
+    pc_id: String,
+    label: String,
+    binary: bool,
+    data: Vec<u8>,
+) -> Result<bool, String> {
+    tracing::debug!(pc_id = %pc_id, %label, binary, len = data.len(), "Sending data channel message");
+    let handle = get_pc_handle(&state, &pc_id)?;
+    let mut pc = handle.lock_str()?;
+    Ok(peer_connection::write_data_channel(
+        &mut pc, &label, binary, &data,
     )?)
 }
 
@@ -705,54 +781,80 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     let mut dropped_audio_events: u64 = 0;
 
     loop {
-        let event = {
+        // Data-channel events are not on `event_rx`: they never pass through the E2EE
+        // boundary `PcEvent` exists for (see `DataChannelEvent`), so they are queued
+        // straight on the connection and drained here instead, under the same lock that
+        // already has to be taken to reach `event_rx`.
+        let (event, dc_events) = {
             let Ok(engine) = state.0.lock() else {
                 return;
             };
             let Some(managed) = engine.get(pc_id) else {
                 return;
             };
-            let Ok(mut rx) = managed.event_rx.lock() else {
+            let pc_event = {
+                let Ok(mut rx) = managed.event_rx.lock() else {
+                    return;
+                };
+                rx.try_recv().ok()
+            };
+            let Ok(mut pc) = managed.handle.lock() else {
                 return;
             };
-            rx.try_recv().ok()
+            let dc_events = peer_connection::drain_data_channel_events(&mut pc);
+            drop(pc);
+            (pc_event, dc_events)
         };
 
-        match event {
-            Some(pc_event) => {
-                let Some(tauri_event) = route_pc_event(
-                    pc_event,
-                    &Routing {
-                        app,
-                        pc_id,
-                        audio_tx: &audio_tx,
-                        video_tx: &video_tx,
-                    },
-                    &mut dropped_audio_events,
-                ) else {
-                    continue;
-                };
+        let mut sent_anything = false;
 
-                // Push event to JS via eval() — calls the global handler registered
-                // by the WebRTC shim on window.top
-                if let Some(webview) = app.get_webview_window("main") {
-                    if let Ok(json) = serde_json::to_string(&tauri_event) {
-                        let js = format!(
-                            "if(window.__elementium_webrtc_event)window.__elementium_webrtc_event({json})"
-                        );
-                        match webview.eval(&js) {
-                            Ok(()) => tracing::debug!(pc_id = pc_id, "eval sent to JS"),
-                            Err(e) => tracing::error!(pc_id = pc_id, err = %e, "eval failed"),
-                        }
-                    }
-                } else {
-                    tracing::error!("No 'main' webview found for eval");
-                }
-            }
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(pc_event) = event {
+            sent_anything = true;
+            if let Some(tauri_event) = route_pc_event(
+                pc_event,
+                &Routing {
+                    app,
+                    pc_id,
+                    audio_tx: &audio_tx,
+                    video_tx: &video_tx,
+                },
+                &mut dropped_audio_events,
+            ) {
+                emit_to_frontend(app, pc_id, &tauri_event);
             }
         }
+
+        for dc_event in dc_events {
+            sent_anything = true;
+            emit_to_frontend(app, pc_id, &data_channel_event_to_webrtc(pc_id, dc_event));
+        }
+
+        if !sent_anything {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// Push one event to JS via `eval()` -- calls the global handler registered by the WebRTC
+/// shim on `window.top`.
+///
+/// Uses `eval()` instead of the Tauri event system (`emit`/`listen`) because Tauri's
+/// permission check blocks `listen()` from non-local URLs (e.g. `http://localhost:5173` in
+/// dev mode). `eval()` bypasses this entirely.
+fn emit_to_frontend(app: &AppHandle, pc_id: &str, event: &WebRtcEvent) {
+    let Some(webview) = app.get_webview_window("main") else {
+        tracing::error!("No 'main' webview found for eval");
+        return;
+    };
+    let Ok(json) = serde_json::to_string(event) else {
+        tracing::error!(pc_id, "Failed to serialize event for eval");
+        return;
+    };
+    let js =
+        format!("if(window.__elementium_webrtc_event)window.__elementium_webrtc_event({json})");
+    match webview.eval(&js) {
+        Ok(()) => tracing::debug!(pc_id, "eval sent to JS"),
+        Err(e) => tracing::error!(pc_id, err = %e, "eval failed"),
     }
 }
 

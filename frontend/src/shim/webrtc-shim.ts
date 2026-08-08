@@ -62,6 +62,15 @@ interface WebRtcEvent {
   candidate?: string;
   mid?: string;
   kind?: string;
+  /** Data channel label, on `dataChannel{Open,Message,Close}` events. */
+  label?: string;
+  /** Whether a `dataChannelMessage` payload was originally binary (`ArrayBuffer`) rather
+   * than a string -- see `RTCDataChannel.onmessage` reconstruction in
+   * `installDataChannel`. */
+  binary?: boolean;
+  /** Raw bytes of a `dataChannelMessage` payload, as a plain number array (how `Vec<u8>`
+   * serializes over Tauri IPC). */
+  data?: number[];
 }
 
 /**
@@ -246,6 +255,14 @@ class ElementiumRTCPeerConnection extends EventTarget {
   private _hasVideo = false;
   // Tracked for passing to create_offer so the SDP includes the right m-lines
   private _pendingDataChannels: { label: string; ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number; protocol?: string }[] = [];
+  /**
+   * Every `RTCDataChannel` this connection knows about, keyed by label -- the only
+   * identifier Rust has for a channel (str0m's `ChannelId` never crosses the IPC
+   * boundary). Populated both by local `createDataChannel()` calls and by
+   * `dataChannelOpen` events for channels the *remote* peer created, which this side only
+   * learns about once str0m's DCEP handshake completes -- see `handleBackendEvent`.
+   */
+  private _dataChannels = new Map<string, RTCDataChannel>();
   private _pendingTransceivers: { kind: string; direction: string; trackId?: string }[] = [];
 
   // Event handler properties (on* style)
@@ -340,7 +357,89 @@ class ElementiumRTCPeerConnection extends EventTarget {
         console.log(`[Elementium] Remote track: mid=${event.mid} kind=${event.kind}`);
         this.emitTrackEvent(event.mid!, event.kind!);
         break;
+
+      case "dataChannelOpen":
+        this.handleDataChannelOpen(event.label!);
+        break;
+
+      case "dataChannelMessage":
+        this.handleDataChannelMessage(event.label!, event.binary ?? false, event.data ?? []);
+        break;
+
+      case "dataChannelClose":
+        this.handleDataChannelClose(event.label!);
+        break;
     }
+  }
+
+  /**
+   * The DCEP handshake for `label` completed on the Rust side.
+   *
+   * Two cases: `label` is a channel *this* side created with `createDataChannel()`, in
+   * which case it already exists in `_dataChannels` with `readyState: "connecting"` and
+   * just needs to flip to `"open"`; or `label` is one the *remote* peer created (this side
+   * never called `createDataChannel()` for it), in which case this is the first this side
+   * hears of it at all, and the DOM contract is to synthesize the channel here and fire
+   * `ondatachannel` -- mirroring what a browser does when the far end negotiates a channel
+   * in-band.
+   */
+  private handleDataChannelOpen(label: string) {
+    let channel = this._dataChannels.get(label);
+    if (!channel) {
+      channel = this.createRemoteDataChannel(label);
+      this._dataChannels.set(label, channel);
+      const ev = new Event("datachannel") as unknown as RTCDataChannelEvent;
+      Object.defineProperty(ev, "channel", { value: channel, enumerable: true });
+      this.dispatchEvent(ev);
+      this.ondatachannel?.call(this as unknown as RTCPeerConnection, ev);
+    }
+    (channel as unknown as { readyState: RTCDataChannelState }).readyState = "open";
+    const openEv = new Event("open");
+    channel.dispatchEvent(openEv);
+    channel.onopen?.call(channel, openEv);
+  }
+
+  /**
+   * A message arrived on `label`. Reconstructs the DOM shapes `onmessage` expects:
+   * `binary` payloads become an `ArrayBuffer` (never a `Blob` -- nothing upstream in this
+   * shim needs one, and every consumer here already expects `ArrayBuffer`), text payloads
+   * are decoded back to a string with the same `TextEncoder`/`TextDecoder` pairing `send()`
+   * uses on the way out.
+   */
+  private handleDataChannelMessage(label: string, binary: boolean, data: number[]) {
+    const channel = this._dataChannels.get(label);
+    if (!channel) {
+      console.warn(`[Elementium] dataChannelMessage for unknown label=${label}, dropping`);
+      return;
+    }
+    const bytes = new Uint8Array(data);
+    const payload: string | ArrayBuffer = binary
+      ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+      : new TextDecoder().decode(bytes);
+    const ev = new MessageEvent("message", { data: payload });
+    channel.dispatchEvent(ev);
+    channel.onmessage?.call(channel, ev);
+  }
+
+  /** The channel named `label` closed, locally or by the remote peer. */
+  private handleDataChannelClose(label: string) {
+    const channel = this._dataChannels.get(label);
+    if (!channel) return;
+    (channel as unknown as { readyState: RTCDataChannelState }).readyState = "closed";
+    const ev = new Event("close");
+    channel.dispatchEvent(ev);
+    channel.onclose?.call(channel, ev);
+    this._dataChannels.delete(label);
+  }
+
+  /**
+   * Build the `RTCDataChannel` shape for a channel the *remote* peer created, learned
+   * about only once its DCEP handshake completes (see `handleDataChannelOpen`). No SDP
+   * negotiation of ours is involved -- str0m already has the channel, so this exists purely
+   * to give JS an object with the same `send()`/event surface as one created locally.
+   */
+  private createRemoteDataChannel(label: string): RTCDataChannel {
+    return this.buildDataChannel(label, {});
   }
 
   /**
@@ -716,8 +815,11 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   createDataChannel(label: string, dataChannelDict?: RTCDataChannelInit): RTCDataChannel {
     console.log(`[Elementium] createDataChannel called: label=${label} ordered=${dataChannelDict?.ordered} maxRetransmits=${dataChannelDict?.maxRetransmits}`);
-    const channelId = dataChannelDict?.id ?? this._dataChannelIdCounter++;
-    // Track for passing to create_offer so the SDP includes m=application
+    // Track for passing to create_offer so the SDP includes m=application. The channel
+    // does not become usable until Rust reports the DCEP handshake complete
+    // (`dataChannelOpen`, handled in `handleBackendEvent`) -- str0m's own docs say
+    // `Rtc::channel()` returns `None` for a fresh `ChannelId` on *either* side, so there is
+    // no shortcut that lets this side start writing before that.
     this._pendingDataChannels.push({
       label,
       ordered: dataChannelDict?.ordered,
@@ -725,6 +827,28 @@ class ElementiumRTCPeerConnection extends EventTarget {
       maxPacketLifeTime: dataChannelDict?.maxPacketLifeTime ?? undefined,
       protocol: dataChannelDict?.protocol,
     });
+
+    const channel = this.buildDataChannel(label, dataChannelDict);
+    this._dataChannels.set(label, channel);
+    return channel;
+  }
+
+  /**
+   * Build the `RTCDataChannel` object shared by both `createDataChannel()` (local) and
+   * `createRemoteDataChannel()` (remote-initiated). `readyState` starts `"connecting"` in
+   * both cases and only ever moves to `"open"`/`"closed"` from a real backend event --
+   * this used to fire `"open"` unconditionally after a `setTimeout(0)` regardless of
+   * whether SDP negotiation, let alone the DCEP handshake, had happened, which is how
+   * `send()` being a no-op went unnoticed: every caller saw a channel that claimed to be
+   * open immediately.
+   */
+  private buildDataChannel(label: string, dataChannelDict?: RTCDataChannelInit): RTCDataChannel {
+    const channelId = dataChannelDict?.id ?? this._dataChannelIdCounter++;
+    // Read at send() time, not captured now: `createDataChannel()` can be called before
+    // `init()`'s `create_peer_connection` call resolves, while `this.pcId` is still null.
+    // By the time a channel can actually be open (a real `dataChannelOpen` backend event),
+    // `pcId` is guaranteed to be set -- the event could not have arrived otherwise.
+    const getPcId = () => this.pcId;
 
     const target = new EventTarget();
     const channel = Object.assign(target, {
@@ -744,22 +868,63 @@ class ElementiumRTCPeerConnection extends EventTarget {
       onclose: null as ((ev: Event) => void) | null,
       onerror: null as ((ev: Event) => void) | null,
       onbufferedamountlow: null as ((ev: Event) => void) | null,
-      send: (_data: string | Blob | ArrayBuffer | ArrayBufferView) => {},
+      send: (data: string | Blob | ArrayBuffer | ArrayBufferView) => {
+        if (channel.readyState !== "open") {
+          // Matches the DOM: `send()` on a channel that is not open throws rather than
+          // silently dropping, which is the shape of bug this whole feature exists to fix
+          // -- a caller that thinks its message left when it did not.
+          throw new DOMException(
+            `Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel.readyState is not 'open'`,
+            "InvalidStateError",
+          );
+        }
+        if (data instanceof Blob) {
+          // Not supported: nothing between here and str0m's `Channel::write` (Tauri IPC,
+          // `Vec<u8>`) has a notion of a `Blob`, and turning one into bytes requires an
+          // async `arrayBuffer()` read that `send()`'s synchronous DOM signature has no
+          // way to await. Every other payload shape (`string`, `ArrayBuffer`,
+          // `ArrayBufferView`) is supported.
+          console.warn(
+            `[Elementium] RTCDataChannel.send(Blob) is not supported by this shim; ` +
+              `message on label=${label} was dropped. Send an ArrayBuffer or string instead.`,
+          );
+          return;
+        }
+        let bytes: Uint8Array;
+        let binary: boolean;
+        if (typeof data === "string") {
+          bytes = new TextEncoder().encode(data);
+          binary = false;
+        } else if (data instanceof ArrayBuffer) {
+          bytes = new Uint8Array(data);
+          binary = true;
+        } else {
+          // ArrayBufferView (typed array / DataView).
+          bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          binary = true;
+        }
+        invoke("send_data_channel_message", {
+          pcId: getPcId(),
+          label,
+          binary,
+          data: Array.from(bytes),
+        }).catch((e) => {
+          console.error(`[Elementium] send_data_channel_message failed: label=${label}`, e);
+        });
+      },
       close: () => {
+        // Local-only: there is no Rust command to tear down the underlying SCTP stream
+        // from this side (str0m's `close_data_channel` lives behind its lower-level
+        // `DirectApi`, not the SDP-negotiated path this connection uses), so this marks
+        // the JS-visible state closed without notifying the peer. A close initiated by the
+        // *remote* side still arrives correctly, via the `dataChannelClose` backend event.
+        if (channel.readyState === "closed") return;
         channel.readyState = "closed";
         const ev = new Event("close");
         target.dispatchEvent(ev);
         channel.onclose?.call(channel as unknown as RTCDataChannel, ev);
       },
     });
-
-    // Fire open event asynchronously (classic script-order: after current microtask)
-    setTimeout(() => {
-      channel.readyState = "open";
-      const ev = new Event("open");
-      target.dispatchEvent(ev);
-      channel.onopen?.call(channel as unknown as RTCDataChannel, ev);
-    }, 0);
 
     return channel as unknown as RTCDataChannel;
   }
