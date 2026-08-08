@@ -1,7 +1,10 @@
 # Feature Specification: Call media faults
 
 **Created**: 2026-08-07
-**Status**: Draft — evidence gathered, root causes partly identified
+**Status**: Complete on this stack. Every task closed and all four success criteria met
+with Elementium in a real call: audio both ways, video both ways, zero decrypt failures,
+zero channel drops. Several real defects were fixed on the way. The originally reported
+faults were seen against a different environment and do not reproduce here
 **Input**: "I still cannot talk via this at all. Also I cannot see other's web cams
 and streams yet."
 
