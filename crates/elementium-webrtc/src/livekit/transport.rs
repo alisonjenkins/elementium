@@ -534,15 +534,18 @@ async fn transport_dispatch(
                     None => break,
                 }
             }
+            // A `None` here means that I/O loop has ended, which only happens when the
+            // transport is being torn down. Breaking rather than ignoring it matters:
+            // `recv` on a closed channel returns immediately and forever, so an ignored
+            // `None` turns this select into a busy loop that spins a core until the
+            // process exits.
             ev = pub_event_rx.recv() => {
-                if let Some(ev) = ev {
-                    let _ = event_tx.send(TransportEvent::PublisherEvent(ev)).await;
-                }
+                let Some(ev) = ev else { break };
+                let _ = event_tx.send(TransportEvent::PublisherEvent(ev)).await;
             }
             ev = sub_event_rx.recv() => {
-                if let Some(ev) = ev {
-                    let _ = event_tx.send(TransportEvent::SubscriberEvent(ev)).await;
-                }
+                let Some(ev) = ev else { break };
+                let _ = event_tx.send(TransportEvent::SubscriberEvent(ev)).await;
             }
         }
     }
