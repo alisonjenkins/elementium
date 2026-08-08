@@ -523,17 +523,44 @@ async fn transport_dispatch(
     mut sub_event_rx: mpsc::Receiver<PcEvent>,
     event_tx: mpsc::Sender<TransportEvent>,
 ) {
+    // Reported once: a gone publisher stays gone, and the failure repeats per frame.
+    let mut publisher_gone_reported = false;
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(TransportCommand::WriteAudio(key, data)) => {
-                        let _ = pub_cmd_tx.send(PcCommand::WriteAudio(key, data)).await;
+                        // A failed send means the publisher task has gone: every frame from
+                        // here on is discarded, and the far end simply stops receiving. That
+                        // is a permanent condition being reported once rather than a
+                        // per-frame log, because if it happens it happens fifty times a
+                        // second and the first one has already said everything.
+                        if pub_cmd_tx
+                            .send(PcCommand::WriteAudio(key, data))
+                            .await
+                            .is_err()
+                            && !publisher_gone_reported
+                        {
+                            publisher_gone_reported = true;
+                            tracing::error!(
+                                track = %key,
+                                "the publisher task is gone; outbound media is being discarded"
+                            );
+                        }
                     }
                     Some(TransportCommand::WriteVideo(key, data, codec)) => {
-                        let _ = pub_cmd_tx
+                        if pub_cmd_tx
                             .send(PcCommand::WriteVideo(key, data, codec))
-                            .await;
+                            .await
+                            .is_err()
+                            && !publisher_gone_reported
+                        {
+                            publisher_gone_reported = true;
+                            tracing::error!(
+                                track = %key,
+                                "the publisher task is gone; outbound media is being discarded"
+                            );
+                        }
                     }
                     Some(TransportCommand::Shutdown) => {
                         let _ = pub_cmd_tx.send(PcCommand::Shutdown).await;
