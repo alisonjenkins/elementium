@@ -1008,7 +1008,19 @@ fn process_transport_events(
             let Ok(mut rx) = event_rx.lock() else {
                 return;
             };
-            rx.try_recv().ok()
+            match rx.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                // The transport is gone, so nothing will ever arrive here again. Ending
+                // the thread matters beyond tidiness: this runs on `spawn_blocking`, and
+                // a blocking task that never returns is one the tokio runtime can never
+                // shut down. `try_recv().ok()` used to fold this case into `Empty`, so the
+                // loop polled a dead channel at 200Hz for the life of the process.
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    tracing::info!("subscriber transport closed; ending media processing");
+                    return;
+                }
+            }
         };
 
         match event {
