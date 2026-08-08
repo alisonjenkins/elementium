@@ -294,6 +294,34 @@ export function describeJoinRequest(url: string): string | null {
   return `join_request ${payload.length} bytes: ${parts.join(" ")}`;
 }
 
+/**
+ * A signalling URL with its credentials removed, safe to log.
+ *
+ * `access_token` is a JWT granting publish and subscribe on the room, and `join_request`
+ * is the whole offer. Both were being logged in full on every open, close and error --
+ * four times per connection, in the log people attach to bug reports.
+ */
+/** Query parameters that must never reach a log. */
+const SECRET_PARAMS = ["access_token", "join_request"];
+
+export function redactSignalUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    for (const key of SECRET_PARAMS) {
+      if (parsed.searchParams.has(key)) parsed.searchParams.set(key, "<redacted>");
+    }
+    return parsed.toString();
+  } catch {
+    // Not absolute, so `URL` will not take it. Parsing it against a placeholder origin
+    // would work and would then report that origin as though it were the server's, so the
+    // values are replaced in the text instead.
+    return SECRET_PARAMS.reduce(
+      (acc, key) => acc.replace(new RegExp(`([?&]${key}=)[^&]*`), "$1<redacted>"),
+      url,
+    );
+  }
+}
+
 /** The bytes of a `send`/`message` payload, or null for text and Blob. */
 export function signalBytes(data: unknown): Uint8Array | null {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);

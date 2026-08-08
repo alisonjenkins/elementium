@@ -9,6 +9,7 @@ import {
   describeJoinRequest,
   describeRequest,
   describeResponse,
+  redactSignalUrl,
 } from "./livekit-signal";
 
 /**
@@ -157,5 +158,24 @@ describe("a leave from the SFU", () => {
 
   it("still names the message when the leave carries no reason", () => {
     expect(describeResponse(new Uint8Array(field(8, [])))).toBe("leave");
+  });
+});
+
+describe("logging a signalling URL", () => {
+  it("removes the access token and the join request", () => {
+    const url =
+      "ws://localhost:7880/rtc/v1?access_token=eyJhbGciOiJIUzI1NiJ9.secret&join_request=CAES";
+    const safe = redactSignalUrl(url);
+    expect(safe).not.toContain("secret");
+    expect(safe).not.toContain("CAES");
+    expect(safe).toContain("localhost:7880/rtc/v1");
+  });
+
+  it("redacts in the text when the URL is not absolute", () => {
+    // `URL` refuses a relative URL without a base, and supplying a placeholder base would
+    // put a hostname that is not the server's into the log.
+    expect(redactSignalUrl("/rtc/v1?access_token=secret&x=1")).toBe(
+      "/rtc/v1?access_token=<redacted>&x=1",
+    );
   });
 });

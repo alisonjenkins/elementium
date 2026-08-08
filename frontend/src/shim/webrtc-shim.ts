@@ -12,6 +12,7 @@ import {
   describeJoinRequest,
   describeRequest,
   describeResponse,
+  redactSignalUrl,
   signalBytes,
 } from "./livekit-signal";
 
@@ -904,9 +905,11 @@ export function setupWebRtcShim(): void {
     constructor(url: string | URL, protocols?: string | string[]) {
       super(url, protocols);
       const wsUrl = url.toString();
+      // Never the raw URL: it carries the access token and the whole join request.
+      const safeUrl = redactSignalUrl(wsUrl);
       const isLk = wsUrl.includes("livekit") || wsUrl.includes("matrixrtc") || wsUrl.includes("rtc");
       if (isLk) {
-        console.log(`[Elementium] WebSocket opening: ${wsUrl}`);
+        console.log(`[Elementium] WebSocket opening: ${safeUrl}`);
         let recvCount = 0;
         let sendCount = 0;
         // Reorder state: buffer publisher offers while waiting for subscriber answer
@@ -925,17 +928,17 @@ export function setupWebRtcShim(): void {
         }
 
         this.addEventListener("open", () => {
-          console.log(`[Elementium] WebSocket opened: ${wsUrl}`);
+          console.log(`[Elementium] WebSocket opened: ${safeUrl}`);
         });
         this.addEventListener("close", (e) => {
-          console.log(`[Elementium] WebSocket closed: ${wsUrl} code=${e.code} reason=${e.reason} wasClean=${e.wasClean}`);
+          console.log(`[Elementium] WebSocket closed: ${safeUrl} code=${e.code} reason=${e.reason} wasClean=${e.wasClean}`);
           // Clean up on close
           awaitingSubscriberAnswer = false;
           bufferedOffers = [];
           if (reorderTimer !== null) { clearTimeout(reorderTimer); reorderTimer = null; }
         });
         this.addEventListener("error", () => {
-          console.log(`[Elementium] WebSocket error: ${wsUrl}`);
+          console.log(`[Elementium] WebSocket error: ${safeUrl}`);
         });
 
         // Intercept incoming messages — detect subscriber offers from SFU
