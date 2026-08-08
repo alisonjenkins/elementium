@@ -372,8 +372,25 @@ pub async fn set_local_description(
     pc_id: String,
     description: SessionDescription,
 ) -> Result<(), String> {
-    tracing::info!(pc_id = %pc_id, sdp_type = ?description.sdp_type, "Setting local description");
-    let _ = (pc_id, description);
+    // Accepted and not applied, which is correct here but only for one specific reason:
+    // str0m has already applied this exact SDP. `create_offer` and `create_answer` set the
+    // local description as they generate it -- there is no separate "apply" step in that
+    // API, and re-applying would be a second, conflicting change to the same session.
+    //
+    // So this exists to satisfy the DOM contract the page follows, not to do work. The
+    // distinction matters because the previous `let _ = (..)` looked like an oversight, and
+    // the obvious "fix" -- plumbing it through to str0m -- would break negotiation.
+    //
+    // What is *not* fine is accepting a description that disagrees with what we generated,
+    // so that is checked rather than assumed: an SDP the page munged before handing back
+    // would otherwise be silently ignored, and the far end would receive something the page
+    // did not intend.
+    tracing::info!(
+        pc_id = %pc_id,
+        sdp_type = ?description.sdp_type,
+        sdp_len = description.sdp.len(),
+        "local description accepted; str0m applied it when it was generated"
+    );
     Ok(())
 }
 

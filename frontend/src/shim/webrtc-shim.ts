@@ -673,15 +673,19 @@ class ElementiumRTCPeerConnection extends EventTarget {
   async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
     if (!description) {
-      // `setLocalDescription()` with no argument is the standard implicit form: the browser
-      // generates the offer or answer itself from the signaling state. Returning silently
-      // made a caller that used it look like a caller that never negotiated at all -- no
-      // log line, no offer on the wire, and no error anywhere to say why.
-      console.error(
-        `[Elementium] setLocalDescription called with no description: pcId=${this.pcId} ` +
-          `signalingState=${this._signalingState}. The implicit form is not implemented, ` +
-          `so no offer or answer will be sent.`,
-      );
+      // The implicit form: the browser generates the offer or answer itself from the
+      // signaling state. Implemented rather than refused, because the alternatives are both
+      // bad — returning silently makes a caller that used it look like one that never
+      // negotiated (no offer on the wire, nothing in the log), and throwing breaks a caller
+      // that is using the API exactly as specified.
+      //
+      // Which one to generate is decided by the same rule the spec gives: an offer unless
+      // a remote offer is outstanding, in which case the reply is an answer.
+      const implicit =
+        this._signalingState === "have-remote-offer"
+          ? await this.createAnswer()
+          : await this.createOffer();
+      await this.setLocalDescription(implicit);
       return;
     }
     console.log(`[Elementium] setLocalDescription: pcId=${this.pcId} type=${description.type}`);
@@ -952,6 +956,16 @@ class ElementiumRTCPeerConnection extends EventTarget {
           data: Array.from(bytes),
         }).catch((e) => {
           console.error(`[Elementium] send_data_channel_message failed: label=${label}`, e);
+          // Also raised on the channel, because that is where a caller looks. `send()` is
+          // synchronous and cannot reject, so the DOM's only route for a transport failure
+          // is an `error` event -- and a console line is not a route at all for code trying
+          // to decide whether to retry.
+          const errorEvent = new Event("error");
+          const handler = (channel as unknown as Record<string, unknown>)["onerror"];
+          if (typeof handler === "function") {
+            (handler as (ev: Event) => void).call(channel, errorEvent);
+          }
+          channel.dispatchEvent?.(errorEvent);
         });
       },
       close: () => {
