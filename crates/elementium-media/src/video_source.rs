@@ -143,7 +143,26 @@ impl VideoSource {
         target_fps: u32,
         target: elementium_codec::EncodeTarget,
     ) -> Result<Self, String> {
-        let pipewire_err = match start_pipewire(target_fps, target) {
+        Self::start_at_device(width, height, target_fps, target, None)
+    }
+
+    /// Start capturing, preferring a specific `PipeWire` node.
+    ///
+    /// The node id comes from the same enumeration the device picker was built from, which
+    /// is the point: before this, the picker listed one set of devices and capture opened
+    /// whatever its own enumeration reached first, so choosing a camera did nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description if no source could be opened at all.
+    pub fn start_at_device(
+        width: Option<u32>,
+        height: Option<u32>,
+        target_fps: u32,
+        target: elementium_codec::EncodeTarget,
+        preferred_node: Option<u32>,
+    ) -> Result<Self, String> {
+        let pipewire_err = match start_pipewire(target_fps, target, preferred_node) {
             Ok(source) => return Ok(source),
             Err(e) => e,
         };
@@ -326,14 +345,32 @@ fn wait_for_first_frame(capturer: &PipewireCapturer) -> Result<(), String> {
 fn start_pipewire(
     target_fps: u32,
     target: elementium_codec::EncodeTarget,
+    preferred_node: Option<u32>,
 ) -> Result<VideoSource, String> {
     let sources = crate::pipewire_nodes::list_video_sources().map_err(|e| e.to_string())?;
     if sources.is_empty() {
         return Err("PipeWire offered no video sources".to_owned());
     }
 
+    // The requested camera first, then the rest as fallbacks.
+    //
+    // Ordered rather than filtered, deliberately: a user who picked a camera that has since
+    // been unplugged should still get a working call, and the alternative -- refusing --
+    // trades a wrong camera for no camera. But taking a different one silently is this
+    // codebase's oldest sin, so the substitution is logged as a substitution.
+    let mut ordered: Vec<&crate::pipewire_nodes::PipewireVideoSource> = sources.iter().collect();
+    if let Some(wanted) = preferred_node {
+        ordered.sort_by_key(|s| u8::from(s.node_id != wanted));
+        if !sources.iter().any(|s| s.node_id == wanted) {
+            tracing::warn!(
+                wanted_node = wanted,
+                "the requested camera is not among PipeWire's sources; using another"
+            );
+        }
+    }
+
     let mut last_error = String::new();
-    for source in &sources {
+    for source in ordered {
         match PipewireCapturer::start_at(source.node_id, target_fps, target) {
             Ok(capturer) => match wait_for_first_frame(&capturer) {
                 Ok(()) => {

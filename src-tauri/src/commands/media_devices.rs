@@ -382,24 +382,61 @@ pub fn set_capture_muted(
     Ok(())
 }
 
+/// The cameras the user can choose from, named so that capture can find them again.
+///
+/// Enumerated from `PipeWire` first, because that is what capture actually opens. They used
+/// to disagree: this listed nokhwa's devices as `video-input-{index}` while capture walked
+/// `PipeWire`'s own node list in its own order, so the id a user picked could not be
+/// resolved back to a node — which is why choosing a camera in settings did nothing at all
+/// and you got whichever one enumeration happened to reach first.
+///
+/// The same disagreement, between an enumeration and the thing that starts capture, was the
+/// screen-share bug recorded as R6 in `specs/008-screen-share-capture/research.md`. It is
+/// worth naming twice.
+///
+/// nokhwa remains the fallback for a machine with no `PipeWire`, where capture falls back
+/// to V4L2 in the same order, so the two still agree.
+fn video_input_devices() -> Vec<MediaDevice> {
+    match elementium_media::pipewire_nodes::list_video_sources() {
+        Ok(sources) if !sources.is_empty() => sources
+            .into_iter()
+            .map(|s| MediaDevice {
+                id: format!("video-input-pw-{}", s.node_id),
+                label: s.description,
+                kind: elementium_types::MediaDeviceKind::VideoInput,
+            })
+            .collect(),
+        Ok(_) | Err(_) => nokhwa::query(nokhwa::utils::ApiBackend::Auto)
+            .map(|cameras| {
+                cameras
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cam)| MediaDevice {
+                        id: format!("video-input-{i}"),
+                        label: cam.human_name().clone(),
+                        kind: elementium_types::MediaDeviceKind::VideoInput,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The `PipeWire` node id inside a device id handed out by `enumerate_devices`.
+///
+/// `None` for the nokhwa fallback ids (`video-input-3`), which name an index into a
+/// different enumeration and cannot be resolved to a node — the capture path then keeps its
+/// existing behaviour of taking the first source that works.
+fn camera_node_id(device_id: Option<&str>) -> Option<u32> {
+    device_id?.strip_prefix("video-input-pw-")?.parse().ok()
+}
+
 #[command]
 pub async fn enumerate_devices() -> Result<Vec<MediaDevice>, String> {
     tracing::info!("Enumerating media devices");
 
     let mut devices = device_enumeration::enumerate_audio_devices();
-
-    // Add video input devices
-    // nokhwa device enumeration is best-effort
-    if let Ok(cameras) = nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
-        for (i, cam) in cameras.iter().enumerate() {
-            devices.push(MediaDevice {
-                id: format!("video-input-{i}"),
-                label: cam.human_name().clone(),
-                kind: elementium_types::MediaDeviceKind::VideoInput,
-            });
-        }
-    }
-
+    devices.extend(video_input_devices());
     Ok(devices)
 }
 
@@ -599,6 +636,7 @@ pub async fn get_user_media(
 
         let (had_previous, inherited_connection) = take_over_camera_pipeline(&media_state, &track_id);
 
+        let req_node_id = camera_node_id(video_constraints.device_id.as_deref());
         let req_width = video_constraints.width;
         let req_height = video_constraints.height;
         // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
@@ -644,6 +682,7 @@ pub async fn get_user_media(
                 &muted_clone,
                 &tid,
                 &VideoCaptureSource::Camera {
+                    node_id: req_node_id,
                     width: req_width,
                     height: req_height,
                     fps: req_fps,
@@ -1093,6 +1132,13 @@ fn bitrate_for(width: u32, height: u32) -> u32 {
 pub enum VideoCaptureSource {
     /// A camera, found by enumeration.
     Camera {
+        /// The `PipeWire` node the user picked, when they picked one.
+        ///
+        /// Parsed from the id `enumerate_devices` handed out, so the picker and capture
+        /// name the same thing. They used to disagree entirely -- the picker listed
+        /// nokhwa's devices and capture walked PipeWire's own list -- which is why
+        /// choosing a camera in settings did nothing.
+        node_id: Option<u32>,
         width: Option<u32>,
         height: Option<u32>,
         fps: u32,
@@ -1130,7 +1176,9 @@ impl VideoCaptureSource {
     ) -> Result<elementium_media::video_source::VideoSource, String> {
         use elementium_media::video_source::VideoSource;
         match self {
-            Self::Camera { width, height, fps } => VideoSource::start_at(*width, *height, *fps, target),
+            Self::Camera { node_id, width, height, fps } => {
+                VideoSource::start_at_device(*width, *height, *fps, target, *node_id)
+            }
             Self::Screencast { node_id } => VideoSource::start_screencast(*node_id, target),
             Self::X11 { source_id } => start_x11_video_source(source_id),
         }
@@ -2358,6 +2406,35 @@ fn generate_track_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{t:x}")
+}
+
+#[cfg(test)]
+mod camera_device_id_tests {
+    use super::camera_node_id;
+
+    /// The picker's id has to resolve back to the node capture will open, or choosing a
+    /// camera does nothing -- which is exactly what it did before these ids agreed.
+    #[test]
+    fn a_pipewire_device_id_resolves_to_its_node() {
+        assert_eq!(camera_node_id(Some("video-input-pw-247")), Some(247));
+    }
+
+    /// The nokhwa fallback ids name an index into a different enumeration. Parsing one as a
+    /// node id would open an unrelated camera with great confidence, so they resolve to
+    /// nothing and capture keeps its "first source that works" behaviour.
+    #[test]
+    fn a_fallback_device_id_resolves_to_nothing() {
+        assert_eq!(camera_node_id(Some("video-input-3")), None);
+        assert_eq!(camera_node_id(Some("")), None);
+        assert_eq!(camera_node_id(None), None);
+    }
+
+    /// A malformed id is refused rather than partially parsed.
+    #[test]
+    fn a_malformed_pipewire_id_resolves_to_nothing() {
+        assert_eq!(camera_node_id(Some("video-input-pw-")), None);
+        assert_eq!(camera_node_id(Some("video-input-pw-abc")), None);
+    }
 }
 
 #[cfg(test)]
