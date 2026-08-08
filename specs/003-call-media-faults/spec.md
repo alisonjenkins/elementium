@@ -241,6 +241,39 @@ federation. None of those exist locally. Which of those differences matters is t
 question -- and the local stack cannot answer it, but it can now serve as the control,
 which it could not before today.
 
+## Finding — 2026-08-08: the hanging test was hanging on the way out
+
+`livekit_local_roundtrip` was recorded as a broken instrument: a ten-second test that
+ran for twenty-five minutes and printed nothing. Both halves of that description were
+misleading, and the second explains the first.
+
+It printed nothing because `LogCapture::install_global` installs a capture layer and no
+formatting layer, so the whole run is silent by construction. That is a property of the
+harness, not evidence about the hang.
+
+With the phases marked out, the test body runs to completion in about 38 seconds and
+**every assertion passes** — 1,500 chunks sent, inbound frames decoded at 48kHz stereo,
+zero decode failures. So the claim this test underwrites, that our client pushes audio
+through a real SFU and gets it back decodable, is not unverifiable. It was true the
+whole time and the test never got far enough to say so.
+
+The hang is teardown, and it is product code rather than test code:
+
+| Loop | Why it never returned |
+|---|---|
+| Subscriber `pc_io_loop` | Started with `cmd_rx: None` — no exit condition of any kind, and `Transport::shutdown` reaches only the publisher |
+| `process_transport_events` | Read with `try_recv().ok()`, folding `Disconnected` into `Empty`, so a dead channel looked idle |
+
+Both run on `spawn_blocking`, and tokio will not shut a runtime down while a blocking
+task is still running. So any process that connected a `LiveKitRoom` could not exit, and
+leaked a thread per connection. A third defect sat beside them: the transport dispatcher
+ignored `None` from its event channels, and `recv` on a closed channel returns `None`
+immediately and forever, so it span a core once either loop ended.
+
+The application takes the shim path and not `LiveKitRoom`, so no user has met these. They
+are still the reason the one test that measures the SFU path end to end could never be
+run to completion.
+
 ## User Scenarios
 
 ### US1 (P1) — Participants can hear each other
