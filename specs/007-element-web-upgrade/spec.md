@@ -293,11 +293,58 @@ tracks get their `m=` sections; here it never comes, so no receive section is ev
 negotiated and there is nothing for inbound RTP to arrive on. The 420 `subscription_response`
 messages are the client asking again and again for tracks it has nowhere to put.
 
-`media_sections_requirement` is almost certainly the replacement: the SFU tells the client
-how many sections to carry, and the client is expected to put them in its *own* offer rather
-than be offered them. That is the next thing to establish, and unlike the last question it
-is answerable from livekit-client's source, because the message is named and the handler
-will be reachable from it.
+`media_sections_requirement` is the replacement, and livekit-client's source says exactly
+what it does with it:
+
+```js
+onMediaSectionsRequirement = requirement => {
+  this.addMediaSections(requirement.numAudios, requirement.numVideos);
+  this.negotiate();
+};
+
+addMediaSections(numAudios, numVideos) {
+  const transceiverInit = { direction: 'recvonly' };
+  for (let i = 0; i < numAudios; i++)
+    this.pcManager?.addPublisherTransceiverOfKind('audio', transceiverInit);
+  for (let i = 0; i < numVideos; i++)
+    this.pcManager?.addPublisherTransceiverOfKind('video', transceiverInit);
+}
+```
+
+**Protocol 17 receives on the publisher connection.** One `recvonly` section per remote
+track, added to the connection we already have, then a re-offer. There is no subscriber
+offer because there is no longer a subscriber negotiation for these — which is why looking
+for one found nothing.
+
+### Why nothing decodes, and it is ours again
+
+`create_offer` in `crates/elementium-webrtc/src/peer_connection.rs` keeps **one audio mid
+and one video mid** per connection, and skips any transceiver whose kind already has one:
+
+```rust
+let existing = match tc.kind {
+    MediaKind::Audio => pc.audio_mid,
+    MediaKind::Video => pc.video_mid,
+};
+if let Some(mid) = existing {
+    tracing::debug!(..., "Transceiver already present, not re-adding");
+    continue;
+}
+```
+
+So when livekit-client asks for one recvonly audio section per remote participant, we add
+the first and silently drop the rest. The offer carries a single audio m-line, the SFU has
+nowhere to put the other streams, and no inbound audio is decoded — the symptom exactly.
+
+That guard was added for a real reason (re-offering appended a duplicate m-line for a track
+that already existed), so the fix is not to delete it. It has to tell "the same transceiver,
+offered again" from "another transceiver of the same kind", which means tracking the mids
+added per kind rather than a single mid per kind. `audio_mid` and `video_mid` are also the
+mids we *send* on, in `write_audio`/`write_video`, so they have to keep meaning that.
+
+This is stated as the cause on the strength of the code and the counts, not on a run: it
+has not yet been fixed and re-measured. That is the next step, and it needs care, because
+getting it wrong silently breaks the send path that works today on v1.12.11.
 
 Routing is not the problem: inbound media is dispatched by `mid`, not by SSRC, so the
 missing `a=ssrc` lines in the protocol-17 answers are a red herring.
