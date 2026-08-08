@@ -21,6 +21,8 @@ interface AutoJoinConfig {
   roomId: string;
   /** Whether to publish video. Either way the microphone is used; video also opens the camera. */
   video?: boolean;
+  /** Turn on the peer-connection trace and livekit-client's own debug logging. */
+  tracePc?: boolean;
 }
 
 const CONFIG = (window as unknown as Record<string, unknown>)[
@@ -115,6 +117,13 @@ function seedSession(cfg: AutoJoinConfig): void {
   window.localStorage.setItem("mx_device_id", cfg.deviceId);
   window.localStorage.setItem("mx_has_access_token", "true");
   window.localStorage.setItem("mx_seen_analytics_toast", "true");
+  if (cfg.tracePc) {
+    // livekit-client logs through `loglevel`, which reads its level from this key. At the
+    // default level it says nothing between "starting to negotiate" and a connection
+    // timeout, which is precisely the interval worth seeing when negotiation stalls.
+    window.localStorage.setItem("loglevel:livekit", "DEBUG");
+    window.localStorage.setItem("loglevel:lk-e2ee", "DEBUG");
+  }
   log(`session seeded for ${cfg.userId}`);
 }
 

@@ -365,7 +365,18 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
-    if (!description) return;
+    if (!description) {
+      // `setLocalDescription()` with no argument is the standard implicit form: the browser
+      // generates the offer or answer itself from the signaling state. Returning silently
+      // made a caller that used it look like a caller that never negotiated at all -- no
+      // log line, no offer on the wire, and no error anywhere to say why.
+      console.error(
+        `[Elementium] setLocalDescription called with no description: pcId=${this.pcId} ` +
+          `signalingState=${this._signalingState}. The implicit form is not implemented, ` +
+          `so no offer or answer will be sent.`,
+      );
+      return;
+    }
     console.log(`[Elementium] setLocalDescription: pcId=${this.pcId} type=${description.type}`);
     console.log("[Elementium] setLocalDescription SDP (post-munge):\n" + (description.sdp ?? "(no sdp)"));
     await invoke("set_local_description", {
@@ -630,10 +641,61 @@ class ElementiumRTCRtpScriptTransform {
 /**
  * Install the WebRTC shim, replacing the global RTCPeerConnection.
  */
+/**
+ * Record every property read and method call on the peer connection, in order.
+ *
+ * Off unless asked for. It exists because "which call does the far end make that we do not
+ * answer" is otherwise unanswerable: livekit-client is a minified bundle, our shim only logs
+ * the calls it already knew about, and a call we never implemented logs nothing at all —
+ * which is indistinguishable from a call that was never made.
+ *
+ * That is not hypothetical. On Element Web v1.12.25 livekit-client stops somewhere between
+ * `createOffer` and `setLocalDescription`, and reading its source did not settle where.
+ *
+ * Enabled by `ELEMENTIUM_TRACE_PC=1` on `just app-join`, which the patch script forwards.
+ */
+let pcCounter = 0;
+
+function tracePeerConnection<T extends object>(pc: T, pcId: string): T {
+  return new Proxy(pc, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      const name = String(prop);
+      // Symbols and the event-handler slots are read constantly and say nothing.
+      if (typeof prop === "symbol" || name.startsWith("on")) return value;
+      if (typeof value === "function") {
+        return (...args: unknown[]) => {
+          console.log(`[PCTrace] ${pcId}.${name}(${args.length} args)`);
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      console.log(`[PCTrace] ${pcId}.${name} -> ${safeTraceValue(value)}`);
+      return value;
+    },
+  });
+}
+
+/** A property value rendered short enough to read in a log, and never a payload. */
+function safeTraceValue(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (typeof value === "object") return Array.isArray(value) ? `[${value.length}]` : "{...}";
+  return String(value).slice(0, 40);
+}
+
 export function setupWebRtcShim(): void {
   const w = window as unknown as Record<string, unknown>;
-  w.RTCPeerConnection = ElementiumRTCPeerConnection;
-  w.webkitRTCPeerConnection = ElementiumRTCPeerConnection;
+  const trace = Boolean(
+    (w["__ELEMENTIUM_AUTOJOIN"] as Record<string, unknown> | undefined)?.["tracePc"],
+  );
+  w.RTCPeerConnection = trace
+    ? new Proxy(ElementiumRTCPeerConnection, {
+        construct(target, args: ConstructorParameters<typeof ElementiumRTCPeerConnection>) {
+          const pc = new target(...args);
+          return tracePeerConnection(pc, String(pcCounter++));
+        },
+      })
+    : ElementiumRTCPeerConnection;
+  w.webkitRTCPeerConnection = w.RTCPeerConnection;
 
   // Register global event handler on window.top so Rust's webview.eval() can reach it.
   // Rust calls: window.__elementium_webrtc_event({type,pcId,...})

@@ -46,7 +46,16 @@ function store(): Record<string, ShimInstall> {
  * function" but "has anything replaced the built-in", which survives our own refactors.
  */
 export function isPatched(fn: unknown): boolean {
-  return typeof fn === "function" && !/\[native code\]/.test(Function.prototype.toString.call(fn));
+  if (typeof fn !== "function") return false;
+  try {
+    return !/\[native code\]/.test(Function.prototype.toString.call(fn));
+  } catch {
+    // `Function.prototype.toString` throws on a Proxy-wrapped function, which is what the
+    // peer-connection trace installs. Something that cannot be stringified is certainly not
+    // the browser's own implementation, so this is "patched" rather than an error — the
+    // diagnostic must not make the thing it is diagnosing look broken.
+    return true;
+  }
 }
 
 /**
