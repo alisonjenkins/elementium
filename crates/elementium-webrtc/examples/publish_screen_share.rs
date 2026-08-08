@@ -409,9 +409,17 @@ async fn main() {
             let mono = elementium_media::audio_capture::downmix_to_mono(&aframe.data, aframe.channels);
             audio_accum.extend_from_slice(&mono);
             if let Some(enc) = audio_encoder.as_mut() {
+                let before = audio_sent;
                 audio_sent = audio_sent.saturating_add(
                     send_audio_chunk(enc, &room_conn, &mut audio_accum, frame_samples, opus_rate).await,
                 );
+                // Announced on the first packet, not only in the closing total: a driving
+                // test measures for half a minute and then kills this process, so it never
+                // sees the total, and asserting on a marker that cannot have been printed
+                // yet fails a run whose audio was flowing perfectly.
+                if before == 0 && audio_sent > 0 {
+                    println!("AUDIO_FLOWING");
+                }
             }
             true
         } else {

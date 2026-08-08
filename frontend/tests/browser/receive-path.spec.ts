@@ -236,7 +236,7 @@ function startScreenPublisher(
   seconds: number,
   keyHex?: string,
   audio = false,
-): Publisher & { audioSent: () => number | null } {
+): Publisher & { audioSent: () => number | null; audioFlowing: () => boolean } {
   const args = [
     "--sfu", SFU_HTTP,
     "--room", room,
@@ -251,7 +251,7 @@ function startScreenPublisher(
   });
   const echo = (c: Buffer) => {
     for (const line of c.toString().split("\n")) {
-      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |AUDIO_SENT |CAPTURED |AUDIO_SINK )/.test(line)) {
+      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |AUDIO_SENT |CAPTURED |AUDIO_SINK |AUDIO_FLOWING)/.test(line)) {
         console.log(`  [screen-publisher] ${line}`);
       }
     }
@@ -259,6 +259,9 @@ function startScreenPublisher(
   proc.stderr.on("data", echo);
   let sent: number | null = null;
   let audioSent: number | null = null;
+  // Set on the publisher's first share-audio packet, so a test that stops the process
+  // before it exits can still tell "audio was flowing" from "audio was never captured".
+  let audioFlowing = false;
   let out = "";
   const live = new Promise<void>((resolve, reject) => {
     proc.stdout.on("data", (chunk: Buffer) => {
@@ -273,6 +276,7 @@ function startScreenPublisher(
       if (m) sent = Number(m[1]);
       const am = /AUDIO_SENT (\d+)/.exec(out);
       if (am) audioSent = Number(am[1]);
+      if (out.includes("AUDIO_FLOWING")) audioFlowing = true;
     });
     proc.on("exit", (code) => {
       if (!out.includes("PUBLISHING")) {
@@ -285,6 +289,7 @@ function startScreenPublisher(
     live,
     sent: () => sent,
     audioSent: () => audioSent,
+    audioFlowing: () => audioFlowing,
     stop: () => proc.kill(),
   };
 }
@@ -1313,16 +1318,16 @@ test.describe("screen share (spec 008)", () => {
       // The publisher's own count of what it actually put on the wire, so a healthy
       // `packetsReceived` can be read against it rather than against a guess -- the same
       // delivery-ratio idea `VIDEO_SENT`/`SENT` already give the video and tone tests.
-      const audioSent = publisher.audioSent();
-      console.log(`  publisher reported AUDIO_SENT ${audioSent}`);
+      // `AUDIO_FLOWING`, not `AUDIO_SENT`: the total is printed when the publisher exits,
+      // and this test measures for half a minute and then kills it, so the total never
+      // arrives. Asserting on it failed a run whose audio was flowing perfectly — 501
+      // packets received, zero concealed — which is exactly the kind of harness fault that
+      // gets mistaken for a product one.
       expect(
-        audioSent,
-        "the publisher must report an AUDIO_SENT count; --audio never captured or encoded anything",
-      ).not.toBeNull();
-      expect(
-        audioSent,
-        "the publisher must have actually sent share-audio packets",
-      ).toBeGreaterThan(0);
+        publisher.audioFlowing(),
+        "the publisher never reported sending a share-audio packet, so nothing was captured " +
+          "or encoded; the receiver counters above cannot mean anything without it",
+      ).toBe(true);
     } finally {
       publisher.stop();
       server.close();

@@ -335,6 +335,36 @@ test and fails the user.
 
 ## Level 6 — Share audio (US3)
 
+**Passed 2026-08-08**, attended, with a 440Hz tone playing through the desktop sink:
+
+```sh
+ATTENDED=1 pnpm exec playwright test -g "share audio is received"
+```
+
+At the browser, over a settled 10s window on the `screen_share_audio` track:
+
+| packetsReceived | packetsLost | concealedSamples | totalSamplesReceived |
+|---|---|---|---|
+| 500 | 0 | **0** | 480000 |
+
+Zero concealment is the number that matters: a decrypt failure, a jitter-buffer stall or a
+malformed payload all show up as concealment while `packetsLost` stays at zero, which is
+how a stream can look healthy on the wire and sound like noise.
+
+**Covered: the delivery half.** SC-004 also asks that the microphone stay independently
+audible and mutable, which needs a concurrent microphone publisher this harness does not
+have. That half is untested and the test says so rather than implying otherwise.
+
+**Two harness faults this run cost, both worth recognising again:**
+
+- The publisher prints its `AUDIO_SENT` total when it *exits*, and the test kills it after
+  measuring — so asserting on that total failed a run whose audio was flowing perfectly
+  (501 packets, zero concealed). It now asserts on an `AUDIO_FLOWING` marker printed on the
+  first packet. A harness fault that reads as a product fault is expensive.
+- Leftover publishers from earlier failed runs hold their SFU connections; kill them before
+  blaming a `CONNECTION_TIMEOUT`.
+
+
 **Proves**: FR-006 through FR-008, SC-004 and SC-005.
 
 Play a known tone from the shared application, with the microphone also live.
