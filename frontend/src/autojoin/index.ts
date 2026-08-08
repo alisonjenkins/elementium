@@ -160,9 +160,15 @@ async function driveElementWeb(cfg: AutoJoinConfig): Promise<void> {
   // second load. Clicking the offered join button is not the answer: it joins by room id
   // with no via-servers and fails.
   try {
-    (await waitFor("the video call button", byName(/^video call$/i), 60_000)).click();
+    (await waitFor("the video call button", byName(/^video call$/i), 90_000)).click();
   } catch {
-    log("room did not appear; reloading once");
+    // What the page was actually showing. "Did not appear" covers a room still loading, a
+    // room preview for an account that is joined, and an error dialog -- and the reload that
+    // follows is only the right move for one of them.
+    log(
+      `room did not appear; page showing: ` +
+        `${document.body?.innerText?.replace(/\s+/g, " ").slice(0, 200) ?? ""}`,
+    );
     location.reload();
     return;
   }
