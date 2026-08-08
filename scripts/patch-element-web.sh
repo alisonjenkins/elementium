@@ -123,7 +123,13 @@ PYEOF
 )
     for f in "$INDEX" "$DIST_DIR/widgets/element-call/index.html"; do
         [[ -f "$f" ]] || continue
-        grep -qF "elementium-autojoin.js" "$f" && continue
+        # Always replaced, never skipped-if-present. The injected blob carries a room id and
+        # an access token, both of which change on every provision -- so honouring an
+        # existing injection points the application at the *previous* run's room, which it is
+        # not in. That presents as "There's no preview, would you like to join?" for an
+        # account the homeserver reports joined, and it is why this worked exactly once: on
+        # the run after the marker had been cleared.
+        sed -i '/__ELEMENTIUM_AUTOJOIN/d; /elementium-autojoin\.js/d' "$f"
         awk -v cfg="$AUTOJOIN_JSON" '
             !done && /<script/ {
                 print "    <script>window.__ELEMENTIUM_AUTOJOIN = " cfg ";</script>"

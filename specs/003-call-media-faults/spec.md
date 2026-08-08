@@ -189,7 +189,32 @@ reported fault reproduces here. That is worth stating plainly because it contrad
 the assumption this feature started from: on this stack, with this homeserver,
 Elementium can hear and be heard.
 
-### The one thing that did not work: the second remote camera
+### Correction: the second remote camera does work
+
+An earlier draft of this section reported that with two remote publishers only the
+first delivered video, on the strength of one run. Two later runs, after the harness
+was fixed, show both tracks delivering frames:
+
+```
+pc-18c9c16eb644c995-2   has_frame=True   12 samples
+pc-18c9c16eb644c995-3   has_frame=True   25 samples
+video-18c9c16efec7679c  has_frame=True   25 samples   (the local self-view)
+```
+
+with 1,028 inbound Opus frames in the same run. So remote video works for more than
+one participant, and the per-track display fix is doing exactly what it was written
+for.
+
+What the single earlier observation was is not established. The most likely reading is
+a peer that had joined but not yet published when the sample was taken — the frame
+counter is global and throttled to every 300th call, so a track that starts late is
+easy to miss entirely. The fetch loop now reports when it stops and counts failures
+instead of swallowing them, so a recurrence will say which it is rather than leaving
+it to be inferred.
+
+The original observation, kept because the reasoning from it was wrong twice over:
+
+### What one run showed, and did not mean
 
 Two remote participants published video. The frontend asked for both display slots and
 only one ever had a frame:
