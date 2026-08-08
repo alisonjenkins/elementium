@@ -11,6 +11,10 @@
 //! the symptom -- "the far end sees black" -- looks exactly like an encoder fault, an E2EE
 //! fault, or a codec negotiation fault, and all three are more famous than this one.
 
+// A failed setup step in a test should stop that test loudly and immediately; the
+// workspace's `expect_used` ban is aimed at the shipping paths, not at assertions.
+#![allow(clippy::expect_used)]
+
 use elementium_types::MediaTrackKey;
 use elementium_webrtc::peer_connection::{
     TransceiverInfo, create_offer, create_peer_connection, write_video,
@@ -126,8 +130,7 @@ fn the_microphone_and_share_audio_get_their_own_send_mids() {
     );
     assert!(
         pc.send_mids
-            .get(&MediaTrackKey::screen_share_audio())
-            .is_some()
+            .contains_key(&MediaTrackKey::screen_share_audio())
     );
 }
 

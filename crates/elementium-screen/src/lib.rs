@@ -1,3 +1,4 @@
+pub mod share;
 pub mod traits;
 
 #[cfg(target_os = "linux")]
@@ -11,4 +12,5 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+pub use share::{ShareBackend, ShareError, ShareSession, start_share};
 pub use traits::ScreenCapturer;
