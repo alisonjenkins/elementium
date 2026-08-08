@@ -365,6 +365,7 @@ impl VideoEncoder for NegotiatedEncoder {
 /// The decoder for whichever codec was negotiated. See [`NegotiatedEncoder`].
 pub enum NegotiatedDecoder {
     Vp8(crate::vpx_codec::Vp8Decoder),
+    H264(crate::h264_codec::H264Decoder),
 }
 
 impl NegotiatedDecoder {
@@ -376,7 +377,8 @@ impl NegotiatedDecoder {
     pub fn new(codec: VideoCodec) -> Result<Self, String> {
         match codec {
             VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Decoder::new()?)),
-            VideoCodec::H264 | VideoCodec::Av1 => Err(format!(
+            VideoCodec::H264 => Ok(Self::H264(crate::h264_codec::H264Decoder::new()?)),
+            VideoCodec::Av1 => Err(format!(
                 "no decoder available for {} on this build",
                 codec.sdp_name()
             )),
@@ -388,12 +390,14 @@ impl VideoDecoder for NegotiatedDecoder {
     fn codec(&self) -> VideoCodec {
         match self {
             Self::Vp8(d) => d.codec(),
+            Self::H264(d) => VideoDecoder::codec(d),
         }
     }
 
     fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
         match self {
             Self::Vp8(d) => VideoDecoder::decode(d, data),
+            Self::H264(d) => VideoDecoder::decode(d, data),
         }
     }
 }

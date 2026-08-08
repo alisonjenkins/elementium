@@ -1,4 +1,5 @@
 pub mod capture_format;
+pub mod h264_codec;
 pub mod hardware;
 pub mod opus_codec;
 pub mod pixel_convert;

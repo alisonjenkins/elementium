@@ -80,6 +80,15 @@ opus = "0.3"
 # Video
 vpx-encode = "0.6"
 env-libvpx-sys = { version = "5.1", features = ["generate"] }
+# Software H.264 decode. A peer publishing H.264 was previously a black tile: the encoder
+# side has had a VAAPI H.264 path for a while, but `NegotiatedDecoder` knew only VP8.
+#
+# Software rather than VAAPI, even though the VAAPI plumbing already exists here. Decode is
+# the side that must never fail: a machine with no GPU driver, or a driver without H.264
+# decode, still has to show the picture, and a decoder that works only where the encoder
+# does would leave exactly the black tile this removes. openh264 vendors its own source and
+# builds with `cc`, so it adds no system dependency.
+openh264 = "0.9"
 
 # Camera
 nokhwa = { version = "0.10", features = ["input-native"] }

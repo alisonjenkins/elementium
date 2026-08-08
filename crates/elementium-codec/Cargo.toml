@@ -10,6 +10,7 @@ elementium-types = { workspace = true }
 opus = { workspace = true }
 vpx-encode = { workspace = true }
 env-libvpx-sys = { workspace = true }
+openh264 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # SIMD-accelerated (AVX2/SSE/NEON, with scalar fallback) YUV<->RGB conversion,
