@@ -176,7 +176,21 @@ pub fn start_screen_share_pipeline(
 
     let tid = track_id.clone();
     let frames = video_frames.clone();
-    let span = tracing::Span::current();
+    // A span of this pipeline's own, not merely whatever was current at spawn.
+    //
+    // Everything `elementium-media` logs -- format negotiation, dropped frames, decode
+    // cost, a node disappearing -- is emitted on this thread and inherits whatever span it
+    // runs under. Inheriting the caller's meant inheriting nothing, because a share is
+    // started from a Tauri command that carries no call context, so capture events could
+    // not be tied to the track they came from. FR-002 asks for exactly that link, and this
+    // is the cheapest place to make it: one span here labels every event underneath it,
+    // including the ones in crates that know nothing about tracks.
+    let span = tracing::info_span!(
+        parent: tracing::Span::current(),
+        "capture",
+        track_id = %track_id,
+        key = %key
+    );
     std::thread::spawn(move || {
         let _guard = span.enter();
         video_pipeline_loop(
@@ -494,7 +508,15 @@ pub async fn get_user_media(
         // correlation_id.
         // If we just stopped a previous pipeline, delay to let the V4L2
         // device release (avoids EBUSY on Linux).
-        let camera_span = tracing::Span::current();
+        // Labelled the same way a share's pipeline is, and for the same reason: the camera
+        // path's capture events come from `elementium-media`, which has no idea which
+        // track it is feeding.
+        let camera_span = tracing::info_span!(
+            parent: tracing::Span::current(),
+            "capture",
+            track_id = %track_id,
+            key = %MediaTrackKey::camera()
+        );
         std::thread::spawn(move || {
             let _guard = camera_span.enter();
             if had_previous {
