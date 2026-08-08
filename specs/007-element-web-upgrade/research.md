@@ -60,6 +60,27 @@ worth having before someone goes looking for a renamed artefact that was never r
 produced the spec's imprecision — the root has 18 scripts and no `build`, which reads as
 "there is no build entry point" when in fact the entry point is a workspace directory away.
 
+### Verified by building, 2026-08-08 — and one claim above is wrong
+
+The recipe was run against tag `v1.12.25`, first by hand and then through the repaired
+`fetch_git()`. Both produced a complete `webapp` with `widgets/element-call` present.
+
+| | |
+|---|---|
+| Build time after install | **39s** (nx, 5 tasks, cold cache) |
+| Output | 153 MB at `apps/web/webapp` |
+| Source cache on disk | **2.3 GB** — git-ignored, and worth deleting between uses |
+
+**The claim that a build dirties the working tree is not true.** `prebuild:module_system`
+declares `{workspaceRoot}/pnpm-lock.yaml` among its *outputs*, and I read that as "the build
+writes it". After a full build `git status` is empty. Declaring a file as an nx output says
+nx may invalidate on it, not that this build modifies it — with the default
+`build_config.yaml` and no extra modules, nothing changes.
+
+The rule it produced — that a rebase should refuse to run over a dirty tree — is still worth
+keeping, but as ordinary hygiene rather than as a consequence of this build. Recorded because
+the reasoning was wrong even though the conclusion was harmless.
+
 ## R2: Node version
 
 **Decision**: build Element Web with Node 24. Do not change the version the rest of the
@@ -78,6 +99,21 @@ suspects the first time a build fails.
 rejected on evidence — no attempt has been made to build on 22 — but the cost of finding
 out the hard way is a debugging session, and the cost of avoiding it is one entry in
 `flake.nix`. T016 still builds to confirm, since this remains a prediction.
+
+### Superseded 2026-08-08: the prediction was wrong, and nothing needs to change
+
+**Node 22.23.2 builds v1.12.25 cleanly.** Twice — by hand and through `fetch_git()` — with
+nx reporting success across all five tasks and a complete 153 MB `webapp`.
+
+So the decision above is withdrawn. No Node 24 entry in `flake.nix`, and one fewer version
+to keep in step. The reasoning that produced it — "the CI pin says what upstream verifies,
+the engine range only what it tolerates" — is still a reasonable prior, and it was still
+worth an hour to find out rather than carrying a toolchain change nobody needed. T016 said
+this would be settled by building and not by reading version ranges, which is exactly what
+happened, in the direction the reading did not favour.
+
+Worth revisiting only if a future release raises `engines` above 22, which is the thing to
+watch rather than `.node-version`.
 
 ## R3: Does a rebase really drop a patch once upstream takes it?
 

@@ -83,18 +83,45 @@ fetch_git() {
         git -C "$cache_dir" checkout FETCH_HEAD
     else
         rm -rf "$cache_dir"
-        git clone --depth 1 --branch "$branch" "$repo" "$cache_dir"
+        # Not shallow. A shallow clone cannot be rebased onto a different upstream tag,
+        # which is the whole point of the patch branch; and the build stamps its version
+        # from `git describe`, which needs tags.
+        git clone --branch "$branch" "$repo" "$cache_dir"
     fi
 
-    # Build
-    cd "$cache_dir"
-    yarn install --frozen-lockfile
-    yarn build
-    cd ..
+    # Build, following upstream's own CI rather than inferring from package.json.
+    #
+    # Element Web became an nx/pnpm monorepo (`apps/web`, `apps/desktop`, `packages/*`), and
+    # the three lines that used to be here were wrong on every count: yarn (there is no
+    # yarn.lock), a root `build` script (the root has 18 scripts and none of them is
+    # `build`), and `webapp/` at the top level. Reading package.json is what produced that
+    # mistake -- the entry point is a workspace directory away. `.github/workflows/build.yml`
+    # is the authority, because it is what upstream actually runs.
+    #
+    # `scripts/layered.sh` runs first and is not optional: a build that skips it is not the
+    # build upstream ships.
+    (
+        cd "$cache_dir"
+        ./scripts/layered.sh
+        cp apps/web/element.io/develop/config.json apps/web/config.json
+        # CI_PACKAGE and VERSION are what upstream sets; without VERSION the build stamps
+        # itself from git describe and fails on a shallow clone.
+        cd apps/web
+        CI_PACKAGE=true VERSION="$(../../scripts/get-version-from-git.sh 2>/dev/null || echo "$branch")" \
+            pnpm run build
+    )
+
+    # `{projectRoot}/webapp` per apps/web/project.json -- the directory was never renamed,
+    # only moved.
+    local built="$cache_dir/apps/web/webapp"
+    [[ -d "$built" ]] || {
+        echo "[fetch] ERROR: build produced no $built" >&2
+        exit 1
+    }
 
     # Copy built output
     rm -rf "$DIST_DIR"
-    cp -r "$cache_dir/webapp" "$DIST_DIR"
+    cp -r "$built" "$DIST_DIR"
 
     echo "git:${repo}:${branch}:${remote_sha}" > "$SOURCE_INFO"
     echo "[fetch] Element Web built from ${branch}@${remote_sha:0:8}"
