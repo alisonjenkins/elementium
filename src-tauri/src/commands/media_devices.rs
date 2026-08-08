@@ -123,6 +123,18 @@ pub struct MediaState {
     /// dropped every handle to the session at the end of the function that created it, so
     /// nothing ever told the portal the share was over.
     pub share: Mutex<Option<ShareHandle>>,
+    /// The correlation id of the call currently connected, if any.
+    ///
+    /// Capture already logged under a correlation id, but a *fresh* one minted per
+    /// `get_user_media`, which is worse than none: two ids for one call look like two
+    /// unrelated flows, and joining a camera's frames to the session that published them
+    /// was impossible in a log. FR-002 asks for one id across a user flow, and the flow
+    /// starts at the room, not at the device.
+    ///
+    /// `None` outside a call, which is a real state rather than an error: device
+    /// enumeration and a preview both run before anyone joins anything, and they get their
+    /// own id.
+    pub session_correlation: Mutex<Option<CorrelationId>>,
 }
 
 /// A running screen share: the track it feeds, and the portal session behind it.
@@ -185,9 +197,20 @@ pub fn start_screen_share_pipeline(
     // not be tied to the track they came from. FR-002 asks for exactly that link, and this
     // is the cheapest place to make it: one span here labels every event underneath it,
     // including the ones in crates that know nothing about tracks.
+    // The call's correlation id is read here, in synchronous code, rather than entered as
+    // a span guard in the async command above: a guard held across an `.await` is attached
+    // to whichever thread resumes the future, so it can end up decorating unrelated work.
+    // This span belongs to a thread that never awaits, which is exactly where it is safe.
+    let call_id = media_state
+        .session_correlation
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default();
     let span = tracing::info_span!(
         parent: tracing::Span::current(),
         "capture",
+        correlation_id = %call_id,
         track_id = %track_id,
         key = %key
     );
@@ -441,7 +464,17 @@ pub async fn get_user_media(
     media_state: State<'_, MediaState>,
     constraints: MediaConstraints,
 ) -> Result<Vec<TrackId>, String> {
-    let call_id = CorrelationId::new();
+    // The connected call's id when there is one, a fresh id when there is not.
+    //
+    // Minting one unconditionally, as this used to, gave a call two correlation ids: the
+    // session's and this one. Two ids for one flow is worse than none, because they look
+    // like unrelated activity and nothing hints that they belong together.
+    let call_id = media_state
+        .session_correlation
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default();
     let call_span = tracing::info_span!(
         "call",
         correlation_id = %call_id,

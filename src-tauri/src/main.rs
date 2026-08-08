@@ -129,6 +129,7 @@ fn register_state(
             pipelines: Mutex::new(std::collections::HashMap::new()),
             share: Mutex::new(None),
             sfu_media_tx: Mutex::new(None),
+            session_correlation: Mutex::new(None),
         })
         .manage(protocols::VideoFrameState(video_frames.clone()))
         .manage(LiveKitState {

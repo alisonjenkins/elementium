@@ -40,6 +40,7 @@ pub struct ConnectResult {
 pub async fn livekit_connect(
     state: State<'_, LiveKitState>,
     e2ee_state: State<'_, E2eeState>,
+    media_state: State<'_, MediaState>,
     app: AppHandle,
     sfu_url: String,
     token: String,
@@ -83,6 +84,13 @@ pub async fn livekit_connect(
 
         // Store in state
         {
+            // Recorded so capture logs under the same id as the session that will carry
+            // their frames. Set here rather than at the room's creation because this is the
+            // point the room is known to be usable, and a capture pipeline started against
+            // a failed connection should not claim its id.
+            if let Ok(mut slot) = media_state.session_correlation.lock() {
+                *slot = Some(correlation_id.clone());
+            }
             let mut rooms = state.rooms.lock_str()?;
             rooms.insert(room_id.clone(), room);
         }
@@ -332,6 +340,12 @@ pub async fn livekit_set_subscriber_volume(
 /// Forget the room the capture pipelines were feeding, leaving them capturing but
 /// unpublished.
 fn detach_capture_pipelines(media_state: &MediaState) {
+    // The call's id goes with the call. A pipeline that outlives the room -- a preview left
+    // running after hanging up -- should not keep logging under a session that has ended,
+    // which would make a later log read as though the call were still up.
+    if let Ok(mut slot) = media_state.session_correlation.lock() {
+        *slot = None;
+    }
     if let Ok(mut guard) = media_state.sfu_media_tx.lock() {
         *guard = None;
     }
