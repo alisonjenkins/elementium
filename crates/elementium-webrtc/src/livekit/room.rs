@@ -67,7 +67,17 @@ pub enum RoomEvent {
     /// cannot decode what everyone else could. The capture pipeline follows this rather
     /// than deciding for itself, because only the SFU knows who is subscribed.
     #[serde(rename_all = "camelCase")]
-    PublishCodecChanged { room_id: String, codec: String },
+    /// The SFU has told us which codec its subscribers are taking.
+    ///
+    /// `encrypted` travels with it because the answer is not the same in both cases: our
+    /// H.264 under E2EE is decoded by another Elementium peer and by two browsers talking
+    /// to each other, but not by a browser receiving from us. Acting on this event without
+    /// knowing whether the room is encrypted would swap a working stream for a black tile.
+    PublishCodecChanged {
+        room_id: String,
+        codec: String,
+        encrypted: bool,
+    },
 }
 
 /// What to put in `AddTrackRequest.encryption` for a room running under `policy`.
@@ -392,6 +402,7 @@ impl LiveKitRoom {
         let rid = room_id.clone();
         let evt_tx = room_event_tx;
         let loop_publish_state = Arc::clone(&publish_state);
+        let room_is_encrypted = track_encryption != encryption::Type::None;
         let loop_span = tracing::Span::current();
 
         tokio::spawn(
@@ -406,6 +417,7 @@ impl LiveKitRoom {
                     rid,
                     evt_tx,
                     loop_publish_state,
+                    room_is_encrypted,
                 )
                 .await;
             }
@@ -764,8 +776,12 @@ fn send_room_event(tx: &mpsc::UnboundedSender<RoomEvent>, event: RoomEvent) {
         RoomEvent::ConnectionStateChanged { room_id, state } => {
             tracing::info!(room_id = %room_id, state = %state, "connection state changed");
         }
-        RoomEvent::PublishCodecChanged { room_id, codec } => {
-            tracing::info!(room_id, codec, "publish codec changed by the SFU");
+        RoomEvent::PublishCodecChanged {
+            room_id,
+            codec,
+            encrypted,
+        } => {
+            tracing::info!(room_id, codec, encrypted, "publish codec changed by the SFU");
         }
         RoomEvent::ActiveSpeakersChanged { room_id, speakers } => {
             tracing::debug!(room_id = %room_id, speakers = ?speakers, "active speakers changed");
@@ -810,6 +826,7 @@ async fn signal_processing_loop(
     room_id: String,
     event_tx: mpsc::UnboundedSender<RoomEvent>,
     publish_state: Arc<Mutex<PublishState>>,
+    encrypted: bool,
 ) {
     // Spawn a blocking task to process transport events (audio/video from subscriber PC).
     // Must be blocking because AudioPlayer (cpal) is not Send. spawn_blocking doesn't
@@ -1007,6 +1024,7 @@ async fn signal_processing_loop(
                         &event_tx,
                         RoomEvent::PublishCodecChanged {
                             room_id: room_id.clone(),
+                            encrypted,
                             codec: wanted
                                 .iter()
                                 .min_by_key(|c| c.negotiation_rank())
