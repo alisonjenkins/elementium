@@ -40,17 +40,36 @@
  */
 const rawKeyMaterial = new WeakMap<CryptoKey, Uint8Array>();
 
+/**
+ * Keys this bridge tried to hand to Rust and could not.
+ *
+ * Counted rather than only logged, because of what a failure means: the native side
+ * encrypts with a key the far end does not have, and every participant hears noise. That
+ * has happened before in this project, and the symptom — "everyone sounds like a modem" —
+ * looks nothing like an IPC error, so a `console.warn` in a webview nobody is watching is
+ * indistinguishable from silence.
+ */
+let keyIpcFailures = 0;
+
 /** Tauri command invoker, tolerant of the command being unavailable. */
 function invokeTauri(cmd: string, args: Record<string, unknown>): void {
+  const failed = (why: string, e: unknown) => {
+    keyIpcFailures += 1;
+    // At error, and stated in terms of the consequence rather than the mechanism. Whoever
+    // reads this is looking at a call that sounds broken, not at an IPC log.
+    console.error(
+      `[Elementium] E2EE IPC ${cmd} ${why} (failure #${keyIpcFailures}): the native backend ` +
+        `does not have this key, so what it sends cannot be decrypted by anyone in the call.`,
+      e,
+    );
+  };
   try {
     const internals = (window as unknown as Record<string, unknown>)["__TAURI_INTERNALS__"] as
       | { invoke?: (cmd: string, args: unknown) => Promise<unknown> }
       | undefined;
-    internals?.invoke?.(cmd, args)?.catch((e: unknown) => {
-      console.warn(`[Elementium] E2EE IPC ${cmd} rejected:`, e);
-    });
+    internals?.invoke?.(cmd, args)?.catch((e: unknown) => failed("was rejected", e));
   } catch (e) {
-    console.warn(`[Elementium] E2EE IPC ${cmd} unavailable:`, e);
+    failed("was unavailable", e);
   }
 }
 
@@ -169,8 +188,9 @@ function noteKeyImported(): number {
       `[Elementium] E2EE call key #${serial} was derived ${Date.now() - entry.at}ms ago and ` +
         `never reached the worker, so the native backend does not have it. ` +
         `derived=${keysImported} forwarded=${keysForwarded} ` +
-        `still_waiting=${pendingImports.size}. This is upstream of the bridge: livekit was ` +
-        `never asked to install it.`,
+        `still_waiting=${pendingImports.size} ipc_failures=${keyIpcFailures}. ` +
+        `A non-zero ipc_failures means the bridge tried and the IPC refused, which is ours; ` +
+        `zero means livekit was never asked to install it, which is upstream of the bridge.`,
     );
   }, UNFORWARDED_KEY_MS);
   return serial;
