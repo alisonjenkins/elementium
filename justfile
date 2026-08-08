@@ -113,6 +113,13 @@ element-web-rebase version:
 element-web-pr commit:
     ./scripts/element-web-pr.sh {{commit}}
 
+# Regenerate `element-web-patches.md` from the patch branch.
+#
+# Generated, never hand-written: a hand-written list is true the day it is written and
+# quietly stops being true the first time upstream takes one of the patches.
+element-web-patches:
+    ./scripts/element-web-patches.sh
+
 # Leave and forget every room the test participants are in.
 #
 # Each provision creates a room and each call test creates another, so they pile up. The

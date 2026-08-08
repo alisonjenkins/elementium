@@ -45,7 +45,7 @@
 # The upstream tag the patch branch is currently rebased onto. Kept beside the pin above
 # rather than derived, so "which upstream are the patches against" is answerable without a
 # checkout -- and so a mismatch with ELEMENT_WEB_VERSION is visible rather than latent.
-: "${ELEMENT_WEB_PATCH_BASE:=}"
+: "${ELEMENT_WEB_PATCH_BASE:=v1.12.25}"
 
 # Override examples:
 #
