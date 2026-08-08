@@ -156,3 +156,63 @@ fn building_from_separate_planes_is_understood_to_copy() {
         "from_planes allocated {bytes} bytes; it is expected to copy {FRAME_BYTES}"
     );
 }
+
+/// Uploading a frame to a GPU surface must write into the driver's mapping, not through a
+/// staging copy of its own.
+///
+/// This is the step the benchmark attributes least reliably. `SurfaceUpload::upload` maps
+/// the image, writes the planes row by row into the driver's memory, and unmaps -- so a
+/// `to_vec()` or a repack added anywhere in that path costs a frame-sized allocation per
+/// frame and shows up only as the accelerated path quietly losing its advantage.
+///
+/// Skips where there is no VAAPI device rather than failing: a machine without a GPU
+/// driver cannot answer this question, and pretending otherwise would make the suite fail
+/// for a reason that has nothing to do with the code.
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+#[test]
+fn uploading_to_a_surface_does_not_copy_the_frame() {
+    use elementium_codec::vaapi::{Display, image::SurfaceUpload, resource::SurfacePool};
+    use std::sync::Arc;
+
+    let Some(display) = Display::open_any() else {
+        eprintln!("skipping: no VAAPI render node on this machine");
+        return;
+    };
+    let display = Arc::new(display);
+    let Ok(pool) = SurfacePool::new_nv12(&display, W, H, 2) else {
+        eprintln!("skipping: the driver would not allocate NV12 surfaces");
+        return;
+    };
+    let Some(surface) = pool.surfaces().first().copied() else {
+        eprintln!("skipping: the pool produced no surface");
+        return;
+    };
+    let Ok(mut upload) = SurfaceUpload::new(&display, W, H) else {
+        eprintln!("skipping: the driver would not create an upload image");
+        return;
+    };
+
+    let y_stride = (W as usize).next_multiple_of(32);
+    let uv_stride = ((W as usize) / 2).next_multiple_of(32);
+    let frame =
+        I420Frame::from_padded(W, H, padded_buffer(), y_stride, uv_stride, 0).expect("valid frame");
+
+    // Prime it: the first upload can fault in the driver's mapping, which is a one-off.
+    let _ = upload.upload(&frame, surface);
+
+    let (result, bytes) = allocated_during(|| upload.upload(&frame, surface));
+    if result.is_err() {
+        eprintln!("skipping: the driver refused the upload");
+        return;
+    }
+
+    // Zero, not "less than a frame". The upload writes into the driver's mapping and has
+    // nothing to allocate, so any allocation at all is a copy that was not there before --
+    // and a threshold of one frame would miss a single plane, which is how the first
+    // version of this test passed while a whole luma plane was being copied.
+    assert_eq!(
+        bytes, 0,
+        "uploading allocated {bytes} bytes; it must write into the driver's mapping and \
+         allocate nothing (a {FRAME_BYTES}-byte frame)"
+    );
+}

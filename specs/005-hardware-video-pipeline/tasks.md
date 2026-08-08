@@ -36,4 +36,4 @@ is answering a question nobody asked.
 ## Phase 4: The copies that remain
 
 - [ ] T010 [US2] Import the camera's buffer as a DMA-BUF so it reaches the GPU without the CPU touching it, removing the two remaining copies on the accelerated path. This is a different mechanism from the current staging-image upload rather than an optimisation of it
-- [ ] T011 [US2] Extend the zero-copy test to cover the surface upload, so a copy reintroduced there fails a test rather than showing up in a benchmark later
+- [X] T011 [US2] **Done.** Asserts the upload allocates *zero* bytes rather than "less than a frame": the first version used a frame-sized threshold and passed while a whole luma plane was being copied, which the negative control caught. It now fails at 921,600 bytes when a copy is reintroduced. Skips where there is no VAAPI device rather than failing for a reason unrelated to the code. Original task follows. Extend the zero-copy test to cover the surface upload, so a copy reintroduced there fails a test rather than showing up in a benchmark later
