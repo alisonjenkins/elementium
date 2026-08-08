@@ -41,6 +41,13 @@ pub enum PipewireError {
     Init(String),
     #[error("PipeWire connection failed: {0}")]
     Connect(String),
+    /// Enumeration ran but its result cannot be trusted.
+    ///
+    /// Distinct from an empty list, which is a legitimate answer meaning the machine has no
+    /// such device. This says we do not know, and a caller that shows "no devices" for it
+    /// would be reporting a fact it does not have.
+    #[error("PipeWire enumeration failed: {0}")]
+    Enumerate(String),
 }
 
 /// How long to let the registry settle before returning what it announced.
@@ -92,7 +99,19 @@ pub fn list_video_sources() -> Result<Vec<PipewireVideoSource>, PipewireError> {
     let _ = timer.update_timer(Some(ENUMERATION_SETTLE), None);
     mainloop.run();
 
-    let sources = found.lock().map(|g| g.clone()).unwrap_or_default();
+    // A poisoned lock is reported, not folded into "no sources". The two are opposite
+    // situations that reach the same caller: an empty list means the machine has no camera,
+    // which a UI shows as "no devices"; a poisoned lock means the enumeration thread panicked
+    // and we know nothing, which a UI would then show as "no devices" too. One of those is
+    // a fact about the machine and the other is a bug in here.
+    let sources = match found.lock() {
+        Ok(list) => list.clone(),
+        Err(_) => {
+            return Err(PipewireError::Enumerate(
+                "the enumeration thread panicked; the video source list is unknown".to_owned(),
+            ));
+        }
+    };
     tracing::info!(count = sources.len(), "PipeWire video sources enumerated");
     for s in &sources {
         tracing::info!(
@@ -237,7 +256,16 @@ pub fn list_audio_sources() -> Result<Vec<PipewireAudioSource>, PipewireError> {
     let _ = timer.update_timer(Some(ENUMERATION_SETTLE), None);
     mainloop.run();
 
-    let sources = found.lock().map(|g| g.clone()).unwrap_or_default();
+    // Same reasoning as the video path above: "we could not find out" is not "there is
+    // nothing".
+    let sources = match found.lock() {
+        Ok(list) => list.clone(),
+        Err(_) => {
+            return Err(PipewireError::Enumerate(
+                "the enumeration thread panicked; the audio source list is unknown".to_owned(),
+            ));
+        }
+    };
     tracing::info!(count = sources.len(), "PipeWire audio sources enumerated");
     for s in &sources {
         tracing::info!(
