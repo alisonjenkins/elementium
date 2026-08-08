@@ -7,7 +7,7 @@ description = "LiveKit-compatible E2EE frame encryption for MatrixRTC calls"
 
 [dependencies]
 elementium-types = { workspace = true }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"

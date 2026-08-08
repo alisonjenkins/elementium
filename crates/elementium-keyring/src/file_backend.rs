@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use aes_gcm::aead::{Aead, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
+use aes_gcm::aead::{Aead, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use argon2::Argon2;
 use tracing::debug;
 
@@ -119,7 +119,10 @@ impl FileBackend {
             random_bytes::<SALT_LEN>()
         };
 
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        // aes-gcm 0.11 moved nonce generation behind the `Generate` trait, and the
+        // `getrandom`-backed `generate()` is the direct replacement for passing `OsRng`:
+        // same source of randomness, one fewer moving part at the call site.
+        let nonce: Nonce<Aes256Gcm> = aes_gcm::aead::Generate::generate();
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_slice())
             .map_err(|e| SecretStoreError::Encryption(e.to_string()))?;
