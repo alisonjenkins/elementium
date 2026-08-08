@@ -13,7 +13,7 @@ is answering a question nobody asked.
 - [ ] T012 [US1] Make the offered codec set include H.264 and make the send path follow the negotiated codec instead of assuming VP8 (payload selection at `peer_connection.rs:637`, and the packetiser). ~~Blocked on feature 003~~ — **unblocked 2026-08-08**, 003 is closed and remote video works. Split into T013–T016 below, because reading it through found a fourth part that is not in this description and that breaks peers rather than us
 - [ ] T013 [US1] Offer H.264 alongside VP8 at `crates/elementium-webrtc/src/peer_connection.rs:159`
 - [ ] T014 [US1] Select the payload type from the codec of the frame being written rather than `Codec::Vp8`, in `write_video` (`peer_connection.rs:637`), and packetise accordingly
-- [ ] T015 [US1] Make `unencrypted_header_size` in `crates/elementium-e2ee/src/lib.rs` codec-aware and match livekit's H.264 rule. **Do this first of the three**: it currently reads the VP8 frame tag on every video frame, so an H.264 frame would have its clear-text header sized from an unrelated bit and no peer could authenticate it — silently, and only at the receiver
+- [ ] T015 [US1] Make `unencrypted_header_size` in `crates/elementium-e2ee/src/lib.rs` codec-aware and match livekit's H.264 rule. **Do this first of the three**: it currently reads the VP8 frame tag on every video frame, so an H.264 frame would have its clear-text header sized from an unrelated bit and no peer could authenticate it — silently, and only at the receiver. The contract is written down in `spec.md`, read from livekit-client 2.21.0: clear bytes end two bytes into the first slice NAL unit, **and** the ciphertext must be RBSP-escaped on the way out and unescaped on the way in, which nothing in this repository does today
 - [ ] T016 [US1] Confirm against a real peer that H.264 video is decrypted and displayed, not merely negotiated — the failure mode T015 describes is invisible from the sending side
 
 ## Phase 2: Prove the saving
@@ -26,7 +26,7 @@ is answering a question nobody asked.
 
 - [ ] T007 [US3] Implement the `VideoToolbox` probe and encoder for macOS in `crates/elementium-codec/src/hardware.rs` and a new `videotoolbox` module — the selection policy is already platform-independent, so only the probe and construction are new
 - [ ] T008 [US3] Implement the Media Foundation probe and encoder for Windows, likewise
-- [ ] T009 [US1] AV1 encoding on VAAPI: the GPU offers it to 8192x4352 and it carries the same quality in roughly two thirds of H.264's bitrate. Only worth doing once H.264 is proven to engage
+- [ ] T009 [US1] AV1 encoding on VAAPI: the GPU offers it to 8192x4352 and it carries the same quality in roughly two thirds of H.264's bitrate. Only worth doing once H.264 is proven to engage. **Blocked for encrypted calls, which is all of them**: livekit's frame cryptor throws on AV1 outright (`av1 is not yet supported for end to end encryption`), so an AV1 publisher cannot be decrypted by any Element Call peer
 
 ## Phase 4: The copies that remain
 

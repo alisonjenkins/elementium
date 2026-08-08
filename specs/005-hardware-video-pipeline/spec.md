@@ -116,6 +116,29 @@ The encoder side needs nothing new: `VideoCodec`, `VideoEncoder::VaapiH264` and
 `ActiveCodec` already exist, and the SFU can already move the pipeline between codecs
 mid-call. This is wiring plus one correctness gap, not new capability.
 
+### The contract T015 has to match, read from livekit-client 2.21.0
+
+From `src/e2ee/worker/FrameCryptor.ts` and `naluUtils.ts`. Two rules, not one, and the
+second is a layer we have no equivalent of anywhere.
+
+**How many bytes stay in the clear.** `findSliceNALUUnencryptedBytes` walks the Annex B
+NAL unit indices and returns `index + 2` for the first *slice* NAL unit — IDR or
+non-IDR — where `index` is the offset of the NAL header byte, immediately after a 3- or
+4-byte start code. If there is no slice NAL unit it throws, and the cryptor falls back to
+the VP8 numbers. Note the asymmetry with VP8: the clear header is not a fixed size, it
+ends two bytes into the first slice.
+
+**Emulation prevention.** When the frame took the NALU path, livekit applies `writeRbsp`
+to the *ciphertext* before assembling the frame, and `parseRbsp` on the way back in when
+`needsRbspUnescaping` says so. Encrypted bytes are uniformly random, so a `00 00 00` or
+`00 00 01` sequence will occur by chance and would be read as a start code by anything
+parsing the stream. This is not optional and it is not a detail: skip it and roughly one
+frame in many thousands corrupts, which is the worst possible failure rate to debug.
+
+AV1 is rejected outright by livekit's cryptor (`is not yet supported for end to end
+encryption`), which means **T009 (AV1 on VAAPI) cannot be done for encrypted calls at
+all** while we interoperate with Element Call. Worth knowing before anyone starts it.
+
 ## Success Criteria
 
 - **SC1**: A real call on this machine logs `backend=vaapi` for video, or logs why
