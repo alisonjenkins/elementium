@@ -114,6 +114,74 @@ impl BitWriter {
     }
 }
 
+/// Bits, read most-significant first: the counterpart of [`BitWriter`].
+///
+/// Reading a header is not the mirror image of writing one, because a reader is handed
+/// bytes it did not produce. Every method here therefore reports running off the end rather
+/// than returning a plausible zero -- a truncated header must fail, not decode to something
+/// that looks valid and drives the hardware from nonsense.
+#[derive(Debug)]
+pub struct BitReader<'a> {
+    bytes: &'a [u8],
+    /// Bits consumed so far, from the start of `bytes`.
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    /// How many bits remain unread.
+    #[must_use]
+    pub const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_mul(8).saturating_sub(self.pos)
+    }
+
+    /// Read one bit, or `None` at the end of the data.
+    pub fn bit(&mut self) -> Option<bool> {
+        let byte = *self.bytes.get(self.pos / 8)?;
+        let shift = 7_u32.checked_sub(u32::try_from(self.pos % 8).ok()?)?;
+        self.pos = self.pos.checked_add(1)?;
+        Some(byte.checked_shr(shift)? & 1 == 1)
+    }
+
+    /// Read `count` bits, most significant first.
+    pub fn bits(&mut self, count: u8) -> Option<u32> {
+        let mut value = 0_u32;
+        for _ in 0..count.min(32) {
+            value = value.checked_mul(2)?.checked_add(u32::from(self.bit()?))?;
+        }
+        Some(value)
+    }
+
+    /// Read an unsigned exponential-Golomb code, `ue(v)`.
+    pub fn ue(&mut self) -> Option<u32> {
+        let mut zeroes = 0_u8;
+        while !self.bit()? {
+            zeroes = zeroes.checked_add(1)?;
+            // A run this long is not a value, it is a corrupt or misaligned buffer. Left to
+            // run, the loop would consume the whole NAL unit looking for a `1`.
+            if zeroes > 31 {
+                return None;
+            }
+        }
+        let rest = self.bits(zeroes)?;
+        (1_u32.checked_shl(u32::from(zeroes))?)
+            .checked_add(rest)?
+            .checked_sub(1)
+    }
+
+    /// Read a signed exponential-Golomb code, `se(v)`.
+    pub fn se(&mut self) -> Option<i32> {
+        let mapped = self.ue()?;
+        let half = i64::from(mapped.checked_add(1)? / 2);
+        let signed = if mapped % 2 == 1 { half } else { half.saturating_neg() };
+        i32::try_from(signed).ok()
+    }
+}
+
 /// Wrap a NAL payload with its start code and header, escaping it as the standard requires.
 ///
 /// `nal_ref_idc` says how important the unit is for reference: 3 for parameter sets and
@@ -150,7 +218,7 @@ fn escape_into(payload: &[u8], out: &mut Vec<u8>) {
     clippy::arithmetic_side_effects
 )]
 mod tests {
-    use super::{BitWriter, nal_unit};
+    use super::{BitReader, BitWriter, nal_unit};
 
     /// The exp-Golomb codes from the standard's own table. Every header depends on these,
     /// so they are checked against known values rather than against themselves.
@@ -268,5 +336,77 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// The reader has to agree with the writer, across the whole range each code uses.
+    ///
+    /// Checked against the writer rather than against hand-computed bits: the writer is
+    /// already trusted by every encoded frame this project has produced, so a disagreement
+    /// is evidence about the reader. Hand-written expectations would only re-test the
+    /// arithmetic I just wrote, twice.
+    #[test]
+    fn the_reader_recovers_every_unsigned_value_the_writer_encodes() {
+        for value in (0..=64_u32).chain([255, 256, 65_535, 65_536, 1_000_000]) {
+            let mut w = BitWriter::new();
+            w.ue(value);
+            w.trailing_bits();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.ue(), Some(value), "ue({value})");
+        }
+    }
+
+    #[test]
+    fn the_reader_recovers_every_signed_value_the_writer_encodes() {
+        for value in -64..=64_i32 {
+            let mut w = BitWriter::new();
+            w.se(value);
+            w.trailing_bits();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.se(), Some(value), "se({value})");
+        }
+    }
+
+    /// Several values in sequence, which is what a real header is: an error in bit position
+    /// shows up only once a second element has to start where the first one ended.
+    #[test]
+    fn the_reader_stays_aligned_across_a_sequence_of_elements() {
+        let mut w = BitWriter::new();
+        w.ue(3);
+        w.bits(0b1011, 4);
+        w.se(-5);
+        w.bit(true);
+        w.ue(0);
+        w.trailing_bits();
+        let bytes = w.finish();
+
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.ue(), Some(3));
+        assert_eq!(r.bits(4), Some(0b1011));
+        assert_eq!(r.se(), Some(-5));
+        assert_eq!(r.bit(), Some(true));
+        assert_eq!(r.ue(), Some(0));
+    }
+
+    /// Running off the end must fail, not return a plausible zero.
+    #[test]
+    fn a_truncated_buffer_reports_the_end_rather_than_inventing_a_value() {
+        let mut r = BitReader::new(&[]);
+        assert_eq!(r.bit(), None);
+        assert_eq!(r.ue(), None);
+        assert_eq!(r.se(), None);
+
+        // A byte of all zeroes is the start of a very long ue(v) that never arrives.
+        let mut r = BitReader::new(&[0x00]);
+        assert_eq!(r.ue(), None, "an unterminated code must not decode");
+    }
+
+    /// A run of zero bits longer than any real code must stop, not scan the whole unit.
+    #[test]
+    fn an_absurd_leading_zero_run_is_refused() {
+        let zeros = [0_u8; 16];
+        let mut r = BitReader::new(&zeros);
+        assert_eq!(r.ue(), None);
     }
 }
