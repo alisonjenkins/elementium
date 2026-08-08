@@ -1058,13 +1058,18 @@ fn video_pipeline_loop(
         if let Some(frame) = capturer.try_recv() {
             frame_count = frame_count.wrapping_add(1);
             if frame_count <= 3 || frame_count.is_multiple_of(100) {
+                // Named by source, not "Camera": this loop serves the screen share too, and
+                // this is the one line that says frames are flowing. Calling a share's
+                // frames camera frames means anyone grepping a log for a share's health
+                // finds camera lines, or nothing, and concludes the capture is dead.
                 tracing::info!(
                     track_id = %track_id,
+                    source = source.label(),
                     frame_count,
                     w = frame.width(),
                     h = frame.height(),
                     compressed = frame.mjpeg().is_some(),
-                    "Camera frame received"
+                    "capture frame received"
                 );
             }
             // The self-view: halved, then converted to RGBA for the canvas. Rate-limited
