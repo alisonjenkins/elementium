@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use elementium_types::{AudioFrame, CorrelationId};
+use elementium_types::{MediaTrackKey, AudioFrame, CorrelationId};
 use elementium_webrtc::EncryptionPolicy;
 use elementium_webrtc::livekit::room::LiveKitRoom;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -184,11 +184,11 @@ fn checkerboard(width: u32, height: u32, step: u32) -> elementium_types::I420Fra
 /// two in flight at once left the second answer describing mids the first offer never had.
 #[allow(clippy::expect_used)]
 async fn publish_tracks(room: &mut LiveKitRoom, codec: Option<elementium_codec::VideoCodec>) {
-    room.publish_track("audio", "microphone")
+    room.publish_track(MediaTrackKey::microphone())
         .expect("publish the audio track");
     if let Some(codec) = codec {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        room.publish_video_track("camera", codec, video_size().0, video_size().1)
+        room.publish_video_track(MediaTrackKey::camera(), codec, video_size().0, video_size().1)
             .expect("publish the video track");
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -279,7 +279,7 @@ async fn send_video_frame(
     let mut sent: u64 = 0;
     for packet in packets {
         if room
-            .write_video(packet.data, codec)
+            .write_video(MediaTrackKey::camera(), packet.data, codec)
             .await
             .is_ok()
         {
@@ -433,7 +433,7 @@ async fn main() {
             channels: CHANNELS,
             data: frame,
             timestamp_us: 0,
-        }) && room_conn.write_audio(packet).await.is_ok()
+        }) && room_conn.write_audio(MediaTrackKey::microphone(), packet).await.is_ok()
         {
             sent = sent.saturating_add(1);
         }

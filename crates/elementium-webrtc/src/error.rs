@@ -21,6 +21,15 @@ pub enum WebRtcError {
     /// before any audio transceiver was negotiated).
     #[error("no {0} writer/mid available")]
     NoWriterForKind(&'static str),
+    /// A write named one of our own tracks that this connection has not published.
+    ///
+    /// Distinct from [`WebRtcError::NoWriterForKind`] on purpose: that one means the media
+    /// kind was never negotiated at all, this one means the kind exists but the specific
+    /// track does not. Conflating them is what a by-kind fallback would do, and it would
+    /// send a screen share down the camera's m-line, which every receiver silently fails to
+    /// decode.
+    #[error("no mid published for track {0}")]
+    NoMidForTrack(String),
     /// A track kind string from a caller (JS, signaling) didn't match a known kind.
     #[error("unknown track kind: {0}")]
     UnknownTrackKind(String),

@@ -12,7 +12,7 @@ use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use elementium_types::{
-    IceConnectionState as IceState, PeerConnectionState, PlaintextMedia, SdpType,
+    IceConnectionState as IceState, MediaTrackKey, PeerConnectionState, PlaintextMedia, SdpType,
     SessionDescription, WireMedia,
 };
 
@@ -109,6 +109,15 @@ pub struct PeerConnectionInner {
     pub audio_mid: Option<Mid>,
     /// The mid we *send* video on. See [`PeerConnectionInner::audio_mid`].
     pub video_mid: Option<Mid>,
+    /// The mid each of our own tracks is published on.
+    ///
+    /// `audio_mid` and `video_mid` cannot answer this once a participant sends two video
+    /// tracks -- their camera and their screen -- because both are video and there is only
+    /// one slot. Writing the second to the first's mid is accepted by the SFU, advances the
+    /// sender's counters, and is never decodable by anyone: a failure indistinguishable
+    /// from success from this side. Hence an explicit map, and no by-kind fallback anywhere
+    /// that reads it.
+    pub send_mids: HashMap<MediaTrackKey, Mid>,
     /// `(kind, track_id)` of every transceiver already offered, to recognise a re-offer.
     ///
     /// Keyed on the track rather than on the kind. A caller that re-offers a transceiver
@@ -219,6 +228,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         rtc,
         audio_mid: None,
         video_mid: None,
+        send_mids: HashMap::new(),
         offered_tracks: Vec::new(),
         pending_offer: None,
         remote_mids: HashMap::new(),
@@ -352,10 +362,20 @@ pub struct TransceiverInfo {
     /// construction. Leaving this `None` lets str0m invent an id the SFU has never seen,
     /// and the association then depends on the server's by-kind fallback.
     pub track_id: Option<String>,
+    /// Which of our own tracks this m-line carries, when it carries one of ours.
+    ///
+    /// `None` for a `recvonly` placeholder, which sends nothing and so has no send mid to
+    /// register. Present for anything we publish, and it is what lets a later write find
+    /// this m-line again rather than guessing by media kind.
+    pub key: Option<MediaTrackKey>,
 }
 
 impl TransceiverInfo {
     /// Create from JS string values.
+    ///
+    /// The key is inferred from the kind because this path is the plain (non-`LiveKit`)
+    /// peer connection, where a participant publishes at most one track of each kind. A
+    /// screen share arrives through `LiveKit`, which names its tracks explicitly.
     #[must_use]
     pub fn from_js(kind: &str, direction: Option<&str>, track_id: Option<String>) -> Self {
         let kind = match kind {
@@ -368,11 +388,45 @@ impl TransceiverInfo {
             Some("inactive") => Direction::Inactive,
             _ => Direction::SendRecv,
         };
+        let key = match direction {
+            Direction::RecvOnly | Direction::Inactive => None,
+            _ => Some(default_key_for(kind)),
+        };
         Self {
             kind,
             direction,
             track_id,
+            key,
         }
+    }
+}
+
+/// The mid this connection publishes `key` on.
+///
+/// Deliberately without a by-kind fallback. Falling back to "the first video mid" for a
+/// track that has not been published would write a screen share down the camera's m-line:
+/// the SFU accepts the packets, the sender's counters advance, and no participant can
+/// decode them. Refusing the write leaves an error at the point of the fault instead of a
+/// silent black picture at every receiver.
+fn send_mid_for(
+    pc: &PeerConnectionInner,
+    key: MediaTrackKey,
+) -> Result<Mid, crate::error::WebRtcError> {
+    pc.send_mids
+        .get(&key)
+        .copied()
+        .ok_or_else(|| crate::error::WebRtcError::NoMidForTrack(key.to_string()))
+}
+
+/// The track a connection sends on the first m-line of a given kind, absent other
+/// information.
+///
+/// Correct wherever only one track of each kind exists: the plain peer connection, and the
+/// answerer role, where the m-lines come from the remote offer and carry no names of ours.
+const fn default_key_for(kind: MediaKind) -> MediaTrackKey {
+    match kind {
+        MediaKind::Audio => MediaTrackKey::microphone(),
+        MediaKind::Video => MediaTrackKey::camera(),
     }
 }
 
@@ -444,6 +498,13 @@ pub fn create_offer(
         match tc.kind {
             MediaKind::Audio => pc.audio_mid = pc.audio_mid.or(Some(mid)),
             MediaKind::Video => pc.video_mid = pc.video_mid.or(Some(mid)),
+        }
+        // Recorded per track as well as per kind, because a second video m-line is a
+        // second track of ours rather than somebody else's receive slot once the caller
+        // has named it. `or_insert` for the same reason the fields above use `or`: the
+        // first m-line offered for a track keeps the role across re-offers.
+        if let Some(key) = tc.key {
+            pc.send_mids.entry(key).or_insert(mid);
         }
     }
 
@@ -628,10 +689,11 @@ fn audio_wallclock(epoch: Instant, rtp_offset: u64, now: Instant) -> Instant {
 /// construction always succeeds.
 pub fn write_audio(
     pc: &mut PeerConnectionInner,
+    key: MediaTrackKey,
     opus_data: &WireMedia,
 ) -> Result<(), crate::error::WebRtcError> {
     let opus_data = opus_data.as_bytes();
-    let mid = pc.audio_mid.ok_or("No audio mid configured")?;
+    let mid = send_mid_for(pc, key)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
         return Err(crate::error::WebRtcError::NoWriterForKind("audio"));
@@ -692,11 +754,12 @@ const fn str0m_codec(codec: elementium_codec::VideoCodec) -> Codec {
 /// construction always succeeds.
 pub fn write_video(
     pc: &mut PeerConnectionInner,
+    key: MediaTrackKey,
     frame: &WireMedia,
     codec: elementium_codec::VideoCodec,
 ) -> Result<(), crate::error::WebRtcError> {
     let frame_data = frame.as_bytes();
-    let mid = pc.video_mid.ok_or("No video mid configured")?;
+    let mid = send_mid_for(pc, key)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
         return Err(crate::error::WebRtcError::NoWriterForKind("video"));
@@ -1321,6 +1384,13 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
                 }
                 _ => {}
             }
+            // Answering a remote offer: the m-lines are the offerer's, so none of them
+            // carries a name of ours. The first of each kind is what we send on, under the
+            // default key -- a share published this way is not possible, because the plain
+            // connection has no way to announce a second video track in the first place.
+            pc.send_mids
+                .entry(default_key_for(media.kind))
+                .or_insert(media.mid);
             Some(PcEvent::RemoteTrackAdded {
                 mid: media.mid.to_string(),
                 kind: match media.kind {
@@ -1729,7 +1799,7 @@ mod audio_send_pacing_tests {
 
 #[cfg(test)]
 mod offer_track_id_tests {
-    use super::{TransceiverInfo, create_offer, create_peer_connection};
+    use super::{MediaTrackKey, TransceiverInfo, create_offer, create_peer_connection};
     use str0m::media::{Direction, MediaKind};
 
     /// The shim path must carry the track id through too.
@@ -1774,6 +1844,7 @@ mod offer_track_id_tests {
                 kind: MediaKind::Audio,
                 direction: Direction::SendRecv,
                 track_id: Some("PA_abc123-audio-microphone".to_owned()),
+                key: Some(MediaTrackKey::microphone()),
             }],
         )
         .expect("offer");
@@ -1804,6 +1875,7 @@ mod offer_track_id_tests {
             kind: MediaKind::Audio,
             direction: Direction::SendRecv,
             track_id: Some("cid-audio".to_owned()),
+            key: Some(MediaTrackKey::microphone()),
         };
         create_offer(&mut pc, &[], std::slice::from_ref(&audio)).expect("first offer");
         let first_mid = pc.audio_mid.expect("audio mid recorded");
@@ -1817,6 +1889,7 @@ mod offer_track_id_tests {
                     kind: MediaKind::Video,
                     direction: Direction::SendRecv,
                     track_id: Some("cid-video".to_owned()),
+                    key: Some(MediaTrackKey::camera()),
                 },
             ],
         )
@@ -1850,6 +1923,7 @@ mod offer_track_id_tests {
                 kind: MediaKind::Video,
                 direction: Direction::SendRecv,
                 track_id: Some("cid-video".to_owned()),
+                key: Some(MediaTrackKey::camera()),
             }],
         )
         .expect("offer");
@@ -1886,6 +1960,7 @@ mod offer_track_id_tests {
             kind: MediaKind::Audio,
             direction: Direction::RecvOnly,
             track_id: None,
+            key: None,
         };
         let offer = create_offer(&mut pc, &[], &[recv(), recv(), recv()]).expect("offer");
 
@@ -1916,6 +1991,7 @@ mod offer_track_id_tests {
                 kind: MediaKind::Audio,
                 direction: Direction::SendRecv,
                 track_id: Some("cid-audio".to_owned()),
+                key: Some(MediaTrackKey::microphone()),
             }],
         )
         .expect("first offer");
@@ -1928,6 +2004,7 @@ mod offer_track_id_tests {
                 kind: MediaKind::Audio,
                 direction: Direction::RecvOnly,
                 track_id: None,
+                key: None,
             }],
         )
         .expect("second offer");

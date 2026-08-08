@@ -16,7 +16,7 @@ use livekit_protocol::{
     SignalTarget, TrackSource, TrackType, encryption,
 };
 
-use elementium_types::{CorrelationId, SdpType, SessionDescription};
+use elementium_types::{CorrelationId, MediaTrackKey, SdpType, SessionDescription, TrackKind};
 
 use crate::e2ee_io::EncryptionPolicy;
 use crate::engine::{IoCommand, VideoFrameBuffer};
@@ -104,10 +104,6 @@ pub struct LiveKitRoom {
     signal_client: SignalClient,
     transport: Transport,
     participants: HashMap<String, ParticipantInfo>,
-    /// `cid` of the published audio/video track, kept so a later renegotiation re-states
-    /// the same msid track ids the SFU already associated with these tracks.
-    audio_cid: Option<String>,
-    video_cid: Option<String>,
     /// Negotiation state shared with the signal loop. See [`PublishState`].
     publish_state: Arc<Mutex<PublishState>>,
     room_event_tx: mpsc::UnboundedSender<RoomEvent>,
@@ -139,9 +135,13 @@ pub struct LiveKitRoom {
 /// second knows when the first may start another.
 #[derive(Debug, Default)]
 struct PublishState {
-    audio_cid: Option<String>,
-    video_cid: Option<String>,
-    has_video: bool,
+    /// The `cid` announced for each track published so far, in publish order.
+    ///
+    /// Ordered rather than a map because an offer's m-lines are positional: an established
+    /// track has to keep the section it was first given, and a `HashMap`'s iteration order
+    /// would reshuffle them on every renegotiation. Each answer would then describe
+    /// different m-lines than the offer it replies to.
+    published: Vec<(MediaTrackKey, String)>,
     /// An offer has been sent and its answer has not been applied.
     ///
     /// str0m keeps exactly one pending offer. Creating a second one while the first is
@@ -155,24 +155,39 @@ struct PublishState {
     renegotiate_pending: bool,
 }
 
+impl PublishState {
+    /// Record a track as published, or return the `cid` it already has.
+    ///
+    /// Re-publishing the same track must not add a second m-line for it: the SFU pairs by
+    /// `cid`, so a duplicate would leave two sections claiming the same track and the
+    /// association would depend on which the server matched first.
+    fn announce(&mut self, key: MediaTrackKey, cid: String) {
+        if !self.published.iter().any(|(k, _)| *k == key) {
+            self.published.push((key, cid));
+        }
+    }
+}
+
 /// The transceivers an offer should describe, given what has been published so far.
 ///
 /// Always every published track, never just the new one: an offer is a complete description
 /// of the connection, and one that omits an established track asks the far end to drop it.
 fn publish_transceivers(state: &PublishState) -> Vec<crate::peer_connection::TransceiverInfo> {
-    let mut transceivers = vec![crate::peer_connection::TransceiverInfo {
-        kind: str0m::media::MediaKind::Audio,
-        direction: str0m::media::Direction::SendRecv,
-        track_id: state.audio_cid.clone(),
-    }];
-    if state.has_video {
-        transceivers.push(crate::peer_connection::TransceiverInfo {
-            kind: str0m::media::MediaKind::Video,
+    state
+        .published
+        .iter()
+        .map(|(key, cid)| crate::peer_connection::TransceiverInfo {
+            kind: match key.kind() {
+                TrackKind::Audio => str0m::media::MediaKind::Audio,
+                TrackKind::Video => str0m::media::MediaKind::Video,
+            },
             direction: str0m::media::Direction::SendRecv,
-            track_id: state.video_cid.clone(),
-        });
-    }
-    transceivers
+            track_id: Some(cid.clone()),
+            // The whole point of the exercise: this is what lets a later write find this
+            // m-line again instead of guessing that "the video one" means the camera.
+            key: Some(*key),
+        })
+        .collect()
 }
 
 /// Build an offer from the publisher connection and send it.
@@ -193,7 +208,12 @@ fn send_publisher_offer(
     };
     tracing::info!(
         offer_mids = %mid_list(&offer.sdp),
-        has_video = state.has_video,
+        tracks = %state
+            .published
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         "publisher offer"
     );
     signal_sender
@@ -380,8 +400,6 @@ impl LiveKitRoom {
             signal_client,
             transport,
             participants,
-            audio_cid: None,
-            video_cid: None,
             publish_state: Arc::clone(&publish_state),
             room_event_tx: room_event_tx.clone(),
             video_frames,
@@ -448,12 +466,12 @@ impl LiveKitRoom {
     /// As [`LiveKitRoom::publish_track`].
     pub fn publish_video_track(
         &mut self,
-        source: &str,
+        key: MediaTrackKey,
         codec: elementium_codec::VideoCodec,
         width: u32,
         height: u32,
     ) -> Result<(), crate::error::WebRtcError> {
-        self.publish_track_inner("video", source, Some((codec, width, height)))
+        self.publish_track_inner(key, Some((codec, width, height)))
     }
 
     /// Publish a track by kind, without declaring a codec.
@@ -464,36 +482,29 @@ impl LiveKitRoom {
     /// # Errors
     ///
     /// Returns an error if the `AddTrack` request or the offer cannot be sent.
-    pub fn publish_track(
-        &mut self,
-        kind: &str,
-        source: &str,
-    ) -> Result<(), crate::error::WebRtcError> {
-        self.publish_track_inner(kind, source, None)
+    pub fn publish_track(&mut self, key: MediaTrackKey) -> Result<(), crate::error::WebRtcError> {
+        self.publish_track_inner(key, None)
     }
 
+    // `&self`: publishing changes only the shared `publish_state` and the signalling
+    // socket, both behind their own synchronisation. It stopped needing exclusive access
+    // when the room's duplicate `audio_cid`/`video_cid` fields went away.
     fn publish_track_inner(
-        &mut self,
-        kind: &str,
-        source: &str,
+        &self,
+        key: MediaTrackKey,
         video: Option<(elementium_codec::VideoCodec, u32, u32)>,
     ) -> Result<(), crate::error::WebRtcError> {
-        let track_type: i32 = match kind {
-            "audio" => TrackType::Audio.into(),
-            "video" => TrackType::Video.into(),
-            _ => {
-                return Err(crate::error::WebRtcError::UnknownTrackKind(
-                    kind.to_string(),
-                ));
-            }
+        let (kind, source) = (key.kind().as_str(), key.source().as_str());
+        let track_type: i32 = match key.kind() {
+            TrackKind::Audio => TrackType::Audio.into(),
+            TrackKind::Video => TrackType::Video.into(),
         };
 
-        let track_source: i32 = match source {
-            "microphone" => TrackSource::Microphone.into(),
-            "camera" => TrackSource::Camera.into(),
-            "screen_share" => TrackSource::ScreenShare.into(),
-            "screen_share_audio" => TrackSource::ScreenShareAudio.into(),
-            _ => TrackSource::Unknown.into(),
+        let track_source: i32 = match key.source() {
+            elementium_types::TrackSource::Microphone => TrackSource::Microphone.into(),
+            elementium_types::TrackSource::Camera => TrackSource::Camera.into(),
+            elementium_types::TrackSource::ScreenShare => TrackSource::ScreenShare.into(),
+            elementium_types::TrackSource::ScreenShareAudio => TrackSource::ScreenShareAudio.into(),
         };
 
         // The SFU pairs this request with an m-line by matching `cid` against the offer's
@@ -501,8 +512,10 @@ impl LiveKitRoom {
         // free (its cid *is* the MediaStreamTrack id); we have to thread it through
         // explicitly, or the association falls back to the server's match-by-kind guess and
         // becomes order-dependent.
-        let cid = format!("{}-{kind}-{source}", self.local_sid);
-        let is_video = kind == "video";
+        //
+        // The tail comes from the key so that the value we route on locally and the value
+        // the SFU pairs on are derived from the same thing and cannot diverge.
+        let cid = format!("{}-{}", self.local_sid, key.cid_suffix());
 
         let span = tracing::info_span!("session", correlation_id = %self.correlation_id, room_id = %self.room_id);
         let _guard = span.enter();
@@ -560,22 +573,12 @@ impl LiveKitRoom {
         }
 
         tracing::info!(cid = %cid, kind, source, "AddTrack cid, also used as the offer msid track id");
-        if is_video {
-            self.video_cid = Some(cid.clone());
-        } else {
-            self.audio_cid = Some(cid.clone());
-        }
 
         let mut state = self
             .publish_state
             .lock()
             .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
-        if is_video {
-            state.video_cid = Some(cid);
-            state.has_video = true;
-        } else {
-            state.audio_cid = Some(cid);
-        }
+        state.announce(key, cid);
 
         // Renegotiation is one at a time. Publishing a second track while the first offer
         // is still unanswered used to replace str0m's pending offer, so the first answer
@@ -617,10 +620,11 @@ impl LiveKitRoom {
     /// Returns `Err` if the command cannot be sent to the transport.
     pub async fn write_audio(
         &self,
+        key: MediaTrackKey,
         data: elementium_types::PlaintextMedia,
     ) -> Result<(), crate::error::WebRtcError> {
         self.transport
-            .send_command(TransportCommand::WriteAudio(data))
+            .send_command(TransportCommand::WriteAudio(key, data))
             .await
     }
 
@@ -629,11 +633,12 @@ impl LiveKitRoom {
     /// Returns `Err` if the command cannot be sent to the transport.
     pub async fn write_video(
         &self,
+        key: MediaTrackKey,
         data: elementium_types::PlaintextMedia,
         codec: elementium_codec::VideoCodec,
     ) -> Result<(), crate::error::WebRtcError> {
         self.transport
-            .send_command(TransportCommand::WriteVideo(data, codec))
+            .send_command(TransportCommand::WriteVideo(key, data, codec))
             .await
     }
 
@@ -688,8 +693,10 @@ fn spawn_media_forwarder(cmd_tx: mpsc::Sender<TransportCommand>) -> mpsc::Sender
 
             while let Some(cmd) = media_rx.recv().await {
                 let transport_cmd = match cmd {
-                    IoCommand::WriteAudio(data) => TransportCommand::WriteAudio(data),
-                    IoCommand::WriteVideo(data, codec) => TransportCommand::WriteVideo(data, codec),
+                    IoCommand::WriteAudio(key, data) => TransportCommand::WriteAudio(key, data),
+                    IoCommand::WriteVideo(key, data, codec) => {
+                        TransportCommand::WriteVideo(key, data, codec)
+                    }
                     IoCommand::Shutdown => break,
                 };
 
@@ -1302,7 +1309,7 @@ mod media_forwarder_tests {
         spawn_media_forwarder,
     };
     use elementium_e2ee::{E2eeContext, E2eeOptions};
-    use elementium_types::PlaintextMedia;
+    use elementium_types::{MediaTrackKey, PlaintextMedia};
     use tokio::sync::mpsc;
 
     /// Encoded media handed to the room must reach the transport unchanged, and as the
@@ -1317,13 +1324,15 @@ mod media_forwarder_tests {
         let media_tx = spawn_media_forwarder(cmd_tx);
 
         media_tx
-            .send(IoCommand::WriteAudio(PlaintextMedia::from_encoder(vec![
-                1, 2, 3,
-            ])))
+            .send(IoCommand::WriteAudio(
+                MediaTrackKey::microphone(),
+                PlaintextMedia::from_encoder(vec![1, 2, 3]),
+            ))
             .await
             .expect("forwarder is running");
         media_tx
             .send(IoCommand::WriteVideo(
+                MediaTrackKey::camera(),
                 PlaintextMedia::from_encoder(vec![4, 5]),
                 elementium_codec::VideoCodec::Vp8,
             ))
@@ -1331,11 +1340,11 @@ mod media_forwarder_tests {
             .expect("forwarder is running");
 
         match cmd_rx.recv().await {
-            Some(TransportCommand::WriteAudio(data)) => assert_eq!(data.as_bytes(), &[1, 2, 3]),
+            Some(TransportCommand::WriteAudio(_, data)) => assert_eq!(data.as_bytes(), &[1, 2, 3]),
             other => panic!("expected WriteAudio, got {}", describe(other.as_ref())),
         }
         match cmd_rx.recv().await {
-            Some(TransportCommand::WriteVideo(data, _)) => assert_eq!(data.as_bytes(), &[4, 5]),
+            Some(TransportCommand::WriteVideo(_, data, _)) => assert_eq!(data.as_bytes(), &[4, 5]),
             other => panic!("expected WriteVideo, got {}", describe(other.as_ref())),
         }
     }
@@ -1349,13 +1358,16 @@ mod media_forwarder_tests {
 
         for _ in 0..8_u8 {
             media_tx
-                .send(IoCommand::WriteAudio(PlaintextMedia::from_encoder(vec![7])))
+                .send(IoCommand::WriteAudio(
+                    MediaTrackKey::microphone(),
+                    PlaintextMedia::from_encoder(vec![7]),
+                ))
                 .await
                 .expect("forwarder stays live while the transport is congested");
         }
 
         assert!(
-            matches!(cmd_rx.recv().await, Some(TransportCommand::WriteAudio(_))),
+            matches!(cmd_rx.recv().await, Some(TransportCommand::WriteAudio(..))),
             "the frames that did fit must still arrive"
         );
     }
@@ -1382,7 +1394,7 @@ mod media_forwarder_tests {
 
     fn describe(cmd: Option<&TransportCommand>) -> &'static str {
         match cmd {
-            Some(TransportCommand::WriteAudio(_)) => "WriteAudio",
+            Some(TransportCommand::WriteAudio(..)) => "WriteAudio",
             Some(TransportCommand::WriteVideo(..)) => "WriteVideo",
             Some(TransportCommand::Shutdown) => "Shutdown",
             None => "channel closed",

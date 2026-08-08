@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
 use elementium_media::audio_playback::AudioSink;
-use elementium_types::{PlaintextMedia, VideoFrame};
+use elementium_types::{MediaTrackKey, PlaintextMedia, VideoFrame};
 
 use crate::e2ee_io::{EncryptionPolicy, encrypt_or_drop, maybe_decrypt_event};
 use crate::peer_connection::{
@@ -26,7 +26,11 @@ pub struct IceServerConfig {
 pub enum IoCommand {
     /// Write an encoded Opus frame to the peer connection. Carries [`PlaintextMedia`]
     /// so it cannot reach the socket without passing through encryption first.
-    WriteAudio(PlaintextMedia),
+    ///
+    /// The [`MediaTrackKey`] says which of our tracks the frame belongs to. Audio has two
+    /// once a share is running -- the microphone and the shared application -- and they go
+    /// to different m-lines.
+    WriteAudio(MediaTrackKey, PlaintextMedia),
     /// Write an encoded video frame to the peer connection. See [`IoCommand::WriteAudio`].
     ///
     /// The codec travels with the frame rather than being assumed. Two things downstream
@@ -34,7 +38,15 @@ pub enum IoCommand {
     /// header, and how much of the frame E2EE leaves in the clear. The second is invisible
     /// to the sender -- a frame framed by the wrong codec's rules is one only the peer
     /// notices, by being unable to authenticate it.
-    WriteVideo(PlaintextMedia, elementium_codec::VideoCodec),
+    ///
+    /// The track key is here for the same class of reason: a camera frame and a screen
+    /// frame are both video, and sending one down the other's m-line fails in a way only
+    /// the receivers can see.
+    WriteVideo(
+        MediaTrackKey,
+        PlaintextMedia,
+        elementium_codec::VideoCodec,
+    ),
     /// Shut down the I/O loop.
     Shutdown,
 }
@@ -288,14 +300,14 @@ fn drain_io_commands(
 ) -> bool {
     loop {
         match cmd_rx.try_recv() {
-            Ok(IoCommand::WriteAudio(opus_data)) => {
+            Ok(IoCommand::WriteAudio(key, opus_data)) => {
                 let Some(data) = encrypt_or_drop(e2ee, opus_data, E2eeMediaKind::Audio, "audio")
                 else {
                     continue;
                 };
                 let mut pc = lock_pc(handle);
                 pacing.record(&pc.id.clone());
-                if let Err(e) = peer_connection::write_audio(&mut pc, &data) {
+                if let Err(e) = peer_connection::write_audio(&mut pc, key, &data) {
                     // Throttled warn, not debug: this is the last hop before the network,
                     // so a persistent failure here means nobody hears us -- and at
                     // `debug` it produced a completely clean log while doing so. The
@@ -316,7 +328,7 @@ fn drain_io_commands(
                     }
                 }
             }
-            Ok(IoCommand::WriteVideo(frame, codec)) => {
+            Ok(IoCommand::WriteVideo(key, frame, codec)) => {
                 let Some(kind) = crate::e2ee_io::video_media_kind(codec) else {
                     tracing::warn!(
                         reason = "no_e2ee_framing_for_codec",
@@ -329,7 +341,7 @@ fn drain_io_commands(
                     continue;
                 };
                 let mut pc = lock_pc(handle);
-                if let Err(e) = peer_connection::write_video(&mut pc, &data, codec) {
+                if let Err(e) = peer_connection::write_video(&mut pc, key, &data, codec) {
                     tracing::debug!("write_video: {e}");
                 }
             }

@@ -58,7 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use elementium_codec::{OpusDecoder, OpusEncoder, OpusEncoderConfig};
 use elementium_e2ee::{E2eeContext, E2eeOptions, MediaKind};
 use elementium_observability_test::LogCapture;
-use elementium_types::{AudioFrame, CorrelationId, WireMedia};
+use elementium_types::{MediaTrackKey, AudioFrame, CorrelationId, WireMedia};
 use elementium_webrtc::EncryptionPolicy;
 use elementium_webrtc::livekit::room::LiveKitRoom;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -391,7 +391,7 @@ async fn send_one(room: &LiveKitRoom, encoder: &mut OpusEncoder, frame: Vec<f32>
             timestamp_us: 0,
         })
         .expect("encode");
-    let ok = room.write_audio(packet).await.is_ok();
+    let ok = room.write_audio(MediaTrackKey::microphone(), packet).await.is_ok();
     tokio::time::sleep(Duration::from_millis(20)).await;
     ok
 }
@@ -506,7 +506,7 @@ async fn measure_sfu_delivery(
     // Fixed settling delays, matching the existing round-trip test: `SignalSender::send`
     // is fire-and-forget, so there is no "signaling ready" signal to wait on.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    alice.publish_track("audio", "microphone").expect("publish");
+    alice.publish_track(MediaTrackKey::microphone()).expect("publish");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Warm-up is event-driven, not a fixed sleep. On a machine with several network

@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use elementium_observability_test::LogCapture;
-use elementium_types::CorrelationId;
+use elementium_types::{CorrelationId, MediaTrackKey};
 use elementium_webrtc::livekit::room::LiveKitRoom;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
@@ -190,7 +190,7 @@ async fn audio_survives_real_publish_subscribe_round_trip() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     alice
-        .publish_track("audio", "microphone")
+        .publish_track(MediaTrackKey::microphone())
         .expect("publish_track should succeed");
 
     // Give the SFU time to process the AddTrack + renegotiate before we start sending media.
@@ -213,7 +213,7 @@ async fn audio_survives_real_publish_subscribe_round_trip() {
             timestamp_us: 0,
         };
         if let Ok(packet) = encoder.encode(&frame) {
-            let _ = alice.write_audio(packet).await;
+            let _ = alice.write_audio(MediaTrackKey::microphone(), packet).await;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -316,7 +316,7 @@ async fn encrypted_h264_survives_our_own_publish_subscribe_round_trip() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let (width, height) = (320, 240);
     alice
-        .publish_video_track("camera", elementium_codec::VideoCodec::H264, width, height)
+        .publish_video_track(MediaTrackKey::camera(), elementium_codec::VideoCodec::H264, width, height)
         .expect("publish the video track");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -354,7 +354,7 @@ async fn encrypted_h264_survives_our_own_publish_subscribe_round_trip() {
         {
             for packet in packets {
                 let _ = alice
-                    .write_video(packet.data, elementium_codec::VideoCodec::H264)
+                    .write_video(MediaTrackKey::camera(), packet.data, elementium_codec::VideoCodec::H264)
                     .await;
             }
         }

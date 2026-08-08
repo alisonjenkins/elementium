@@ -38,10 +38,14 @@ pub enum TransportCommand {
     /// Write an encoded Opus audio frame to the Publisher PC. Carries
     /// [`elementium_types::PlaintextMedia`] so it cannot reach the socket without
     /// passing through encryption first.
-    WriteAudio(elementium_types::PlaintextMedia),
+    WriteAudio(
+        elementium_types::MediaTrackKey,
+        elementium_types::PlaintextMedia,
+    ),
     /// Write an encoded video frame to the Publisher PC, in the codec named alongside it.
     /// See [`TransportCommand::WriteAudio`] and [`crate::engine::IoCommand::WriteVideo`].
     WriteVideo(
+        elementium_types::MediaTrackKey,
         elementium_types::PlaintextMedia,
         elementium_codec::VideoCodec,
     ),
@@ -170,42 +174,6 @@ impl Transport {
         })
     }
 
-    /// Create an SDP offer on the Publisher PC (for publishing tracks).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the Publisher PC lock is poisoned or offer creation fails.
-    /// Create the publisher offer.
-    ///
-    /// `audio_cid`/`video_cid` are the `cid` values sent in the matching `AddTrackRequest`,
-    /// and become the offer's msid track ids. The SFU pairs a published track with an
-    /// m-line by matching those two, so they must agree -- see
-    /// [`peer_connection::TransceiverInfo::track_id`].
-    pub fn create_publisher_offer(
-        &self,
-        include_video: bool,
-        audio_cid: Option<String>,
-        video_cid: Option<String>,
-    ) -> Result<SessionDescription, crate::error::WebRtcError> {
-        let mut pc = self
-            .publisher
-            .lock()
-            .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
-        let mut transceivers = vec![peer_connection::TransceiverInfo {
-            kind: str0m::media::MediaKind::Audio,
-            direction: str0m::media::Direction::SendRecv,
-            track_id: audio_cid,
-        }];
-        if include_video {
-            transceivers.push(peer_connection::TransceiverInfo {
-                kind: str0m::media::MediaKind::Video,
-                direction: str0m::media::Direction::SendRecv,
-                track_id: video_cid,
-            });
-        }
-        peer_connection::create_offer(&mut pc, &[], &transceivers)
-    }
-
     /// Set the SDP answer on the Publisher PC (received from SFU).
     ///
     /// # Errors
@@ -282,8 +250,12 @@ enum WriteKind {
 
 /// Internal command for the Publisher I/O loop.
 enum PcCommand {
-    WriteAudio(elementium_types::PlaintextMedia),
+    WriteAudio(
+        elementium_types::MediaTrackKey,
+        elementium_types::PlaintextMedia,
+    ),
     WriteVideo(
+        elementium_types::MediaTrackKey,
         elementium_types::PlaintextMedia,
         elementium_codec::VideoCodec,
     ),
@@ -320,19 +292,21 @@ fn pc_io_loop(
         if let Some(ref mut rx) = cmd_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(PcCommand::WriteAudio(data)) => {
+                    Ok(PcCommand::WriteAudio(key, data)) => {
                         write_encrypted_or_drop(
                             &handle,
                             e2ee.as_context(),
+                            key,
                             data,
                             WriteKind::Audio,
                             &mut audio_publish,
                         );
                     }
-                    Ok(PcCommand::WriteVideo(data, codec)) => {
+                    Ok(PcCommand::WriteVideo(key, data, codec)) => {
                         write_encrypted_or_drop(
                             &handle,
                             e2ee.as_context(),
+                            key,
                             data,
                             WriteKind::Video(codec),
                             &mut video_publish,
@@ -448,6 +422,7 @@ impl PublishCounters {
 fn write_encrypted_or_drop(
     handle: &PeerConnectionHandle,
     e2ee: Option<&E2eeContext>,
+    key: elementium_types::MediaTrackKey,
     data: elementium_types::PlaintextMedia,
     what: WriteKind,
     counters: &mut PublishCounters,
@@ -488,8 +463,8 @@ fn write_encrypted_or_drop(
     let result = {
         let mut pc = lock_pc(handle);
         match what {
-            WriteKind::Audio => peer_connection::write_audio(&mut pc, &data),
-            WriteKind::Video(codec) => peer_connection::write_video(&mut pc, &data, codec),
+            WriteKind::Audio => peer_connection::write_audio(&mut pc, key, &data),
+            WriteKind::Video(codec) => peer_connection::write_video(&mut pc, key, &data, codec),
         }
     };
     match result {
@@ -552,11 +527,13 @@ async fn transport_dispatch(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(TransportCommand::WriteAudio(data)) => {
-                        let _ = pub_cmd_tx.send(PcCommand::WriteAudio(data)).await;
+                    Some(TransportCommand::WriteAudio(key, data)) => {
+                        let _ = pub_cmd_tx.send(PcCommand::WriteAudio(key, data)).await;
                     }
-                    Some(TransportCommand::WriteVideo(data, codec)) => {
-                        let _ = pub_cmd_tx.send(PcCommand::WriteVideo(data, codec)).await;
+                    Some(TransportCommand::WriteVideo(key, data, codec)) => {
+                        let _ = pub_cmd_tx
+                            .send(PcCommand::WriteVideo(key, data, codec))
+                            .await;
                     }
                     Some(TransportCommand::Shutdown) => {
                         let _ = pub_cmd_tx.send(PcCommand::Shutdown).await;
