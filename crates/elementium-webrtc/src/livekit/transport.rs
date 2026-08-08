@@ -55,6 +55,13 @@ pub struct Transport {
     pub cmd_tx: mpsc::Sender<TransportCommand>,
     pub event_rx: Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
     pub e2ee: EncryptionPolicy,
+    /// The subscriber I/O loop's command channel, kept only so it can be closed.
+    ///
+    /// Nothing is ever sent on it -- a subscriber has no media to write. It exists
+    /// because a `spawn_blocking` task that never returns is one the tokio runtime can
+    /// never shut down, so *something* has to tell that loop its transport is gone.
+    /// Dropping this sender does it: the loop sees `Disconnected` and returns.
+    sub_cmd_tx: mpsc::Sender<PcCommand>,
 }
 
 impl Transport {
@@ -115,6 +122,9 @@ impl Transport {
         let (pub_event_tx, pub_event_rx) = mpsc::channel::<PcEvent>(256);
         let (sub_event_tx, sub_event_rx) = mpsc::channel::<PcEvent>(256);
         let (pub_cmd_tx, pub_cmd_rx) = mpsc::channel::<PcCommand>(256);
+        // See `Transport::sub_cmd_tx`: the subscriber's only use for a command channel is
+        // learning when to stop.
+        let (sub_cmd_tx, sub_cmd_rx) = mpsc::channel::<PcCommand>(1);
 
         // spawn_blocking doesn't propagate the ambient span on its own, so capture it
         // here and enter it inside each closure to keep the same correlation_id.
@@ -136,7 +146,7 @@ impl Transport {
         let sub_e2ee = e2ee.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = io_loop_span.enter();
-            pc_io_loop(sub_h, sub_s, None, sub_event_tx, sub_e2ee);
+            pc_io_loop(sub_h, sub_s, Some(sub_cmd_rx), sub_event_tx, sub_e2ee);
         });
 
         // Spawn dispatcher: routes TransportCommands to Publisher and merges events
@@ -153,6 +163,7 @@ impl Transport {
             cmd_tx,
             event_rx: Arc::new(Mutex::new(event_rx)),
             e2ee,
+            sub_cmd_tx,
         })
     }
 
@@ -247,8 +258,12 @@ impl Transport {
     }
 
     /// Shut down both `PeerConnections`.
+    ///
+    /// Both, not just the publisher: the dispatcher only reaches the publisher, and a
+    /// subscriber loop left running holds a `spawn_blocking` thread open for good.
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(TransportCommand::Shutdown).await;
+        let _ = self.sub_cmd_tx.send(PcCommand::Shutdown).await;
     }
 }
 
