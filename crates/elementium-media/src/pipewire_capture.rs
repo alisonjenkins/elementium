@@ -633,6 +633,12 @@ struct CaptureTiming {
     total: std::time::Duration,
     worst: std::time::Duration,
     bytes: u64,
+    /// Smallest source buffer seen in the window, alongside `mean_source_kb`.
+    ///
+    /// The mean alone cannot tell a genuinely short buffer from an ordinary one: "0.5% of
+    /// MJPEG buffers fail to decode, and they are short" is a claim about the tail of this
+    /// distribution, not its centre. Tracking the minimum costs one comparison per frame.
+    min_bytes: Option<u64>,
     /// Buffers the source handed us, whether or not they became frames.
     ///
     /// The difference between this and `frames` is the whole diagnostic. "Capture is
@@ -682,7 +688,9 @@ impl CaptureTiming {
         self.frames = self.frames.saturating_add(1);
         self.total = self.total.saturating_add(elapsed);
         self.worst = self.worst.max(elapsed);
-        self.bytes = self.bytes.saturating_add(u64::try_from(bytes).unwrap_or(0));
+        let bytes64 = u64::try_from(bytes).unwrap_or(0);
+        self.bytes = self.bytes.saturating_add(bytes64);
+        self.min_bytes = Some(self.min_bytes.map_or(bytes64, |m| m.min(bytes64)));
 
         if self.frames.is_multiple_of(Self::REPORT_EVERY) {
             let mean = self
@@ -697,6 +705,7 @@ impl CaptureTiming {
                     .checked_div(self.frames)
                     .and_then(|b| b.checked_div(1024))
                     .unwrap_or(0),
+                min_source_bytes = self.min_bytes.unwrap_or(0),
                 offered = self.offered,
                 rate_limited = self.rate_limited,
                 queue_full = self.queue_full,
@@ -1297,14 +1306,43 @@ fn attach_and_connect(
                 }
             } else {
                 timing.dropped(DropReason::Unusable);
+                // Distinguishes driver truncation from a race in our own read, for MJPEG
+                // specifically: a buffer cut off mid-write by the driver still starts with a
+                // valid SOI (the first bytes written) and simply stops before EOI. A buffer
+                // we read while another writer was rewriting it would more likely show a
+                // *corrupt* header -- we would have raced the same write that lays down the
+                // marker -- not a clean start with a missing tail. Checked only on the
+                // failure path, which is already rare enough (~0.5%) that this costs nothing
+                // worth measuring; it does no work on the 99.5% that decode.
+                let (soi_ok, eoi_ok, head_hex, tail_hex) = if n.encoding == Encoding::Mjpeg {
+                    let soi = matches!(bytes, [0xFF, 0xD8, ..]);
+                    let eoi = matches!(bytes, [.., 0xFF, 0xD9]);
+                    // A handful of bytes at each end, not the whole buffer: enough to tell a
+                    // zeroed allocation (never written) from live garbage (overwritten mid-read)
+                    // from an ordinary JPEG that is simply short, without logging kilobytes on
+                    // a path that already runs on every one of these rare failures.
+                    let head = bytes.get(..bytes.len().min(8)).unwrap_or(bytes);
+                    let tail_start = bytes.len().saturating_sub(8);
+                    let tail = bytes.get(tail_start..).unwrap_or(bytes);
+                    let hex = |b: &[u8]| {
+                        b.iter().fold(String::new(), |mut acc, x| {
+                            let _ = std::fmt::Write::write_fmt(&mut acc, format_args!("{x:02x}"));
+                            acc
+                        })
+                    };
+                    (Some(soi), Some(eoi), Some(hex(head)), Some(hex(tail)))
+                } else {
+                    (None, None, None, None)
+                };
                 tracing::warn!(
                     len = bytes.len(),
                     // The buffer's own description of itself, because "too short" says
                     // nothing about which of the three lengths involved was wrong.
-                    data_type, max_size, chunk_size = size,
+                    data_type, max_size, chunk_size = size, chunk_offset,
                     width, height, stride,
                     encoding = ?n.encoding,
                     reason = unusable_reason(n.encoding),
+                    soi_ok, eoi_ok, head_hex, tail_hex,
                     "PipeWire frame could not be converted; frame dropped"
                 );
             }

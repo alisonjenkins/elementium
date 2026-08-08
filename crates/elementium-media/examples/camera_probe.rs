@@ -55,7 +55,15 @@ fn main() {
                 print!("  node {} ({}): ", s.node_id, s.description);
                 match elementium_media::pipewire_capture::PipewireCapturer::start(s.node_id) {
                     Ok(cap) => {
-                        let deadline = Instant::now() + Duration::from_secs(3);
+                        // Overridable for measurement runs: the default 3s window rarely
+                        // sees more than one MJPEG decode failure (they are ~0.5% of
+                        // buffers), too few to characterise the tail of the size
+                        // distribution.
+                        let secs = std::env::var("ELEMENTIUM_PROBE_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(3);
+                        let deadline = Instant::now() + Duration::from_secs(secs);
                         let mut frames = 0_u32;
                         let mut started: Option<Instant> = None;
                         let mut latest: Option<Instant> = None;
@@ -94,7 +102,7 @@ fn main() {
                             }
                         }
                         match (frames, sample, started, latest) {
-                            (0, _, _, _) => println!("connected but delivered 0 frames in 3s"),
+                            (0, _, _, _) => println!("connected but delivered 0 frames in {secs}s"),
                             (count, Some((width, height, len)), Some(from), Some(to)) => {
                                 let span = to.saturating_duration_since(from).as_secs_f64();
                                 let fps = if span > 0.0 && count > 1 {
@@ -103,7 +111,7 @@ fn main() {
                                     0.0
                                 };
                                 println!(
-                                    "{count} frames in 3s ({fps:.1} fps), {width}x{height}, {len} bytes RGBA"
+                                    "{count} frames in {secs}s ({fps:.1} fps), {width}x{height}, {len} bytes RGBA"
                                 );
                             }
                             _ => println!("{frames} frames"),
