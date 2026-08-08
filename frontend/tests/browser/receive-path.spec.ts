@@ -155,6 +155,7 @@ function startPublisher(
   badFrames = 0,
   video: "h264" | "vp8" | null = null,
   keyIndex = 0,
+  videoSize: "tiny" | null = null,
 ): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
@@ -166,6 +167,7 @@ function startPublisher(
     ...(badFrames > 0 ? ["--bad-frames", String(badFrames)] : []),
     ...(video ? [`--video-${video}`] : []),
     ...(keyIndex > 0 ? ["--key-index", String(keyIndex)] : []),
+    ...(videoSize ? ["--video-size", videoSize] : []),
   ];
   // `RUST_LOG` at info: the publisher's own view of negotiation and ICE is the other half
   // of any failure here, and discarding its stderr made a publisher-side fault look like a
@@ -366,6 +368,7 @@ async function measureVideo(
   codec: "h264" | "vp8",
   encrypted = true,
   keyIndex = 0,
+  videoSize: "tiny" | null = null,
 ): Promise<VideoStats> {
   const roomName = `elementium-${codec}-${Date.now()}`;
   console.log(`  room: ${roomName}`);
@@ -392,6 +395,7 @@ async function measureVideo(
     0,
     codec,
     keyIndex,
+    videoSize,
   );
   try {
     await publisher.live;
@@ -840,6 +844,27 @@ test.describe("browser receive path", () => {
       server.close();
       await ctx.close();
     }
+  });
+
+  /**
+   * Encrypted H.264 small enough to fit one RTP packet.
+   *
+   * A fragmented frame and an unfragmented one take different paths through str0m's
+   * packetiser, and our encrypted frames are the only ones that fail. Publishing at 160x120
+   * puts most frames under the MTU: if they assemble, fragmentation is where to look, and
+   * if they do not, it is not.
+   */
+  test("diagnostic: encrypted H.264 below the MTU", async ({ page }) => {
+    test.fixme(
+      true,
+      "Answered: frames small enough to travel in one RTP packet fail exactly as " +
+        "fragmented ones do, so FU-A is not where the fault is. Kept because it rules out " +
+        "a whole code path in one run. See 005 T020.",
+    );
+    const stats = await measureVideo(page, "h264", true, 0, "tiny");
+    console.log(`  tiny encrypted H.264: ${JSON.stringify(stats)}`);
+    expect(stats.framesReceived, "unfragmented encrypted H.264 must assemble")
+      .toBeGreaterThan(5);
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.

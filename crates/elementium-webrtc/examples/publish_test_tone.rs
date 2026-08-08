@@ -100,8 +100,15 @@ fn mint_token(identity: &str, room: &str) -> String {
 
 /// The published video size. Small enough to encode comfortably in software or hardware,
 /// large enough that a wrong stride or a half-decrypted frame is unmistakable.
-const VIDEO_WIDTH: u32 = 320;
-const VIDEO_HEIGHT: u32 = 240;
+/// Overridable so a run can publish frames small enough to fit one RTP packet. Whether a
+/// frame is fragmented is the difference between two code paths in the packetiser, and
+/// sizing it below the MTU is the cheapest way to ask which one is at fault.
+fn video_size() -> (u32, u32) {
+    match arg("--video-size").as_deref() {
+        Some("tiny") => (160, 120),
+        _ => (320, 240),
+    }
+}
 
 /// One 20ms mono frame of a 440Hz sine at half scale.
 ///
@@ -181,7 +188,7 @@ async fn publish_tracks(room: &mut LiveKitRoom, codec: Option<elementium_codec::
         .expect("publish the audio track");
     if let Some(codec) = codec {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        room.publish_video_track("camera", codec, VIDEO_WIDTH, VIDEO_HEIGHT)
+        room.publish_video_track("camera", codec, video_size().0, video_size().1)
             .expect("publish the video track");
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -237,8 +244,8 @@ fn build_video_encoder(codec: elementium_codec::VideoCodec) -> elementium_codec:
     elementium_codec::NegotiatedEncoder::new(
         codec,
         elementium_codec::EncoderConfig {
-            width: VIDEO_WIDTH,
-            height: VIDEO_HEIGHT,
+            width: video_size().0,
+            height: video_size().1,
             bitrate_kbps: 1_000,
             max_framerate: 25,
         },
@@ -265,7 +272,7 @@ async fn send_video_frame(
     let step = u32::try_from(tick.checked_div(2).unwrap_or(0)).unwrap_or(0);
     let Ok(packets) = elementium_codec::VideoEncoder::encode(
         encoder,
-        &checkerboard(VIDEO_WIDTH, VIDEO_HEIGHT, step),
+        &checkerboard(video_size().0, video_size().1, step),
     ) else {
         return 0;
     };
