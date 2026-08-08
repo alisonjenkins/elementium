@@ -226,6 +226,70 @@ It does add a task the plan did not have — the shim's `RTCPeerConnection` has 
 up to what livekit-client now expects — and that is a bigger piece of work than the upgrade
 it blocks.
 
+## Finding — 2026-08-08: the cause was ours, and it was a misspelled property
+
+The signalling trace answered the question the previous finding left open. What the SFU
+replies to an offer carried in the join request is:
+
+```
+[LKSignal] connect: join_request 1023 bytes, compression=GZIP
+[LKSignal] recv #0 join (659 bytes)
+[LKSignal] send #0 add_track (46 bytes)
+[LKSignal] recv #1 refresh_token (463 bytes)
+[LKSignal] recv #2 leave reason=STATE_MISMATCH action=RECONNECT (6 bytes)
+```
+
+No answer, ever. `STATE_MISMATCH` is the SFU refusing the negotiation, and the LiveKit
+server log says exactly what it objected to:
+
+```
+received offer  {"offer": {"type":"unknown", "sdp":"v=0\r\no=str0m-0.16.2 ..."}}
+```
+
+**The offer had no type.** `create_offer` returns a Rust `SessionDescription`, whose field
+is renamed to `type`; the shim declared the IPC response as `{ sdpType, sdp }` and read
+`desc.sdpType`, a property that has never existed on it. Every description handed to
+livekit-client carried `type: undefined`, proto3 dropped the empty field, and the SFU got
+an untyped offer. Three call sites had it, including the answer returned by
+`set_remote_description`, which fed an untyped `localDescription`.
+
+This was not new, and not upstream's doing. It has been true the whole time. On protocol 16
+the WebSocket shim injects the missing `type` back into outgoing offers and answers — which
+is precisely what that block of code was written for, and its comment says so. Protocol 17
+carries the publisher offer in the connection URL, where the injection cannot reach it, and
+the latent bug became a hard failure.
+
+So the previous finding's framing — "a new connection flow to support" — was wrong in the
+part that mattered. The flow needed no support. It removed the cover from a defect of ours.
+
+### What works now on v1.12.25
+
+With the type read correctly, the SFU answers: `answer` (2,520 bytes), then trickle,
+`track_published`, `subscription_response`, and a steady ping/pong. 16,750 frames captured,
+16,749 sent, one dropped to a channel closed during an early reconnect. E2EE keys exchanged
+both ways (113 key events), and the decrypt failures are all in the first seconds before any
+key is known.
+
+### What still does not work
+
+**Zero inbound Opus frames decoded.** The SFU's answer offers the remote tracks
+(`a=sendonly` with real msids) and we subscribe, but nothing is decoded from them. Publishing
+works; receiving does not. That is the remaining blocker on the upgrade, and it is a
+different problem from the one this finding closes — the negotiation now succeeds.
+
+The pin is back at v1.12.11 until inbound audio works, because a pinned version whose calls
+are half-deaf is worse than one that is known to work.
+
+### Two things this cost, that are worth naming
+
+The trace was logging the full WebSocket URL on open, opened, close and error — four times
+per connection, including `access_token`, a JWT granting publish and subscribe on the room.
+That predates this work; it was visible because reading the trace put it in front of me.
+
+And the previous session's `[LKSignal]` predecessor dumped whole message bodies as byte
+arrays for the first five messages in each direction. Kinds and sizes answered the question
+in one run; the bytes never did.
+
 ## The shape of the answer
 
 Three kinds of change, told apart by intent, with a different home and a different cost
