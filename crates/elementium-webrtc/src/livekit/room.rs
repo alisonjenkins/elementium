@@ -13,7 +13,7 @@ use livekit_protocol::signal_request;
 use livekit_protocol::signal_response;
 use livekit_protocol::{
     AddTrackRequest, JoinResponse, ParticipantInfo, SessionDescription as LkSessionDescription,
-    SignalTarget, TrackInfo, TrackSource, TrackType, encryption,
+    SignalTarget, TrackSource, TrackType, encryption,
 };
 
 use elementium_types::{CorrelationId, SdpType, SessionDescription};
@@ -94,11 +94,12 @@ pub struct LiveKitRoom {
     signal_client: SignalClient,
     transport: Transport,
     participants: HashMap<String, ParticipantInfo>,
-    local_tracks: Vec<TrackInfo>,
     /// `cid` of the published audio/video track, kept so a later renegotiation re-states
     /// the same msid track ids the SFU already associated with these tracks.
     audio_cid: Option<String>,
     video_cid: Option<String>,
+    /// Negotiation state shared with the signal loop. See [`PublishState`].
+    publish_state: Arc<Mutex<PublishState>>,
     room_event_tx: mpsc::UnboundedSender<RoomEvent>,
     video_frames: VideoFrameBuffer,
     /// Where the capture pipelines write encoded media for this room.
@@ -119,6 +120,92 @@ pub struct LiveKitRoom {
     /// the payload is plaintext -- they hand ciphertext straight to Opus or VP8 and get
     /// noise or nothing, with no error anywhere to say why.
     track_encryption: encryption::Type,
+}
+
+/// What the publisher has announced, and whether an offer is outstanding.
+///
+/// Shared between `publish_track` and the signal loop because they are the two halves of
+/// one conversation: one side starts an offer, the other applies the answer, and only the
+/// second knows when the first may start another.
+#[derive(Debug, Default)]
+struct PublishState {
+    audio_cid: Option<String>,
+    video_cid: Option<String>,
+    has_video: bool,
+    /// An offer has been sent and its answer has not been applied.
+    ///
+    /// str0m keeps exactly one pending offer. Creating a second one while the first is
+    /// unanswered replaces it, and the first answer then arrives describing m-lines the
+    /// surviving offer never had -- "Mid in answer is not in offer". Worse, the second
+    /// offer describes only the newly added track, so the answer for it drops the other
+    /// one too, and a publisher that had working audio ends up sending nothing at all.
+    offer_in_flight: bool,
+    /// A track was published while an offer was outstanding, so another offer is owed once
+    /// the current one completes.
+    renegotiate_pending: bool,
+}
+
+/// The transceivers an offer should describe, given what has been published so far.
+///
+/// Always every published track, never just the new one: an offer is a complete description
+/// of the connection, and one that omits an established track asks the far end to drop it.
+fn publish_transceivers(state: &PublishState) -> Vec<crate::peer_connection::TransceiverInfo> {
+    let mut transceivers = vec![crate::peer_connection::TransceiverInfo {
+        kind: str0m::media::MediaKind::Audio,
+        direction: str0m::media::Direction::SendRecv,
+        track_id: state.audio_cid.clone(),
+    }];
+    if state.has_video {
+        transceivers.push(crate::peer_connection::TransceiverInfo {
+            kind: str0m::media::MediaKind::Video,
+            direction: str0m::media::Direction::SendRecv,
+            track_id: state.video_cid.clone(),
+        });
+    }
+    transceivers
+}
+
+/// Build an offer from the publisher connection and send it.
+///
+/// Shared by the first publish and by the renegotiation the signal loop starts once an
+/// answer lands, so both produce the same shape of offer from the same state.
+fn send_publisher_offer(
+    publisher: &crate::peer_connection::PeerConnectionHandle,
+    signal_sender: &SignalSender,
+    state: &PublishState,
+) -> Result<(), crate::error::WebRtcError> {
+    let transceivers = publish_transceivers(state);
+    let offer = {
+        let mut pc = publisher
+            .lock()
+            .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
+        crate::peer_connection::create_offer(&mut pc, &[], &transceivers)?
+    };
+    tracing::info!(
+        offer_mids = %mid_list(&offer.sdp),
+        has_video = state.has_video,
+        "publisher offer"
+    );
+    signal_sender
+        .send(signal_request::Message::Offer(LkSessionDescription {
+            r#type: "offer".to_owned(),
+            sdp: offer.sdp,
+            ..Default::default()
+        }))
+        .map_err(|e| {
+            crate::error::WebRtcError::Signaling(format!("failed to send publisher offer: {e}"))
+        })
+}
+
+/// The `a=mid:` values in an SDP, in order, for logging a negotiation mismatch.
+///
+/// "Mid in answer is not in offer" names one mid and neither list, which leaves the actual
+/// question -- which m-lines did each side describe -- unanswerable from the log.
+fn mid_list(sdp: &str) -> String {
+    sdp.lines()
+        .filter_map(|l| l.strip_prefix("a=mid:"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl LiveKitRoom {
@@ -235,6 +322,10 @@ impl LiveKitRoom {
         // drift apart: whatever encrypts the frames is what describes them.
         let track_encryption = declared_encryption(&e2ee);
 
+        // Shared with the signal loop, which is where an answer is applied and therefore
+        // the only place that knows when the next offer may be sent.
+        let publish_state = Arc::new(Mutex::new(PublishState::default()));
+
         // Create transport (Publisher + Subscriber PeerConnections)
         let transport = match Transport::new_with_e2ee(&room_id, e2ee, None) {
             Ok(t) => t,
@@ -279,9 +370,9 @@ impl LiveKitRoom {
             signal_client,
             transport,
             participants,
-            local_tracks: Vec::new(),
             audio_cid: None,
             video_cid: None,
+            publish_state: Arc::clone(&publish_state),
             room_event_tx: room_event_tx.clone(),
             video_frames,
             media_tx,
@@ -300,6 +391,7 @@ impl LiveKitRoom {
         let vf = room.video_frames.clone();
         let rid = room_id.clone();
         let evt_tx = room_event_tx;
+        let loop_publish_state = Arc::clone(&publish_state);
         let loop_span = tracing::Span::current();
 
         tokio::spawn(
@@ -313,6 +405,7 @@ impl LiveKitRoom {
                     vf,
                     rid,
                     evt_tx,
+                    loop_publish_state,
                 )
                 .await;
             }
@@ -404,45 +497,44 @@ impl LiveKitRoom {
             )));
         }
 
-        // Trigger SDP renegotiation on Publisher
-        let include_video = is_video || self.has_video_track();
-        let (audio_cid, video_cid) = if is_video {
-            (self.audio_cid.clone(), Some(cid.clone()))
-        } else {
-            (Some(cid.clone()), self.video_cid.clone())
-        };
+        tracing::info!(cid = %cid, kind, source, "AddTrack cid, also used as the offer msid track id");
         if is_video {
             self.video_cid = Some(cid.clone());
         } else {
             self.audio_cid = Some(cid.clone());
         }
-        tracing::info!(cid = %cid, kind, source, "AddTrack cid, also used as the offer msid track id");
-        let offer = match self
-            .transport
-            .create_publisher_offer(include_video, audio_cid, video_cid)
-        {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(reason = %e, "publish track failed");
-                return Err(e);
-            }
-        };
 
-        if let Err(e) =
-            self.signal_sender
-                .send(signal_request::Message::Offer(LkSessionDescription {
-                    r#type: "offer".to_string(),
-                    sdp: offer.sdp,
-                    ..Default::default()
-                }))
-        {
-            tracing::error!(reason = %e, "publish track failed");
-            return Err(crate::error::WebRtcError::Signaling(format!(
-                "failed to send publisher offer: {e}"
-            )));
+        let mut state = self
+            .publish_state
+            .lock()
+            .map_err(|_| crate::error::WebRtcError::LockPoisoned)?;
+        if is_video {
+            state.video_cid = Some(cid);
+            state.has_video = true;
+        } else {
+            state.audio_cid = Some(cid);
         }
 
-        Ok(())
+        // Renegotiation is one at a time. Publishing a second track while the first offer
+        // is still unanswered used to replace str0m's pending offer, so the first answer
+        // arrived describing m-lines the surviving offer never had and *both* tracks
+        // stopped writing. The owed offer is sent when the outstanding answer lands.
+        if state.offer_in_flight {
+            state.renegotiate_pending = true;
+            tracing::info!(
+                kind,
+                "an offer is already outstanding; renegotiation deferred until it is answered"
+            );
+            return Ok(());
+        }
+        state.offer_in_flight = true;
+        let result = send_publisher_offer(&self.transport.publisher, &self.signal_sender, &state);
+        if result.is_err() {
+            // Nothing is outstanding if the offer never went out, and leaving the flag set
+            // would block every later publish on this connection.
+            state.offer_in_flight = false;
+        }
+        result
     }
 
     /// The channel a capture pipeline should write encoded media into to publish it.
@@ -455,11 +547,6 @@ impl LiveKitRoom {
         self.media_tx.clone()
     }
 
-    /// Check if we already have a published video track.
-    fn has_video_track(&self) -> bool {
-        let video_type: i32 = TrackType::Video.into();
-        self.local_tracks.iter().any(|t| t.r#type == video_type)
-    }
 
     /// Send a media command to the transport (audio/video data).
     ///
@@ -672,6 +759,7 @@ async fn signal_processing_loop(
     video_frames: VideoFrameBuffer,
     room_id: String,
     event_tx: mpsc::UnboundedSender<RoomEvent>,
+    publish_state: Arc<Mutex<PublishState>>,
 ) {
     // Spawn a blocking task to process transport events (audio/video from subscriber PC).
     // Must be blocking because AudioPlayer (cpal) is not Send. spawn_blocking doesn't
@@ -712,7 +800,33 @@ async fn signal_processing_loop(
                 match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                     Ok(_) => tracing::info!(pc_id = %pc.id, "publisher answer applied"),
                     Err(e) => {
-                        tracing::error!(pc_id = %pc.id, reason = %e, "publisher answer failed");
+                        // The mids on both sides, because "Mid in answer is not in offer"
+                        // names one mid and neither list, which leaves the actual question
+                        // -- which m-lines did we offer -- unanswerable from the log.
+                        tracing::error!(
+                            pc_id = %pc.id,
+                            reason = %e,
+                            answer_mids = %mid_list(&desc.sdp),
+                            "publisher answer failed"
+                        );
+                    }
+                }
+                drop(pc);
+
+                // The offer is no longer outstanding, whether or not its answer applied.
+                // Sending the owed offer regardless is deliberate: a publisher stuck with
+                // a track it announced and never described is worse than one that tries
+                // again, and the failure above is already reported.
+                let Ok(mut state) = publish_state.lock() else {
+                    tracing::error!("publish state lock poisoned; cannot renegotiate");
+                    continue;
+                };
+                state.offer_in_flight = false;
+                if std::mem::take(&mut state.renegotiate_pending) {
+                    state.offer_in_flight = true;
+                    if let Err(e) = send_publisher_offer(&publisher, &signal_sender, &state) {
+                        state.offer_in_flight = false;
+                        tracing::error!(reason = %e, "deferred renegotiation failed");
                     }
                 }
             }
