@@ -297,6 +297,16 @@ go upstream.
    work and its corresponding source has to be available to the people receiving it. A
    public fork satisfies that by existing.
 
+   **The fork already exists**, from an earlier attempt to contribute. Inspected rather than
+   assumed: public, `develop` **identical** to upstream's, no other branches, so the patch
+   branch starts from a clean base and disturbs nothing.
+
+   One thing that inspection turned up and would otherwise have surfaced as a confusing
+   error: **the fork has no tags.** GitHub does not copy them. The patch branch rebases onto
+   upstream *release tags*, so the tooling needs two remotes — the fork for the branch,
+   `element-hq/element-web` for the tags. A rebase that fetched only from the fork fails with
+   `invalid upstream 'v1.12.25'`, which reads like a typo.
+
    Two consequences that are not ours to arrange:
 
    - Upstream requires a **CLA**, not a DCO (`cla-assistant.io/element-hq/element-web`). It

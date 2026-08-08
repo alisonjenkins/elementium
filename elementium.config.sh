@@ -26,9 +26,17 @@
 # AGPL-3.0-or-later, so a shipped source patch is a modified AGPL work whose corresponding
 # source has to be available to whoever receives it.
 #
-# Empty until the first patch exists. Nothing reads these while the patch set is empty, and
-# a fork nobody has committed to is a repository that rots.
+# The fork already existed and is in sync with upstream `develop`, with no divergent
+# branches, so the patch branch starts from a clean base.
 : "${ELEMENT_WEB_FORK:=https://github.com/alisonjenkins/element-web}"
+
+# Where tags come from, which is *not* the fork.
+#
+# GitHub does not copy tags into a fork, and the fork has none. The patch branch rebases
+# onto upstream release tags, so a rebase that fetched only from the fork would fail with
+# "invalid upstream v1.12.25" -- which reads like a typo rather than a missing remote. Two
+# remotes: the fork for the branch, `ELEMENT_WEB_REPO` above for the tags.
+: "${ELEMENT_WEB_UPSTREAM:=${ELEMENT_WEB_REPO}}"
 
 # The branch carrying our patches. Rebased, never merged: merging would bury the individual
 # commits that make a contribution a cherry-pick rather than a rewrite.

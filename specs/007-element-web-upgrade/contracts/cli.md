@@ -50,6 +50,10 @@ rebasing 3 patches onto v1.12.25
 
 **Rules**
 
+- **Tags come from upstream, not from the fork.** GitHub does not copy tags into a fork, and
+  `alisonjenkins/element-web` has none. A rebase that fetched only from the fork fails with
+  `invalid upstream 'v1.12.25'`, which reads like a typo rather than a missing remote. Two
+  remotes, always: the fork for the branch, `element-hq/element-web` for the tags.
 - `dropped` is stated, never silent. It is how a contribution landing is discovered.
 - A conflict on a commit carrying an `Elementium-Upstream:` trailer gets the second line
   above, because "amended in review" is the most likely cause and the least obvious.
