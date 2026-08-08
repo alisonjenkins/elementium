@@ -35,6 +35,8 @@
 //! - Encryption: AES-128-GCM with 16-byte auth tag appended to ciphertext
 //! - Key derivation: HKDF-SHA256, salt `"LKFrameEncryptionKey"`, info 128 zero bytes
 
+pub mod h264;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
