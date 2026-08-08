@@ -1384,6 +1384,58 @@ fn format_choice(formats: &[libspa::param::video::VideoFormat]) -> libspa::pod::
     }
 }
 
+/// `DRM_FORMAT_MOD_LINEAR`: the DRM modifier for a plain row-major buffer with no tiling or
+/// compression. One of the two non-hardware-specific modifiers a compositor can offer.
+const DRM_FORMAT_MOD_LINEAR: i64 = 0;
+
+/// `DRM_FORMAT_MOD_INVALID` (`0x00FF_FFFF_FFFF_FFFF`, i.e. `(1 << 56) - 1`): the DRM
+/// convention for "no explicit modifier" rather than a real tiling/compression layout. In
+/// `PipeWire`'s screencast usage it is the marker for a buffer with an *implicit* layout --
+/// which in practice means a plain mapped buffer (shm or a `MemPtr`/`MemFd` allocation)
+/// rather than a DMA-BUF carrying a GPU-specific tiling scheme. Offering it is how a client
+/// says "I can take whatever layout you'd use for a non-GPU buffer" without claiming to
+/// understand any vendor's real modifier.
+const DRM_FORMAT_MOD_INVALID: i64 = 0x00FF_FFFF_FFFF_FFFF;
+
+/// A `VideoModifier` property offering only the non-hardware DRM modifiers, for screencasts.
+///
+/// Measured against a real node (`pw-cli enum-params <node> EnumFormat` on a window shared
+/// from niri via `xdg-desktop-portal-gnome`): the node's `EnumFormat` carries a `modifier`
+/// property flagged `SPA_POD_PROP_FLAG_MANDATORY`. That flag means a client whose own
+/// `EnumFormat` omits `modifier` cannot match the format at all -- not "gets a default", but
+/// outright fails negotiation with `no more input formats`. A camera never does this, which
+/// is why this property is confined to the screencast profile: adding it unconditionally
+/// would risk changing what a working camera negotiates for no reason.
+///
+/// `MOD_INVALID` and `MOD_LINEAR` are exactly the two modifiers on that node's list that
+/// name a plain buffer rather than a GPU-specific tiling layout, so they are the only two
+/// offered here. This client's buffer path (`buffers_param`) only accepts `MemPtr`/`MemFd`,
+/// which cannot map a real DMA-BUF tiling layout regardless of what the format negotiates --
+/// so offering hardware modifiers would be worse than useless, it would let the stream
+/// fixate on a layout this client then cannot read.
+///
+/// The `DONT_FIXATE` flag is set because that is what the protocol expects on a modifier
+/// choice: `libspa`'s `PropertyFlags::DONT_FIXATE` is gated behind a Cargo feature this
+/// workspace does not enable (`v0_3_33`), but the underlying bit is a plain `u32` constant
+/// from `libspa::sys` that exists unconditionally, so it is set via `from_bits_retain`
+/// rather than the named flag.
+fn video_modifier_property() -> libspa::pod::Property {
+    use libspa::pod::{ChoiceValue, Property, PropertyFlags, Value};
+    use libspa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+    Property {
+        key: libspa::param::format::FormatProperties::VideoModifier.as_raw(),
+        flags: PropertyFlags::from_bits_retain(libspa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE),
+        value: Value::Choice(ChoiceValue::Long(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Enum {
+                default: DRM_FORMAT_MOD_INVALID,
+                alternatives: vec![DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR],
+            },
+        ))),
+    }
+}
+
 /// Ask for any of these raw pixel layouts, preferring the first.
 fn raw_format_param(
     request: CaptureRequest,
@@ -1393,7 +1445,7 @@ fn raw_format_param(
     let target_fps = request.target_fps;
     let max_size = request.profile.max_size();
     let min_framerate = request.profile.min_framerate();
-    let obj = object! {
+    let mut obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
         libspa::param::ParamType::EnumFormat,
         property!(
@@ -1438,6 +1490,11 @@ fn raw_format_param(
             libspa::utils::Fraction { num: target_fps, denom: 1 }
         ),
     };
+    // Screencast-only: see `video_modifier_property` for why a camera must never get this
+    // and a screencast node can require it to negotiate at all.
+    if request.profile == SourceProfile::Screencast {
+        obj.properties.push(video_modifier_property());
+    }
     serialize(obj)
 }
 
