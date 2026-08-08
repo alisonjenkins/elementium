@@ -250,3 +250,132 @@ async fn audio_survives_real_publish_subscribe_round_trip() {
         assert_eq!(event.field("decoded_channels"), Some("2"));
     }
 }
+
+/// Encrypted H.264, published and subscribed by our own stack through the real SFU.
+///
+/// This is the instrument the H.264 investigation has lacked. A browser receiver rejects our
+/// encrypted H.264 while accepting livekit's, and everything between has been eliminated:
+/// the encryption is byte-correct against livekit's own worker, the SFU parses the stream
+/// and counts both keyframes, and two browsers manage the same combination happily.
+///
+/// So the question is whether the stream is self-consistent. If our own depacketiser
+/// reassembles it, the packets are well-formed by our own reckoning and the disagreement is
+/// with Chrome specifically. If it does not, the fault is in our packetisation and can be
+/// found here -- in Rust, in seconds, instead of through a browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the local SFU; run with --ignored"]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::as_conversions, clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+async fn encrypted_h264_survives_our_own_publish_subscribe_round_trip() {
+    let capture = LogCapture::new();
+    capture.install_global();
+
+    let room_name = format!(
+        "elementium-h264-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis()
+    );
+
+    let key = [0_u8; 32];
+    let context = |identity: &str| {
+        let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
+        ctx.set_local_identity(identity);
+        ctx.set_key(identity, 0, &key);
+        // The receiver needs the sender's key under the *sender's* identity, which is how
+        // every real participant learns it.
+        ctx.set_key("alice", 0, &key);
+        ctx
+    };
+
+    let frames_alice: elementium_webrtc::engine::VideoFrameBuffer =
+        Arc::new(Mutex::new(HashMap::new()));
+    let frames_bob: elementium_webrtc::engine::VideoFrameBuffer =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let (mut alice, _ae) = LiveKitRoom::connect(
+        SFU_URL,
+        &mint_token("alice", &room_name),
+        frames_alice,
+        CorrelationId::new(),
+        elementium_webrtc::EncryptionPolicy::Encrypted(context("alice")),
+    )
+    .await
+    .expect("alice connects");
+
+    let (_bob, _be) = LiveKitRoom::connect(
+        SFU_URL,
+        &mint_token("bob", &room_name),
+        Arc::clone(&frames_bob),
+        CorrelationId::new(),
+        elementium_webrtc::EncryptionPolicy::Encrypted(context("bob")),
+    )
+    .await
+    .expect("bob connects");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (width, height) = (320, 240);
+    alice
+        .publish_video_track("camera", elementium_codec::VideoCodec::H264, width, height)
+        .expect("publish the video track");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let Ok(mut encoder) = elementium_codec::NegotiatedEncoder::new(
+        elementium_codec::VideoCodec::H264,
+        elementium_codec::EncoderConfig {
+            width,
+            height,
+            bitrate_kbps: 1_000,
+            max_framerate: 25,
+        },
+    ) else {
+        eprintln!("skipping: no H.264 encoder on this machine");
+        return;
+    };
+
+    for step in 0..500_u32 {
+        let cols = width as usize;
+        let rows = height as usize;
+        let mut luma = vec![0_u8; cols * rows];
+        for (i, px) in luma.iter_mut().enumerate() {
+            let shift = (step as usize) * 4;
+            let block = (i % cols + shift) / 16 + (i / cols) / 16;
+            *px = if block.is_multiple_of(2) { 210 } else { 30 };
+        }
+        let chroma = (cols / 2) * (rows / 2);
+        if let Some(frame) = elementium_types::I420Frame::from_planes(
+            width,
+            height,
+            &luma,
+            &vec![100; chroma],
+            &vec![150; chroma],
+            0,
+        ) && let Ok(packets) = elementium_codec::VideoEncoder::encode(&mut encoder, &frame)
+        {
+            for packet in packets {
+                let _ = alice
+                    .write_video(packet.data, elementium_codec::VideoCodec::H264)
+                    .await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // A decoded frame reaching the frame buffer is the whole assertion: it means the packets
+    // were reassembled, the frame decrypted, and the picture decoded, by our own code end to
+    // end through a real SFU.
+    let decoded = frames_bob.lock().map_or(0, |b| b.len());
+    let events = capture.events();
+    let dropped: Vec<_> = events
+        .iter()
+        .filter(|e| e.message().is_some_and(|m| m.contains("E2EE dropping inbound")))
+        .collect();
+    eprintln!("decoded tracks: {decoded}, inbound E2EE drops: {}", dropped.len());
+    assert!(
+        decoded > 0,
+        "no H.264 picture reached the frame buffer; {} inbound E2EE drops",
+        dropped.len()
+    );
+}
