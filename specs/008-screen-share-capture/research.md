@@ -276,6 +276,30 @@ import exists, or until a compositor/portal combination that offers an shm fallb
 used. Everything above the capture negotiation — routing, pipeline, publish, teardown,
 frontend — is in place and independently tested; this is the one remaining link.
 
+## R10: offering a modifier clears negotiation and is still not enough — measured 2026-08-08
+
+R9 left one cheap route open: offer a `modifier` property listing only the two
+non-hardware entries (`DRM_FORMAT_MOD_INVALID`, `DRM_FORMAT_MOD_LINEAR`) and see whether
+the compositor falls back to a mappable buffer. It was tried, against the same real node.
+
+Half of it works. `no more input formats` is gone and the format is agreed:
+
+```text
+PipeWire capture format negotiated width=1880 height=1446 encoding=Raw(Bgrx)
+PipeWire capture stream state old=Paused new=Error("error alloc buffers: Invalid argument")
+```
+
+The failure simply moves one step later, to buffer allocation, and zero frames arrive
+(`delivered rate: 0.0fps against 30 requested`). The compositor accepts our pixel format
+and then allocates DMA-BUF regardless of the modifier offered; `MemPtr`/`MemFd` cannot
+satisfy that.
+
+**This settles the question R9 left open: DMA-BUF import is unavoidable on this
+compositor.** The modifier property is kept anyway — it is a correct, confined step that
+a screencast node genuinely requires to negotiate, and without it the DMA-BUF work would
+fail earlier for a second, unrelated reason. Keeping it means the next attempt fails in
+exactly one place instead of two.
+
 ## Open question carried into implementation
 
 **Q**: Can the window chosen through the portal be correlated to that application's
