@@ -6,7 +6,7 @@
 : "${ELEMENT_WEB_SOURCE:=release}"
 
 # Release mode settings
-: "${ELEMENT_WEB_VERSION:=v1.12.11}"
+: "${ELEMENT_WEB_VERSION:=v1.12.25}"
 
 # Git repo (used by both release and git modes for the download/clone URL)
 : "${ELEMENT_WEB_REPO:=https://github.com/element-hq/element-web}"

@@ -342,9 +342,28 @@ offered again" from "another transceiver of the same kind", which means tracking
 added per kind rather than a single mid per kind. `audio_mid` and `video_mid` are also the
 mids we *send* on, in `write_audio`/`write_video`, so they have to keep meaning that.
 
-This is stated as the cause on the strength of the code and the counts, not on a run: it
-has not yet been fixed and re-measured. That is the next step, and it needs care, because
-getting it wrong silently breaks the send path that works today on v1.12.11.
+### Fixed, and measured
+
+Identity is now the track rather than the kind, and a transceiver with no track is always
+new — `recvonly` placeholders have no track by construction, and there is nothing to tell
+two of them apart by. `audio_mid` and `video_mid` keep their real meaning, the mid we
+*send* on, and no longer move once set.
+
+Measured on v1.12.25 against three participants:
+
+| Quickstart check | Before | After |
+|---|---|---|
+| Distinct inbound mids | 0 | **4** — two Opus, two VP8, one pair per remote participant |
+| Inbound Opus frames decoded | **0** | 306 and climbing, `peak_amplitude` 0.054 |
+| Outbound audio | 16,749 / 16,750 | **2,250 / 2,250**, `dropped_channel_closed: 0` |
+| E2EE first frame | — | both participants, `waited_ms` 886 and 926 |
+
+Transceivers added per connection went from a hard ceiling of two to sixteen.
+
+**The upgrade lands.** The pin moves to v1.12.25.
+
+Both new Rust tests fail against the old dedupe and pass against the new one, so the
+regression has a guard rather than a note.
 
 Routing is not the problem: inbound media is dispatched by `mid`, not by SSRC, so the
 missing `a=ssrc` lines in the protocol-17 answers are a red herring.
