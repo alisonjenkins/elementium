@@ -15,6 +15,41 @@ import {
   signalBytes,
 } from "./livekit-signal";
 
+/**
+ * What `create_offer` and `create_answer` actually return over the Tauri IPC.
+ *
+ * The Rust `SessionDescription` renames its field to `type` for exactly this reason, so
+ * the key is `type` and never `sdpType`. This was declared as `{ sdpType, sdp }` for a
+ * long time, which type-checks and is always `undefined`: the description reached
+ * livekit-client with no type at all, proto3 dropped the empty field, and the SFU rejected
+ * the negotiation with `STATE_MISMATCH`. It was invisible because the WebSocket shim
+ * injected the missing field back in on the way out.
+ */
+interface NativeSessionDescription {
+  type?: RTCSdpType;
+  sdp: string;
+}
+
+/**
+ * A description with its type guaranteed, whatever the native side returned.
+ *
+ * The type is not decoration: livekit-client copies it into the protobuf, and a
+ * description without one is refused by the SFU rather than diagnosed. `expected` is what
+ * this call site asked for, so a native side that stops sending the field degrades to
+ * still-correct rather than to silently untyped.
+ */
+function sessionDescription(
+  desc: NativeSessionDescription,
+  expected: RTCSdpType,
+): RTCSessionDescriptionInit {
+  if (desc.type !== expected) {
+    console.error(
+      `[Elementium] native ${expected} came back with type=${String(desc.type)}; using ${expected}`,
+    );
+  }
+  return { type: desc.type ?? expected, sdp: desc.sdp };
+}
+
 interface PeerConnectionResult {
   id: string;
 }
@@ -343,7 +378,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
   async createOffer(_options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
     console.log(`[Elementium] createOffer: pcId=${this.pcId} hasVideo=${this._hasVideo} dc=${this._pendingDataChannels.length} tc=${this._pendingTransceivers.length}`);
-    const desc = await invoke<{ sdpType: string; sdp: string }>("create_offer", {
+    const desc = await invoke<NativeSessionDescription>("create_offer", {
       pcId: this.pcId,
       includeVideo: this._hasVideo,
       dataChannels: this._pendingDataChannels.length > 0 ? this._pendingDataChannels : null,
@@ -354,19 +389,17 @@ class ElementiumRTCPeerConnection extends EventTarget {
     this._pendingTransceivers = [];
     console.log(`[Elementium] createOffer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
     console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
-    const init: RTCSessionDescriptionInit = { type: desc.sdpType as RTCSdpType, sdp: desc.sdp };
-    return init;
+    return sessionDescription(desc, "offer");
   }
 
   async createAnswer(_options?: RTCAnswerOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
     console.log(`[Elementium] createAnswer: pcId=${this.pcId}`);
-    const desc = await invoke<{ sdpType: string; sdp: string }>("create_answer", {
+    const desc = await invoke<NativeSessionDescription>("create_answer", {
       pcId: this.pcId,
     });
     console.log(`[Elementium] createAnswer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
-    const init: RTCSessionDescriptionInit = { type: desc.sdpType as RTCSdpType, sdp: desc.sdp };
-    return init;
+    return sessionDescription(desc, "answer");
   }
 
   async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
@@ -399,7 +432,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
     console.log(`[Elementium] setRemoteDescription: pcId=${this.pcId} type=${description.type} sdpLen=${description.sdp?.length ?? 0}`);
     console.log("[Elementium] setRemoteDescription SDP:\n" + (description.sdp ?? "(no sdp)"));
 
-    const result = await invoke<{ sdpType: string; sdp: string } | null>(
+    const result = await invoke<NativeSessionDescription | null>(
       "set_remote_description",
       {
         pcId: this.pcId,
@@ -412,10 +445,9 @@ class ElementiumRTCPeerConnection extends EventTarget {
     if (description.type === "offer") {
       this._signalingState = "have-remote-offer";
       if (result) {
-        this._localDescription = new RTCSessionDescription({
-          type: result.sdpType as RTCSdpType,
-          sdp: result.sdp,
-        });
+        this._localDescription = new RTCSessionDescription(
+          sessionDescription(result, "answer"),
+        );
       }
     } else {
       this._signalingState = "stable";
