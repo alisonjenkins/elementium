@@ -427,6 +427,16 @@ async function measureVideo(
     console.log(`  before: ${JSON.stringify(before)}`);
     console.log(`  after:  ${JSON.stringify(after)}`);
 
+    // The audio track alongside the video one. It matters because a decrypt failure
+    // reported by the worker names no track: if audio is healthy in a run that reports
+    // `InvalidKey`, the failing frames are the video ones, and if audio is not, the error
+    // says nothing about video at all.
+    const audio = await page.evaluate(() =>
+      (window as never as {
+        __stats: () => Promise<{ concealedSamples?: number; packetsReceived?: number } | { error: string }>;
+      }).__stats(),
+    );
+    console.log(`  audio alongside: ${JSON.stringify(audio)}`);
     const errors = await page.evaluate(
       () => (window as never as { __errors: string[] }).__errors,
     );
@@ -611,11 +621,10 @@ test.describe("browser receive path", () => {
   test("H.264 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
     test.fixme(
       true,
-      "The frame the browser receives is not the frame we send. Our encryption is not at " +
-        "fault: an encrypted frame taken straight from the encoder decrypts cleanly using " +
-        "livekit's own worker functions and key derivation (header 27, IV 12, kid 0, 1515 " +
-        "bytes recovered). In a real call the same worker reports 'InvalidKey: Decryption " +
-        "failed' on every frame, so something between the two alters the bytes. See 005 T020.",
+      "Encrypted H.264 never assembles a frame at the receiver, with or without the page " +
+        "holding the key. Our encryption is provably correct -- a frame decrypts cleanly " +
+        "through livekit's own worker functions -- and the encrypted frame carries the " +
+        "same Annex B NAL structure as the plain one. See 005 T020.",
     );
     const roomName = `elementium-h264-${Date.now()}`;
     console.log(`  room: ${roomName}`);
@@ -758,6 +767,79 @@ test.describe("browser receive path", () => {
     expect(stats.mimeType, "the SFU must have negotiated H.264").toMatch(/H264/i);
     expect(stats.framesDecoded, "frames must decode at a non-zero key index")
       .toBeGreaterThan(10);
+  });
+
+  /**
+   * CONTROL: browser-to-browser H.264 under E2EE, with our publisher nowhere in it.
+   *
+   * The question this settles is whether livekit's own sender and receiver can carry H.264
+   * with insertable-streams encryption at all. Every other control has narrowed the failure
+   * to that combination; this one says whose failure it is. If two browsers manage it, the
+   * fault is in what we send. If they do not, H.264 under E2EE is not something this stack
+   * supports, and preferring VP8 when encryption is on becomes a product decision rather
+   * than a bug to chase.
+   */
+  test("control: browser to browser, H.264 under E2EE", async ({ browser }) => {
+    const roomName = `elementium-b2b-h264-${Date.now()}`;
+    console.log(`  room: ${roomName}`);
+    const server = await startPageServer();
+    const ctx = await browser.newContext();
+
+    try {
+      const subscriber = await ctx.newPage();
+      subscriber.on("console", (m) => console.log(`  [sub:${m.type()}] ${m.text()}`));
+      const subQuery = new URLSearchParams({
+        url: SFU_WS,
+        token: mintToken("browser-subscriber", roomName),
+        key: KEY_HEX,
+      });
+      await subscriber.goto(`${server.origin}/?${subQuery.toString()}`);
+      await expect.poll(() => subscriber.textContent("#state"), { timeout: 20_000 }).toBe(
+        "connected",
+      );
+
+      const publisher = await ctx.newPage();
+      publisher.on("console", (m) => console.log(`  [pub:${m.type()}] ${m.text()}`));
+      const pubQuery = new URLSearchParams({
+        url: SFU_WS,
+        token: mintToken("browser-publisher", roomName),
+        key: KEY_HEX,
+        publish: "1",
+        pubvideo: "h264",
+      });
+      await publisher.goto(`${server.origin}/?${pubQuery.toString()}`);
+      await expect.poll(() => publisher.textContent("#state"), { timeout: 20_000 }).toBe(
+        "publishing",
+      );
+
+      await expect
+        .poll(
+          () =>
+            subscriber.evaluate(
+              () => (window as never as { __videoSubscribed: boolean }).__videoSubscribed,
+            ),
+          { timeout: 30_000, message: "the subscriber never subscribed to the video" },
+        )
+        .toBe(true);
+
+      const read = async () =>
+        subscriber.evaluate(() =>
+          (window as never as {
+            __videoStats: () => Promise<Record<string, number | string | null>>;
+          }).__videoStats(),
+        );
+      await subscriber.waitForTimeout(8_000);
+      const stats = await read();
+      console.log(`  browser-to-browser H.264 + E2EE: ${JSON.stringify(stats)}`);
+
+      expect(
+        stats.framesDecoded,
+        "two browsers must manage H.264 under E2EE, or nothing can",
+      ).toBeGreaterThan(0);
+    } finally {
+      server.close();
+      await ctx.close();
+    }
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.

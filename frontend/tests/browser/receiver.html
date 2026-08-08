@@ -271,6 +271,16 @@
     // fault is in the environment or in livekit's own subscribe path, not in what we send.
     if (params.get("publish") === "1") {
       await room.localParticipant.setMicrophoneEnabled(true);
+      // Optionally publish video too, at a named codec. This is what makes a
+      // browser-to-browser control possible for a codec question: if livekit's own sender
+      // and receiver cannot carry H.264 under E2EE either, the fault is not in what we
+      // send, and the answer is a product decision rather than a bug.
+      const pubCodec = params.get("pubvideo");
+      if (pubCodec) {
+        await room.localParticipant.setCameraEnabled(true, undefined, {
+          videoCodec: pubCodec,
+        });
+      }
       setState("publishing");
     }
   </script>
