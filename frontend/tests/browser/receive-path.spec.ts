@@ -949,3 +949,234 @@ test.describe("browser receive path", () => {
     }
   });
 });
+
+/**
+ * Screen and application sharing (spec `008-screen-share-capture`).
+ *
+ * SC-001 and SC-003 both want the same thing this whole file already provides for camera
+ * video: a real browser, running real libwebrtc, measured with `getStats()` rather than
+ * trusted by eye or by track state. Neither test below can actually run yet, and the
+ * reason is the same one `specs/008-screen-share-capture/quickstart.md` gives for its own
+ * Level 4 and Level 5: proving the feature requires a real capture, and a real capture on
+ * this stack means `elementium_screen::start_share()` opening the XDG ScreenCast portal and
+ * showing a picker dialog that only a human can answer. `ashpd`'s call blocks on that
+ * dialog by design -- see the identical point made in
+ * `crates/elementium-media/examples/capture_attribution.rs` about its own portal call --
+ * so there is no timeout to wait out and no way to script past it from here.
+ *
+ * There is a second gap below the portal, independent of the dialog: every video test
+ * elsewhere in this file drives the browser side with `publish_test_tone`, a Rust binary
+ * that stands in for the app's sender. It does not capture a screen -- it draws a
+ * checkerboard and publishes that (see `--video-h264`/`--video-vp8` in
+ * `crates/elementium-webrtc/examples/publish_test_tone.rs`, sourced from
+ * `MediaTrackKey::camera()`, never from `elementium_screen`). There is no equivalent
+ * example that calls `elementium_screen::start_share()`, reads real frames from the
+ * `WaylandCapturer`, and feeds them into `LiveKitRoom::publish_video_track()` the way the
+ * real `get_display_media` command now does. Writing that binary would close this gap for
+ * SC-001, in the way `publish_test_tone` already does for camera video, but it lives under
+ * `crates/`, outside what this suite (`frontend/tests/browser/`) may touch.
+ *
+ * Both tests are written to the shape they would need once that binary exists, so that
+ * unblocking them is "point PUBLISHER_SCREEN at a real binary and delete the fixme", not
+ * "write the test". What would fully unblock a CI run: that publish-side example, plus
+ * either a persisted portal choice (`ashpd::desktop::PersistMode::ExplicitlyRevoked` or
+ * `Persistent`, replaying a previously approved source without a dialog -- the current
+ * `elementium_screen::start_share()` uses `PersistMode::DoNot`, so this would need a code
+ * change outside this suite too) or a headless/mock portal backend the harness can point
+ * `XDG_DESKTOP_PORTAL_DIR`/`busctl` at instead of the real one.
+ */
+test.describe("screen share (spec 008)", () => {
+  test.describe.configure({ mode: "serial", timeout: 180_000 });
+
+  /** The publisher this describe block needs and does not have. See the block comment. */
+  const PUBLISHER_SCREEN = path.join(REPO, "target/debug/examples/publish_screen_share");
+
+  /**
+   * SC-001: "A screen share started in a call produces a steadily increasing decoded frame
+   * count at the receiving participant, sustained for at least 30 seconds."
+   *
+   * The single most important property of this test is what it does *not* do: stop at one
+   * before/after pair. The bug this feature fixes handed the page a perfectly valid, `live`
+   * `MediaStreamTrack` that carried nothing -- every naive assertion (track exists, track is
+   * live, one frame arrived) passed for months while the remote participant saw black. A
+   * two-sample delta is close to that same trap: a source that delivers one keyframe and
+   * then stalls -- a very plausible shape for a regression here, since it is exactly what a
+   * capturer that opens a session but stops pumping frames after the first would produce --
+   * shows the same "increased" verdict a healthy stream does, if all you ever check is
+   * start and end.
+   *
+   * So this samples `framesDecoded` repeatedly across the full window and requires *every*
+   * consecutive pair to show growth, not just the first and last. That is what "steadily
+   * increasing... sustained" in SC-001's wording actually rules out.
+   */
+  test("a screen share produces a sustained, increasing decoded frame count", async ({
+    page,
+  }) => {
+    test.fixme(
+      true,
+      "Blocked on two things, neither fixable from frontend/tests/browser/: (1) no " +
+        "publish-side example drives the real screen-capture path -- publish_test_tone " +
+        "only ever sources a synthetic checkerboard frame from MediaTrackKey::camera(), " +
+        "never from elementium_screen::start_share() -- so PUBLISHER_SCREEN above names a " +
+        "binary that does not exist; (2) even once it does, start_share() shows the XDG " +
+        "ScreenCast portal's picker and blocks on a human clicking it, which cannot happen " +
+        "in an unattended run. See the block comment above for exactly what would unblock " +
+        "each half. Left in this shape -- real assertions against a named, missing binary " +
+        "-- rather than as a bare todo, so it is ready to run the moment that binary and a " +
+        "restore-token or mock-portal path both exist.",
+    );
+
+    const roomName = `elementium-screenshare-${Date.now()}`;
+    console.log(`  room: ${roomName}`);
+    const server = await startPageServer();
+
+    page.on("console", (m) => console.log(`  [page:${m.type()}] ${m.text()}`));
+    page.on("pageerror", (e) => console.log(`  [page:error] ${e.message}`));
+
+    // Encrypted, per FR-011: shared video must be protected on the same terms as camera
+    // video, so the receive path under test is the E2EE one, not a plaintext shortcut.
+    const query = new URLSearchParams({
+      url: SFU_WS,
+      token: mintToken("browser-subscriber", roomName),
+      key: KEY_HEX,
+    });
+    await page.goto(`${server.origin}/?${query.toString()}`);
+    await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
+
+    // 45s of real capture: the 30s SC-001 asks for, plus room for the 5s settle window
+    // below so the measured span is at least 30s of steady state, not 30s including
+    // jitter-buffer priming.
+    const publisher = startPublisher(roomName, 45, KEY_HEX);
+    // startPublisher assumes PUBLISHER (publish_test_tone); a real version of this test
+    // needs its own spawn against PUBLISHER_SCREEN with a --screen flag, requesting a
+    // monitor source non-interactively via a persisted portal choice. Sketched here rather
+    // than built, since PUBLISHER_SCREEN does not exist to spawn.
+    void PUBLISHER_SCREEN;
+
+    try {
+      await publisher.live;
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              () => (window as never as { __videoSubscribed: boolean }).__videoSubscribed,
+            ),
+          { timeout: 30_000, message: "the browser never subscribed to the shared screen" },
+        )
+        .toBe(true);
+
+      const read = async (): Promise<VideoStats> => {
+        let last = "not attempted";
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const s = await page.evaluate(() =>
+            (window as never as {
+              __videoStats: () => Promise<VideoStats | { error: string }>;
+            }).__videoStats(),
+          );
+          if (!("error" in s)) return s;
+          last = s.error;
+          await page.waitForTimeout(500);
+        }
+        throw new Error(`could not read video stats after 10s: ${last}`);
+      };
+
+      // Let the jitter buffer and decoder settle before the measured window starts.
+      await page.waitForTimeout(5_000);
+
+      // Six 5-second steps: 30 seconds of observation, sampled often enough that a burst
+      // followed by a stall cannot hide inside the average the way it would in a single
+      // before/after pair.
+      const SAMPLE_INTERVAL_MS = 5_000;
+      const SAMPLE_COUNT = 7;
+      const samples: number[] = [];
+      for (let i = 0; i < SAMPLE_COUNT; i += 1) {
+        if (i > 0) await page.waitForTimeout(SAMPLE_INTERVAL_MS);
+        const s = await read();
+        samples.push(s.framesDecoded);
+      }
+      console.log(`  framesDecoded every 5s over 30s: ${JSON.stringify(samples)}`);
+
+      // The actual SC-001 assertion: every consecutive pair must show growth. Checking only
+      // samples[0] and samples[last] would pass for a stream that delivered one burst of
+      // frames in the first five seconds and nothing after -- which is a live track, a
+      // subscribed track, and a `framesDecoded` that "increased" by any two-point measure,
+      // while failing exactly the property SC-001 states: steadily increasing, sustained
+      // for the whole window.
+      for (let i = 1; i < samples.length; i += 1) {
+        expect(
+          samples[i],
+          `framesDecoded must still be climbing at t=${(i * SAMPLE_INTERVAL_MS) / 1000}s ` +
+            `(sample ${i}: ${samples[i]} vs sample ${i - 1}: ${samples[i - 1]}); a flat step ` +
+            `here means the stream started and then stopped delivering, which a single ` +
+            `before/after pair spanning the same 30s cannot distinguish from healthy`,
+        ).toBeGreaterThan(samples[i - 1]);
+      }
+    } finally {
+      publisher.stop();
+      server.close();
+    }
+  });
+
+  /**
+   * SC-003: "Sharing a single window transmits nothing from outside that window,
+   * demonstrated by changing content elsewhere and observing no change at the receiver."
+   *
+   * This is the negative test the spec and quickstart both insist is the actual claim:
+   * confirming the *chosen* window's content arrives proves only that capture works --
+   * SC-001 already covers that. Confirming that a change *outside* the chosen window does
+   * **not** reach the receiver is FR-005 and US2's whole privacy property, and it is the
+   * one a backend that silently falls back to full-monitor capture would fail while still
+   * passing every positive test.
+   *
+   * It is written here as a documented manual procedure, not as automated Playwright code,
+   * because it cannot be expressed as an assertion with what this harness has:
+   *
+   * 1. It needs the real portal picker, with a human choosing a single *window* rather than
+   *    a monitor -- the same blocker SC-001 above has, and additionally one Level 7 of the
+   *    quickstart calls out separately: window selection depends on which portal backend is
+   *    present (`org.gnome.Mutter.ScreenCast` vs. the monitor-only wlroots backend), so even
+   *    a human running this by hand has to check `busctl --user list` first.
+   * 2. It needs a *second*, independently controlled window whose content changes on cue,
+   *    outside Playwright's reach entirely -- Playwright drives the one Chromium page this
+   *    harness serves, not arbitrary windows on the desktop.
+   * 3. Above all, it needs to look at *pixels*. `receiver.html`'s `__videoStats` reports
+   *    only `RTCPeerConnection.getStats()` counters -- frame counts, not frame content.
+   *    "Nothing changed" is not a counter question: `framesDecoded` climbs identically
+   *    whether the decoded picture is the chosen window or a full-desktop capture that
+   *    happens to contain it, so no counter-based assertion, however cleverly sampled,
+   *    could tell scoped capture from unscoped capture. Answering this needs the attached
+   *    `<video>` element's actual decoded pixels -- e.g. drawing it to a canvas and
+   *    comparing regions before and after the change -- which `receiver.html` does not do
+   *    for any test in this file, because until now nothing here needed to look at a
+   *    picture rather than a number.
+   *
+   * Manual procedure (mirrors quickstart.md Level 5):
+   *
+   *   1. Start a call between two endpoints (`just dev-test-env` + a second participant, or
+   *      `just call-peers` / `just app-join`).
+   *   2. From one endpoint, start a screen share and pick a single *window* in the portal
+   *      picker (requires `org.gnome.Mutter.ScreenCast` or an equivalent window-capable
+   *      backend -- confirm with `busctl --user list | grep ScreenCast` first, per
+   *      quickstart Level 7; a monitor-only backend makes this test inapplicable, not
+   *      failed).
+   *   3. At the receiver, confirm the shared window's content is visible and updating --
+   *      this much SC-001 already establishes.
+   *   4. Change content in a *different* window on the sharer's desktop: play a video,
+   *      resize something, move a bright window over the shared one.
+   *   5. Watch the receiver for the length of that change. Pass: nothing about the received
+   *      picture reflects it. Fail: any trace of the other window's content reaches the
+   *      receiver, which means the backend captured more than the chosen window regardless
+   *      of what the picker said.
+   */
+  test("a single-window share carries nothing from outside that window", async () => {
+    test.skip(
+      true,
+      "SC-003 needs a pixel-level comparison this harness has no facility for -- " +
+        "framesDecoded and the other getStats() counters cannot distinguish scoped capture " +
+        "from unscoped capture, only 'something arrived' from 'nothing did'. See the doc " +
+        "comment immediately above for the reasoning and the manual procedure this stands " +
+        "in for until receiver.html gains a pixel-sampling hook and a way to script a " +
+        "second, independently changing window.",
+    );
+  });
+});
