@@ -84,6 +84,148 @@ function getTopWindow(): Record<string, unknown> {
 const __pcRegistry = new Map<string, (event: WebRtcEvent) => void>();
 
 /**
+ * Shape of the `get_transport_stats` Tauri command's result -- the Rust side of
+ * `TransportStatsResult` in `src-tauri/src/commands/webrtc.rs`, field-for-field. Every
+ * `| null` here is a real "not measured", not a stand-in for zero: see
+ * `OutboundTransportStats` in `crates/elementium-webrtc/src/peer_connection.rs` for what
+ * str0m does and doesn't report.
+ */
+interface RustOutboundStats {
+  mid: string;
+  kind: string | null;
+  bytesSent: number;
+  packetsSent: number;
+  nackCount: number;
+  pliCount: number;
+  firCount: number;
+  roundTripTimeMs: number | null;
+  remotePacketsLost: number | null;
+  remoteJitterRtpUnits: number | null;
+}
+
+interface RustInboundStats {
+  mid: string;
+  kind: string | null;
+  bytesReceived: number;
+  packetsReceived: number;
+  nackCount: number;
+  pliCount: number;
+  firCount: number;
+  lossFraction: number | null;
+}
+
+interface RustCandidatePairStats {
+  roundTripTimeMs: number | null;
+  localAddr: string | null;
+  remoteAddr: string | null;
+}
+
+interface RustTransportStats {
+  outbound: RustOutboundStats[];
+  inbound: RustInboundStats[];
+  candidatePair: RustCandidatePairStats | null;
+}
+
+/**
+ * RTP clock rate (Hz) for a media kind, used to convert str0m's raw RTCP jitter (RTP
+ * timestamp ticks) into the seconds the WebRTC stats spec wants.
+ *
+ * Fixed by the codecs this app negotiates, not something worth threading a lookup table
+ * for: Opus is always 48 kHz (RFC 7587 §4) and both VP8 and H.264 are always 90 kHz
+ * (RFC 6386 §2, RFC 6184 §2).
+ */
+const CLOCK_RATE_HZ: Record<string, number> = { audio: 48_000, video: 90_000 };
+
+/**
+ * Build a real `RTCStatsReport`-shaped `Map` from the Rust side's transport-stats
+ * snapshot, for `RTCPeerConnection.getStats()`.
+ *
+ * Element Call's connection-quality indicators read this, which is the whole reason this
+ * exists: before this, `getStats()` always resolved an empty `Map`, so the indicators
+ * could never show anything but blank or a default "everything is fine" green.
+ *
+ * Only fields Rust actually reported are set. In particular: `ssrc` is left off every
+ * entry (str0m's stats events do not carry it, and inventing one that has to be right
+ * per-track was out of scope here); inbound entries have no `packetsLost` because str0m
+ * only exposes a loss *fraction* for inbound media, not the cumulative count the spec
+ * field means, so it is surfaced as `fractionLost` instead of mislabeled; inbound entries
+ * have no `jitter` because str0m does not expose one for media we are receiving (only for
+ * what a peer reports back about media we *send*, which is why outbound entries can have
+ * one).
+ */
+async function getTransportStatsReport(pcId: string | null): Promise<RTCStatsReport> {
+  const entries = new Map<string, unknown>();
+  if (!pcId) {
+    return entries as unknown as RTCStatsReport;
+  }
+
+  let stats: RustTransportStats;
+  try {
+    stats = await invoke<RustTransportStats>("get_transport_stats", { pcId });
+  } catch (err) {
+    console.error(`[Elementium] getStats: get_transport_stats failed pcId=${pcId}`, err);
+    return entries as unknown as RTCStatsReport;
+  }
+
+  for (const s of stats.outbound) {
+    const id = `outbound-rtp-${s.mid}`;
+    const entry: Record<string, unknown> = {
+      id,
+      type: "outbound-rtp",
+      mid: s.mid,
+      bytesSent: s.bytesSent,
+      packetsSent: s.packetsSent,
+      nackCount: s.nackCount,
+      pliCount: s.pliCount,
+      firCount: s.firCount,
+    };
+    if (s.kind) entry.kind = s.kind;
+    if (s.roundTripTimeMs !== null) entry.roundTripTime = s.roundTripTimeMs / 1000;
+    if (s.remotePacketsLost !== null) entry.packetsLost = s.remotePacketsLost;
+    if (s.remoteJitterRtpUnits !== null && s.kind && s.kind in CLOCK_RATE_HZ) {
+      entry.jitter = s.remoteJitterRtpUnits / CLOCK_RATE_HZ[s.kind];
+    }
+    entries.set(id, entry);
+  }
+
+  for (const s of stats.inbound) {
+    const id = `inbound-rtp-${s.mid}`;
+    const entry: Record<string, unknown> = {
+      id,
+      type: "inbound-rtp",
+      mid: s.mid,
+      bytesReceived: s.bytesReceived,
+      packetsReceived: s.packetsReceived,
+      nackCount: s.nackCount,
+      pliCount: s.pliCount,
+      firCount: s.firCount,
+    };
+    if (s.kind) entry.kind = s.kind;
+    if (s.lossFraction !== null) entry.fractionLost = s.lossFraction;
+    entries.set(id, entry);
+  }
+
+  if (stats.candidatePair) {
+    const pair = stats.candidatePair;
+    const id = "candidate-pair-selected";
+    const entry: Record<string, unknown> = {
+      id,
+      type: "candidate-pair",
+      // Only ever built when str0m reports a *selected* pair, so "succeeded" is the only
+      // state this can honestly report -- there is nothing upstream to distinguish
+      // "still checking" from "no pair" for this to also cover.
+      state: "succeeded",
+    };
+    if (pair.roundTripTimeMs !== null) entry.currentRoundTripTime = pair.roundTripTimeMs / 1000;
+    if (pair.localAddr) entry.localCandidateAddr = pair.localAddr;
+    if (pair.remoteAddr) entry.remoteCandidateAddr = pair.remoteAddr;
+    entries.set(id, entry);
+  }
+
+  return entries as unknown as RTCStatsReport;
+}
+
+/**
  * Shimmed RTCPeerConnection that delegates to the Rust backend.
  *
  * Extends EventTarget for proper event dispatching. Element Web's
@@ -630,7 +772,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
   getTransceivers(): RTCRtpTransceiver[] { return [...this._transceivers]; }
 
   async getStats(_selector?: MediaStreamTrack | null): Promise<RTCStatsReport> {
-    return new Map() as unknown as RTCStatsReport;
+    return getTransportStatsReport(this.pcId);
   }
 
   restartIce(): void {

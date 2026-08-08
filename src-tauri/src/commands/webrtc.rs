@@ -361,6 +361,115 @@ pub async fn add_ice_candidate(
     )?)
 }
 
+/// One outbound (sent) track's transport stats, as returned to JS.
+///
+/// Field names match what `getStats()` needs to build a spec-shaped `RTCStatsReport`
+/// entry; see [`peer_connection::OutboundTransportStats`] for what each is derived from
+/// and why the optional ones are `None` rather than `0` when str0m has not reported them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundStatsResult {
+    pub mid: String,
+    pub kind: Option<String>,
+    pub bytes_sent: u64,
+    pub packets_sent: u64,
+    pub nack_count: u64,
+    pub pli_count: u64,
+    pub fir_count: u64,
+    pub round_trip_time_ms: Option<u64>,
+    pub remote_packets_lost: Option<u64>,
+    pub remote_jitter_rtp_units: Option<u32>,
+}
+
+/// One inbound (received) track's transport stats, as returned to JS. See
+/// [`OutboundStatsResult`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundStatsResult {
+    pub mid: String,
+    pub kind: Option<String>,
+    pub bytes_received: u64,
+    pub packets_received: u64,
+    pub nack_count: u64,
+    pub pli_count: u64,
+    pub fir_count: u64,
+    pub loss_fraction: Option<f32>,
+}
+
+/// The selected ICE candidate pair's stats, as returned to JS.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidatePairStatsResult {
+    pub round_trip_time_ms: Option<u64>,
+    pub local_addr: Option<String>,
+    pub remote_addr: Option<String>,
+}
+
+/// Everything `getStats()` needs for one peer connection, as last reported by str0m.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportStatsResult {
+    pub outbound: Vec<OutboundStatsResult>,
+    pub inbound: Vec<InboundStatsResult>,
+    pub candidate_pair: Option<CandidatePairStatsResult>,
+}
+
+/// Real transport-level statistics for a peer connection (bytes/packets, RTCP loss and
+/// RTT, the selected ICE candidate pair), for the shim's `RTCPeerConnection.getStats()`.
+///
+/// Reads a snapshot Rust already keeps updated from str0m's stats events -- see
+/// [`peer_connection::transport_stats_snapshot`] -- rather than asking str0m for
+/// anything, so this never blocks on the I/O loop and never reports a number that is not
+/// really the most recent one seen.
+#[command]
+pub async fn get_transport_stats(
+    state: State<'_, WebRtcState>,
+    pc_id: String,
+) -> Result<TransportStatsResult, String> {
+    let handle = get_pc_handle(&state, &pc_id)?;
+    let pc = handle.lock_str()?;
+    let snapshot = peer_connection::transport_stats_snapshot(&pc);
+    drop(pc);
+
+    Ok(TransportStatsResult {
+        outbound: snapshot
+            .outbound
+            .into_iter()
+            .map(|s| OutboundStatsResult {
+                mid: s.mid,
+                kind: s.kind.map(str::to_string),
+                bytes_sent: s.bytes_sent,
+                packets_sent: s.packets_sent,
+                nack_count: s.nack_count,
+                pli_count: s.pli_count,
+                fir_count: s.fir_count,
+                round_trip_time_ms: s.round_trip_time_ms,
+                remote_packets_lost: s.remote_packets_lost,
+                remote_jitter_rtp_units: s.remote_jitter_rtp_units,
+            })
+            .collect(),
+        inbound: snapshot
+            .inbound
+            .into_iter()
+            .map(|s| InboundStatsResult {
+                mid: s.mid,
+                kind: s.kind.map(str::to_string),
+                bytes_received: s.bytes_received,
+                packets_received: s.packets_received,
+                nack_count: s.nack_count,
+                pli_count: s.pli_count,
+                fir_count: s.fir_count,
+                loss_fraction: s.loss_fraction,
+            })
+            .collect(),
+        candidate_pair: snapshot.candidate_pair.map(|c| CandidatePairStatsResult {
+            round_trip_time_ms: c.round_trip_time_ms,
+            local_addr: c.local_addr,
+            remote_addr: c.remote_addr,
+        }),
+    })
+}
+
 #[command]
 pub async fn close_peer_connection(
     state: State<'_, WebRtcState>,

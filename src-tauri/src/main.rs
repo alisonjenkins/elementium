@@ -151,6 +151,7 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         commands::webrtc::set_local_description,
         commands::webrtc::set_remote_description,
         commands::webrtc::add_ice_candidate,
+        commands::webrtc::get_transport_stats,
         commands::webrtc::close_peer_connection,
         commands::media_devices::enumerate_devices,
         commands::media_devices::get_user_media,

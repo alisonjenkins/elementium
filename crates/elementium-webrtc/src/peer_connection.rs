@@ -186,6 +186,20 @@ pub struct PeerConnectionInner {
     /// Cached remote ICE candidate SDP strings, re-added after SDP renegotiation.
     /// str0m's `accept_offer` may clear remote candidates, so we re-add them.
     pub remote_candidates: Vec<String>,
+    /// Latest outbound (egress) RTCP stats per mid, from `Event::MediaEgressStats`.
+    ///
+    /// str0m only *emits* these on its own one-second cadence (see
+    /// `set_stats_interval` above); anything that wants "the current numbers" on demand,
+    /// like `getStats()`, has nowhere else to read them from between events. Kept as a
+    /// snapshot per mid, overwritten in place, rather than appended -- callers want the
+    /// most recent measurement, not a history.
+    pub egress_stats: HashMap<Mid, str0m::stats::MediaEgressStats>,
+    /// Latest inbound (ingress) RTCP stats per mid, from `Event::MediaIngressStats`. See
+    /// `egress_stats` for why this is a snapshot.
+    pub ingress_stats: HashMap<Mid, str0m::stats::MediaIngressStats>,
+    /// Latest connection-level stats (RTT, selected ICE candidate pair), from
+    /// `Event::PeerStats`. See `egress_stats` for why this is a snapshot.
+    pub peer_stats: Option<str0m::stats::PeerStats>,
 }
 
 /// Thread-safe handle to a peer connection.
@@ -246,6 +260,9 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         transmit_log_count: 0,
         recv_log_count: 0,
         remote_candidates: Vec::new(),
+        egress_stats: HashMap::new(),
+        ingress_stats: HashMap::new(),
+        peer_stats: None,
     }
 }
 
@@ -1434,7 +1451,22 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
             })
         }
         Event::MediaData(data) => media_data_event(pc, data),
-        Event::MediaEgressStats(stats) => Some(egress_stats_event(&pc.id, &stats)),
+        Event::MediaEgressStats(stats) => {
+            pc.egress_stats.insert(stats.mid, stats.clone());
+            Some(egress_stats_event(&pc.id, &stats))
+        }
+        // Not surfaced as a `PcEvent` -- nothing downstream in this crate currently
+        // consumes per-track inbound RTCP the way `EgressStats` feeds the encoder's FEC
+        // sizing. Recorded here so `getStats()` has real inbound numbers to report;
+        // storing it is the whole fix, no event needs to travel further.
+        Event::MediaIngressStats(stats) => {
+            pc.ingress_stats.insert(stats.mid, stats);
+            None
+        }
+        Event::PeerStats(stats) => {
+            pc.peer_stats = Some(stats);
+            None
+        }
         Event::KeyframeRequest(req) => {
             tracing::info!(
                 pc_id = %pc.id,
@@ -1475,6 +1507,163 @@ fn egress_stats_event(pc_id: &str, stats: &str0m::stats::MediaEgressStats) -> Wi
         rtt_ms: stats.rtt.and_then(|d| u64::try_from(d.as_millis()).ok()),
         packets: stats.packets,
         nacks: stats.nacks,
+    }
+}
+
+/// Transport stats for one of our outbound (sent) tracks.
+///
+/// In plain types so callers outside this crate (the Tauri command layer, which does not
+/// depend on `str0m`) can serialize them without reaching for the `str0m` types directly.
+///
+/// `round_trip_time_ms`, `remote_packets_lost` and `remote_jitter_rtp_units` are all
+/// `None` rather than `0` when str0m has not reported them, per the rule this type exists
+/// to enforce: a `0` here would be indistinguishable from a real "clean" measurement, and
+/// `getStats()` callers (connection-quality indicators) treat the two very differently.
+#[derive(Debug, Clone)]
+pub struct OutboundTransportStats {
+    pub mid: String,
+    /// `None` when this mid is not one this side recognises as audio or video -- should
+    /// not happen in practice (egress stats only exist for tracks we negotiated), but
+    /// there is no reason to assert it here.
+    pub kind: Option<&'static str>,
+    pub bytes_sent: u64,
+    pub packets_sent: u64,
+    pub nack_count: u64,
+    pub pli_count: u64,
+    pub fir_count: u64,
+    /// Round-trip time extracted from the peer's most recent RTCP receiver report for
+    /// this track.
+    pub round_trip_time_ms: Option<u64>,
+    /// Cumulative packets the peer's RTCP receiver reports say it never received. This is
+    /// the peer's own count, not a local recomputation -- str0m has nothing else to offer,
+    /// and no local guess gets any closer to what the peer actually experienced.
+    pub remote_packets_lost: Option<u64>,
+    /// Jitter as measured by the peer, in raw RTP timestamp ticks (str0m does not convert
+    /// this to seconds). Left as ticks rather than divided here: the correct clock rate
+    /// depends on the codec (Opus 48 kHz vs VP8/H.264 90 kHz per RFC 7587 §4, RFC 6386
+    /// §2, RFC 6184 §2), and `kind` above is the cheapest place to make that conversion
+    /// correctly -- doing it here with the wrong assumption would be worse than not doing
+    /// it, so it is left for whoever has `kind` in hand.
+    pub remote_jitter_rtp_units: Option<u32>,
+}
+
+/// Transport stats for one of our inbound (received) tracks. See
+/// [`OutboundTransportStats`] for why every optional field stays `None` instead of `0`
+/// when unmeasured.
+#[derive(Debug, Clone)]
+pub struct InboundTransportStats {
+    pub mid: String,
+    pub kind: Option<&'static str>,
+    pub bytes_received: u64,
+    pub packets_received: u64,
+    pub nack_count: u64,
+    pub pli_count: u64,
+    pub fir_count: u64,
+    /// Fraction (`0.0..=1.0`) of the peer's packets we did not receive, extracted from
+    /// the RTCP receiver report we ourselves last sent. Not the same shape as a spec
+    /// `packetsLost` (a cumulative count): str0m only exposes the fraction for inbound
+    /// media, so that is what this reports, under its own name rather than mislabeled.
+    pub loss_fraction: Option<f32>,
+}
+
+/// The ICE candidate pair str0m has selected, with its round-trip time.
+#[derive(Debug, Clone, Default)]
+pub struct CandidatePairTransportStats {
+    pub round_trip_time_ms: Option<u64>,
+    pub local_addr: Option<String>,
+    pub remote_addr: Option<String>,
+}
+
+/// Every transport stat this crate currently has for a peer connection.
+///
+/// Gathered from whatever `Event::MediaEgressStats`/`MediaIngressStats`/`PeerStats` have
+/// arrived so far. Built fresh on each call from the snapshots `handle_str0m_event`
+/// already maintains -- never blocks on str0m and never invents a number it does not
+/// have.
+#[derive(Debug, Clone, Default)]
+pub struct TransportStatsSnapshot {
+    pub outbound: Vec<OutboundTransportStats>,
+    pub inbound: Vec<InboundTransportStats>,
+    pub candidate_pair: Option<CandidatePairTransportStats>,
+}
+
+/// Which media kind a mid carries, for tagging a stats entry.
+///
+/// Checked against the tracks this side actually knows about rather than guessed: a
+/// wrong answer here would point a video quality indicator at audio numbers or vice
+/// versa, which is worse than the `None` this returns when the mid is not recognised.
+fn mid_kind(pc: &PeerConnectionInner, mid: Mid) -> Option<&'static str> {
+    if let Some(kind) = pc.remote_mids.get(&mid) {
+        return Some(media_kind_str(*kind));
+    }
+    if pc.audio_mid == Some(mid) {
+        return Some("audio");
+    }
+    if pc.video_mid == Some(mid) {
+        return Some("video");
+    }
+    None
+}
+
+const fn media_kind_str(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Audio => "audio",
+        MediaKind::Video => "video",
+    }
+}
+
+/// Build the current transport-stats snapshot for `getStats()` from whatever str0m has
+/// reported so far. See [`TransportStatsSnapshot`].
+#[must_use]
+pub fn transport_stats_snapshot(pc: &PeerConnectionInner) -> TransportStatsSnapshot {
+    let outbound = pc
+        .egress_stats
+        .values()
+        .map(|stats| {
+            let kind = mid_kind(pc, stats.mid);
+            OutboundTransportStats {
+                mid: stats.mid.to_string(),
+                kind,
+                bytes_sent: stats.bytes,
+                packets_sent: stats.packets,
+                nack_count: stats.nacks,
+                pli_count: stats.plis,
+                fir_count: stats.firs,
+                round_trip_time_ms: stats.rtt.and_then(|d| u64::try_from(d.as_millis()).ok()),
+                remote_packets_lost: stats.remote.as_ref().map(|r| r.packets_lost),
+                remote_jitter_rtp_units: stats.remote.as_ref().map(|r| r.jitter),
+            }
+        })
+        .collect();
+
+    let inbound = pc
+        .ingress_stats
+        .values()
+        .map(|stats| InboundTransportStats {
+            mid: stats.mid.to_string(),
+            kind: mid_kind(pc, stats.mid),
+            bytes_received: stats.bytes,
+            packets_received: stats.packets,
+            nack_count: stats.nacks,
+            pli_count: stats.plis,
+            fir_count: stats.firs,
+            loss_fraction: stats.loss,
+        })
+        .collect();
+
+    let candidate_pair = pc.peer_stats.as_ref().map(|stats| {
+        let pair = stats.selected_candidate_pair.as_ref();
+        CandidatePairTransportStats {
+            round_trip_time_ms: stats.rtt.and_then(|d| u64::try_from(d.as_millis()).ok()),
+            local_addr: pair.map(|p| p.local.addr.to_string()),
+            remote_addr: pair.map(|p| p.remote.addr.to_string()),
+        }
+    });
+
+    TransportStatsSnapshot {
+        outbound,
+        inbound,
+        candidate_pair,
     }
 }
 
@@ -1667,6 +1856,120 @@ mod tests {
         assert_eq!(unwrap_red_primary(&[0xEF, 0x00, 0x03, 0xFF, 0x6F]), None);
         // Truncated mid-header (only 2 of 4 redundant header bytes present).
         assert_eq!(unwrap_red_primary(&[0xEF, 0x00]), None);
+    }
+
+    /// `transport_stats_snapshot` must carry every real number str0m gave it through
+    /// unchanged (bytes, packets, RTCP counters, the peer's own loss/RTT/jitter
+    /// measurements) and must resolve `kind` from the tracks this side actually
+    /// negotiated -- not guess it, since a wrong `kind` would point Element Call's video
+    /// quality indicator at audio numbers or vice versa.
+    #[test]
+    // `.expect()` on the lookups below is the test failing loudly if the mapping under
+    // test dropped an entry -- not a real fallibility this function needs to handle.
+    #[allow(clippy::expect_used)]
+    fn transport_stats_snapshot_maps_real_str0m_numbers_without_inventing_any() {
+        let mut pc = create_peer_connection("stats-test-pc".to_string());
+        let audio_mid = Mid::from("0");
+        let video_mid = Mid::from("1");
+        pc.audio_mid = Some(audio_mid);
+        pc.video_mid = Some(video_mid);
+
+        let now = Instant::now();
+        pc.egress_stats.insert(
+            audio_mid,
+            str0m::stats::MediaEgressStats {
+                mid: audio_mid,
+                rid: None,
+                bytes: 4_000,
+                packets: 50,
+                firs: 0,
+                plis: 1,
+                nacks: 2,
+                rtt: Some(Duration::from_millis(80)),
+                loss: Some(0.01),
+                timestamp: now,
+                remote: Some(str0m::stats::RemoteIngressStats {
+                    jitter: 480, // 10ms at Opus's 48kHz clock
+                    maximum_sequence_number: str0m::rtp::SeqNo::from(1000u64),
+                    packets_lost: 3,
+                }),
+            },
+        );
+        // No RTCP receiver report arrived for the video track this interval -- `remote`
+        // must come back `None`, not a fabricated zero.
+        pc.egress_stats.insert(
+            video_mid,
+            str0m::stats::MediaEgressStats {
+                mid: video_mid,
+                rid: None,
+                bytes: 90_000,
+                packets: 120,
+                firs: 0,
+                plis: 0,
+                nacks: 0,
+                rtt: None,
+                loss: None,
+                timestamp: now,
+                remote: None,
+            },
+        );
+        pc.ingress_stats.insert(
+            audio_mid,
+            str0m::stats::MediaIngressStats {
+                mid: audio_mid,
+                rid: None,
+                bytes: 2_000,
+                packets: 25,
+                firs: 0,
+                plis: 0,
+                nacks: 1,
+                rtt: None,
+                loss: Some(0.02),
+                timestamp: now,
+                remote: None,
+            },
+        );
+
+        let snapshot = transport_stats_snapshot(&pc);
+
+        let outbound_audio = snapshot
+            .outbound
+            .iter()
+            .find(|s| s.mid == audio_mid.to_string())
+            .expect("audio egress entry present");
+        assert_eq!(outbound_audio.kind, Some("audio"));
+        assert_eq!(outbound_audio.bytes_sent, 4_000);
+        assert_eq!(outbound_audio.packets_sent, 50);
+        assert_eq!(outbound_audio.nack_count, 2);
+        assert_eq!(outbound_audio.pli_count, 1);
+        assert_eq!(outbound_audio.round_trip_time_ms, Some(80));
+        assert_eq!(outbound_audio.remote_packets_lost, Some(3));
+        assert_eq!(outbound_audio.remote_jitter_rtp_units, Some(480));
+
+        let outbound_video = snapshot
+            .outbound
+            .iter()
+            .find(|s| s.mid == video_mid.to_string())
+            .expect("video egress entry present");
+        assert_eq!(outbound_video.kind, Some("video"));
+        // No receiver report this interval: must be `None`, never `0`.
+        assert_eq!(outbound_video.round_trip_time_ms, None);
+        assert_eq!(outbound_video.remote_packets_lost, None);
+        assert_eq!(outbound_video.remote_jitter_rtp_units, None);
+
+        let inbound_audio = snapshot
+            .inbound
+            .first()
+            .expect("audio ingress entry present");
+        assert_eq!(inbound_audio.kind, Some("audio"));
+        assert_eq!(inbound_audio.bytes_received, 2_000);
+        assert_eq!(inbound_audio.packets_received, 25);
+        assert_eq!(inbound_audio.nack_count, 1);
+        assert_eq!(inbound_audio.loss_fraction, Some(0.02));
+
+        // No `Event::PeerStats` has arrived: the candidate pair must be absent, not a
+        // default-constructed stand-in with fabricated zeros.
+        assert!(snapshot.candidate_pair.is_none());
     }
 }
 
