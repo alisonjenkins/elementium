@@ -106,6 +106,69 @@ by building, not by reasoning.
 The upstream tree has a `patches/` directory of its own. Whatever we adopt should not
 collide with it, and it is a useful precedent for what the project considers normal.
 
+## Finding — 2026-08-08: the upgrade was attempted, and it is blocked on one thing
+
+The pin was moved to v1.12.25 and moved back. Everything the reading predicted held; one
+thing it did not predict does not work, and it is not in any of the surfaces that were
+checked.
+
+### What held
+
+| Checked | Result on v1.12.25 |
+|---|---|
+| Every patch step's assertion | passed — CSP removed, both injections took |
+| Shim contract (4 checks) | passed, in the main window and the widget frame |
+| Full Playwright suite | **21 passed**, including all five Element Call scenarios and the fourth-joiner rotation |
+| Config keys, dist layout, `setKey` worker message | unchanged, as predicted |
+
+So the entire structural analysis was right, and the Playwright participants — real Element
+Web without our shims — work perfectly on the new version. The upgrade is not blocked by
+Element Web.
+
+### What does not work
+
+Elementium itself cannot establish a peer connection:
+
+```
+[CallViewModel][ConnectionManager] livekitRoom.connect FAILED ws://localhost:7880
+    ConnectionError: could not establish pc connection
+Error boundary caught: Error: Failed to connect to Livekit server
+```
+
+Everything up to that point succeeds. The JWT is obtained, the WebSocket opens, and the SFU
+answers: `connected to Livekit Server ... version: 1.13.5, protocol: 17`. Element Call
+reaches "in the call". Only the media transport fails.
+
+The measurement that localises it:
+
+| | v1.12.11 | v1.12.25 |
+|---|---|---|
+| `setLocalDescription` calls on our shim | 8 | **0** |
+| `setRemoteDescription` calls | 8 | **0** |
+| `createOffer` calls | — | 3, each returning ~2.8 kB of SDP |
+| Outbound audio | 5,250 of 5,250 sent | 766 of 6,500, then a closed channel |
+
+We create the peer connections and produce offers. The new livekit-client **never calls
+`setLocalDescription`**, so the offer is never sent, no answer ever arrives, and the
+connection times out. The failure is therefore in our `RTCPeerConnection` shim's API
+surface, at some call the new client makes *before* `setLocalDescription` — not in the
+offer we generate, which it never asks for.
+
+`protocol: 17` in the handshake is the visible sign that livekit-client moved. Which call
+it now makes first, and what it expects back, is the next thing to find out: instrument the
+shim to log every method and property access, and compare the two versions' call sequences
+directly.
+
+### What this changes about the plan
+
+Nothing structural, and the ordering was right: the instrumentation from Phases 1 and 2 was
+in place before the pin moved, so the failure was localised from logs in one run rather than
+bisected. The pin is back at v1.12.11 and the working tree runs it.
+
+It does add a task the plan did not have — the shim's `RTCPeerConnection` has to be brought
+up to what livekit-client now expects — and that is a bigger piece of work than the upgrade
+it blocks.
+
 ## The shape of the answer
 
 Three kinds of change, told apart by intent, with a different home and a different cost
