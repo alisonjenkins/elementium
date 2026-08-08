@@ -801,47 +801,30 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     let mut dropped_audio_events: u64 = 0;
 
     loop {
-        // Data-channel events are not on `event_rx`: they never pass through the E2EE
-        // boundary `PcEvent` exists for (see `DataChannelEvent`), so they are queued
-        // straight on the connection and drained here instead, under the same lock that
-        // already has to be taken to reach `event_rx`.
-        let (event, dc_events) = {
-            let Ok(engine) = state.0.lock() else {
-                return;
-            };
-            let Some(managed) = engine.get(pc_id) else {
-                return;
-            };
-            let pc_event = {
-                let Ok(mut rx) = managed.event_rx.lock() else {
-                    return;
-                };
-                rx.try_recv().ok()
-            };
-            let Ok(mut pc) = managed.handle.lock() else {
-                return;
-            };
-            let dc_events = peer_connection::drain_data_channel_events(&mut pc);
-            drop(pc);
-            (pc_event, dc_events)
+        let Some((event, control_events, dc_events)) = drain_pc_queues(state, pc_id) else {
+            return;
         };
 
+        let routing = Routing {
+            app,
+            pc_id,
+            audio_tx: &audio_tx,
+            video_tx: &video_tx,
+        };
         let mut sent_anything = false;
 
         if let Some(pc_event) = event {
             sent_anything = true;
-            if let Some(tauri_event) = route_pc_event(
-                pc_event,
-                &Routing {
-                    app,
-                    pc_id,
-                    audio_tx: &audio_tx,
-                    video_tx: &video_tx,
-                },
-                &mut dropped_audio_events,
-            ) {
-                emit_to_frontend(app, pc_id, &tauri_event);
-            }
+            route_and_emit(pc_event, &routing, &mut dropped_audio_events);
+        }
+
+        // Every pending control event, not just one -- unlike the bounded media event
+        // above, there is no backpressure concern in taking them as fast as they arrive,
+        // and draining the whole queue here (in the order `try_recv` returns them, which
+        // is arrival order) is what keeps them in the order they happened.
+        for control_event in control_events {
+            sent_anything = true;
+            route_and_emit(control_event, &routing, &mut dropped_audio_events);
         }
 
         for dc_event in dc_events {
@@ -853,6 +836,57 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
+}
+
+/// Route one [`PcEvent`] and, if it maps to a frontend event, emit it.
+///
+/// Split out of `forward_events` because the media and control paths both need exactly
+/// this sequence and would otherwise duplicate it.
+fn route_and_emit(event: PcEvent, routing: &Routing<'_>, dropped_audio_events: &mut u64) {
+    if let Some(tauri_event) = route_pc_event(event, routing, dropped_audio_events) {
+        emit_to_frontend(routing.app, routing.pc_id, &tauri_event);
+    }
+}
+
+/// One pass of pulling everything currently queued for `pc_id`: at most one media event
+/// (`event_rx` is bounded and droppable, so only the newest is worth taking per pass),
+/// every pending control event (`control_rx` is unbounded and undroppable), and every
+/// pending data-channel event. Data-channel events are not on `event_rx`: they never pass
+/// through the E2EE boundary `PcEvent` exists for (see `DataChannelEvent`), so they are
+/// queued straight on the connection and drained here instead, under the same lock that
+/// already has to be taken to reach the other two.
+///
+/// Returns `None` when the connection is gone or a lock is poisoned, telling the caller
+/// to stop forwarding for this `pc_id` entirely.
+#[allow(clippy::type_complexity)]
+fn drain_pc_queues(
+    state: &WebRtcState,
+    pc_id: &str,
+) -> Option<(
+    Option<PcEvent>,
+    Vec<PcEvent>,
+    Vec<peer_connection::DataChannelEvent>,
+)> {
+    let engine = state.0.lock().ok()?;
+    let managed = engine.get(pc_id)?;
+
+    let pc_event = managed.event_rx.lock().ok()?.try_recv().ok();
+
+    let control_events = {
+        let mut rx = managed.control_rx.lock().ok()?;
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    };
+
+    let mut pc = managed.handle.lock().ok()?;
+    let dc_events = peer_connection::drain_data_channel_events(&mut pc);
+    drop(pc);
+    drop(engine);
+
+    Some((pc_event, control_events, dc_events))
 }
 
 /// Push one event to JS via `eval()` -- calls the global handler registered by the WebRTC

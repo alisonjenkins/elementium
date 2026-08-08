@@ -60,7 +60,16 @@ pub struct ManagedPc {
     pub handle: PeerConnectionHandle,
     pub socket: Arc<UdpSocket>,
     pub io_cmd_tx: mpsc::Sender<IoCommand>,
+    /// High-rate media events (`AudioData`/`VideoData`), bounded so a stalled consumer
+    /// sheds load instead of growing without limit. See [`PcEvent::is_media`].
     pub event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
+    /// Control events (connection/ICE state, candidates, stats, keyframe requests).
+    /// Unbounded: each is the only notice of a transition that will not repeat, so this
+    /// side of the split must never drop under backpressure. Defensible as unbounded
+    /// specifically because these are rare and bounded by real state transitions, not by
+    /// anything an adversary or a busy network could drive unboundedly -- there is no
+    /// event source here that fires faster than the state machine it reports on.
+    pub control_rx: Arc<Mutex<mpsc::UnboundedReceiver<PcEvent>>>,
     /// The `peer_connection` tracing span this connection was created under, carrying
     /// its `correlation_id`. Retained so later operations on this connection (e.g.
     /// closing it) can re-enter the same span.
@@ -143,9 +152,12 @@ impl WebRtcEngine {
         let handle: PeerConnectionHandle = Arc::new(Mutex::new(pc_inner));
         let socket = Arc::new(socket);
 
-        // Channels for the I/O loop
+        // Channels for the I/O loop. Media (`event_tx`) stays bounded and droppable;
+        // control (`control_tx`) is unbounded so a burst of media never costs it an event
+        // -- see the fields' doc comments on `ManagedPc` and `PcEvent::is_media`.
         let (io_cmd_tx, io_cmd_rx) = mpsc::channel::<IoCommand>(256);
         let (event_tx, event_rx) = mpsc::channel::<PcEvent>(256);
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<PcEvent>();
 
         // Spawn the I/O loop as a blocking task (it does synchronous UDP I/O)
         let loop_handle = handle.clone();
@@ -154,7 +166,14 @@ impl WebRtcEngine {
         let loop_span = span.clone();
         tokio::task::spawn_blocking(move || {
             let _enter = loop_span.enter();
-            io_loop(&loop_handle, &loop_socket, io_cmd_rx, &event_tx, &loop_e2ee);
+            io_loop(
+                &loop_handle,
+                &loop_socket,
+                io_cmd_rx,
+                &event_tx,
+                &control_tx,
+                &loop_e2ee,
+            );
         });
 
         self.connections.insert(
@@ -164,6 +183,7 @@ impl WebRtcEngine {
                 socket,
                 io_cmd_tx,
                 event_rx: Arc::new(Mutex::new(event_rx)),
+                control_rx: Arc::new(Mutex::new(control_rx)),
                 span,
             },
         );
@@ -364,6 +384,7 @@ fn io_loop(
     socket: &Arc<UdpSocket>,
     mut cmd_rx: mpsc::Receiver<IoCommand>,
     event_tx: &mpsc::Sender<PcEvent>,
+    control_tx: &mpsc::UnboundedSender<PcEvent>,
     e2ee_ctx: &Arc<Mutex<EncryptionPolicy>>,
 ) {
     let mut recv_buf = vec![0u8; 2000];
@@ -394,18 +415,35 @@ fn io_loop(
             match peer_connection::poll_once(&mut pc, socket, &mut recv_buf) {
                 Ok((events, deadline)) => {
                     for event in events {
-                        if let Some(event) = maybe_decrypt_event(event, e2ee.as_context())
-                            && event_tx.try_send(event).is_err()
-                        {
-                            dropped_events = dropped_events.saturating_add(1);
-                            // Unthrottled: this is a real invisible-loss channel this
-                            // codebase has never had visibility into before, and
-                            // capacity-256 means it shouldn't fire under normal load at
-                            // all -- if it does, every occurrence matters.
-                            tracing::warn!(
+                        let Some(event) = maybe_decrypt_event(event, e2ee.as_context()) else {
+                            continue;
+                        };
+                        // Media is droppable under backpressure; control is not. Splitting
+                        // here rather than merging the two channels downstream is what
+                        // keeps a media burst from ever being able to starve a control
+                        // event of a slot -- there is no shared capacity to contend for.
+                        if event.is_media() {
+                            if event_tx.try_send(event).is_err() {
+                                dropped_events = dropped_events.saturating_add(1);
+                                // Unthrottled: this is a real invisible-loss channel this
+                                // codebase has never had visibility into before, and
+                                // capacity-256 means it shouldn't fire under normal load at
+                                // all -- if it does, every occurrence matters.
+                                tracing::warn!(
+                                    pc_id = %pc.id,
+                                    dropped_events,
+                                    "PcEvent dropped: event_tx to forward_events full"
+                                );
+                            }
+                        } else if control_tx.send(event).is_err() {
+                            // Only fails when `forward_events` has already returned (the
+                            // receiver dropped), which only happens after this connection
+                            // was removed -- nothing downstream is listening to lose this
+                            // event *to*, so it is not a loss in the sense this split
+                            // exists to prevent.
+                            tracing::debug!(
                                 pc_id = %pc.id,
-                                dropped_events,
-                                "PcEvent dropped: event_tx to forward_events full"
+                                "control event undelivered: forward_events already exited"
                             );
                         }
                     }

@@ -93,6 +93,21 @@ pub enum PcEvent<P = PlaintextMedia> {
     },
 }
 
+impl<P> PcEvent<P> {
+    /// Is this a high-rate media payload that is safe to drop under backpressure?
+    ///
+    /// `AudioData`/`VideoData` are the only variants that arrive at a rate that can
+    /// realistically fill a bounded channel, and a dropped one is inherently self-healing:
+    /// the next frame supersedes it and, for audio, PLC covers the gap. Everything else --
+    /// state transitions, ICE candidates, stats, keyframe requests -- is comparatively rare
+    /// and each instance is the only notice of something that will not repeat, so those
+    /// belong on an unbounded queue instead. See `engine::io_loop`, which routes on this.
+    #[must_use]
+    pub const fn is_media(&self) -> bool {
+        matches!(self, Self::AudioData { .. } | Self::VideoData { .. })
+    }
+}
+
 /// A [`PcEvent`] whose media payload came straight off the network and may still be
 /// encrypted. Cannot reach a decoder: decoders only accept [`PlaintextMedia`].
 pub type WirePcEvent = PcEvent<WireMedia>;
@@ -1914,6 +1929,61 @@ mod tests {
         {
             let guard = lock_pc(&handle);
             assert_eq!(guard.id, "test-pc");
+        }
+    }
+
+    /// Pins the media/control split `engine::io_loop` routes on: exactly `AudioData` and
+    /// `VideoData` are droppable media, everything else is undroppable control. This is
+    /// exactly the classification the bug report was about -- a wrong answer here would
+    /// silently mean either media on the undroppable channel (defeating the point of
+    /// keeping it bounded) or a control event on the droppable one (reintroducing the
+    /// frozen `connectionState` bug this split exists to fix). Exhaustive over every
+    /// variant so a new `PcEvent` variant added later has to be placed here too, rather
+    /// than defaulting to whichever side is picked without anyone noticing.
+    #[test]
+    fn is_media_classifies_every_pc_event_variant() {
+        let media_events: Vec<PcEvent> = vec![
+            PcEvent::AudioData {
+                mid: "0".to_string(),
+                data: PlaintextMedia::from_encoder(Vec::new()),
+                contiguous: true,
+            },
+            PcEvent::VideoData {
+                mid: "0".to_string(),
+                data: PlaintextMedia::from_encoder(Vec::new()),
+                codec: elementium_codec::VideoCodec::Vp8,
+            },
+        ];
+        for event in media_events {
+            assert!(event.is_media(), "{event:?} should be droppable media");
+        }
+
+        let control_events: Vec<PcEvent> = vec![
+            PcEvent::IceConnectionStateChange(IceState::Connected),
+            PcEvent::ConnectionStateChange(PeerConnectionState::Connected),
+            PcEvent::IceCandidate("candidate:0".to_string()),
+            PcEvent::IceGatheringComplete,
+            PcEvent::Connected,
+            PcEvent::RemoteTrackAdded {
+                mid: "0".to_string(),
+                kind: "audio".to_string(),
+            },
+            PcEvent::KeyframeRequested {
+                mid: "0".to_string(),
+            },
+            PcEvent::EgressStats {
+                mid: "0".to_string(),
+                loss: Some(0.0),
+                rtt_ms: Some(10),
+                packets: 1,
+                nacks: 0,
+            },
+        ];
+        for event in control_events {
+            assert!(
+                !event.is_media(),
+                "{event:?} should be undroppable control"
+            );
         }
     }
 
