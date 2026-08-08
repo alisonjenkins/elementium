@@ -351,9 +351,28 @@ Zero concealment is the number that matters: a decrypt failure, a jitter-buffer 
 malformed payload all show up as concealment while `packetsLost` stays at zero, which is
 how a stream can look healthy on the wire and sound like noise.
 
-**Covered: the delivery half.** SC-004 also asks that the microphone stay independently
-audible and mutable, which needs a concurrent microphone publisher this harness does not
-have. That half is untested and the test says so rather than implying otherwise.
+**The independence half, also passed 2026-08-08:**
+
+```sh
+ATTENDED=1 pnpm exec playwright test -g "microphone stays independent"
+```
+
+The publisher sends share audio and a synthetic 660Hz microphone together, then silences
+the microphone half way through and says so. Measured across that moment:
+
+| after the mute | microphone | share audio |
+|---|---|---|
+| packets received | **+0** | **+500** |
+
+The shape of the change is the assertion, not its size. "Both tracks received packets"
+would pass just as happily if muting one had killed both — which is the failure worth
+ruling out, since two audio tracks sharing an m-line would look identical on every counter
+that matters to the delivery half.
+
+**A measurement error worth remembering**: the first version sampled at the *start* of the
+run and reported +895 microphone packets after the mute, failing a working implementation.
+Every one of those had been sent before the microphone was silenced. Sample at the event
+you are measuring, not before it.
 
 **Two harness faults this run cost, both worth recognising again:**
 

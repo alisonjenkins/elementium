@@ -236,7 +236,12 @@ function startScreenPublisher(
   seconds: number,
   keyHex?: string,
   audio = false,
-): Publisher & { audioSent: () => number | null; audioFlowing: () => boolean } {
+  micTone = false,
+): Publisher & {
+  audioSent: () => number | null;
+  audioFlowing: () => boolean;
+  micMuted: () => boolean;
+} {
   const args = [
     "--sfu", SFU_HTTP,
     "--room", room,
@@ -244,6 +249,7 @@ function startScreenPublisher(
     "--seconds", String(seconds),
     ...(keyHex ? ["--key-hex", keyHex] : []),
     ...(audio ? ["--audio"] : []),
+    ...(micTone ? ["--mic-tone"] : []),
   ];
   const proc = spawn(PUBLISHER_SCREEN, args, {
     stdio: "pipe",
@@ -251,7 +257,7 @@ function startScreenPublisher(
   });
   const echo = (c: Buffer) => {
     for (const line of c.toString().split("\n")) {
-      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |AUDIO_SENT |CAPTURED |AUDIO_SINK |AUDIO_FLOWING)/.test(line)) {
+      if (line.trim() && !/^(PUBLISHING|VIDEO_SENT |AUDIO_SENT |CAPTURED |AUDIO_SINK |AUDIO_FLOWING|MIC_)/.test(line)) {
         console.log(`  [screen-publisher] ${line}`);
       }
     }
@@ -262,6 +268,9 @@ function startScreenPublisher(
   // Set on the publisher's first share-audio packet, so a test that stops the process
   // before it exits can still tell "audio was flowing" from "audio was never captured".
   let audioFlowing = false;
+  // The publisher silences its synthetic microphone half way through and says so, which is
+  // the moment SC-004's "independently mutable" claim is measured either side of.
+  let micMuted = false;
   let out = "";
   const live = new Promise<void>((resolve, reject) => {
     proc.stdout.on("data", (chunk: Buffer) => {
@@ -277,6 +286,7 @@ function startScreenPublisher(
       const am = /AUDIO_SENT (\d+)/.exec(out);
       if (am) audioSent = Number(am[1]);
       if (out.includes("AUDIO_FLOWING")) audioFlowing = true;
+      if (out.includes("MIC_MUTED")) micMuted = true;
     });
     proc.on("exit", (code) => {
       if (!out.includes("PUBLISHING")) {
@@ -290,6 +300,7 @@ function startScreenPublisher(
     sent: () => sent,
     audioSent: () => audioSent,
     audioFlowing: () => audioFlowing,
+    micMuted: () => micMuted,
     stop: () => proc.kill(),
   };
 }
@@ -1385,6 +1396,110 @@ test.describe("screen share (spec 008)", () => {
    *      receiver, which means the backend captured more than the chosen window regardless
    *      of what the picker said.
    */
+  /**
+   * SC-004's other half: "...while the microphone remains independently audible and
+   * independently mutable."
+   *
+   * Delivery of share audio alone does not establish it. Two audio tracks on one connection
+   * could share an m-line, or one could silence the other, and every counter that matters
+   * to the first half would look identical. So this run publishes both -- share audio from
+   * the desktop sink and a synthetic 660Hz microphone -- and the publisher silences the
+   * microphone half way through, announcing it.
+   *
+   * The assertion is the shape of the change, not its size: after the mute, the microphone
+   * must stop arriving and the share must keep arriving. A test that only checked "both
+   * tracks received packets" would pass just as happily if muting one had killed both.
+   */
+  test("the microphone stays independent of share audio, and can be muted alone", async ({
+    page,
+  }) => {
+    test.skip(
+      !process.env.ATTENDED,
+      "needs a person to choose a source in the portal picker; run with ATTENDED=1",
+    );
+    test.setTimeout(420_000);
+
+    const roomName = `elementium-mic-independence-${Date.now()}`;
+    console.log(`  room: ${roomName}`);
+    const server = await startPageServer();
+    page.on("pageerror", (e) => console.log(`  [page:error] ${e.message}`));
+
+    const query = new URLSearchParams({
+      url: SFU_WS,
+      token: mintToken("browser-subscriber", roomName),
+      key: KEY_HEX,
+    });
+    await page.goto(`${server.origin}/?${query.toString()}`);
+    await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
+
+    // 60s: the publisher mutes at the half way point, leaving 30s either side to measure.
+    const publisher = startScreenPublisher(roomName, 60, KEY_HEX, true, true);
+
+    const read = async (source: string) =>
+      page.evaluate(
+        (s) => (window as never as { __stats: (s: string) => Promise<InboundStats | { error: string }> }).__stats(s),
+        source,
+      );
+
+    try {
+      await publisher.live;
+      await expect
+        .poll(async () => {
+          const mic = await read("microphone");
+          const share = await read("screen_share_audio");
+          return !("error" in mic) && !("error" in share);
+        }, { timeout: 60_000, message: "both audio tracks must be subscribed" })
+        .toBe(true);
+
+      // Before the mute: both flowing.
+      await page.waitForTimeout(8_000);
+      const micBefore = await read("microphone");
+      const shareBefore = await read("screen_share_audio");
+      if ("error" in micBefore || "error" in shareBefore) throw new Error("stats unavailable");
+
+      await expect
+        .poll(() => publisher.micMuted(), { timeout: 90_000, message: "the publisher never muted its microphone" })
+        .toBe(true);
+
+      // Sampled *at* the mute, not at the start of the run. Measuring from the earlier
+      // sample counts every legitimate pre-mute packet as "still arriving after the mute"
+      // -- which is exactly how the first version of this test failed a working
+      // implementation, reporting +895 microphone packets that had all been sent before
+      // the microphone was ever silenced.
+      const micAtMute = await read("microphone");
+      const shareAtMute = await read("screen_share_audio");
+      if ("error" in micAtMute || "error" in shareAtMute) throw new Error("stats unavailable at mute");
+
+      // Past the jitter buffer's tail, so packets already in flight are not counted as
+      // "still arriving".
+      await page.waitForTimeout(10_000);
+
+      const micAfter = await read("microphone");
+      const shareAfter = await read("screen_share_audio");
+      if ("error" in micAfter || "error" in shareAfter) throw new Error("stats unavailable after mute");
+
+      const micDelta = micAfter.packetsReceived - micAtMute.packetsReceived;
+      const shareDelta = shareAfter.packetsReceived - shareAtMute.packetsReceived;
+      console.log(`  after the mute: microphone +${micDelta} packets, share audio +${shareDelta}`);
+
+      expect(micBefore.packetsReceived, "the microphone must have been arriving before the mute").toBeGreaterThan(0);
+      expect(shareBefore.packetsReceived, "share audio must have been arriving before the mute").toBeGreaterThan(0);
+      expect(
+        micDelta,
+        `the microphone kept arriving after it was muted (+${micDelta} packets), so the two ` +
+          `tracks are not independently controllable`,
+      ).toBeLessThan(50);
+      expect(
+        shareDelta,
+        `share audio stopped when the microphone was muted (+${shareDelta} packets), so ` +
+          `muting one track silenced the other -- which is the failure this test exists for`,
+      ).toBeGreaterThan(100);
+    } finally {
+      publisher.stop();
+      server.close();
+    }
+  });
+
   test("a single-window share carries nothing from outside that window", async () => {
     test.skip(
       true,

@@ -232,6 +232,20 @@ async fn send_audio_chunk(
     sent
 }
 
+/// One 20ms mono frame of a 660Hz sine, for the synthetic microphone.
+///
+/// A different pitch from the 440Hz tone a share-audio run plays through the speakers, so
+/// the two are distinguishable by ear as well as by counter when someone listens to a run.
+#[allow(clippy::cast_precision_loss, clippy::as_conversions, clippy::arithmetic_side_effects)]
+fn mic_tone_frame(start_sample: u32, samples: usize, rate: u32) -> Vec<f32> {
+    (0..samples)
+        .map(|i| {
+            let n = start_sample.wrapping_add(u32::try_from(i).unwrap_or(0));
+            (2.0 * std::f32::consts::PI * 660.0 * (n as f32) / (rate as f32)).sin() * 0.5
+        })
+        .collect()
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::expect_used, clippy::print_stdout, clippy::too_many_lines)]
 async fn main() {
@@ -248,6 +262,12 @@ async fn main() {
     let seconds: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(35);
     let codec = elementium_codec::VideoCodec::Vp8;
     let audio = std::env::args().any(|a| a == "--audio");
+    // A synthetic microphone, so SC-004's other half can be asked: does the microphone stay
+    // audible alongside share audio, and can it be silenced without silencing the share?
+    // A generated tone rather than a real capture device: the question is whether two
+    // independently-keyed audio tracks stay independent, and a real microphone would add a
+    // device that may not exist on the machine running this.
+    let mic = std::env::args().any(|a| a == "--mic-tone");
 
     // The portal first, before the SFU connection: it blocks on a person, and holding a
     // room connection open across that wait would have the publisher time out in the SFU
@@ -338,6 +358,13 @@ async fn main() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
+    if mic {
+        room_conn
+            .publish_track(MediaTrackKey::microphone())
+            .expect("publish the synthetic microphone track");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
     let opus_rate = elementium_media::pipewire_audio::TARGET_SAMPLE_RATE;
     let mut audio_encoder = audio_capture.is_some().then(|| {
         elementium_codec::OpusEncoder::with_config(
@@ -351,6 +378,25 @@ async fn main() {
     let frame_samples = usize::try_from(opus_rate).unwrap_or(48_000).saturating_mul(20) / 1000;
     let mut audio_accum: Vec<f32> = Vec::with_capacity(frame_samples.saturating_mul(2));
     let mut audio_sent: u64 = 0;
+
+    let mut mic_encoder = mic.then(|| {
+        elementium_codec::OpusEncoder::with_config(
+            opus_rate,
+            AUDIO_CHANNELS,
+            elementium_codec::OpusEncoderConfig::default(),
+        )
+        .expect("Opus encoder for the synthetic microphone")
+    });
+    let mut mic_sample: u32 = 0;
+    let mut mic_sent: u64 = 0;
+    let mut mic_muted = false;
+    // Muted half way through, and announced, so a driving test can measure the same two
+    // tracks either side of the change. "Independently mutable" is only demonstrated if the
+    // share keeps flowing across the moment the microphone stops.
+    let mic_mute_at = std::time::Instant::now()
+        .checked_add(Duration::from_secs(seconds.saturating_div(2)))
+        .unwrap_or_else(std::time::Instant::now);
+    let mut mic_next = std::time::Instant::now();
 
     let mut encoder = elementium_codec::NegotiatedEncoder::new(
         codec,
@@ -401,6 +447,38 @@ async fn main() {
             false
         };
 
+        // The synthetic microphone runs on a clock, unlike the capture sources: it is
+        // generated, so nothing else decides when a frame exists.
+        if let Some(enc) = mic_encoder.as_mut() {
+            let now = std::time::Instant::now();
+            if !mic_muted && now >= mic_mute_at {
+                mic_muted = true;
+                println!("MIC_MUTED");
+            }
+            if !mic_muted && now >= mic_next {
+                mic_next = now
+                    .checked_add(Duration::from_millis(20))
+                    .unwrap_or(now);
+                let data = mic_tone_frame(mic_sample, frame_samples, opus_rate);
+                mic_sample = mic_sample.wrapping_add(u32::try_from(frame_samples).unwrap_or(960));
+                if let Ok(packet) = enc.encode(&elementium_types::AudioFrame {
+                    sample_rate: opus_rate,
+                    channels: AUDIO_CHANNELS,
+                    data,
+                    timestamp_us: 0,
+                }) && room_conn
+                    .write_audio(MediaTrackKey::microphone(), packet)
+                    .await
+                    .is_ok()
+                {
+                    if mic_sent == 0 {
+                        println!("MIC_FLOWING");
+                    }
+                    mic_sent = mic_sent.saturating_add(1);
+                }
+            }
+        }
+
         // Polled the same way the video source is, and for the same reason: `PipeWire`
         // delivers on its own quantum, not on a cadence this loop should impose.
         let got_audio = if let Some(capture) = audio_capture.as_ref()
@@ -437,6 +515,9 @@ async fn main() {
     println!("VIDEO_SENT {sent}");
     if audio_capture.is_some() {
         println!("AUDIO_SENT {audio_sent}");
+    }
+    if mic {
+        println!("MIC_SENT {mic_sent}");
     }
     room_conn.disconnect().await;
     session.close().await;
