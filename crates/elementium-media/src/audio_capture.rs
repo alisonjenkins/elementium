@@ -75,11 +75,45 @@ impl AudioCapturer {
     /// Returns [`CaptureError`] if no input device is available, the device
     /// config cannot be read, or the audio stream cannot be built/started.
     pub fn start() -> Result<Self, CaptureError> {
+        Self::start_on_device(None)
+    }
+
+    /// Start capturing from a chosen input device, or the default when none is chosen.
+    ///
+    /// `index` is the position in `cpal`'s own `input_devices()` iteration, which is what
+    /// [`crate::device_enumeration::enumerate_audio_devices`] numbers its ids by -- so the
+    /// device the user picked and the device opened here come from one list rather than
+    /// two. Before this, the chosen id was carried all the way down and then ignored: the
+    /// default microphone was always opened, whatever the settings said.
+    ///
+    /// A chosen device that has since gone away falls back to the default rather than
+    /// failing, because a call with the wrong microphone beats a call with none -- but the
+    /// substitution is logged, since doing it silently is what made the original bug
+    /// invisible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError`] if no input device is available, the device config cannot
+    /// be read, or the audio stream cannot be built or started.
+    pub fn start_on_device(index: Option<usize>) -> Result<Self, CaptureError> {
         let host = cpal::default_host();
-        let device = host.default_input_device().ok_or_else(|| {
-            tracing::error!(error_kind = "no_device", "No audio input device available");
-            CaptureError::NoDevice
-        })?;
+        let chosen = index.and_then(|i| {
+            let found = host.input_devices().ok().and_then(|mut d| d.nth(i));
+            if found.is_none() {
+                tracing::warn!(
+                    requested_index = i,
+                    "the requested microphone is no longer present; using the default"
+                );
+            }
+            found
+        });
+        let device = match chosen {
+            Some(device) => device,
+            None => host.default_input_device().ok_or_else(|| {
+                tracing::error!(error_kind = "no_device", "No audio input device available");
+                CaptureError::NoDevice
+            })?,
+        };
 
         let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
 

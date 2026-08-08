@@ -382,6 +382,15 @@ pub fn set_capture_muted(
     Ok(())
 }
 
+/// The index inside an `audio-input-{n}` device id, which is cpal's own enumeration order.
+///
+/// `None` for anything else, in which case the default device is used — the same rule the
+/// camera path applies to ids it cannot resolve.
+fn microphone_index(device_id: &str) -> Option<usize> {
+    device_id.strip_prefix("audio-input-")?.parse().ok()
+}
+
+
 /// The cameras the user can choose from, named so that capture can find them again.
 ///
 /// Enumerated from `PipeWire` first, because that is what capture actually opens. They used
@@ -413,7 +422,7 @@ fn video_input_devices() -> Vec<MediaDevice> {
                     .enumerate()
                     .map(|(i, cam)| MediaDevice {
                         id: format!("video-input-{i}"),
-                        label: cam.human_name().clone(),
+                        label: cam.human_name(),
                         kind: elementium_types::MediaDeviceKind::VideoInput,
                     })
                     .collect()
@@ -473,7 +482,7 @@ fn connection_for_new_pipeline(
 ///
 /// Replaces whatever was running and takes over its connection, so a mid-call restart
 /// keeps sending -- see [`stop_pipeline_inheriting_connection`].
-fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
+fn start_audio_pipeline(media_state: &MediaState, device_index: Option<usize>) -> TrackId {
     let key = MediaTrackKey::microphone();
     let track_id = TrackId(format!("audio-{}", generate_track_id()));
     tracing::info!(track_id = %track_id, "Starting audio capture");
@@ -507,7 +516,14 @@ fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
     let audio_span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = audio_span.enter();
-        audio_capture_loop(key, &encode_tx_clone, &muted_clone, &stop_rx, &loss_estimate_clone);
+        audio_capture_loop(
+            key,
+            device_index,
+            &encode_tx_clone,
+            &muted_clone,
+            &stop_rx,
+            &loss_estimate_clone,
+        );
     });
 
     if let Ok(mut pipelines) = media_state.pipelines.lock() {
@@ -591,6 +607,16 @@ fn take_over_camera_pipeline(
     (had_previous, inherited_connection)
 }
 
+/// The microphone the caller asked for, resolved the same way the picker numbered it.
+fn chosen_microphone(constraints: &MediaConstraints) -> Option<usize> {
+    constraints
+        .audio
+        .as_ref()
+        .and_then(|a| a.device_id.as_deref())
+        .and_then(microphone_index)
+}
+
+
 
 #[command]
 pub async fn get_user_media(
@@ -621,7 +647,7 @@ pub async fn get_user_media(
     let mut track_ids = Vec::new();
 
     if constraints.audio.is_some() {
-        track_ids.push(start_audio_pipeline(&media_state));
+        track_ids.push(start_audio_pipeline(&media_state, chosen_microphone(&constraints)));
     }
 
     if let Some(ref video_constraints) = constraints.video {
@@ -1134,9 +1160,9 @@ pub enum VideoCaptureSource {
     Camera {
         /// The `PipeWire` node the user picked, when they picked one.
         ///
-        /// Parsed from the id `enumerate_devices` handed out, so the picker and capture
+        /// Parsed from the id [`enumerate_devices`] handed out, so the picker and capture
         /// name the same thing. They used to disagree entirely -- the picker listed
-        /// nokhwa's devices and capture walked PipeWire's own list -- which is why
+        /// nokhwa's devices and capture walked `PipeWire`'s own list -- which is why
         /// choosing a camera in settings did nothing.
         node_id: Option<u32>,
         width: Option<u32>,
@@ -2161,12 +2187,13 @@ fn retune_fec_if_needed(
 /// connection when `encode_tx` is connected (deferred connection pattern).
 fn audio_capture_loop(
     key: MediaTrackKey,
+    device_index: Option<usize>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     muted: &Arc<std::sync::atomic::AtomicBool>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     loss_estimate: &Arc<NetworkLossEstimate>,
 ) {
-    let capturer = match AudioCapturer::start() {
+    let capturer = match AudioCapturer::start_on_device(device_index) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to start audio capture: {e}");
