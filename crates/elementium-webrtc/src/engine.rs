@@ -311,7 +311,7 @@ fn drain_io_commands(
                 }
             }
             Ok(IoCommand::WriteVideo(vp8_data)) => {
-                let Some(data) = encrypt_or_drop(e2ee, vp8_data, E2eeMediaKind::Video, "video")
+                let Some(data) = encrypt_or_drop(e2ee, vp8_data, E2eeMediaKind::VideoVp8, "video")
                 else {
                     continue;
                 };

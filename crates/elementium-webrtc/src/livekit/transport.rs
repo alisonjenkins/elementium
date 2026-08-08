@@ -318,7 +318,7 @@ fn pc_io_loop(
                             &handle,
                             e2ee.as_context(),
                             data,
-                            E2eeMediaKind::Video,
+                            E2eeMediaKind::VideoVp8,
                             &mut video_publish,
                         );
                     }
@@ -438,7 +438,7 @@ fn write_encrypted_or_drop(
 ) {
     let label = match kind {
         E2eeMediaKind::Audio => "audio",
-        E2eeMediaKind::Video => "video",
+        E2eeMediaKind::VideoVp8 | E2eeMediaKind::VideoH264 => "video",
     };
     counters.offered = counters.offered.saturating_add(1);
 
@@ -458,7 +458,9 @@ fn write_encrypted_or_drop(
         let mut pc = lock_pc(handle);
         match kind {
             E2eeMediaKind::Audio => peer_connection::write_audio(&mut pc, &data),
-            E2eeMediaKind::Video => peer_connection::write_video(&mut pc, &data),
+            E2eeMediaKind::VideoVp8 | E2eeMediaKind::VideoH264 => {
+                peer_connection::write_video(&mut pc, &data)
+            }
         }
     };
     match result {

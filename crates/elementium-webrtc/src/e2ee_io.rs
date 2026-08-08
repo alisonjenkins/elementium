@@ -181,7 +181,7 @@ pub(crate) fn maybe_decrypt_event(
             }
         }
         PcEvent::VideoData { mid, data } => {
-            match ctx.decrypt_frame_any(&data, E2eeMediaKind::Video) {
+            match ctx.decrypt_frame_any(&data, E2eeMediaKind::VideoVp8) {
                 Ok(Some(decrypted)) => Some(PcEvent::VideoData {
                     mid,
                     data: decrypted,

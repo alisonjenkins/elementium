@@ -147,11 +147,19 @@ impl std::fmt::Display for KeyIndex {
     }
 }
 
-/// Media kind for determining unencrypted header size.
+/// What a frame is, for the purpose of framing it.
+///
+/// Video is split by codec rather than left as one variant, because how much of a frame
+/// stays in the clear is a codec question with two entirely different answers, and getting
+/// it wrong produces frames the peer cannot authenticate — silently, and only at their end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Audio,
-    Video,
+    /// VP8: a fixed 10 or 3 bytes, read from the frame tag.
+    VideoVp8,
+    /// H.264: two bytes into the first slice NAL unit, and the ciphertext is RBSP-escaped.
+    /// See [`h264`].
+    VideoH264,
 }
 
 /// Configuration options for E2EE, matching livekit-client's `KeyProviderOptions`.
@@ -724,7 +732,7 @@ impl E2eeContext {
             return None;
         };
 
-        let header_size = unencrypted_header_size(frame, kind);
+        let Framing { header_size, rbsp } = framing(frame, kind);
         let Some(header) = frame.get(..header_size) else {
             tracing::error!(
                 reason = "malformed_header",
@@ -767,16 +775,24 @@ impl E2eeContext {
         drop(inner);
 
         // Build output: [header] [ciphertext (includes GCM tag)] [IV] [IV_LENGTH] [key_index]
-        let capacity = header_size
-            .saturating_add(ciphertext.len())
+        let capacity = ciphertext
+            .len()
             .saturating_add(IV_SIZE)
             .saturating_add(TRAILER_SIZE);
-        let mut output = Vec::with_capacity(capacity);
+        let mut body = Vec::with_capacity(capacity);
+        body.extend_from_slice(&ciphertext);
+        body.extend_from_slice(&iv);
+        body.push(IV_SIZE_U8);
+        body.push(key_index.as_wire_byte());
+
+        // Everything after the clear header is escaped for H.264, exactly as livekit does.
+        // Ciphertext is uniformly random, so it produces start-code sequences by chance;
+        // without this a small fraction of frames are misparsed downstream.
+        let body = if rbsp { h264::write_rbsp(&body) } else { body };
+
+        let mut output = Vec::with_capacity(header_size.saturating_add(body.len()));
         output.extend_from_slice(header);
-        output.extend_from_slice(&ciphertext);
-        output.extend_from_slice(&iv);
-        output.push(IV_SIZE_U8);
-        output.push(key_index.as_wire_byte());
+        output.extend_from_slice(&body);
 
         Some(WireMedia::from_encrypted(output))
     }
@@ -911,13 +927,18 @@ impl E2eeContext {
         participant: &str,
         kind: MediaKind,
     ) -> Result<Option<PlaintextMedia>, E2eeError> {
+        // Undo the sender's RBSP escaping before anything reads offsets from the frame: the
+        // IV and trailer sit at the end of the escaped region, so their positions are wrong
+        // until this has run. Borrows `unescaped`, which must outlive the parts below.
+        let mut unescaped = Vec::new();
+        let bytes = rbsp_decoded(frame.as_bytes(), kind, &mut unescaped);
         let FrameParts {
             header,
             ciphertext,
             iv,
             key_index,
-        } = split_frame(frame.as_bytes(), kind)?;
-        let frame = frame.as_bytes();
+        } = split_frame(bytes, kind)?;
+        let frame = bytes;
 
         let inner = self.lock_read()?;
         let options = inner.options.clone();
@@ -1025,6 +1046,36 @@ struct FrameParts<'a> {
     key_index: KeyIndex,
 }
 
+/// Undo an H.264 sender's RBSP escaping, leaving anything else untouched.
+///
+/// Only the region after the clear header is unescaped. The header is real H.264, which the
+/// encoder has already escaped for its own reasons, and unescaping that would corrupt it.
+///
+/// Returns a borrow of `frame` when there is nothing to do, and of `scratch` otherwise, so
+/// the common case costs nothing.
+fn rbsp_decoded<'a>(frame: &'a [u8], kind: MediaKind, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    let Framing {
+        header_size,
+        rbsp: true,
+    } = framing(frame, kind)
+    else {
+        return frame;
+    };
+    let (Some(header), Some(body)) = (frame.get(..header_size), frame.get(header_size..)) else {
+        return frame;
+    };
+    // livekit checks the frame rather than remembering what it did, so a sender that did not
+    // escape is left alone. Matching that matters: the check is what makes this safe to run
+    // on frames from clients older than the escaping.
+    if !h264::needs_rbsp_unescaping(body) {
+        return frame;
+    }
+    scratch.clear();
+    scratch.extend_from_slice(header);
+    scratch.extend_from_slice(&h264::parse_rbsp(body));
+    scratch
+}
+
 /// Split an inbound frame into `[header][ciphertext][IV][IV_LENGTH][key_index]`.
 ///
 /// Every offset is re-derived with checked arithmetic rather than relying on the length
@@ -1122,31 +1173,53 @@ fn build_iv(counter: u64) -> [u8; IV_SIZE] {
     iv
 }
 
+/// How a frame is to be framed: how much stays in the clear, and whether the rest is
+/// RBSP-escaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Framing {
+    header_size: usize,
+    /// True only for H.264 frames in which a slice NAL unit was found. livekit escapes the
+    /// ciphertext exactly then, and falls back to the VP8 rules when it does not.
+    rbsp: bool,
+}
+
 /// Determine how many bytes at the start of the frame should remain unencrypted.
 ///
-/// - Audio (Opus): 0 bytes — entire frame is encrypted
-/// - Video (VP8): 1 byte minimum (the first byte contains keyframe flag and version),
-///   but we check the VP8 payload descriptor to preserve the right amount
-fn unencrypted_header_size(frame: &[u8], kind: MediaKind) -> usize {
-    let wanted = match kind {
-        // RFC 6716 §3.1: the Opus TOC byte carries the packet's own framing, so livekit
-        // leaves it in the clear. It is still authenticated, as associated data.
-        MediaKind::Audio => 1,
-        MediaKind::Video => {
-            // livekit's `UNENCRYPTED_BYTES`: 10 bytes for a key frame, 3 for a delta
-            // frame -- the VP8 uncompressed data chunk (RFC 6386 §9.1), which is 3 bytes
-            // of frame tag plus, on a key frame, the 3-byte start code and 4 bytes of
-            // dimensions.
-            //
-            // Bit 0 of the frame tag is the frame type: 0 = key frame, 1 = interframe.
-            if frame.first().is_some_and(|b| b & 0x01 == 0) {
-                10
-            } else {
-                3
-            }
+/// - Audio (Opus): the TOC byte
+/// - VP8: 10 bytes on a key frame, 3 on a delta frame
+/// - H.264: two bytes into the first slice NAL unit, falling back to the VP8 rules when
+///   there is no slice to find — which is what livekit does when its own NALU scan throws
+fn framing(frame: &[u8], kind: MediaKind) -> Framing {
+    let vp8 = || {
+        // livekit's `UNENCRYPTED_BYTES`: 10 bytes for a key frame, 3 for a delta frame --
+        // the VP8 uncompressed data chunk (RFC 6386 §9.1), which is 3 bytes of frame tag
+        // plus, on a key frame, the 3-byte start code and 4 bytes of dimensions.
+        //
+        // Bit 0 of the frame tag is the frame type: 0 = key frame, 1 = interframe.
+        if frame.first().is_some_and(|b| b & 0x01 == 0) {
+            10
+        } else {
+            3
         }
     };
-    wanted.min(frame.len())
+    let (wanted, rbsp) = match kind {
+        // RFC 6716 §3.1: the Opus TOC byte carries the packet's own framing, so livekit
+        // leaves it in the clear. It is still authenticated, as associated data.
+        MediaKind::Audio => (1, false),
+        MediaKind::VideoVp8 => (vp8(), false),
+        MediaKind::VideoH264 => {
+            h264::unencrypted_bytes(frame).map_or_else(|| (vp8(), false), |n| (n, true))
+        }
+    };
+    Framing {
+        header_size: wanted.min(frame.len()),
+        rbsp,
+    }
+}
+
+/// Determine how many bytes at the start of the frame should remain unencrypted.
+fn unencrypted_header_size(frame: &[u8], kind: MediaKind) -> usize {
+    framing(frame, kind).header_size
 }
 
 #[cfg(test)]
@@ -1262,7 +1335,7 @@ mod tests {
         let encrypted = ctx
             .encrypt_frame(
                 &PlaintextMedia::from_encoder(original.clone()),
-                MediaKind::Video,
+                MediaKind::VideoVp8,
             )
             .expect("encryption should succeed");
 
@@ -1273,10 +1346,108 @@ mod tests {
         );
 
         let decrypted = ctx
-            .decrypt_frame(&encrypted, "alice", MediaKind::Video)
+            .decrypt_frame(&encrypted, "alice", MediaKind::VideoVp8)
             .expect("decryption should not error")
             .expect("decryption should produce output");
 
+        assert_eq!(decrypted.as_bytes(), original.as_slice());
+    }
+
+    /// An Annex B H.264 frame: SPS, PPS, then an IDR slice with a payload.
+    fn h264_keyframe() -> Vec<u8> {
+        let mut f = vec![0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e];
+        f.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80]);
+        f.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        f.extend_from_slice(b"slice-payload-that-is-long-enough-to-be-worth-encrypting");
+        f
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn encrypt_decrypt_h264_roundtrip() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"video-key-material-abcdefghijkl");
+
+        let original = h264_keyframe();
+        let encrypted = ctx
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(original.clone()),
+                MediaKind::VideoH264,
+            )
+            .expect("encryption should succeed");
+
+        // The parameter sets and the first two bytes of the slice travel in the clear.
+        let clear = h264::unencrypted_bytes(&original).expect("the frame has a slice");
+        assert_eq!(
+            encrypted.as_bytes().get(..clear),
+            original.get(..clear),
+            "the clear header must survive unchanged"
+        );
+
+        let decrypted = ctx
+            .decrypt_frame(&encrypted, "alice", MediaKind::VideoH264)
+            .expect("decryption should not error")
+            .expect("decryption should produce output");
+        assert_eq!(decrypted.as_bytes(), original.as_slice());
+    }
+
+    /// The reason the escaping exists, asserted rather than assumed.
+    ///
+    /// Ciphertext is random, so a start-code sequence turns up in it by chance. Anything
+    /// walking the stream would read that as the beginning of a new NAL unit.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn an_encrypted_h264_frame_contains_no_accidental_start_codes() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"video-key-material-abcdefghijkl");
+
+        let original = h264_keyframe();
+        let clear = h264::unencrypted_bytes(&original).expect("the frame has a slice");
+
+        // One frame is not enough: the sequence appears by chance, so this needs enough
+        // frames -- each with a different IV, hence different ciphertext -- to be evidence.
+        for _ in 0..500 {
+            let encrypted = ctx
+                .encrypt_frame(
+                    &PlaintextMedia::from_encoder(original.clone()),
+                    MediaKind::VideoH264,
+                )
+                .expect("encryption should succeed");
+            let body = encrypted
+                .as_bytes()
+                .get(clear..)
+                .expect("frame is longer than its header");
+            assert!(
+                !body.windows(3).any(|w| w == [0, 0, 0] || w == [0, 0, 1]),
+                "a start code survived into the encrypted body"
+            );
+        }
+    }
+
+    /// A frame encrypted as VP8 and read back as VP8 is unaffected by any of this.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn h264_framing_does_not_disturb_vp8() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"video-key-material-abcdefghijkl");
+
+        // A VP8 delta frame whose payload happens to contain a start-code sequence.
+        let mut original = vec![0x91, 0x80, 0x42];
+        original.extend_from_slice(&[0xaa, 0, 0, 1, 0xbb, 0, 0, 3, 0xcc]);
+
+        let encrypted = ctx
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(original.clone()),
+                MediaKind::VideoVp8,
+            )
+            .expect("encryption should succeed");
+        let decrypted = ctx
+            .decrypt_frame(&encrypted, "alice", MediaKind::VideoVp8)
+            .expect("decryption should not error")
+            .expect("decryption should produce output");
         assert_eq!(decrypted.as_bytes(), original.as_slice());
     }
 
@@ -1455,7 +1626,10 @@ mod tests {
         // A frame shorter than the nominal header must clamp rather than slice out of
         // bounds -- inbound frame lengths are attacker-controlled.
         assert_eq!(unencrypted_header_size(b"", MediaKind::Audio), 0);
-        assert_eq!(unencrypted_header_size(&[0x10, 0x00], MediaKind::Video), 2);
+        assert_eq!(
+            unencrypted_header_size(&[0x10, 0x00], MediaKind::VideoVp8),
+            2
+        );
     }
 
     #[test]
@@ -1466,13 +1640,13 @@ mod tests {
         if let Some(b) = keyframe.first_mut() {
             *b = 0x10;
         }
-        assert_eq!(unencrypted_header_size(&keyframe, MediaKind::Video), 10);
+        assert_eq!(unencrypted_header_size(&keyframe, MediaKind::VideoVp8), 10);
 
         let mut delta = long;
         if let Some(b) = delta.first_mut() {
             *b = 0x11;
         }
-        assert_eq!(unencrypted_header_size(&delta, MediaKind::Video), 3);
+        assert_eq!(unencrypted_header_size(&delta, MediaKind::VideoVp8), 3);
     }
 
     /// A livekit frame's trailer says how long its IV is, and livekit always says 12.
@@ -1743,10 +1917,10 @@ mod wire_format_interop_tests {
         // Frame tag bit 0 == 0 marks a key frame -> 10 unencrypted bytes.
         let mut keyframe = vec![0x10u8];
         keyframe.extend_from_slice(b"0123456789abcdef");
-        assert_eq!(unencrypted_header_size(&keyframe, MediaKind::Video), 10);
+        assert_eq!(unencrypted_header_size(&keyframe, MediaKind::VideoVp8), 10);
         let frame = livekit_style_frame(&keyframe, 10, 0);
         let decrypted = ctx
-            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Video)
+            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::VideoVp8)
             .expect("decryption should not error")
             .expect("a key is configured");
         assert_eq!(decrypted.as_bytes(), keyframe.as_slice());
@@ -1754,10 +1928,10 @@ mod wire_format_interop_tests {
         // Frame tag bit 0 == 1 marks an interframe -> 3 unencrypted bytes.
         let mut delta = vec![0x11u8];
         delta.extend_from_slice(b"0123456789abcdef");
-        assert_eq!(unencrypted_header_size(&delta, MediaKind::Video), 3);
+        assert_eq!(unencrypted_header_size(&delta, MediaKind::VideoVp8), 3);
         let frame = livekit_style_frame(&delta, 3, 0);
         let decrypted = ctx
-            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::Video)
+            .decrypt_frame(&WireMedia::from_network(frame), "bob", MediaKind::VideoVp8)
             .expect("decryption should not error")
             .expect("a key is configured");
         assert_eq!(decrypted.as_bytes(), delta.as_slice());
