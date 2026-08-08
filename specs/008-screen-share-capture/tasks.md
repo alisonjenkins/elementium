@@ -83,7 +83,7 @@ negotiate on this machine. See research R9 for the measured evidence.
 **Independent test**: share one window, change content in a *different* window, confirm the receiver sees no change. The negative test is the test — a backend that silently falls back to full-monitor capture passes the positive one and fails the user.
 
 - [X] T027 [US2] Record the portal's returned source kind (monitor vs window) on the `ShareSession` in `crates/elementium-screen/src/wayland.rs`, since the audio scoping in Phase 5 and the diagnostics both need to know which was chosen
-- [ ] T028 [US2] Handle the shared window disappearing mid-share in `crates/elementium-screen/src/wayland.rs` — end the share cleanly and report why, rather than pumping a dead node
+- [X] T028 [US2] **Done 2026-08-08, and the obvious implementation would have been wrong.** Closing a shared window does *not* error the stream — it goes Streaming/Paused/Streaming and simply stops delivering, which is indistinguishable from a healthy static share. The signal is the node being removed from the `PipeWire` registry (its id was observed being recycled for an unrelated Link seconds later). A frame-stall timeout, the tempting fix, would end legitimate shares of a still document. Verified live by killing a shared window mid-capture. Handle the shared window disappearing mid-share in `crates/elementium-screen/src/wayland.rs` — end the share cleanly and report why, rather than pumping a dead node
 - [ ] T029 [US2] (SC-003; SC-001 is now covered by the attended browser test — see quickstart Level 4) Add a browser test to `frontend/tests/browser/` asserting that content changed outside the shared window produces no change at the receiver (SC-003)
 
 ---

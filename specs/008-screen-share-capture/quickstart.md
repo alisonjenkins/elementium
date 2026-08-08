@@ -159,6 +159,27 @@ portal session is left open.
 **Why by hand and by count**: a leak of one is invisible; a leak of ten is obvious. This
 is why the criterion is ten cycles rather than one.
 
+### A shared window disappearing (T028), measured 2026-08-08
+
+```sh
+# one throwaway window, shared and then killed mid-capture
+setsid foot --title=SHARE-TEST-WINDOW sh -c 'while true; do date; sleep 1; done' &
+echo $!                     # kill this pid a few seconds into streaming
+nix develop -c cargo run -p elementium-media --example capture_attribution -- --screen
+```
+
+**Pass**: the run logs `the captured PipeWire node was removed` and prints
+`source failed during the run: true`. A control run with the window left open prints
+`false`.
+
+**What this rules out, and why the obvious fix is wrong**: closing the window does not
+error the stream. The observed transition is Streaming -> Paused -> Streaming, after which
+no frame ever arrives — and *that is also what a healthy share of a static window looks
+like*, since a compositor emits on damage. A frame-stall timeout would therefore end
+legitimate shares of a still document. The node's removal from the registry is the only
+unambiguous signal, and the id is recycled quickly (seen reused for an unrelated Link),
+so it must be watched rather than polled for.
+
 ---
 
 ## Level 4 — A remote participant sees the screen (the actual feature)
