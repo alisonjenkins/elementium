@@ -290,9 +290,21 @@ go upstream.
 
 ## Open questions
 
-1. **Fork hosting.** A fork of `element-hq/element-web` under the user's account is the
-   obvious answer, but it is their account and their call, and it decides where CI for the
-   patch branch would live.
+1. ~~**Fork hosting.**~~ **Answered 2026-08-08: a public fork on the user's own account** —
+   `alisonjenkins/element-web`, long-lived branch `elementium`, rebased onto each upstream
+   tag. Public is not a preference here: Element Web is AGPL-3.0 and Elementium declares
+   `AGPL-3.0-or-later`, so once a *source* patch ships we are distributing a modified AGPL
+   work and its corresponding source has to be available to the people receiving it. A
+   public fork satisfies that by existing.
+
+   Two consequences that are not ours to arrange:
+
+   - Upstream requires a **CLA**, not a DCO (`cla-assistant.io/element-hq/element-web`). It
+     is signed once, personally, and is a precondition for the contributing half of this
+     feature. No tooling can stand in for it.
+   - This repository declares `AGPL-3.0-or-later` in `Cargo.toml` and has **no `LICENSE`
+     file**, so GitHub reports it as unlicensed. Unrelated to the fork and worth fixing
+     regardless.
 2. **Node 24.** Upstream builds on 24 and we provide 22.23.2. Settled by building, not by
    reading version ranges.
 3. **Is a source build needed at all before the first patch exists?** The patch set is

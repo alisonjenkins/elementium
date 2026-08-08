@@ -14,6 +14,31 @@
 # Git mode settings — branch/tag to check out (only used when SOURCE=git)
 : "${ELEMENT_WEB_BRANCH:=}"
 
+# --- Carrying patches against Element Web -------------------------------------------
+#
+# Where changes to Element Web itself live: one atomic commit per change on a long-lived
+# branch of a fork, rebased onto each upstream tag. Carrying a change and offering it
+# upstream are then the same operation -- `git cherry-pick` onto a branch from the current
+# tag, and a pull request -- and a change upstream accepts disappears from the branch at the
+# next rebase, because rebase drops commits whose patch-id upstream already has.
+#
+# Public deliberately, not by default: Element Web is AGPL-3.0 and this project declares
+# AGPL-3.0-or-later, so a shipped source patch is a modified AGPL work whose corresponding
+# source has to be available to whoever receives it.
+#
+# Empty until the first patch exists. Nothing reads these while the patch set is empty, and
+# a fork nobody has committed to is a repository that rots.
+: "${ELEMENT_WEB_FORK:=https://github.com/alisonjenkins/element-web}"
+
+# The branch carrying our patches. Rebased, never merged: merging would bury the individual
+# commits that make a contribution a cherry-pick rather than a rewrite.
+: "${ELEMENT_WEB_PATCH_BRANCH:=elementium}"
+
+# The upstream tag the patch branch is currently rebased onto. Kept beside the pin above
+# rather than derived, so "which upstream are the patches against" is answerable without a
+# checkout -- and so a mismatch with ELEMENT_WEB_VERSION is visible rather than latent.
+: "${ELEMENT_WEB_PATCH_BASE:=}"
+
 # Override examples:
 #
 # Build from a custom fork/branch:
