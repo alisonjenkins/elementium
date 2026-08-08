@@ -1143,6 +1143,36 @@ fn ensure_encoder(
         return;
     }
 
+    // Refused here rather than handed to the codec, because the codec's answer is true and
+    // useless: `Failed to initialize VP8 encoder width=0 height=0` says nothing about *why*
+    // the geometry is zero, and this session lost time to exactly that line while the real
+    // fault was upstream — frames failing to convert, so nothing ever set a size. Naming
+    // the cause here points at the capture rather than at the encoder.
+    if width == 0 || height == 0 {
+        tracing::error!(
+            width,
+            height,
+            codec = wanted.sdp_name(),
+            "refusing to build an encoder with no geometry; the capture has not produced a \
+             frame with a size yet, so look upstream of the encoder"
+        );
+        return;
+    }
+
+    // Odd geometry never reaches here from the capture path, which crops to even at
+    // negotiation, but an encoder that is handed it anyway fails at construction with
+    // "VP8 requires even dimensions" — a failure the caller cannot act on mid-call.
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        tracing::error!(
+            width,
+            height,
+            codec = wanted.sdp_name(),
+            "refusing to build an encoder for odd geometry; VP8 cannot encode it, and the \
+             capture should have cropped it to even before this point"
+        );
+        return;
+    }
+
     let bitrate = bitrate_for(width, height);
     let config = EncoderConfig {
         width,
