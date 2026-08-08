@@ -941,7 +941,17 @@ class ElementiumRTCPeerConnection extends EventTarget {
   }
 
   restartIce(): void {
-    console.log("[Elementium] restartIce called");
+    // Marks the connection as needing renegotiation and fires `negotiationneeded`, which is
+    // what the DOM specifies -- the restart itself rides on the offer the page then makes.
+    // This used to only log, so a call could not recover from a network change short of a
+    // full reconnect.
+    void invoke("restart_ice", { pcId: this.pcId })
+      .then(() => {
+        this.fireEvent("negotiationneeded", this.onnegotiationneeded);
+      })
+      .catch((e) => {
+        console.error(`[Elementium] restart_ice(${this.pcId}) failed:`, e);
+      });
   }
 }
 

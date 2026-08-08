@@ -132,6 +132,14 @@ pub enum DataChannelEvent {
 pub struct PeerConnectionInner {
     pub id: String,
     pub rtc: Rtc,
+    /// Set when the page has called `restartIce()` and the next offer should carry fresh
+    /// ICE credentials.
+    ///
+    /// A flag rather than an immediate action, because that is what the DOM API means: it
+    /// marks the connection as needing renegotiation, and the offer the page then makes is
+    /// where the restart belongs. Without it, a network change -- a laptop waking, Wi-Fi to
+    /// Ethernet -- left the call unable to recover short of a full reconnect.
+    pub ice_restart_requested: bool,
     /// The mid we *send* audio on: the first audio transceiver offered.
     ///
     /// Not "the audio m-line". A connection can carry several, and since livekit protocol
@@ -288,6 +296,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
 
     PeerConnectionInner {
         id,
+        ice_restart_requested: false,
         rtc,
         audio_mid: None,
         video_mid: None,
@@ -499,6 +508,16 @@ const fn default_key_for(kind: MediaKind) -> MediaTrackKey {
     }
 }
 
+/// Ask that the next offer carry fresh ICE credentials.
+///
+/// Mirrors `RTCPeerConnection.restartIce()`: it records the request and returns. The
+/// restart is applied by [`create_offer`], because that is when an offer exists to carry
+/// it, and the page is what decides to make one.
+pub const fn request_ice_restart(pc: &mut PeerConnectionInner) {
+    pc.ice_restart_requested = true;
+}
+
+
 /// Create an SDP offer with the specified data channels and transceivers.
 ///
 /// Unlike the WebRTC browser API which implicitly includes all added transceivers
@@ -514,6 +533,22 @@ pub fn create_offer(
     transceivers: &[TransceiverInfo],
 ) -> Result<SessionDescription, crate::error::WebRtcError> {
     let mut api = pc.rtc.sdp_api();
+
+    // A requested ICE restart is applied to *this* offer and then forgotten.
+    //
+    // `restartIce()` in the DOM does not renegotiate by itself: it marks the connection as
+    // needing one and the page then makes an offer. Following that shape means the restart
+    // rides on the offer the page was going to send anyway, rather than this layer inventing
+    // a renegotiation nobody asked for.
+    //
+    // Local candidates are kept, because the usual reason for a restart -- a network change,
+    // a laptop waking up -- invalidates the *path*, not every address this machine has, and
+    // rediscovering them all costs seconds of silence for no benefit.
+    if pc.ice_restart_requested {
+        pc.ice_restart_requested = false;
+        api.ice_restart(true);
+        tracing::info!(pc_id = %pc.id, "applying a requested ICE restart to this offer");
+    }
 
     // Add data channels (m=application)
     for dc in data_channels {

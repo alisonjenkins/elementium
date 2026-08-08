@@ -546,6 +546,26 @@ pub async fn get_transport_stats(
     })
 }
 
+/// Ask that the next offer carry fresh ICE credentials.
+///
+/// What `RTCPeerConnection.restartIce()` means: the request is recorded and the offer the
+/// page makes next carries it. Before this the shim only logged, so a call could not
+/// recover from a network change -- waking from suspend, moving from Wi-Fi to Ethernet --
+/// and the only way back was a full reconnect.
+///
+/// # Errors
+///
+/// Returns an error if the peer connection is unknown, rather than succeeding quietly: a
+/// caller told the restart was accepted will wait for a recovery that cannot come.
+#[command]
+pub async fn restart_ice(state: State<'_, WebRtcState>, pc_id: String) -> Result<(), String> {
+    let handle = get_pc_handle(&state, &pc_id)?;
+    let mut pc = handle.lock_str()?;
+    peer_connection::request_ice_restart(&mut pc);
+    tracing::info!(pc_id = %pc_id, "ICE restart requested; the next offer will carry it");
+    Ok(())
+}
+
 #[command]
 pub async fn close_peer_connection(
     state: State<'_, WebRtcState>,
