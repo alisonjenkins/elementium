@@ -143,18 +143,41 @@ of full-motion video, which is the case to measure before raising it.
 
 ## Level 3 — Teardown leaves nothing behind
 
-**Proves**: SC-006. Cheap to run, and the current code fails it — `get_display_media`
-drops its capturer handle with the capture still running.
+**Proves**: SC-006. Passed 2026-08-08 — see the measured table below. (Written when the
+code still failed it: `get_display_media` used to drop its capturer handle with the capture
+still running.)
 
 ```sh
-# Start and stop a share ten times, then check what survived
-pw-dump | grep -c '"node.name"'      # before
-# ... ten start/stop cycles ...
-pw-dump | grep -c 'node.name'        # after: must match
+nix develop -c cargo run -p elementium-media --example capture_attribution -- --screen --cycles 10
 ```
 
-**Pass**: node count returns to baseline, no `wayland-screencast` threads remain, no
-portal session is left open.
+One portal grant, ten open/close cycles, then the process **holds for 20s** so the graph
+can be inspected while it is still alive — process exit would clean up a leak rather than
+reveal it. During the hold:
+
+```sh
+pw-dump | grep -c elementium-capture                     # PipeWire objects we still own
+ps -o nlwp= -p "$(pgrep -f examples/capture_attribution)" # threads, in the *binary*
+```
+
+**Measured 2026-08-08**: 0 objects and 1 thread after ten cycles.
+
+**Both metrics were validated before being trusted**, because a counter that reads zero in
+every state proves nothing:
+
+| | idle | while capturing | after 10 cycles |
+|---|---|---|---|
+| `elementium-capture` objects | 0 | 1 | 0 |
+| threads in the binary | 1 | 2 | 1 |
+
+Note the `pgrep`: an earlier reading of "1 thread while capturing" was the `timeout`/`cargo`
+wrapper, not the example. Measuring the wrong process is the easiest way to get a clean
+result here, and it looks identical to a real one.
+
+**Scope, stated plainly**: this measures *our* capture teardown — stream, thread, node —
+across ten cycles of one portal grant. It does not measure ten portal sessions; that
+teardown is `ShareSession::close` and its `Drop` backstop, which logs
+`screencast portal session closed` on each share.
 
 **Why by hand and by count**: a leak of one is invisible; a leak of ten is obvious. This
 is why the criterion is ten cycles rather than one.

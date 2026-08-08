@@ -278,6 +278,50 @@ fn run_camera(target: elementium_codec::EncodeTarget) {
 #[cfg(target_os = "linux")]
 #[allow(clippy::print_stdout)]
 /// Ask the portal for a screencast node, open it, and measure it the same way.
+/// Open and close the granted screencast node `cycles` times, then hold, so the `PipeWire`
+/// graph can be inspected from outside for what the teardown left behind (SC-006).
+///
+/// One portal grant, many capture cycles, because the leak being measured is in *our*
+/// teardown -- the stream, its thread and its node -- and asking a person to click a picker
+/// ten times measures their patience instead. The portal session's own teardown is a
+/// separate question, answered by `ShareSession::close` and its `Drop` backstop.
+#[cfg(target_os = "linux")]
+fn run_screen_cycles(target: elementium_codec::EncodeTarget, cycles: u32) {
+    let node_id = {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            println!("could not build a runtime for the portal call");
+            return;
+        };
+        match runtime.block_on(request_screencast_node()) {
+            Ok(id) => id,
+            Err(e) => {
+                println!("portal: {e}");
+                return;
+            }
+        }
+    };
+    println!("portal granted node {node_id}; running {cycles} open/close cycles");
+
+    for i in 1..=cycles {
+        match elementium_media::video_source::VideoSource::start_screencast(node_id, target) {
+            Ok(source) => {
+                std::thread::sleep(Duration::from_millis(800));
+                let (w, h) = source.size();
+                source.stop();
+                drop(source);
+                println!("  cycle {i}: opened {w}x{h}, stopped");
+            }
+            Err(e) => println!("  cycle {i}: could not open: {e}"),
+        }
+    }
+
+    // Held open deliberately: the thing being measured is what survives *inside a running
+    // process*, and process exit would clean up a leak rather than reveal it.
+    println!("all cycles done; holding for 20s -- inspect now, e.g.:");
+    println!("  pw-dump | grep -c elementium-capture");
+    std::thread::sleep(Duration::from_secs(20));
+}
+
 fn run_screen(target: elementium_codec::EncodeTarget) {
     let source = match open_screencast_source(target) {
         Ok(source) => source,
@@ -334,7 +378,19 @@ fn main() {
         )
         .init();
 
-    if screen {
+    let cycles: u32 = args
+        .iter()
+        .position(|a| a == "--cycles")
+        .and_then(|i| args.get(i.saturating_add(1)))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    if screen && cycles > 0 {
+        #[cfg(target_os = "linux")]
+        run_screen_cycles(target, cycles);
+        #[cfg(not(target_os = "linux"))]
+        println!("--cycles needs the XDG desktop portal, which this platform does not have");
+    } else if screen {
         run_screen(target);
     } else {
         run_camera(target);

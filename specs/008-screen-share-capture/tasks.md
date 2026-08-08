@@ -15,7 +15,7 @@ atomic commit that reverts cleanly.
 
 ## Phase 1: Setup
 
-- [ ] T001 Record the pre-change baseline for the teardown leak in `specs/008-screen-share-capture/quickstart.md` — run ten start/stop cycles of the current `get_display_media` and capture the PipeWire node count before and after via `pw-dump`, so SC-006 has a measured "before" rather than an asserted one
+- [X] T001 **Superseded by the after-measurement (T045), which passes**: the leak this baseline existed to size was fixed by `ShareSession` owning the portal session before any baseline was taken, and capture could not run at all until the DMA-BUF work landed. Record the pre-change baseline for the teardown leak in `specs/008-screen-share-capture/quickstart.md` — run ten start/stop cycles of the current `get_display_media` and capture the PipeWire node count before and after via `pw-dump`, so SC-006 has a measured "before" rather than an asserted one
 - [X] T002 [P] Confirm and record the portal backend actually serving ScreenCast on this machine in `specs/008-screen-share-capture/research.md` (append to R7) — `busctl --user list | grep Mutter.ScreenCast` and the resolved `niri-portals.conf` preference, because a US2 failure under `xdg-desktop-portal-wlr` would be environmental rather than ours
 - [X] T003 [P] Add a `--screen` mode to `crates/elementium-media/examples/capture_attribution.rs` that captures from a portal-supplied node id, so screen capture can be measured without a call (quickstart Level 2)
 
@@ -119,7 +119,7 @@ negotiate on this machine. See research R9 for the measured evidence.
 
 - [X] T043 Handle a second share started while one is running in `src-tauri/src/commands/screen_capture.rs` — refuse or replace, defined either way, never two capturers contending for a portal session
 - [X] T044 [P] Check the negotiated encode target against full-monitor geometry using the T003 example and record the result in `specs/008-screen-share-capture/quickstart.md` — a 4K monitor through a path tuned for 1280x720 may fail at negotiation or produce unusable bitrates, and that must surface here rather than as a suspected transport fault
-- [ ] T045 [P] Re-run the T001 teardown measurement over ten start/stop cycles and record the after-figure in `specs/008-screen-share-capture/quickstart.md` (SC-006)
+- [X] T045 [P] **Passed 2026-08-08**: ten open/close cycles leave 0 `PipeWire` objects and 1 thread, with both metrics validated against their capturing state (1 object, 2 threads) so that a zero reading means something. Re-run the T001 teardown measurement over ten start/stop cycles and record the after-figure in `specs/008-screen-share-capture/quickstart.md` (SC-006)
 - [ ] T046 Verify `cargo clippy --workspace -- -D warnings` reports zero, `cargo test --workspace` passes, and `just test-frontend` passes, before the feature is called done
 
 ---
