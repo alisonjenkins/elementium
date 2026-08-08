@@ -25,6 +25,11 @@ if-addrs = "0.15.0"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# For the publish_screen_share example only: it drives the real capture path -- portal,
+# PipeWire node, DMA-BUF import -- rather than a synthetic frame source, which is the whole
+# point of it. A dev-dependency, so nothing in the shipping crate gains a screen dependency.
+elementium-screen = { workspace = true }
+elementium-media = { workspace = true }
 elementium-observability-test = { workspace = true }
 jsonwebtoken = { workspace = true }
 
