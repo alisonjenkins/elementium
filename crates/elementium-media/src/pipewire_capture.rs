@@ -1068,9 +1068,33 @@ fn attach_and_connect(
                 ?encoding,
                 "PipeWire capture format negotiated"
             );
+            // Rounded down to even, and this is load-bearing rather than tidy.
+            //
+            // VP8 refuses odd dimensions outright -- "VP8 requires even dimensions, got
+            // 1703x1406" -- and a window is whatever width the user dragged it to, so an
+            // odd one is not an edge case here the way it is for a camera. Cropping the
+            // last column or row costs a pixel nobody can see; failing to encode costs the
+            // whole share, at the point where the picker has already been accepted and
+            // everything looks like it is working.
+            //
+            // Done here, where the negotiated geometry is recorded, so that the size the
+            // capture reports, the size its frames are converted at, and the size the
+            // encoder is built for cannot disagree. A mismatch between those three reads
+            // as a sheared picture rather than as a refusal.
+            let even_width = size.width & !1;
+            let even_height = size.height & !1;
+            if (even_width, even_height) != (size.width, size.height) {
+                tracing::info!(
+                    from_width = size.width,
+                    from_height = size.height,
+                    width = even_width,
+                    height = even_height,
+                    "capture geometry cropped to even dimensions for the encoder"
+                );
+            }
             if let Ok(mut n) = fmt_state.lock() {
-                n.width = size.width;
-                n.height = size.height;
+                n.width = even_width;
+                n.height = even_height;
                 n.encoding = encoding;
             }
         })
