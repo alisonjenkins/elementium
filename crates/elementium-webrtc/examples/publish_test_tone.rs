@@ -98,6 +98,11 @@ fn mint_token(identity: &str, room: &str) -> String {
     .unwrap_or_default()
 }
 
+/// The published video size. Small enough to encode comfortably in software or hardware,
+/// large enough that a wrong stride or a half-decrypted frame is unmistakable.
+const VIDEO_WIDTH: u32 = 320;
+const VIDEO_HEIGHT: u32 = 240;
+
 /// One 20ms mono frame of a 440Hz sine at half scale.
 ///
 /// A pure tone rather than noise or speech: the receiver's measurement is a concealment
@@ -131,6 +136,37 @@ fn wrong_key(base: &[u8]) -> Vec<u8> {
         *b ^= 0xFF;
     }
     key
+}
+
+/// One frame of a moving checkerboard, as I420.
+///
+/// Moving, not static: a receiver that decodes only the keyframe and then repeats it looks
+/// identical to a working one on a still picture. The pattern is high-contrast so a frame
+/// that arrives half-decrypted is visibly wrong rather than merely noisy.
+fn checkerboard(width: u32, height: u32, step: u32) -> elementium_types::I420Frame {
+    let cols = usize::try_from(width).unwrap_or(0);
+    let rows = usize::try_from(height).unwrap_or(0);
+    let shift = usize::try_from(step).unwrap_or(0).saturating_mul(8);
+    let mut luma = vec![0_u8; cols.saturating_mul(rows)];
+    for (i, px) in luma.iter_mut().enumerate() {
+        let col = i.checked_rem(cols.max(1)).unwrap_or(0);
+        let row = i.checked_div(cols.max(1)).unwrap_or(0);
+        let block = col.saturating_add(shift) / 16 + row / 16;
+        *px = if block.is_multiple_of(2) { 210 } else { 30 };
+    }
+    let chroma = cols.div_ceil(2).saturating_mul(rows.div_ceil(2));
+    elementium_types::I420Frame::from_planes(
+        width,
+        height,
+        &luma,
+        &vec![100_u8; chroma],
+        &vec![150_u8; chroma],
+        0,
+    )
+    .unwrap_or_else(|| {
+        elementium_types::I420Frame::from_planes(16, 16, &[0; 256], &[0; 64], &[0; 64], 0)
+            .unwrap_or_else(|| unreachable!("a 16x16 frame is always valid"))
+    })
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -176,6 +212,12 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
+    // Publishing video as well as the tone. H.264 specifically: its E2EE framing differs
+    // from VP8's -- a different clear-header rule and RBSP-escaped ciphertext -- and that
+    // contract was until now only checked against livekit's *source*. This is what checks
+    // it against livekit's running worker.
+    let video = std::env::args().any(|a| a == "--video-h264");
+
     let base_key =
         arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
     let ctx = base_key.as_ref().map(|material| {
@@ -216,6 +258,15 @@ async fn main() {
     room_conn
         .publish_track("audio", "microphone")
         .expect("publish the audio track");
+    if video {
+        // Spaced from the audio publish rather than issued back to back. Each publish
+        // triggers its own offer/answer, and two in flight at once left the second answer
+        // describing mids the first offer never had -- "Mid in answer is not in offer".
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        room_conn
+            .publish_track("video", "camera")
+            .expect("publish the video track");
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Tell the driving test we are live, so it can stop guessing at timing.
@@ -239,6 +290,26 @@ async fn main() {
     // measure. A test publisher that produces it by itself cannot measure it.
     let mut ticker = tokio::time::interval(Duration::from_millis(20));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+
+    // Built only when asked for: a machine with no VAAPI H.264 encoder should fail here,
+    // loudly, rather than run the test as though video were being published.
+    let mut video_encoder = if video {
+        Some(
+            elementium_codec::NegotiatedEncoder::new(
+                elementium_codec::VideoCodec::H264,
+                elementium_codec::EncoderConfig {
+                    width: VIDEO_WIDTH,
+                    height: VIDEO_HEIGHT,
+                    bitrate_kbps: 1_000,
+                    max_framerate: 25,
+                },
+            )
+            .expect("an H.264 encoder"),
+        )
+    } else {
+        None
+    };
+    let mut video_sent: u64 = 0;
 
     let mut key_index: u8 = 0;
     for i in 0..frames {
@@ -264,6 +335,25 @@ async fn main() {
             println!("ROTATED {key_index}");
         }
 
+        if let Some(encoder) = video_encoder.as_mut() {
+            // One video frame per two audio frames: 25fps against the tone's 50, which is
+            // enough to show motion without making the encoder the pacing bottleneck.
+            if i.is_multiple_of(2) {
+                let step = u32::try_from(i / 2).unwrap_or(0);
+                if let Ok(packets) = elementium_codec::VideoEncoder::encode(
+                    encoder,
+                    &checkerboard(VIDEO_WIDTH, VIDEO_HEIGHT, step),
+                ) {
+                    for packet in packets {
+                        let _ = room_conn
+                            .write_video(packet.data, elementium_codec::VideoCodec::H264)
+                            .await;
+                        video_sent = video_sent.saturating_add(1);
+                    }
+                }
+            }
+        }
+
         let frame = tone_frame(sample_index);
         sample_index = sample_index.wrapping_add(u32::try_from(FRAME_SAMPLES).unwrap_or(960));
         if let Ok(packet) = encoder.encode(&AudioFrame {
@@ -280,5 +370,8 @@ async fn main() {
     // The receiving side reads this to compute a delivery ratio against what we actually
     // put on the wire, rather than against what it hoped we would.
     println!("SENT {sent}");
+    if video {
+        println!("VIDEO_SENT {video_sent}");
+    }
     room_conn.disconnect().await;
 }

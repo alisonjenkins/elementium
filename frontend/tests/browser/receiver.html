@@ -151,7 +151,52 @@
         window.__subscribed = true;
         setState("subscribed");
       }
+      if (track.kind === "video") {
+        // Attached for the same reason audio is: an unattached video track is not pulled
+        // through the decoder, so `framesDecoded` would stay at zero however many frames
+        // arrived and decrypted correctly.
+        const el = track.attach();
+        el.muted = true;
+        el.autoplay = true;
+        document.body.appendChild(el);
+        window.__videoTrack = track;
+        window.__videoSubscribed = true;
+      }
     });
+
+    /**
+     * Inbound video stats.
+     *
+     * `framesDecoded` is the measurement that matters, and the reason is the whole point of
+     * the H.264 test: a frame whose E2EE framing we got wrong still *arrives*, and still
+     * counts in `packetsReceived`. It fails at the decrypt, silently, and the only visible
+     * consequence is that no picture is ever decoded.
+     */
+    window.__videoStats = async () => {
+      if (!window.__videoSubscribed) return { error: "no video track was subscribed" };
+
+      for (const pc of window.__pcs) {
+        const report = await pc.getStats();
+        let inbound = null;
+        report.forEach((s) => {
+          if (s.type === "inbound-rtp" && s.kind === "video") inbound = s;
+        });
+        if (!inbound) continue;
+
+        let codec = null;
+        report.forEach((s) => {
+          if (s.type === "codec" && s.id === inbound.codecId) codec = s;
+        });
+        return {
+          mimeType: codec?.mimeType ?? null,
+          packetsReceived: inbound.packetsReceived ?? 0,
+          framesDecoded: inbound.framesDecoded ?? 0,
+          frameWidth: inbound.frameWidth ?? 0,
+          frameHeight: inbound.frameHeight ?? 0,
+        };
+      }
+      return { error: "no inbound video stats on any peer connection" };
+    };
 
     /**
      * Inbound audio stats, read from every peer connection the page created.

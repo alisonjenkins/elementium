@@ -153,6 +153,7 @@ function startPublisher(
   keyHex?: string,
   rotateFrames = 0,
   badFrames = 0,
+  video = false,
 ): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
@@ -162,6 +163,7 @@ function startPublisher(
     ...(keyHex ? ["--key-hex", keyHex] : []),
     ...(rotateFrames > 0 ? ["--rotate-frames", String(rotateFrames)] : []),
     ...(badFrames > 0 ? ["--bad-frames", String(badFrames)] : []),
+    ...(video ? ["--video-h264"] : []),
   ];
   // `RUST_LOG` at info: the publisher's own view of negotiation and ICE is the other half
   // of any failure here, and discarding its stderr made a publisher-side fault look like a
@@ -478,6 +480,108 @@ test.describe("browser receive path", () => {
       stats.totalSamplesReceived,
       "if this is non-zero the receiver recovered, and the latch described above is gone",
     ).toBe(0);
+  });
+
+  /**
+   * The one test that checks our H.264 E2EE framing against livekit's running worker.
+   *
+   * The framing contract was read out of livekit-client's source and reproduced over 596
+   * frames of their own vectors, which is strong evidence about the *code* and none at all
+   * about the runtime. H.264 clear-header sizing and RBSP escaping are exactly the kind of
+   * thing that agrees with a careful reading and disagrees with the shipped worker.
+   *
+   * `framesDecoded` is the assertion, not `packetsReceived`. A frame whose framing we got
+   * wrong still arrives and still counts as received: it fails inside the decrypt, in a
+   * worker, silently. The only visible consequence is that no picture is ever produced --
+   * which is precisely the failure the sending side cannot see, and the reason this test
+   * exists rather than a Rust round trip through our own code.
+   */
+  test("H.264 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
+    test.fixme(
+      true,
+      "Blocked on the publisher renegotiation bug: a second publish_track produces an " +
+        "answer whose mids the offer never had (\"Mid in answer is not in offer\"), and " +
+        "both tracks then fail to write. Publishing audio alone works, so this is " +
+        "renegotiation. See 005 T019.",
+    );
+    const roomName = `elementium-h264-${Date.now()}`;
+    console.log(`  room: ${roomName}`);
+    const server = await startPageServer();
+
+    page.on("console", (m) => console.log(`  [page:${m.type()}] ${m.text()}`));
+    page.on("pageerror", (e) => console.log(`  [page:error] ${e.message}`));
+
+    const query = new URLSearchParams({
+      url: SFU_WS,
+      token: mintToken("browser-subscriber", roomName),
+      key: KEY_HEX,
+    });
+    await page.goto(`${server.origin}/?${query.toString()}`);
+    await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
+
+    const publisher = startPublisher(roomName, 20, KEY_HEX, 0, 0, true);
+    try {
+      await publisher.live;
+
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              () => (window as never as { __videoSubscribed: boolean }).__videoSubscribed,
+            ),
+          { timeout: 30_000, message: "the browser never subscribed to the published video" },
+        )
+        .toBe(true);
+
+      type VideoStats = {
+        mimeType: string | null;
+        packetsReceived: number;
+        framesDecoded: number;
+        frameWidth: number;
+        frameHeight: number;
+      };
+      const read = async (): Promise<VideoStats> => {
+        let last = "not attempted";
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const s = await page.evaluate(() =>
+            (window as never as {
+              __videoStats: () => Promise<VideoStats | { error: string }>;
+            }).__videoStats(),
+          );
+          if (!("error" in s)) return s;
+          last = s.error;
+          await page.waitForTimeout(500);
+        }
+        throw new Error(`could not read video stats after 10s: ${last}`);
+      };
+
+      await page.waitForTimeout(5_000);
+      const before = await read();
+      await page.waitForTimeout(8_000);
+      const after = await read();
+      console.log(`  before: ${JSON.stringify(before)}`);
+      console.log(`  after:  ${JSON.stringify(after)}`);
+
+      expect(after.mimeType, "the SFU must have negotiated H.264, not VP8").toMatch(/H264/i);
+      expect(
+        after.packetsReceived - before.packetsReceived,
+        "video packets must be arriving at all",
+      ).toBeGreaterThan(0);
+      expect(
+        after.framesDecoded - before.framesDecoded,
+        "livekit's worker must decrypt our H.264 frames into pictures",
+      ).toBeGreaterThan(10);
+      expect(after.frameWidth, "decoded width").toBe(320);
+      expect(after.frameHeight, "decoded height").toBe(240);
+
+      const errors = await page.evaluate(
+        () => (window as never as { __errors: string[] }).__errors,
+      );
+      expect(errors, "no E2EE worker errors").toEqual([]);
+    } finally {
+      publisher.stop();
+      server.close();
+    }
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.
