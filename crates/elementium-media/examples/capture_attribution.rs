@@ -112,6 +112,33 @@ fn dump_to(frame: &elementium_media::captured_frame::CapturedFrame, path: &str) 
     }
 }
 
+/// Mean luma over a sample of the frame, or 0 for a frame that carries no pixels.
+///
+/// Sampled rather than exhaustive: this runs on every frame inside the receive loop, and a
+/// full pass over a 7-megapixel plane would add latency to the measurement of latency.
+#[allow(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
+fn mean_luma(frame: &elementium_media::captured_frame::CapturedFrame) -> f64 {
+    let elementium_media::captured_frame::CapturedFrame::Planar(planar) = frame else {
+        return 0.0;
+    };
+    let y = planar.y();
+    let step = (y.len() / 20_000).max(1);
+    let mut total: u64 = 0;
+    let mut count: u64 = 0;
+    for i in (0..y.len()).step_by(step) {
+        total += u64::from(y.get(i).copied().unwrap_or(0));
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    // `u32::try_from(..).map(f64::from)` rather than `as`: the workspace bans silent
+    // numeric casts, and a sample count that overflowed a u32 would be a bug worth seeing.
+    let sum = u32::try_from(total.min(u64::from(u32::MAX))).map_or(0.0, f64::from);
+    let n = u32::try_from(count.min(u64::from(u32::MAX))).map_or(1.0, f64::from);
+    sum / n
+}
+
 #[allow(clippy::arithmetic_side_effects)]
 /// Run the same receive loop the camera path uses, against anything that hands back frames.
 ///
@@ -123,10 +150,35 @@ fn measure(try_recv: impl Fn() -> Option<elementium_media::captured_frame::Captu
     let mut received = 0_u64;
     let started = Instant::now();
     let mut last_slot = u64::MAX;
+    let latency_probe = std::env::var("CAPTURE_LATENCY").is_ok();
+    let mut baseline_luma: Option<f64> = None;
     let mut first_at: Option<Instant> = None;
     let mut last_at: Option<Instant> = None;
     while Instant::now() < deadline {
         if let Some(frame) = try_recv() {
+            if latency_probe {
+                // Report the wall-clock moment the captured picture first moves.
+                //
+                // SC-002 asks how long a change on screen takes to reach a viewer. The half
+                // that is ours -- compositor damage, PipeWire delivery, our decode and
+                // queueing -- is measurable here: a driver notes when it changed the shared
+                // window, this notes when that change arrived, and the difference is the
+                // capture-side latency. The mean is taken over a sample of the luma plane
+                // rather than every byte, because this runs inside the receive loop and
+                // must not become the thing it is measuring.
+                let mean = mean_luma(&frame);
+                match baseline_luma {
+                    None => baseline_luma = Some(mean),
+                    Some(base) if (mean - base).abs() > 2.0 => {
+                        let at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis());
+                        println!("PICTURE_CHANGED_AT {at} (mean luma {base:.1} -> {mean:.1})");
+                        baseline_luma = Some(mean);
+                    }
+                    Some(_) => {}
+                }
+            }
             if let Ok(prefix) = std::env::var("CAPTURE_DUMP_SERIES") {
                 // A numbered series rather than one frame, so a run can be compared against
                 // itself over time: share one window, change something else, and see

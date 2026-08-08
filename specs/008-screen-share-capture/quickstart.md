@@ -203,6 +203,37 @@ legitimate shares of a still document. The node's removal from the registry is t
 unambiguous signal, and the id is recycled quickly (seen reused for an unrelated Link),
 so it must be watched rather than polled for.
 
+### Capture latency (SC-002), measured 2026-08-08
+
+```sh
+# a window whose contents are driven through a fifo, so the change time is known exactly
+mkfifo $F/pipe
+setsid foot --title=LATENCY-WINDOW sh -c "...; while true; do sh -c 'cat < $F/pipe'; done" &
+
+CAPTURE_LATENCY=1 CAPTURE_SECONDS=30 \
+  nix develop -c cargo run -p elementium-media --example capture_attribution -- --screen
+# then write a full screen of '#' and a full screen of ' ' alternately, recording each
+# write time, and compare against the run's PICTURE_CHANGED_AT lines
+```
+
+Ten alternating changes, milliseconds from writing to the window to the change appearing in
+a captured frame:
+
+| min | median | mean | max |
+|---|---|---|---|
+| 309 | 333 | 384 | 761 |
+
+**Scope, stated plainly.** This is the *capture* half: terminal render, compositor damage,
+`PipeWire` delivery, and our decode and queueing. It does not include encode, the SFU, the
+network, or the receiver's jitter buffer and decoder, so it is a lower bound on SC-002's
+end-to-end second rather than a measurement of it. The margin is wide enough — a third of a
+second against a budget of one — that the remaining path would have to be slower than the
+capture to breach it, but that has not been measured and is not claimed.
+
+The single 761ms outlier is worth keeping in view rather than averaging away: at 30fps the
+capture is not the limit, but a damage-driven source can coalesce updates, and the tail is
+what a user notices.
+
 ---
 
 ## Level 4 — A remote participant sees the screen (the actual feature)
