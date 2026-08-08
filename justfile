@@ -96,6 +96,15 @@ app-join:
 element-web-sync version:
     ./scripts/element-web-sync.sh {{version}}
 
+# Move the patch branch onto a new upstream tag, and say what happened to each commit.
+#
+# Three outcomes per commit, not two: applied, conflicted, and **dropped**. Dropped means
+# upstream has the change now -- `git rebase` discards a commit whose patch-id upstream
+# already has -- which is how a contribution landing is discovered. It has to be stated,
+# because silently vanishing reads as a patch that went missing.
+element-web-rebase version:
+    ./scripts/element-web-rebase.sh {{version}}
+
 # Leave and forget every room the test participants are in.
 #
 # Each provision creates a room and each call test creates another, so they pile up. The
