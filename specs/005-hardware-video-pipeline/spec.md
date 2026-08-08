@@ -139,6 +139,26 @@ AV1 is rejected outright by livekit's cryptor (`is not yet supported for end to 
 encryption`), which means **T009 (AV1 on VAAPI) cannot be done for encrypted calls at
 all** while we interoperate with Element Call. Worth knowing before anyone starts it.
 
+### And a fifth part, found by doing the first three: we cannot receive H.264
+
+`NegotiatedDecoder` has one variant, `Vp8`, and `NegotiatedDecoder::new` returns
+`no decoder available for H264 on this build`. The inbound path decodes every video frame
+with a `Vp8Decoder`.
+
+An SDP offer is not per-direction. Adding H.264 to `create_peer_connection` tells the far
+end we will *receive* it as well as send it, and the moment a peer publishes H.264 we get
+a track we cannot decode — a black tile, with no error that says why. On the LiveKit
+transport that could be avoided by enabling it on the publisher `PeerConnection` only,
+since publisher and subscriber are separate connections there; on the path the
+application actually takes, livekit-client creates both through the same shim and our Rust
+cannot tell them apart.
+
+So T013 is not a one-line change either, and its real prerequisite is T017: an H.264
+decoder. Three of the four parts of T012 are done — the framing, the payload-type choice,
+and carrying the codec with each frame. Offering it is the one that has to wait, which is
+the safe way round: everything is in place for the day we can decode it, and nothing has
+changed for a peer today.
+
 ## Success Criteria
 
 - **SC1**: A real call on this machine logs `backend=vaapi` for video, or logs why
