@@ -412,7 +412,29 @@ Stated precisely, because this is a privacy claim and the difference matters: th
 exercised the *capture path* via the Level 2 example, which never requests audio at all. It
 demonstrates that capturing a screen does not itself open an audio stream. It does **not**
 yet exercise the `audio: false` branch of `get_display_media`, which is the guard a user's
-opt-out actually flows through. That check still needs the running app.
+opt-out actually flows through.
+
+**The remaining check, ready to run against the app** (T053). It needs the app because that
+branch only exists there; it takes about two minutes:
+
+```sh
+# 1. Baseline, before the app is running at all.
+pw-dump | python3 -c "import json,sys; print(sorted(o['id'] for o in json.load(sys.stdin) \
+  if 'Stream/Input/Audio' in str((o.get('info') or {}).get('props', {}).get('media.class',''))))"
+
+# 2. Start the app, join a call, and share a screen with the audio option OFF.
+just dev
+
+# 3. Same command again. The set of ids must be identical, not merely the same size.
+```
+
+**Pass**: the id set is unchanged. **Fail**: any new `Stream/Input/Audio` node whose
+`application.name` or `node.name` names this app.
+
+Compare ids rather than counts: an unrelated application starting and stopping between the
+two samples keeps the count equal while the set changes, and a count is exactly the kind of
+evidence that looks like proof and is not. Sample the baseline *before* launching the app,
+since a share started later inherits whatever the app already opened for the microphone.
 
 **Scope disclosure**: when application audio was requested and the desktop mix was
 captured instead, confirm the response carries `audioScopeFallback: true` and that this
