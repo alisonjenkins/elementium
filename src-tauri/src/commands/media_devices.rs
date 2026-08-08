@@ -162,16 +162,27 @@ pub fn start_screen_share_pipeline(
     let active_codec_clone = active_codec.clone();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
+    // Which capture source to open is decided by which backend granted the share -- a
+    // PipeWire node to pull for the portal, a source id to hand X11's push capturer for
+    // X11 -- not by anything the pipeline loop itself has to know about.
+    let capture_source = match session.source() {
+        elementium_screen::ShareSource::Wayland { node_id } => {
+            VideoCaptureSource::Screencast { node_id: *node_id }
+        }
+        elementium_screen::ShareSource::X11 { source_id } => {
+            VideoCaptureSource::X11 { source_id: source_id.clone() }
+        }
+    };
+
     let tid = track_id.clone();
     let frames = video_frames.clone();
-    let node_id = session.node_id();
     let span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = span.enter();
         video_pipeline_loop(
             key,
             &tid,
-            VideoCaptureSource::Screencast { node_id },
+            &capture_source,
             &frames,
             &encode_tx_clone,
             &keyframe_requested_clone,
@@ -493,7 +504,7 @@ pub async fn get_user_media(
             video_pipeline_loop(
                 MediaTrackKey::camera(),
                 &tid,
-                VideoCaptureSource::Camera {
+                &VideoCaptureSource::Camera {
                     width: req_width,
                     height: req_height,
                     fps: req_fps,
@@ -822,7 +833,7 @@ fn bitrate_for(width: u32, height: u32) -> u32 {
 /// The rest of the pipeline -- encoder negotiation, keyframe policy, pacing, preview,
 /// E2EE-bound dispatch -- is identical for a camera and a shared screen, so the difference
 /// is confined to this one enum rather than to a second copy of the loop.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum VideoCaptureSource {
     /// A camera, found by enumeration.
     Camera {
@@ -832,6 +843,10 @@ pub enum VideoCaptureSource {
     },
     /// A `PipeWire` node the desktop portal already granted for screen capture.
     Screencast { node_id: u32 },
+    /// An X11 source id (`monitor-<n>`/`window-<n>` from `get_capture_sources`), captured by
+    /// `xcap` through the push adapter -- see `start_x11_video_source` and
+    /// `elementium_media::video_source::VideoSource::start_push`.
+    X11 { source_id: String },
 }
 
 impl VideoCaptureSource {
@@ -841,34 +856,89 @@ impl VideoCaptureSource {
     /// A share has no requested size -- the user picked a monitor or a window and its size
     /// is whatever it is -- so 1920x1080 stands in until the first frame says otherwise.
     /// This decides only whether a hardware encoder is size-capable, not what is captured.
-    const fn negotiation_geometry(self) -> (u32, u32) {
+    /// Not `String`-holding data itself, so borrowing rather than consuming `self` costs
+    /// nothing here and lets `open`/`label` keep doing the same below.
+    const fn negotiation_geometry(&self) -> (u32, u32) {
         match self {
             Self::Camera { width, height, .. } => {
-                (unwrap_or_const(width, 1280), unwrap_or_const(height, 720))
+                (unwrap_or_const(*width, 1280), unwrap_or_const(*height, 720))
             }
-            Self::Screencast { .. } => (1920, 1080),
+            Self::Screencast { .. } | Self::X11 { .. } => (1920, 1080),
         }
     }
 
     /// Open the source.
     fn open(
-        self,
+        &self,
         target: elementium_codec::EncodeTarget,
     ) -> Result<elementium_media::video_source::VideoSource, String> {
         use elementium_media::video_source::VideoSource;
         match self {
-            Self::Camera { width, height, fps } => VideoSource::start_at(width, height, fps, target),
-            Self::Screencast { node_id } => VideoSource::start_screencast(node_id, target),
+            Self::Camera { width, height, fps } => VideoSource::start_at(*width, *height, *fps, target),
+            Self::Screencast { node_id } => VideoSource::start_screencast(*node_id, target),
+            Self::X11 { source_id } => start_x11_video_source(source_id),
         }
     }
 
     /// What to call this in a log line.
-    const fn label(self) -> &'static str {
+    const fn label(&self) -> &'static str {
         match self {
             Self::Camera { .. } => "camera",
             Self::Screencast { .. } => "screencast",
+            Self::X11 { .. } => "x11",
         }
     }
+}
+
+/// Bridge a running `X11Capturer` into a `VideoSource`.
+///
+/// `elementium-media` cannot depend on `elementium-screen` (the dependency runs the other
+/// way: `elementium-screen` depends on `elementium-media` for `I420Frame` conversion), so
+/// `VideoSource::start_push` is generic over any push producer and this is where the
+/// concrete `X11Capturer` meets it -- the only place in the codebase that imports both.
+///
+/// `target` (the negotiated encoder geometry) is not passed to `X11Capturer::start`: xcap
+/// captures whatever the monitor or window actually is and has no format to negotiate,
+/// unlike the `PipeWire` path where the capture format itself depends on where the frame is
+/// headed.
+///
+/// The capturer is parked behind a mutex only so its `stop(&mut self)` can be reached from
+/// the `Fn` (not `FnMut`) closure `VideoSource::start_push` requires; this is not a hot
+/// path, so the extra indirection costs nothing that matters.
+///
+/// # Errors
+///
+/// Whatever `X11Capturer::start` reports: no display, an unrecognised or non-existent
+/// source id, or a backend failure (see `x11.rs`'s four distinct messages).
+fn start_x11_video_source(
+    source_id: &str,
+) -> Result<elementium_media::video_source::VideoSource, String> {
+    use elementium_media::captured_frame::CapturedFrame;
+    use elementium_screen::ScreenCapturer;
+    use elementium_screen::x11::X11Capturer;
+
+    let mut capturer = X11Capturer::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    capturer
+        .start(
+            source_id,
+            Box::new(move |frame| {
+                let _ = tx.send(CapturedFrame::Planar(frame));
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let capturer = Arc::new(Mutex::new(capturer));
+    let stopper_capturer = Arc::clone(&capturer);
+    let stopper: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+        if let Ok(mut c) = stopper_capturer.lock() {
+            let _ = c.stop();
+        }
+    });
+
+    Ok(elementium_media::video_source::VideoSource::start_push(
+        rx, stopper, "x11",
+    ))
 }
 
 /// `Option::unwrap_or` is not `const`; this is.
@@ -889,7 +959,7 @@ const fn unwrap_or_const(value: Option<u32>, fallback: u32) -> u32 {
 fn video_pipeline_loop(
     key: MediaTrackKey,
     track_id: &str,
-    source: VideoCaptureSource,
+    source: &VideoCaptureSource,
     video_frames: &VideoFrameBuffer,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,

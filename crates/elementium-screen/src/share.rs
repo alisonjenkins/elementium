@@ -65,6 +65,22 @@ pub enum ShareBackend {
     X11,
 }
 
+/// Where a running share's frames come from.
+///
+/// The two backends hand off to the media layer in opposite directions -- see `x11.rs`'s
+/// module doc -- and this is what lets `ShareSession` carry either without pretending one is
+/// the other: the portal grants a `PipeWire` node the media layer *pulls* from, while X11 has
+/// no node at all, only the source id the caller chose from `get_capture_sources`, which
+/// `elementium-media`'s push adapter (`video_source::VideoSource::start_push`) is driven by
+/// instead.
+#[derive(Debug, Clone)]
+pub enum ShareSource {
+    /// The `PipeWire` node the compositor granted, for the portal backend.
+    Wayland { node_id: u32 },
+    /// The source id chosen from `get_capture_sources`, for the X11 backend.
+    X11 { source_id: String },
+}
+
 /// A running share.
 ///
 /// Dropping this ends the share. The portal session is closed explicitly by
@@ -72,8 +88,8 @@ pub enum ShareBackend {
 /// for the paths that cannot.
 pub struct ShareSession {
     backend: ShareBackend,
-    /// The `PipeWire` node the compositor granted, for the portal backend.
-    node_id: u32,
+    /// Which node or source to capture, and how -- see [`ShareSource`].
+    source: ShareSource,
     /// Whether the user picked a whole monitor or a single window.
     ///
     /// Reported by the portal rather than requested by us. It decides how share audio is
@@ -99,10 +115,11 @@ impl ShareSession {
         self.backend
     }
 
-    /// The `PipeWire` node id to open for video.
+    /// Where this share's frames come from -- a `PipeWire` node to pull, or an X11 source id
+    /// to push from. See [`ShareSource`].
     #[must_use]
-    pub const fn node_id(&self) -> u32 {
-        self.node_id
+    pub const fn source(&self) -> &ShareSource {
+        &self.source
     }
 
     #[must_use]
@@ -112,14 +129,15 @@ impl ShareSession {
 
     /// End the share, closing the portal session.
     ///
-    /// Takes `self` so a closed session cannot be used afterwards.
+    /// Takes `self` so a closed session cannot be used afterwards. A no-op for a backend with
+    /// no portal (X11): there is nothing there to close.
     pub async fn close(mut self) {
         #[cfg(target_os = "linux")]
         if let Some(portal) = self.portal.take() {
             match portal.session.close().await {
-                Ok(()) => tracing::info!(node_id = self.node_id, "screencast portal session closed"),
+                Ok(()) => tracing::info!(source = ?self.source, "screencast portal session closed"),
                 Err(e) => tracing::warn!(
-                    node_id = self.node_id,
+                    source = ?self.source,
                     reason = %e,
                     "screencast portal session could not be closed; it will be dropped instead"
                 ),
@@ -144,7 +162,7 @@ impl Drop for ShareSession {
             });
         } else {
             tracing::warn!(
-                node_id = self.node_id,
+                source = ?self.source,
                 "share dropped outside a runtime; the portal session is left for the \
                  compositor to reap"
             );
@@ -217,7 +235,7 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
 
     Ok(ShareSession {
         backend: ShareBackend::WaylandPortal,
-        node_id,
+        source: ShareSource::Wayland { node_id },
         source_kind,
         portal: Some(PortalSession { proxy, session }),
     })
@@ -237,9 +255,112 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
     ))
 }
 
+/// Recover the kind a `get_capture_sources`-issued X11 id encodes, from its prefix.
+///
+/// Best-effort, not a validation: an id that does not parse is left for
+/// [`crate::x11::X11Capturer::start`] to reject with one of its four specific messages when
+/// the share is actually opened, rather than being checked twice against two copies of the
+/// same rule.
+fn x11_source_kind(source_id: &str) -> Option<CaptureSourceKind> {
+    if source_id.starts_with("monitor-") {
+        Some(CaptureSourceKind::Monitor)
+    } else if source_id.starts_with("window-") {
+        Some(CaptureSourceKind::Window)
+    } else {
+        None
+    }
+}
+
+/// Start a share of one specific X11 source, chosen from
+/// [`crate::x11::X11Capturer::sources`] (what `get_capture_sources` calls).
+///
+/// Unlike [`start_share`], there is no picker behind this: X11 has no compositor dialog to
+/// hand the choice to, so `source_id` *is* the whole selection. Its absence is refused here,
+/// synchronously and by name, rather than being allowed through to become a session that
+/// starts and never captures anything -- the exact silent failure T042 removed from
+/// `X11Capturer::start` itself.
+///
+/// Not `async`: unlike the portal path there is no dialog to await and no D-Bus round trip.
+///
+/// # Errors
+///
+/// [`ShareError::Capture`] if no source id was given.
+#[cfg(target_os = "linux")]
+pub fn start_x11_share(source_id: Option<&str>) -> Result<ShareSession, ShareError> {
+    let source_id = source_id.ok_or_else(|| {
+        ShareError::Capture(
+            "an X11 share needs a source id from get_capture_sources; there is no picker to \
+             fall back on"
+                .to_owned(),
+        )
+    })?;
+
+    let source_kind = x11_source_kind(source_id);
+    tracing::info!(source_id, source_kind = ?source_kind, "starting an X11 screen share");
+
+    Ok(ShareSession {
+        backend: ShareBackend::X11,
+        source: ShareSource::X11 {
+            source_id: source_id.to_owned(),
+        },
+        source_kind,
+        portal: None,
+    })
+}
+
+/// No X11 capture backend exists off Linux, matching [`start_share`]'s non-Linux stub.
+///
+/// # Errors
+///
+/// Always [`ShareError::NoBackend`].
+#[cfg(not(target_os = "linux"))]
+pub fn start_x11_share(_source_id: Option<&str>) -> Result<ShareSession, ShareError> {
+    Err(ShareError::NoBackend(
+        "screen sharing is implemented for Linux only".to_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PICKER_CANCELLED, ShareError};
+    use super::{PICKER_CANCELLED, ShareError, start_x11_share};
+
+    /// The whole point of [`start_x11_share`]'s `Option` parameter: X11 has no picker to
+    /// fall back on, so a missing source id has to be refused here rather than producing a
+    /// session that silently never captures anything.
+    #[test]
+    fn an_x11_share_with_no_source_id_is_refused() {
+        let result = start_x11_share(None);
+        assert!(
+            result.is_err(),
+            "an X11 share started without a source id must not succeed"
+        );
+    }
+
+    /// The seam this task exists to close: an X11-chosen source id has to survive into the
+    /// session exactly as given, since it is what the media layer will hand to
+    /// `X11Capturer::start` to open the real capture. Linux-only because
+    /// `start_x11_share`'s real implementation -- as opposed to its `NoBackend` stub -- only
+    /// exists there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_x11_share_carries_its_source_id_and_kind_through() {
+        use elementium_types::CaptureSourceKind;
+
+        use super::{ShareBackend, ShareSource};
+
+        let result = start_x11_share(Some("monitor-3"));
+        assert!(result.is_ok(), "a valid id must be accepted");
+        if let Ok(session) = result {
+            assert_eq!(session.backend(), ShareBackend::X11);
+            assert_eq!(session.source_kind(), Some(CaptureSourceKind::Monitor));
+            let mut carried_x11_source = false;
+            if let ShareSource::X11 { source_id } = session.source() {
+                carried_x11_source = true;
+                assert_eq!(source_id, "monitor-3");
+            }
+            assert!(carried_x11_source, "an X11 share must carry an X11 source");
+        }
+    }
 
     /// The frontend decides whether to report a failure by matching this prefix, so the
     /// message has to start with it. A reworded error that drops the marker turns every

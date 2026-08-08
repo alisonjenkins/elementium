@@ -10,6 +10,8 @@
 //! through `PipeWire`, so the reverse order would work by luck on some machines and fail on
 //! others for reasons no log would explain.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::captured_frame::CapturedFrame;
@@ -30,10 +32,73 @@ use crate::pipewire_capture::PipewireCapturer;
 /// that is silent without saying why.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A video source fed by a capturer that pushes frames from a thread it owns, rather than
+/// one this module pulls from (contrast [`PipewireCapturer`]).
+///
+/// This crate cannot depend on `elementium-screen` -- the dependency runs the other way, so
+/// that crate can use [`VideoSource`] for its own capturers -- so this type knows nothing
+/// about X11 or `xcap` specifically. It is the generic half of the bridge; the concrete half,
+/// which actually owns an `X11Capturer` and feeds `tx`, lives in the Tauri command layer that
+/// depends on both crates. See `crates/elementium-screen/src/x11.rs` for why X11 capture is
+/// shaped this way at all.
+pub struct PushCapturer {
+    rx: Receiver<CapturedFrame>,
+    /// Updated from the most recently received frame, since -- unlike `PipeWire` -- nothing
+    /// here negotiates a size up front; the first frame is the first anyone learns it.
+    width: AtomicU32,
+    height: AtomicU32,
+    /// Tells the producer thread to stop. Called from [`PushCapturer::stop`] and from
+    /// `Drop`, matching every other capturer in this module: a pipeline loop that exits
+    /// without calling `stop()` explicitly (an error return, a panic unwind) must not leave
+    /// the producer thread running forever, capturing frames nobody will ever read.
+    stopper: Box<dyn Fn() + Send + Sync>,
+    /// Distinguishes this producer from others sharing the same generic plumbing in logs.
+    label: &'static str,
+}
+
+impl PushCapturer {
+    /// The next pushed frame, if one has arrived since the last call.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<CapturedFrame> {
+        let frame = self.rx.try_recv().ok()?;
+        self.width.store(frame.width(), Ordering::Relaxed);
+        self.height.store(frame.height(), Ordering::Relaxed);
+        Some(frame)
+    }
+
+    /// The size of the most recently received frame, or `(0, 0)` before the first one.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        (self.width.load(Ordering::Relaxed), self.height.load(Ordering::Relaxed))
+    }
+
+    /// Which producer this is, for logging.
+    #[must_use]
+    pub const fn backend(&self) -> &'static str {
+        self.label
+    }
+
+    /// Signal the producer thread to stop.
+    ///
+    /// Idempotent, like the stop signal on every other capturer here -- calling it twice
+    /// (once explicitly, once from `Drop`) must not be an error.
+    pub fn stop(&self) {
+        (self.stopper)();
+    }
+}
+
+impl Drop for PushCapturer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// A running video capture, from whichever backend worked.
 pub enum VideoSource {
     Pipewire(PipewireCapturer),
     V4l2(CameraCapturer),
+    /// Fed by a push-based producer -- X11 today, see [`PushCapturer`].
+    Push(PushCapturer),
 }
 
 impl VideoSource {
@@ -134,6 +199,29 @@ impl VideoSource {
         Ok(Self::Pipewire(capturer))
     }
 
+    /// Build a video source from frames pushed on `rx`, rather than pulled.
+    ///
+    /// `stopper` is called both when [`VideoSource::stop`] is called explicitly and as a
+    /// `Drop` backstop, and must end the thread pushing into `rx` -- otherwise that thread
+    /// outlives this source, still capturing frames on its own schedule with nothing left to
+    /// read them, until whatever owns it is torn down some other way. `label` names the
+    /// producer in logs (`"x11"` today; see [`PushCapturer`] for why this crate cannot name
+    /// it more specifically itself).
+    #[must_use]
+    pub fn start_push(
+        rx: Receiver<CapturedFrame>,
+        stopper: Box<dyn Fn() + Send + Sync>,
+        label: &'static str,
+    ) -> Self {
+        Self::Push(PushCapturer {
+            rx,
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            stopper,
+            label,
+        })
+    }
+
     /// The next frame, if one is waiting.
     ///
     /// Not always pixels: see [`CapturedFrame`]. The `V4L2` path always decodes, since
@@ -144,6 +232,7 @@ impl VideoSource {
         match self {
             Self::Pipewire(c) => c.try_recv(),
             Self::V4l2(c) => c.try_recv().map(CapturedFrame::Planar),
+            Self::Push(c) => c.try_recv(),
         }
     }
 
@@ -153,6 +242,7 @@ impl VideoSource {
         match self {
             Self::Pipewire(c) => c.size(),
             Self::V4l2(c) => (c.width(), c.height()),
+            Self::Push(c) => c.size(),
         }
     }
 
@@ -162,6 +252,7 @@ impl VideoSource {
         match self {
             Self::Pipewire(_) => "pipewire",
             Self::V4l2(_) => "v4l2",
+            Self::Push(c) => c.backend(),
         }
     }
 
@@ -170,6 +261,7 @@ impl VideoSource {
         match self {
             Self::Pipewire(c) => c.stop(),
             Self::V4l2(c) => c.stop(),
+            Self::Push(c) => c.stop(),
         }
     }
 }
@@ -249,4 +341,71 @@ fn start_pipewire(
         }
     }
     Err(last_error)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use elementium_types::I420Frame;
+
+    use super::VideoSource;
+    use crate::captured_frame::CapturedFrame;
+
+    fn tiny_frame() -> I420Frame {
+        // 2x2 is the smallest size `from_planes` will accept: one Y byte per pixel, one
+        // rounded-up-to-1x1 U/V byte each. The pixel values are irrelevant here -- only the
+        // frame's identity (its size) is being checked.
+        I420Frame::from_planes(2, 2, &[0, 0, 0, 0], &[0], &[0], 0).expect("2x2 planes are valid")
+    }
+
+    /// This is the whole point of the push adapter: a frame pushed onto the channel by a
+    /// producer thread this test stands in for (X11's, in production) has to come back out
+    /// of `try_recv` exactly as sent, with `size()` reflecting it -- proving the pull-shaped
+    /// `VideoSource` interface really does read what a push-shaped producer wrote.
+    #[test]
+    fn a_pushed_frame_is_received_and_sizes_the_source() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push");
+
+        assert_eq!(source.size(), (0, 0), "no frame has arrived yet");
+        assert!(source.try_recv().is_none(), "nothing was pushed yet");
+
+        let _ = tx.send(CapturedFrame::Planar(tiny_frame()));
+
+        let received = source.try_recv();
+        assert!(received.is_some(), "the pushed frame must be received");
+        if let Some(frame) = received {
+            assert_eq!((frame.width(), frame.height()), (2, 2));
+        }
+        assert_eq!(source.size(), (2, 2), "size must update from the received frame");
+    }
+
+    /// The producer thread has to be told to stop, both when `stop()` is called explicitly
+    /// and when the source is simply dropped (a pipeline loop exiting on an error path,
+    /// say) -- otherwise it keeps running with nothing left reading what it pushes. Both
+    /// paths go through the same `stopper` closure, so this pins that it actually runs
+    /// rather than being wired up and silently never called.
+    #[test]
+    fn dropping_or_stopping_a_push_source_signals_its_producer() {
+        let (_tx, rx) = std::sync::mpsc::channel::<CapturedFrame>();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_writer = Arc::clone(&stopped);
+
+        let source = VideoSource::start_push(
+            rx,
+            Box::new(move || stopped_writer.store(true, Ordering::Relaxed)),
+            "test-push",
+        );
+        assert!(!stopped.load(Ordering::Relaxed), "not stopped before either signal");
+
+        source.stop();
+        assert!(stopped.load(Ordering::Relaxed), "stop() must signal the producer");
+
+        drop(source);
+        // stop() is idempotent (see `PushCapturer::stop`'s doc), so Drop calling it again is
+        // expected and harmless; the assertion above already proved the signal fires.
+    }
 }

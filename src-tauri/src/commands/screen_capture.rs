@@ -66,9 +66,12 @@ pub async fn get_capture_sources() -> Result<Vec<CaptureSource>, String> {
 
 /// Start sharing a screen, window or application.
 ///
-/// `source_id` is honoured where the platform lets an application choose; where selection
-/// belongs to the compositor it is ignored and the portal's picker decides, which is why it
-/// is optional rather than defaulted.
+/// `source_id` is what makes an X11 share possible at all: X11 has no compositor picker, so
+/// the id chosen from [`get_capture_sources`] is the only way to say what to capture, and its
+/// absence there is a refusal (see [`elementium_screen::start_x11_share`]), not a fallback.
+/// On Wayland it is ignored -- the portal's own picker decides -- which is why the parameter
+/// is optional rather than defaulted: `None` means different things on the two backends, and
+/// this command is what decides which backend a given call reaches (see below).
 ///
 /// # Errors
 ///
@@ -88,11 +91,20 @@ pub async fn get_display_media(
         "starting a screen share"
     );
 
-    // Awaited on the caller's runtime rather than run on a nested one. The portal exchange
-    // shows a dialog and takes as long as a person takes to decide.
-    let session = elementium_screen::start_share()
-        .await
-        .map_err(|e| e.to_string())?;
+    // Which backend to use is decided here, explicitly, by whether a source id was given --
+    // not left for `elementium-screen` to infer from the platform. X11 has no picker of its
+    // own, so a source id (chosen from `get_capture_sources`) *is* what asks for the X11
+    // path; without one there is nothing for X11 to open, and the request falls through to
+    // the portal's own picker, exactly as it did before X11 existed here.
+    //
+    // The portal branch is awaited on the caller's runtime rather than run on a nested one:
+    // it shows a dialog and takes as long as a person takes to decide. The X11 branch has no
+    // dialog and nothing to await.
+    let session = if let Some(id) = source_id.as_deref() {
+        elementium_screen::start_x11_share(Some(id)).map_err(|e| e.to_string())?
+    } else {
+        elementium_screen::start_share().await.map_err(|e| e.to_string())?
+    };
 
     let video_frames = {
         let engine = webrtc_state.0.lock().map_err(|_| "engine lock poisoned")?;
@@ -112,7 +124,13 @@ pub async fn get_display_media(
         (None, None, false)
     };
 
-    let node_id = session.node_id();
+    // Extracted before `session` moves into the replaced `ShareHandle` below: whichever
+    // variant this share is, name it precisely enough for the log line to say what was
+    // actually opened, not just that something was.
+    let share_source_desc = match session.source() {
+        elementium_screen::ShareSource::Wayland { node_id } => format!("pipewire node {node_id}"),
+        elementium_screen::ShareSource::X11 { source_id } => format!("x11 source {source_id}"),
+    };
     let source_kind = session.source_kind();
 
     // One share at a time. Replacing rather than layering: two portal sessions racing for
@@ -137,7 +155,7 @@ pub async fn get_display_media(
     }
 
     tracing::info!(
-        node_id,
+        source = %share_source_desc,
         source_kind = ?source_kind,
         track_id = %track_id,
         "screen share started"
