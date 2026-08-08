@@ -72,7 +72,7 @@ impl SignalClient {
     /// WebSocket handshake fails.
     pub async fn connect(sfu_url: &str, token: &str) -> Result<Self, SignalError> {
         let ws_url = build_ws_url(sfu_url, token)?;
-        tracing::info!(url = %ws_url, "connect attempt started");
+        tracing::info!(url = %redact_token(&ws_url), "connect attempt started");
 
         let (ws_stream, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
             Ok(v) => v,
@@ -185,6 +185,37 @@ fn build_ws_url(sfu_url: &str, token: &str) -> Result<String, SignalError> {
     Ok(url.to_string())
 }
 
+/// Replace the `access_token` query parameter's value with a placeholder.
+///
+/// The join URL carries a `LiveKit` JWT that grants the right to join the room, publish and
+/// subscribe, for as long as it is valid -- an hour, by default. Logged whole, it is a
+/// working credential sitting in a log file, a terminal scrollback, a CI artefact or a
+/// bug report, and anyone holding it can join the call. Nothing else in the URL is
+/// sensitive, and the rest is genuinely useful when diagnosing a connection, so the token
+/// alone is replaced rather than the line being dropped.
+///
+/// Deliberately not "log the first few characters": a prefix of a JWT is its header, which
+/// is the same for every token this codebase mints and identifies nothing.
+fn redact_token(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        // Unparseable here means the URL was built and then mangled. Returning it as-is
+        // would put the token back in the log, which is the one outcome to avoid.
+        return "<unparseable url>".to_owned();
+    };
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| {
+            if k == "access_token" {
+                (k.into_owned(), "<redacted>".to_owned())
+            } else {
+                (k.into_owned(), v.into_owned())
+            }
+        })
+        .collect();
+    parsed.query_pairs_mut().clear().extend_pairs(pairs);
+    parsed.to_string()
+}
+
 type WsWrite =
     futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 type WsRead = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
@@ -255,4 +286,37 @@ async fn ws_reader_loop(
         }
     }
     tracing::info!("signal reader loop ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_ws_url, redact_token};
+
+    /// A token that appears in the URL must not appear in what gets logged.
+    ///
+    /// Asserted against the real `build_ws_url` output rather than a hand-written URL, so
+    /// that adding another token-bearing parameter to the join URL breaks this test rather
+    /// than quietly widening what reaches the logs.
+    #[test]
+    fn the_join_token_never_reaches_the_log_line() {
+        let token = "eyJhbGciOiJIUzI1NiJ9.aVeryRealLookingClaimsSection.andASignature";
+        let url = build_ws_url("http://127.0.0.1:7880", token).unwrap_or_default();
+        assert!(url.contains(token), "the URL under test must carry the token");
+
+        let logged = redact_token(&url);
+        assert!(
+            !logged.contains(token),
+            "the join token must not survive into a log line: {logged}"
+        );
+        assert!(logged.contains("access_token=%3Credacted%3E") || logged.contains("<redacted>"));
+        // The rest of the URL is what makes the line worth logging at all.
+        assert!(logged.contains("127.0.0.1:7880"));
+        assert!(logged.contains("protocol="));
+    }
+
+    /// A URL that cannot be parsed must not be logged verbatim as a fallback.
+    #[test]
+    fn an_unparseable_url_is_not_echoed_back() {
+        assert_eq!(redact_token("not a url at all"), "<unparseable url>");
+    }
 }
