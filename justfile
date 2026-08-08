@@ -120,6 +120,14 @@ element-web-pr commit:
 element-web-patches:
     ./scripts/element-web-patches.sh
 
+# Run the whole carry-and-contribute cycle against a synthetic upstream.
+#
+# Carries a change, offers it, has a stand-in upstream take it, and checks it *disappears*
+# on the next rebase with nobody editing anything. That drop is the claim the arrangement
+# rests on, and it is the one thing reading the scripts cannot verify.
+element-web-patch-selftest:
+    ./scripts/element-web-patch-selftest.sh
+
 # Leave and forget every room the test participants are in.
 #
 # Each provision creates a room and each call test creates another, so they pile up. The
