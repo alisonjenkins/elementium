@@ -96,6 +96,69 @@ first call  (works):  ... @tester2:localhost:AUUTRURUIG index 0 ...
 second call (broken): only @tester1's own key, seven times
 ```
 
+## Decision — 2026-08-08: what to do when a key misses the `useKeyDelay` window (T012)
+
+The fault T008 left standing: a sender distributes a new key, waits `useKeyDelay`
+(5000ms), and starts encrypting with it whether or not the key arrived. A peer it did
+not reach hears nothing until it does.
+
+**Decision: change nothing in the sending schedule, and rely on the receive path
+already retrying.** The reasoning, option by option, because three of the four are
+worse than they look.
+
+**Raise `useKeyDelay`.** The delay is a sender-side constant, so raising it is safe for
+interoperability — peers adopt whatever index arrives, whenever it arrives. It is not
+safe for the property the rotation exists to provide: the window is exactly how long a
+participant who has just left can still decrypt the call. Doubling the delay doubles
+that. Trading forward secrecy for a shorter silence is the wrong trade to make silently,
+and this fault has never been measured on the stack where it was reported.
+
+**Defer adoption until distribution is acknowledged.** There is nothing to wait for.
+Matrix to-device delivery gives the sender no receipt, so an acknowledgement would have
+to be an application-level message that no other client sends — it would work only
+between two Elementium instances, which is the one case that is not the reported fault.
+
+**Re-send at a fresh index on suspicion.** This makes it worse. A new index starts the
+same race over again, and it does so at exactly the moment the evidence says the first
+one was lost.
+
+**Do nothing on the sender, because the receiver already recovers.** Two facts make this
+tolerable rather than resigned:
+
+- livekit-client stops retrying an index after `failureTolerance` (10) failures, but
+  installing a key at that index clears the count, so a late key revives it. The gap is
+  a gap, not a permanent loss.
+- **Our own decrypt path has no such latch at all.** `elementium-e2ee` tries every frame
+  against every key it holds; the only counter it keeps is for throttling the failure
+  log. So "I cannot hear others" self-heals the moment the key lands, without a
+  rejoin — and it is the reported symptom whose recovery we actually control.
+
+What is left is "others cannot hear me" during the gap, and that is governed entirely by
+the peer's client. We cannot fix it from here without breaking interoperability.
+
+So the useful work is measurement, not mitigation, and T001 already built it: the
+interval between a key being installed and the first frame it decrypts. If that interval
+is small on the user's homeserver, this is not their fault and the search continues
+elsewhere. If it is seconds, raising the delay becomes a trade worth putting to them
+with a number attached rather than a guess.
+
+### The number, on this stack
+
+From the 2026-08-08 app-join run:
+
+```
+E2EE key decrypted its first frame  @tester2:...:HTYDMWBJWO  index 1  waited_ms 1325
+E2EE key decrypted its first frame  @tester3:...:YOKREAJPDQ  index 1  waited_ms 1325
+```
+
+**1.3 seconds**, against a 5-second budget. Nothing came close to missing the window,
+which is the third independent reason not to change the schedule here.
+
+The same run shows nothing dying inside `RTCEncryptionManager` either: 29 keys received
+by the bridge, 29 forwarded to the native backend, 29 installed. No parked key, no key
+judged out of order. The failure modes described under "What is already known" are real
+in the source and simply do not occur on this stack.
+
 ## User Scenarios
 
 ### US1 (P1) — A participant hears the others promptly after joining
