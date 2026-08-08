@@ -11,12 +11,30 @@ fn dim(n: u32) -> usize {
     usize::try_from(n).expect("u32 fits in usize on supported platforms")
 }
 
-/// Halves a plane dimension for 4:2:0 chroma subsampling. Division by the
-/// literal 2 cannot overflow or panic (the only failure mode, div-by-zero,
+/// Halves a dimension when *downscaling*. Truncating is correct here: a 2x2 average has no
+/// meaning for a trailing odd row or column, so the output simply omits it.
+///
+/// Division by the literal 2 cannot overflow or panic (the only failure mode, div-by-zero,
 /// is impossible with a nonzero literal divisor).
 #[allow(clippy::arithmetic_side_effects)]
 const fn half(n: usize) -> usize {
     n / 2
+}
+
+/// The size of a 4:2:0 chroma plane dimension for a frame of dimension `n`.
+///
+/// Rounds *up*, and the distinction from [`half`] is not pedantry: I420 stores one chroma
+/// sample per 2x2 block, so an odd dimension still needs a whole trailing sample to cover
+/// its last row or column. Truncating instead under-allocates the U and V planes by one
+/// row or column, which every conversion then rejects.
+///
+/// Only reachable with an odd dimension, which is why it survived: a camera negotiates even
+/// geometry, so nothing hit it until a screen share of a window did -- a window is whatever
+/// width the user dragged it to. The symptom was a blank frame and
+/// `Chroma plane have invalid size, it must be at least 598956, but it was 598253` at
+/// 1703x1406, followed by a VP8 encoder refusing to initialise at 0x0.
+const fn chroma_dim(n: usize) -> usize {
+    n.div_ceil(2)
 }
 
 /// The color conversion standard used throughout this module. Matches the BT.601 full-range
@@ -33,8 +51,8 @@ const MATRIX: YuvStandardMatrix = YuvStandardMatrix::Bt601;
 fn empty_i420(width: u32, height: u32) -> I420Frame {
     let w = dim(width);
     let h = dim(height);
-    let uv_w = half(w);
-    let uv_h = half(h);
+    let uv_w = chroma_dim(w);
+    let uv_h = chroma_dim(h);
     // `from_padded` rather than `from_planes`: a zeroed buffer of exactly the right size
     // is trivially valid at tight strides, so this cannot fail for any geometry that fits
     // in memory, and expressing it this way avoids needing a fallback that cannot happen.
@@ -58,8 +76,8 @@ fn convert_to_i420(
 ) -> I420Frame {
     let w = dim(width);
     let h = dim(height);
-    let uv_w = half(w);
-    let uv_h = half(h);
+    let uv_w = chroma_dim(w);
+    let uv_h = chroma_dim(h);
 
     let mut y_plane = vec![0u8; w.saturating_mul(h)];
     let mut u_plane = vec![0u8; uv_w.saturating_mul(uv_h)];
@@ -215,17 +233,23 @@ pub fn halve_i420(frame: &I420Frame) -> Option<I420Frame> {
     if w < 4 || h < 4 {
         return None;
     }
-    let (uv_w, uv_h) = (half(w), half(h));
+    let (uv_w, uv_h) = (chroma_dim(w), chroma_dim(h));
 
     // Rows are read at the frame's stride and written tightly packed: the result is ours,
     // so it has no reason to carry the source's padding.
-    let y = halve_plane(frame.y(), w, h, frame.y_stride())?;
-    let u = halve_plane(frame.u(), uv_w, uv_h, frame.uv_stride())?;
-    let v = halve_plane(frame.v(), uv_w, uv_h, frame.uv_stride())?;
+    // The output geometry first, because the chroma planes have to be sized to cover *it*,
+    // not to be a naive halving of the source's chroma. For an odd result those differ by a
+    // row, and the frame is refused at construction if they disagree.
+    let (out_w, out_h) = (half(w), half(h));
+    let (out_uv_w, out_uv_h) = (chroma_dim(out_w), chroma_dim(out_h));
+
+    let y = halve_plane(frame.y(), w, h, frame.y_stride(), out_w, out_h)?;
+    let u = halve_plane(frame.u(), uv_w, uv_h, frame.uv_stride(), out_uv_w, out_uv_h)?;
+    let v = halve_plane(frame.v(), uv_w, uv_h, frame.uv_stride(), out_uv_w, out_uv_h)?;
 
     I420Frame::from_planes(
-        u32::try_from(half(w)).ok()?,
-        u32::try_from(half(h)).ok()?,
+        u32::try_from(out_w).ok()?,
+        u32::try_from(out_h).ok()?,
         &y,
         &u,
         &v,
@@ -238,22 +262,43 @@ pub fn halve_i420(frame: &I420Frame) -> Option<I420Frame> {
 /// Two rows at a time as fixed-size pairs, so the bounds check happens once per pair
 /// rather than once per sample -- the difference measured 7x on the RGBA equivalent in an
 /// unoptimised build, which is what `just dev` produces.
-fn halve_plane(src: &[u8], width: usize, height: usize, stride: usize) -> Option<Vec<u8>> {
+/// `out_w`/`out_h` are given by the caller rather than derived, because luma and chroma
+/// want different rounding from the same source. The output frame's luma is `width/2`
+/// truncated, but its chroma must cover that luma with a sample per 2x2 block -- which for
+/// an odd result is one more row or column than truncation yields. Deriving both from the
+/// source produced a chroma plane one row short, and `I420Frame::from_planes` correctly
+/// refused the frame, so an odd geometry lost its self-view entirely.
+///
+/// A source row or column with no partner is averaged with itself rather than dropped: the
+/// alternative is an output that silently omits the last row of the picture.
+fn halve_plane(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Option<Vec<u8>> {
     if stride < width {
         return None;
     }
-    let (out_w, out_h) = (half(width), half(height));
     let mut out = Vec::with_capacity(out_w.saturating_mul(out_h));
 
     for y in 0..out_h {
-        let top_start = y.checked_mul(2)?.checked_mul(stride)?;
-        let bottom_start = top_start.checked_add(stride)?;
+        let top_y = y.checked_mul(2)?;
+        // Clamped, not assumed: `top_y + 1` is off the end for the trailing row of an odd
+        // source, and reading it would either fail or splice in the next plane's bytes.
+        let bottom_y = top_y.checked_add(1)?.min(height.saturating_sub(1));
+        let top_start = top_y.checked_mul(stride)?;
+        let bottom_start = bottom_y.checked_mul(stride)?;
         let top = src.get(top_start..top_start.checked_add(width)?)?;
         let bottom = src.get(bottom_start..bottom_start.checked_add(width)?)?;
 
-        for (t, b) in top.chunks_exact(2).zip(bottom.chunks_exact(2)) {
-            let [t0, t1]: [u8; 2] = t.try_into().ok()?;
-            let [b0, b1]: [u8; 2] = b.try_into().ok()?;
+        for x in 0..out_w {
+            let left = x.checked_mul(2)?;
+            let right = left.checked_add(1)?.min(width.saturating_sub(1));
+            let (t0, t1) = (*top.get(left)?, *top.get(right)?);
+            let (b0, b1) = (*bottom.get(left)?, *bottom.get(right)?);
             out.push(mean4(t0, t1, b0, b1));
         }
     }
@@ -473,5 +518,52 @@ mod halve_i420_tests {
     #[test]
     fn degenerate_geometry_is_refused() {
         assert!(halve_i420(&frame(2, 2, 0, 128, 128)).is_none());
+    }
+}
+
+// A failed setup step in a test should stop that test loudly; the workspace's `expect_used`
+// ban is aimed at the shipping paths, not at assertions.
+#[allow(clippy::expect_used)]
+#[cfg(test)]
+mod odd_geometry_tests {
+    use super::{bgra_to_i420, halve_i420};
+
+    /// A frame of odd width must convert to a real picture, not a blank one.
+    ///
+    /// Found by sharing a window 1703 pixels wide. Nothing before this could produce an odd
+    /// dimension -- a camera negotiates even geometry -- so the chroma planes were sized by
+    /// truncating division and came out one column short, the conversion refused the frame,
+    /// and every frame of that share was blank. The encoder then failed to initialise at
+    /// 0x0, which is where it finally became visible.
+    #[test]
+    fn an_odd_width_frame_converts_to_something_other_than_blank() {
+        let (w, h) = (1703_u32, 1406_u32);
+        let px = usize::try_from(w).unwrap_or(0) * usize::try_from(h).unwrap_or(0);
+        // Mid-grey rather than black, so "blank" and "converted" are distinguishable: a
+        // failed conversion returns zeroed planes, and zero is a legitimate luma value.
+        let bgra = vec![128_u8; px * 4];
+
+        let frame = bgra_to_i420(w, h, &bgra);
+
+        assert_eq!(frame.width(), w);
+        assert_eq!(frame.height(), h);
+        assert!(
+            frame.y().iter().any(|&v| v != 0),
+            "an odd-width frame converted to an all-zero luma plane, which is the blank \
+             frame this test exists to catch"
+        );
+    }
+
+    /// Odd dimensions must survive the self-view halving too.
+    #[test]
+    fn an_odd_width_frame_can_be_halved() {
+        let (w, h) = (1703_u32, 1406_u32);
+        let px = usize::try_from(w).unwrap_or(0) * usize::try_from(h).unwrap_or(0);
+        let frame = bgra_to_i420(w, h, &vec![128_u8; px * 4]);
+
+        let halved = halve_i420(&frame).expect("an odd-width frame must halve");
+        assert_eq!(halved.width(), w / 2);
+        assert_eq!(halved.height(), h / 2);
+        assert!(halved.y().iter().any(|&v| v != 0));
     }
 }
