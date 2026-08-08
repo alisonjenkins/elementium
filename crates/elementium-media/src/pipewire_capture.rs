@@ -565,6 +565,8 @@ enum DropReason {
     QueueFull,
     /// Could not be decoded, or did not match the negotiated geometry.
     Unusable,
+    /// Arrived before the stream format was known, which happens once at stream start.
+    NotNegotiated,
 }
 
 /// Rolling per-frame cost of decoding captured buffers.
@@ -592,6 +594,13 @@ struct CaptureTiming {
     queue_full: u64,
     /// Dropped because the buffer could not be decoded or was malformed.
     unusable: u64,
+    /// Dropped because the format was not negotiated yet.
+    ///
+    /// Separate from `unusable` because it is not a fault: `PipeWire` delivers the first
+    /// buffer or two before `param_changed` reports the format, and there is nothing to do
+    /// with those but drop them. Counted together they read as a decode failure on every
+    /// stream start, which is what sent this measurement looking for a decoder bug.
+    not_negotiated: u64,
 }
 
 impl CaptureTiming {
@@ -610,6 +619,9 @@ impl CaptureTiming {
             DropReason::RateLimited => self.rate_limited = self.rate_limited.saturating_add(1),
             DropReason::QueueFull => self.queue_full = self.queue_full.saturating_add(1),
             DropReason::Unusable => self.unusable = self.unusable.saturating_add(1),
+            DropReason::NotNegotiated => {
+                self.not_negotiated = self.not_negotiated.saturating_add(1);
+            }
         }
     }
 
@@ -636,6 +648,7 @@ impl CaptureTiming {
                 rate_limited = self.rate_limited,
                 queue_full = self.queue_full,
                 unusable = self.unusable,
+                not_negotiated = self.not_negotiated,
                 "capture decode cost"
             );
             *self = Self::default();
@@ -869,10 +882,28 @@ fn attach_and_connect(
     let nominal_gap = 1_000_000_000_u64
         .checked_div(u64::from(target_fps.max(1)))
         .unwrap_or(0);
-    let min_gap = std::time::Duration::from_nanos(
-        nominal_gap.saturating_sub(nominal_gap.checked_div(8).unwrap_or(0)),
-    );
-    let mut last_decoded: Option<std::time::Instant> = None;
+    // How early a frame may arrive and still count for its slot.
+    //
+    // The fixed timeline removes the ratchet, but on its own it still drops a frame that
+    // arrives a millisecond before its deadline -- and the next one is then a full interval
+    // later, so that slot is lost outright. An eighth of the interval is comfortably more
+    // than the jitter observed from a camera and far less than the gap to the next rate one
+    // would plausibly run at, so a genuinely faster source is still limited.
+    let early_tolerance = std::time::Duration::from_nanos(nominal_gap.checked_div(8).unwrap_or(0));
+    let nominal_gap = std::time::Duration::from_nanos(nominal_gap);
+    // When the next frame is *due*, on a timeline of its own rather than measured from the
+    // last one accepted.
+    //
+    // Measuring from the last accepted frame ratchets: a frame that arrives late moves the
+    // window late with it, so the following one -- arriving on the camera's own cadence --
+    // is now early and is dropped, which moves the window again. A 30fps camera measured
+    // this way delivered 28.5fps with 19 of 319 buffers dropped as rate-limited, none of
+    // which the consumer was too slow for.
+    //
+    // Advancing a deadline by exactly the nominal gap keeps the reference fixed, so jitter
+    // costs nothing as long as the source's average rate is right, while a genuinely faster
+    // source is still limited to the target.
+    let mut next_due: Option<std::time::Instant> = None;
 
     let listener = stream
         .add_local_listener::<()>()
@@ -957,16 +988,30 @@ fn attach_and_connect(
             };
             timing.offered();
             if n.encoding == Encoding::Unsupported {
-                timing.dropped(DropReason::Unusable);
+                timing.dropped(DropReason::NotNegotiated);
                 return;
             }
             // Checked before anything is read out of the buffer, let alone decoded.
             let now = std::time::Instant::now();
-            if last_decoded.is_some_and(|t| now.saturating_duration_since(t) < min_gap) {
-                timing.dropped(DropReason::RateLimited);
-                return;
+            match next_due {
+                Some(due) if now.checked_add(early_tolerance).is_some_and(|t| t < due) => {
+                    timing.dropped(DropReason::RateLimited);
+                    return;
+                }
+                Some(due) => {
+                    // Advance by exactly one interval, so the cadence stays anchored. If the
+                    // stream stalled long enough that the next slot is already in the past,
+                    // resynchronise rather than emitting a burst to catch up -- the frames
+                    // for those slots do not exist.
+                    let stepped = due.checked_add(nominal_gap).unwrap_or(now);
+                    next_due = Some(if stepped > now {
+                        stepped
+                    } else {
+                        now.checked_add(nominal_gap).unwrap_or(now)
+                    });
+                }
+                None => next_due = now.checked_add(nominal_gap),
             }
-            last_decoded = Some(now);
 
             let datas = buffer.datas_mut();
             let Some(data) = datas.first_mut() else {
