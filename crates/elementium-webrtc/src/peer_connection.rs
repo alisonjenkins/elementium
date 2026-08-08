@@ -625,7 +625,16 @@ pub fn write_audio(
     Ok(())
 }
 
-/// Write a VP8-encoded video frame to the peer connection.
+/// The str0m codec matching one of ours.
+const fn str0m_codec(codec: elementium_codec::VideoCodec) -> Codec {
+    match codec {
+        elementium_codec::VideoCodec::Vp8 => Codec::Vp8,
+        elementium_codec::VideoCodec::H264 => Codec::H264,
+        elementium_codec::VideoCodec::Av1 => Codec::Av1,
+    }
+}
+
+/// Write an encoded video frame to the peer connection.
 ///
 /// # Errors
 ///
@@ -639,20 +648,26 @@ pub fn write_audio(
 /// construction always succeeds.
 pub fn write_video(
     pc: &mut PeerConnectionInner,
-    vp8_data: &WireMedia,
+    frame: &WireMedia,
+    codec: elementium_codec::VideoCodec,
 ) -> Result<(), crate::error::WebRtcError> {
-    let vp8_data = vp8_data.as_bytes();
+    let frame_data = frame.as_bytes();
     let mid = pc.video_mid.ok_or("No video mid configured")?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
         return Err(crate::error::WebRtcError::NoWriterForKind("video"));
     };
 
+    // The payload type follows the codec of the bytes in hand rather than an assumption
+    // about which codec that is. Writing VP8's payload type on an H.264 frame produces a
+    // stream the receiver decodes as VP8 and cannot make sense of, with nothing on either
+    // side reporting an error.
+    let wanted = str0m_codec(codec);
     let pt = writer
         .payload_params()
-        .find(|p| p.spec().codec == Codec::Vp8)
+        .find(|p| p.spec().codec == wanted)
         .map(str0m::format::PayloadParams::pt)
-        .ok_or("No VP8 payload type negotiated")?;
+        .ok_or_else(|| format!("No {} payload type negotiated", codec.sdp_name()))?;
 
     // The RTP timestamp must describe when the frame was *captured*, on the 90kHz clock.
     //
@@ -678,7 +693,7 @@ pub fn write_video(
     let rtp_time = MediaTime::new(rtp_offset, NonZeroU32::new(90_000).unwrap().into());
 
     writer
-        .write(pt, now, rtp_time, vp8_data)
+        .write(pt, now, rtp_time, frame_data)
         .map_err(|e| format!("Failed to write video: {e}"))?;
 
     pc.video_frame_count = pc

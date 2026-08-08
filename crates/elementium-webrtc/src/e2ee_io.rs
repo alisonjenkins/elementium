@@ -44,6 +44,22 @@ impl EncryptionPolicy {
     }
 }
 
+/// How E2EE should frame a video frame of this codec.
+///
+/// `None` for AV1: livekit's frame cryptor refuses it outright (`av1 is not yet supported
+/// for end to end encryption`), so there is no framing an Element Call peer could undo. No
+/// AV1 frame can reach here today either -- the encoder for it does not exist -- but saying
+/// so in the type is better than a mapping that quietly picks VP8's rules for it.
+pub(crate) const fn video_media_kind(
+    codec: elementium_codec::VideoCodec,
+) -> Option<E2eeMediaKind> {
+    match codec {
+        elementium_codec::VideoCodec::Vp8 => Some(E2eeMediaKind::VideoVp8),
+        elementium_codec::VideoCodec::H264 => Some(E2eeMediaKind::VideoH264),
+        elementium_codec::VideoCodec::Av1 => None,
+    }
+}
+
 /// Encrypt an outbound frame if E2EE is active, or drop it with a warning if encryption is
 /// configured but fails -- fail-closed, never sends plaintext when E2EE is supposed to be
 /// protecting the frame.

@@ -27,8 +27,14 @@ pub enum IoCommand {
     /// Write an encoded Opus frame to the peer connection. Carries [`PlaintextMedia`]
     /// so it cannot reach the socket without passing through encryption first.
     WriteAudio(PlaintextMedia),
-    /// Write an encoded VP8 frame to the peer connection. See [`IoCommand::WriteAudio`].
-    WriteVideo(PlaintextMedia),
+    /// Write an encoded video frame to the peer connection. See [`IoCommand::WriteAudio`].
+    ///
+    /// The codec travels with the frame rather than being assumed. Two things downstream
+    /// need it and get it wrong in different ways: the payload type written into the RTP
+    /// header, and how much of the frame E2EE leaves in the clear. The second is invisible
+    /// to the sender -- a frame framed by the wrong codec's rules is one only the peer
+    /// notices, by being unable to authenticate it.
+    WriteVideo(PlaintextMedia, elementium_codec::VideoCodec),
     /// Shut down the I/O loop.
     Shutdown,
 }
@@ -310,13 +316,20 @@ fn drain_io_commands(
                     }
                 }
             }
-            Ok(IoCommand::WriteVideo(vp8_data)) => {
-                let Some(data) = encrypt_or_drop(e2ee, vp8_data, E2eeMediaKind::VideoVp8, "video")
-                else {
+            Ok(IoCommand::WriteVideo(frame, codec)) => {
+                let Some(kind) = crate::e2ee_io::video_media_kind(codec) else {
+                    tracing::warn!(
+                        reason = "no_e2ee_framing_for_codec",
+                        codec = codec.sdp_name(),
+                        "Dropping outbound video frame: this codec has no E2EE framing"
+                    );
+                    continue;
+                };
+                let Some(data) = encrypt_or_drop(e2ee, frame, kind, "video") else {
                     continue;
                 };
                 let mut pc = lock_pc(handle);
-                if let Err(e) = peer_connection::write_video(&mut pc, &data) {
+                if let Err(e) = peer_connection::write_video(&mut pc, &data, codec) {
                     tracing::debug!("write_video: {e}");
                 }
             }

@@ -481,9 +481,10 @@ impl LiveKitRoom {
     pub async fn write_video(
         &self,
         data: elementium_types::PlaintextMedia,
+        codec: elementium_codec::VideoCodec,
     ) -> Result<(), crate::error::WebRtcError> {
         self.transport
-            .send_command(TransportCommand::WriteVideo(data))
+            .send_command(TransportCommand::WriteVideo(data, codec))
             .await
     }
 
@@ -539,7 +540,7 @@ fn spawn_media_forwarder(cmd_tx: mpsc::Sender<TransportCommand>) -> mpsc::Sender
             while let Some(cmd) = media_rx.recv().await {
                 let transport_cmd = match cmd {
                     IoCommand::WriteAudio(data) => TransportCommand::WriteAudio(data),
-                    IoCommand::WriteVideo(data) => TransportCommand::WriteVideo(data),
+                    IoCommand::WriteVideo(data, codec) => TransportCommand::WriteVideo(data, codec),
                     IoCommand::Shutdown => break,
                 };
 
@@ -1132,9 +1133,10 @@ mod media_forwarder_tests {
             .await
             .expect("forwarder is running");
         media_tx
-            .send(IoCommand::WriteVideo(PlaintextMedia::from_encoder(vec![
-                4, 5,
-            ])))
+            .send(IoCommand::WriteVideo(
+                PlaintextMedia::from_encoder(vec![4, 5]),
+                elementium_codec::VideoCodec::Vp8,
+            ))
             .await
             .expect("forwarder is running");
 
@@ -1143,7 +1145,7 @@ mod media_forwarder_tests {
             other => panic!("expected WriteAudio, got {}", describe(other.as_ref())),
         }
         match cmd_rx.recv().await {
-            Some(TransportCommand::WriteVideo(data)) => assert_eq!(data.as_bytes(), &[4, 5]),
+            Some(TransportCommand::WriteVideo(data, _)) => assert_eq!(data.as_bytes(), &[4, 5]),
             other => panic!("expected WriteVideo, got {}", describe(other.as_ref())),
         }
     }
@@ -1191,7 +1193,7 @@ mod media_forwarder_tests {
     fn describe(cmd: Option<&TransportCommand>) -> &'static str {
         match cmd {
             Some(TransportCommand::WriteAudio(_)) => "WriteAudio",
-            Some(TransportCommand::WriteVideo(_)) => "WriteVideo",
+            Some(TransportCommand::WriteVideo(..)) => "WriteVideo",
             Some(TransportCommand::Shutdown) => "Shutdown",
             None => "channel closed",
         }

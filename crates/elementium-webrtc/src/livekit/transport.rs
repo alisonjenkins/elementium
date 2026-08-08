@@ -39,9 +39,9 @@ pub enum TransportCommand {
     /// [`elementium_types::PlaintextMedia`] so it cannot reach the socket without
     /// passing through encryption first.
     WriteAudio(elementium_types::PlaintextMedia),
-    /// Write an encoded VP8 video frame to the Publisher PC. See
-    /// [`TransportCommand::WriteAudio`].
-    WriteVideo(elementium_types::PlaintextMedia),
+    /// Write an encoded video frame to the Publisher PC, in the codec named alongside it.
+    /// See [`TransportCommand::WriteAudio`] and [`crate::engine::IoCommand::WriteVideo`].
+    WriteVideo(elementium_types::PlaintextMedia, elementium_codec::VideoCodec),
     /// Shut down the transport.
     Shutdown,
 }
@@ -267,10 +267,20 @@ impl Transport {
     }
 }
 
+/// What a write is, carrying whatever the rest of the path needs to know about it.
+///
+/// The video codec travels here rather than being assumed, because two decisions downstream
+/// depend on it: the RTP payload type, and how much of the frame E2EE leaves in the clear.
+#[derive(Clone, Copy)]
+enum WriteKind {
+    Audio,
+    Video(elementium_codec::VideoCodec),
+}
+
 /// Internal command for the Publisher I/O loop.
 enum PcCommand {
     WriteAudio(elementium_types::PlaintextMedia),
-    WriteVideo(elementium_types::PlaintextMedia),
+    WriteVideo(elementium_types::PlaintextMedia, elementium_codec::VideoCodec),
     Shutdown,
 }
 
@@ -309,16 +319,16 @@ fn pc_io_loop(
                             &handle,
                             e2ee.as_context(),
                             data,
-                            E2eeMediaKind::Audio,
+                            WriteKind::Audio,
                             &mut audio_publish,
                         );
                     }
-                    Ok(PcCommand::WriteVideo(data)) => {
+                    Ok(PcCommand::WriteVideo(data, codec)) => {
                         write_encrypted_or_drop(
                             &handle,
                             e2ee.as_context(),
                             data,
-                            E2eeMediaKind::VideoVp8,
+                            WriteKind::Video(codec),
                             &mut video_publish,
                         );
                     }
@@ -433,14 +443,29 @@ fn write_encrypted_or_drop(
     handle: &PeerConnectionHandle,
     e2ee: Option<&E2eeContext>,
     data: elementium_types::PlaintextMedia,
-    kind: E2eeMediaKind,
+    what: WriteKind,
     counters: &mut PublishCounters,
 ) {
-    let label = match kind {
-        E2eeMediaKind::Audio => "audio",
-        E2eeMediaKind::VideoVp8 | E2eeMediaKind::VideoH264 => "video",
+    let label = match what {
+        WriteKind::Audio => "audio",
+        WriteKind::Video(_) => "video",
     };
     counters.offered = counters.offered.saturating_add(1);
+
+    let kind = match what {
+        WriteKind::Audio => E2eeMediaKind::Audio,
+        WriteKind::Video(codec) => {
+            let Some(kind) = crate::e2ee_io::video_media_kind(codec) else {
+                counters.encrypt_dropped = counters.encrypt_dropped.saturating_add(1);
+                counters.last_failure = Some(format!(
+                    "{} has no E2EE framing a peer could undo",
+                    codec.sdp_name()
+                ));
+                return;
+            };
+            kind
+        }
+    };
 
     let Some(data) = crate::e2ee_io::encrypt_or_drop(e2ee, data, kind, label) else {
         counters.encrypt_dropped = counters.encrypt_dropped.saturating_add(1);
@@ -456,11 +481,9 @@ fn write_encrypted_or_drop(
 
     let result = {
         let mut pc = lock_pc(handle);
-        match kind {
-            E2eeMediaKind::Audio => peer_connection::write_audio(&mut pc, &data),
-            E2eeMediaKind::VideoVp8 | E2eeMediaKind::VideoH264 => {
-                peer_connection::write_video(&mut pc, &data)
-            }
+        match what {
+            WriteKind::Audio => peer_connection::write_audio(&mut pc, &data),
+            WriteKind::Video(codec) => peer_connection::write_video(&mut pc, &data, codec),
         }
     };
     match result {
@@ -526,8 +549,8 @@ async fn transport_dispatch(
                     Some(TransportCommand::WriteAudio(data)) => {
                         let _ = pub_cmd_tx.send(PcCommand::WriteAudio(data)).await;
                     }
-                    Some(TransportCommand::WriteVideo(data)) => {
-                        let _ = pub_cmd_tx.send(PcCommand::WriteVideo(data)).await;
+                    Some(TransportCommand::WriteVideo(data, codec)) => {
+                        let _ = pub_cmd_tx.send(PcCommand::WriteVideo(data, codec)).await;
                     }
                     Some(TransportCommand::Shutdown) => {
                         let _ = pub_cmd_tx.send(PcCommand::Shutdown).await;

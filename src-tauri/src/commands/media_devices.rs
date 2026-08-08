@@ -843,6 +843,11 @@ fn encode_and_send<E: VideoEncoder>(
     frame: &elementium_media::captured_frame::CapturedFrame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
+    // Asked of the encoder rather than of `ActiveCodec`: the encoder is what produced these
+    // bytes, and it may still be the previous one for a frame or two after the SFU asks for
+    // a change. The payload type and the E2EE framing both follow from this, and both are
+    // wrong in ways nothing local would notice if it named a codec the bytes are not in.
+    let codec = encoder.codec();
     // The compressed bytes go straight to the encoder where it can take them, which on a
     // GPU with a JPEG block means the CPU never touches a pixel of this frame. `None` says
     // it cannot, and then the frame is decoded here as it always was.
@@ -863,7 +868,7 @@ fn encode_and_send<E: VideoEncoder>(
                 && let Some(tx) = guard.as_ref()
             {
                 for packet in packets {
-                    let _ = tx.try_send(IoCommand::WriteVideo(packet.data));
+                    let _ = tx.try_send(IoCommand::WriteVideo(packet.data, codec));
                 }
             }
         }
