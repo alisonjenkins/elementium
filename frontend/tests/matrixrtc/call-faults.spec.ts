@@ -61,6 +61,14 @@ const FIXTURE = path.join(REPO, "target/test-env-fixture.json");
  */
 const AUDIBLE_WITHIN_MS = 30_000;
 
+/**
+ * How old the call's key must be before a joiner causes a rotation.
+ *
+ * Element Call reuses a key younger than ten seconds when someone joins. Waiting past that
+ * is the difference between testing a rotation and testing nothing.
+ */
+const KEY_AGE_FOR_ROTATION_MS = 12_000;
+
 interface Fixture {
   room_id: string;
   participants: Credentials[];
@@ -80,6 +88,11 @@ test.afterAll(async () => {
   await server?.close();
   server = null;
 });
+
+/** The highest key index this participant has installed for anyone, or -1 for none. */
+function highestKeyIndex(keys: { keyIndex: number }[]): number {
+  return keys.reduce((max, k) => Math.max(max, k.keyIndex), -1);
+}
 
 /** Wait until this participant is receiving usable audio from `expected` others. */
 async function expectHears(p: Participant, expected: number, label: string): Promise<void> {
@@ -210,6 +223,63 @@ test.describe("MatrixRTC call faults", () => {
 
       await expectHears(joined[0]!, 1, "after the third participant left");
       await expectHears(joined[1]!, 1, "after the third participant left");
+    } finally {
+      await hangUp(joined, contexts);
+    }
+  });
+
+  /**
+   * A fourth participant joining a call that is already running.
+   *
+   * The leaver case above rotates unconditionally. A joiner does not: Element Call keeps the
+   * existing key if it is young, on the reasoning that a key distributed moments ago has not
+   * yet been anywhere the new arrival could have seen it. So a test that joins the fourth
+   * participant immediately exercises no rotation at all and passes for a reason unrelated to
+   * what it claims to check.
+   *
+   * Hence the wait. Twelve seconds is over the ten-second threshold with enough margin that a
+   * loaded machine does not quietly turn this back into the no-rotation case.
+   */
+  test("everyone keeps hearing each other when a fourth participant joins", async ({
+    browser,
+  }) => {
+    const four = await freshSessions(4);
+    const roomId = await createCallRoom(four, "fourth joins");
+    const contexts = await Promise.all(four.map(() => browser.newContext()));
+    const joined: Participant[] = [];
+    try {
+      for (const [i, who] of four.slice(0, 3).entries()) {
+        const p = await openRoom(contexts[i]!, server!, who, roomId);
+        await joinCall(p);
+        joined.push(p);
+      }
+      await expectHears(joined[0]!, 2, "before the fourth joins");
+
+      // See the note above: without this the join is too soon to rotate anything.
+      await joined[0]!.page.waitForTimeout(KEY_AGE_FOR_ROTATION_MS);
+
+      // What "a rotation happened" looks like from inside a participant: a key installed at
+      // an index higher than any it held before. Recorded so the assertion after the join can
+      // show the rotation occurred rather than assume it.
+      const highestBefore = highestKeyIndex(await keysInstalled(joined[0]!));
+
+      const fourth = await openRoom(contexts[3]!, server!, four[3]!, roomId);
+      await joinCall(fourth);
+      joined.push(fourth);
+
+      // Without this the test could pass with no rotation at all -- which is precisely the
+      // failure mode the wait above exists to avoid, and it would be invisible.
+      await expect
+        .poll(async () => highestKeyIndex(await keysInstalled(joined[0]!)), {
+          timeout: AUDIBLE_WITHIN_MS,
+        })
+        .toBeGreaterThan(highestBefore);
+
+      // The three who were already in the call must survive a rotation they did not cause,
+      // and the arrival must be heard by all of them rather than only seen.
+      await expectHears(joined[0]!, 3, "after the fourth joined");
+      await expectHears(joined[1]!, 3, "after the fourth joined");
+      await expectHears(fourth, 3, "the fourth participant");
     } finally {
       await hangUp(joined, contexts);
     }
