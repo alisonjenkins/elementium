@@ -68,8 +68,14 @@ function withoutShims(html: string): string {
  * E2EE worker, and therefore anything these tests measure about encryption -- require a
  * secure context, and loopback counts as one where a LAN address does not.
  */
-export async function startElementWeb(): Promise<ElementWebServer> {
+export async function startElementWeb(
+  options: { keepShims?: boolean } = {},
+): Promise<ElementWebServer> {
   const testConfig = await readFile(TEST_CONFIG, "utf8");
+  // Every other test here wants Element Web *without* our shims, for the reason in this
+  // module's header. The shim contract test is the exception and the only one: it exists to
+  // prove the injection took, so it must be served exactly as the application gets it.
+  const transform = options.keepShims ? (html: string) => html : withoutShims;
 
   const httpd: Server = createServer((req, res) => {
     void (async () => {
@@ -98,7 +104,7 @@ export async function startElementWeb(): Promise<ElementWebServer> {
         if (pathname.endsWith(".html")) {
           const html = await readFile(file, "utf8");
           res.writeHead(200, { "content-type": MIME[".html"]! });
-          res.end(withoutShims(html));
+          res.end(transform(html));
           return;
         }
         const body = await readFile(file);

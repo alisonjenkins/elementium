@@ -20,6 +20,12 @@ interface ShimInstall {
    *      "Worker.prototype.postMessage", "Storage.prototype.getItem"
    */
   detail: string;
+  /**
+   * True when the shim deliberately declined because the environment does not need it —
+   * the secret storage shim outside Tauri, for instance. Distinct from `installed: false`,
+   * which means it tried and did not attach.
+   */
+  skipped?: boolean;
   /** Present only when `installed` is false: why not. */
   reason?: string;
 }
@@ -37,15 +43,28 @@ One per module, named after the module rather than the API it patches, so the ma
 "which of our things is missing":
 
 `console-bridge`, `secret-storage`, `webrtc`, `media-devices`, `e2ee-bridge`,
-`membership-log`, `livekit-bridge`, `canvas-track`
+`membership-log`, `livekit-bridge`
+
+Seven, not eight. `canvas-track.ts` was in the first draft of this contract and does not
+belong: it is a helper used by the WebRTC shim, with no global of its own to attach to.
+Reporting an install for it would have meant inventing one.
 
 ## Rules
 
 - Every key is present after `index.ts` finishes, whether or not the shim succeeded. A
   missing key means the module did not run at all, which is a different fault from
   `installed: false` and must not be reportable as the same thing.
-- `installed: false` carries a `reason`. A shim that declines to install because the
-  environment does not need it is a legitimate outcome; one that fails silently is not.
+- `installed: false` carries a `reason`, and `skipped: true` when declining was correct.
+  The secret storage shim bails out without Tauri IPC, which is right in a plain browser and
+  must not read as a failure to attach — collapsing the two would make the test either fail
+  in Chromium or pass over a real fault.
+- **Verified, not self-reported.** `installed` comes from a predicate evaluated *after*
+  setup returns, not from setup having run. The predicate asks "is this still the browser's
+  own implementation", by stringifying the target and looking for `[native code]` — blunt,
+  and right, because the question is whether anything replaced the built-in rather than
+  whether it is our particular function. A first attempt compared the class name, which
+  passes in a dev server and fails on every minified build: the wrong way round for a
+  release gate.
 - The map is set in **both** documents — the main window and the Element Call widget frame.
   They are separately injected, and the widget is the half that carries the media.
 - **No key material, tokens, or payloads.** `detail` names an API, never a value. The
