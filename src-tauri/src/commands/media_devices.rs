@@ -2436,6 +2436,46 @@ fn generate_track_id() -> String {
 }
 
 #[cfg(test)]
+mod mute_flag_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::dropped_because_muted;
+
+    /// The capture loops ask this before touching a frame, and the answer decides whether
+    /// media reaches the wire. Muting was a local fact for a long time -- the icon changed
+    /// and the microphone kept publishing -- so the flag having the sense it claims is
+    /// worth pinning even though the function is one line.
+    #[test]
+    fn a_raised_flag_drops_the_frame_and_a_lowered_one_does_not() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!dropped_because_muted(&flag), "an unmuted track must publish");
+
+        flag.store(true, Ordering::Relaxed);
+        assert!(dropped_because_muted(&flag), "a muted track must not publish");
+
+        flag.store(false, Ordering::Relaxed);
+        assert!(!dropped_because_muted(&flag), "unmuting must resume publishing");
+    }
+
+    /// The flag is shared with the capture thread by handle, so a change made through one
+    /// clone has to be visible through another. If it were copied instead, muting would
+    /// set a flag nobody reads -- which is precisely the bug, one level down.
+    #[test]
+    fn the_flag_is_shared_not_copied() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let held_by_pipeline = Arc::clone(&flag);
+
+        flag.store(true, Ordering::Relaxed);
+
+        assert!(
+            dropped_because_muted(&held_by_pipeline),
+            "the capture loop must see a mute set through the handle the command holds"
+        );
+    }
+}
+
+#[cfg(test)]
 mod camera_device_id_tests {
     use super::camera_node_id;
 
