@@ -252,11 +252,48 @@ on it, and watch the change appear at the other endpoint.
 
 **Proves**: FR-005 and SC-003, which are privacy properties rather than features.
 
-1. Share a single window.
-2. Change content in a **different** window — play a video, resize something.
-3. Confirm the receiver sees no change.
+**Measured 2026-08-08, and it passes.** Run it with two scripted windows and compare the
+captured pixels, rather than by eye:
 
-**Pass**: nothing from outside the chosen window reaches the receiver.
+```sh
+# two windows that each sit still until their flag file appears, then fill themselves
+setsid foot --title=SHARE-A-1 sh -c '...tick until $F/goa, then fill with #...' &
+setsid foot --title=SHARE-B-1 sh -c '...tick until $F/gob, then fill with @...' &
+
+CAPTURE_DUMP_SERIES=/tmp/sc3_ CAPTURE_SECONDS=40 \
+  nix develop -c cargo run -p elementium-media --example capture_attribution -- --screen
+# pick SHARE-A-1, then: touch $F/gob at t+8s, touch $F/goa at t+24s
+```
+
+Mean absolute pixel difference of each dumped frame against the first:
+
+| ~t | event | mean abs diff | pixels differing |
+|---|---|---|---|
+| 0–20s | the *other* window fills itself at t+8s | **0.00** | **0.0%** |
+| 25s | the *shared* window fills itself at t+24s | 0.07 | 0.0% |
+| 30s | " | 4.56 | 2.9% |
+| 35s | " | 4.81 | 3.1% |
+
+**The second half is not decoration, it is what makes the first half mean anything.** A
+comparison that cannot detect change would report 0.00 against a frozen capture, a black
+frame, or a stream that died twenty seconds ago. The control shows the same measurement
+moving when the *shared* window changes, so the zero above is a real negative.
+
+**Two traps, both hit while doing this:**
+
+- **A completely static window produces no frames at all.** A compositor emits on damage, so
+  a window that never changes never gets captured, and the receiver's video element sits at
+  `readyState=0` while the share is working perfectly. The scripted windows tick a
+  two-character clock for exactly this reason — far below the comparison's resolution, but
+  enough to keep frames flowing.
+- **Give the windows unique titles per run.** A stale window from an earlier attempt is
+  indistinguishable in the picker, and picking one yields a capture that ticks forever and
+  never responds to the flag files — which reads exactly like "the change did not leak".
+
+**Not automatable in the browser harness**, and this was measured rather than assumed:
+Playwright's Chromium takes the workspace on a tiling compositor, the scripted windows stop
+being composited, and capture starves — 7 packets sent against 44 keyframe requests. Hence
+the check lives at the capture side, where nothing competes for the screen.
 
 **Why the negative test is the test**: confirming the chosen window appears proves only
 that capture works. Confirming that the *unchosen* window does not appear is the whole

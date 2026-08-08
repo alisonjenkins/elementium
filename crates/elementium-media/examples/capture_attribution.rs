@@ -94,13 +94,19 @@ fn dump_first_frame(frame: &elementium_media::captured_frame::CapturedFrame) {
     let Ok(path) = std::env::var("CAPTURE_DUMP") else {
         return;
     };
+    dump_to(frame, &path);
+}
+
+/// Write one frame's luma plane to `path` as a binary PGM.
+#[allow(clippy::print_stdout)]
+fn dump_to(frame: &elementium_media::captured_frame::CapturedFrame, path: &str) {
     let elementium_media::captured_frame::CapturedFrame::Planar(planar) = frame else {
-        println!("  (first frame is undecoded JPEG; not dumping)");
+        println!("  (frame is undecoded JPEG; not dumping)");
         return;
     };
     let mut out = format!("P5\n{} {}\n255\n", planar.width(), planar.height()).into_bytes();
     out.extend_from_slice(planar.y());
-    match std::fs::write(&path, &out) {
+    match std::fs::write(path, &out) {
         Ok(()) => println!("  wrote the first frame's luma plane to {path}"),
         Err(e) => println!("  could not write {path}: {e}"),
     }
@@ -113,12 +119,25 @@ fn dump_first_frame(frame: &elementium_media::captured_frame::CapturedFrame) {
 /// example is comparing the two, which is only valid if both are timed the same way.
 fn measure(try_recv: impl Fn() -> Option<elementium_media::captured_frame::CapturedFrame>) -> Measurement {
     let cpu_before = cpu_seconds();
-    let deadline = Instant::now().checked_add(Duration::from_secs(SECONDS)).unwrap_or_else(Instant::now);
+    let deadline = Instant::now().checked_add(Duration::from_secs(seconds())).unwrap_or_else(Instant::now);
     let mut received = 0_u64;
+    let started = Instant::now();
+    let mut last_slot = u64::MAX;
     let mut first_at: Option<Instant> = None;
     let mut last_at: Option<Instant> = None;
     while Instant::now() < deadline {
         if let Some(frame) = try_recv() {
+            if let Ok(prefix) = std::env::var("CAPTURE_DUMP_SERIES") {
+                // A numbered series rather than one frame, so a run can be compared against
+                // itself over time: share one window, change something else, and see
+                // whether the captured picture moved. That is SC-003's actual claim, and no
+                // counter can answer it.
+                let slot = Instant::now().saturating_duration_since(started).as_secs() / 5;
+                if slot != last_slot {
+                    last_slot = slot;
+                    dump_to(&frame, &format!("{prefix}{slot:02}.pgm"));
+                }
+            }
             if received == 0 {
                 // The first frame, written out as a greyscale image when asked for.
                 //
@@ -249,6 +268,15 @@ fn cpu_seconds() -> f64 {
 
 const TARGET_FPS: u32 = 30;
 const SECONDS: u64 = 15;
+
+/// Override the measurement length, for runs that orchestrate something around the capture
+/// (see `CAPTURE_DUMP_SERIES`, which needs time for a change to be made and observed).
+fn seconds() -> u64 {
+    std::env::var("CAPTURE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SECONDS)
+}
 
 #[allow(clippy::print_stdout)]
 /// Enumerate cameras, pick a delivering one, and measure it.

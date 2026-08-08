@@ -51,6 +51,8 @@ import { createServer } from "node:http";
 import { createHmac } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -1219,12 +1221,17 @@ test.describe("screen share (spec 008)", () => {
   test("a single-window share carries nothing from outside that window", async () => {
     test.skip(
       true,
-      "SC-003 needs a pixel-level comparison this harness has no facility for -- " +
-        "framesDecoded and the other getStats() counters cannot distinguish scoped capture " +
-        "from unscoped capture, only 'something arrived' from 'nothing did'. See the doc " +
-        "comment immediately above for the reasoning and the manual procedure this stands " +
-        "in for until receiver.html gains a pixel-sampling hook and a way to script a " +
-        "second, independently changing window.",
+      "SC-003 is proven, but not from here: attempted in this harness and it cannot work. " +
+        "The test must script two windows and change one of them, and this compositor tiles " +
+        "-- Playwright's Chromium takes the workspace, the scripted windows stop being " +
+        "composited, and a window that is not being drawn produces no damage and therefore " +
+        "no frames at all. Measured: the publisher sent 7 packets and stopped while the SFU " +
+        "asked for a keyframe 44 times. The pixel comparison lives at the capture side " +
+        "instead, where nothing competes for the screen: see quickstart.md Level 5, which " +
+        "records 0.00 mean pixel change from content outside the shared window against 4.56 " +
+        "from content inside it. `window.__videoFingerprint()` in receiver.html is kept: it " +
+        "is what a receiver-side pixel assertion would use once a headless capture source " +
+        "exists that does not need a composited window.",
     );
   });
 });
