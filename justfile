@@ -84,6 +84,18 @@ app-join:
         nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
             cargo tauri dev
 
+# Move to an Element Web release, and find out whether we still work on it.
+#
+# Fetches the version, rebuilds and re-injects the shims, and runs the shim contract checks
+# in a real browser. Writes the pin only if all of that passes -- a half-applied upgrade is
+# worse than none, because the next person cannot tell which version they are debugging.
+#
+# It answers "do the shims install", not "do calls work". The second needs media, and the
+# media check is `just call-peers` plus `just app-join`; see
+# specs/007-element-web-upgrade/quickstart.md.
+element-web-sync version:
+    ./scripts/element-web-sync.sh {{version}}
+
 # Leave and forget every room the test participants are in.
 #
 # Each provision creates a room and each call test creates another, so they pile up. The

@@ -38,9 +38,9 @@ attributed.
 
 ## Phase 4: Staying in sync is one command (US3)
 
-- [ ] T012 [US3] `just element-web-sync <version>` in `justfile`: fetch the named release, re-apply patches and config, run the Phase 2 shim contract checks, and print a verdict. One command, and a report that names what broke rather than a build log to read
-- [ ] T013 [US3] Have the sync report the upstream release notes range between the pinned version and the target, so the person running it can see what changed without leaving the terminal. Fourteen releases of blind diff is why this one waited so long
-- [ ] T014 [P] [US3] Document in `docs/element-web.md`: how to bump a version, what to run, what to do when a shim contract fails, which failures mean "upstream moved" rather than "we broke it", and how to revert the pin when an upgrade cannot be fixed quickly (`fetch-element-web.sh` wipes `element-web-dist`, so the revert is a re-fetch rather than an undo). **Include the rule for where a change belongs** — host integration stays a runtime shim, a product change becomes a commit on the patch branch, packaging stays in the patch script — with the test for each, from `spec.md`. That rule is what makes the patch set stay small, and it is the first thing to be forgotten if it lives only in a spec
+- [X] T012 [US3] `just element-web-sync <version>` in `justfile`: fetch the named release, re-apply patches and config, run the Phase 2 shim contract checks, and print a verdict. One command, and a report that names what broke rather than a build log to read
+- [X] T013 [US3] Have the sync report the upstream release notes range between the pinned version and the target, so the person running it can see what changed without leaving the terminal. Fourteen releases of blind diff is why this one waited so long
+- [X] T014 [P] [US3] Document in `docs/element-web.md`: how to bump a version, what to run, what to do when a shim contract fails, which failures mean "upstream moved" rather than "we broke it", and how to revert the pin when an upgrade cannot be fixed quickly (`fetch-element-web.sh` wipes `element-web-dist`, so the revert is a re-fetch rather than an undo). **Include the rule for where a change belongs** — host integration stays a runtime shim, a product change becomes a commit on the patch branch, packaging stays in the patch script — with the test for each, from `spec.md`. That rule is what makes the patch set stay small, and it is the first thing to be forgotten if it lives only in a spec
 
 ## Phase 5: Carrying patches, and giving them back (US4, US5)
 
