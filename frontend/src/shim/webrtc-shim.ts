@@ -8,6 +8,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
+import {
+  describeJoinRequest,
+  describeRequest,
+  describeResponse,
+  signalBytes,
+} from "./livekit-signal";
 
 interface PeerConnectionResult {
   id: string;
@@ -876,6 +882,16 @@ export function setupWebRtcShim(): void {
         let bufferedOffers: (string | ArrayBufferLike | Blob | ArrayBufferView)[] = [];
         let reorderTimer: ReturnType<typeof setTimeout> | null = null;
 
+        if (trace) {
+          // Which connection flow is in use, and what we packed into it. A protocol-16
+          // client has no join request at all, so its absence is as informative as its
+          // contents -- see `livekit-signal.ts`.
+          const join = describeJoinRequest(wsUrl);
+          console.log(
+            `[LKSignal] connect: ${join ?? "no join_request (pre-protocol-17 flow)"}`,
+          );
+        }
+
         this.addEventListener("open", () => {
           console.log(`[Elementium] WebSocket opened: ${wsUrl}`);
         });
@@ -893,20 +909,19 @@ export function setupWebRtcShim(): void {
         // Intercept incoming messages — detect subscriber offers from SFU
         this.addEventListener("message", (e) => {
           const idx = recvCount++;
-          let firstByte = -1;
-          if (e.data instanceof ArrayBuffer) {
-            const bytes = new Uint8Array(e.data);
-            firstByte = bytes.length > 0 ? bytes[0] : -1;
-            if (idx < 5) {
-              console.log(`[Elementium] WS recv #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte} FULL:`, Array.from(bytes));
+          const bytes = signalBytes(e.data);
+          const firstByte = bytes !== null && bytes.length > 0 ? bytes[0] : -1;
+          if (trace) {
+            if (bytes !== null) {
+              console.log(
+                `[LKSignal] recv #${idx} ${describeResponse(bytes)} (${bytes.byteLength} bytes)`,
+              );
+            } else if (e.data instanceof Blob) {
+              console.log(`[LKSignal] recv #${idx} blob (${e.data.size} bytes)`);
             } else {
-              console.log(`[Elementium] WS recv #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte}`, bytes.slice(0, 32));
+              // Never the message body: signalling text carries tokens and identities.
+              console.log(`[LKSignal] recv #${idx} text (${String(e.data).length} chars)`);
             }
-          } else if (e.data instanceof Blob) {
-            console.log(`[Elementium] WS recv #${idx}: blob ${e.data.size} bytes`);
-          } else {
-            const str = String(e.data);
-            console.log(`[Elementium] WS recv #${idx}: text ${str.length} chars`, str.slice(0, 200));
           }
 
           // If SFU sent a subscriber offer, mark that we need to answer it
@@ -937,28 +952,18 @@ export function setupWebRtcShim(): void {
           }
 
           // Determine the protobuf tag of the outgoing message
-          let firstByte = -1;
-          if (data instanceof ArrayBuffer) {
-            const bytes = new Uint8Array(data);
-            firstByte = bytes.length > 0 ? bytes[0] : -1;
-            if (idx < 5) {
-              console.log(`[Elementium] WS send #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte} FULL:`, Array.from(bytes));
+          const outBytes = signalBytes(data);
+          const firstByte = outBytes !== null && outBytes.length > 0 ? outBytes[0] : -1;
+          if (trace) {
+            if (outBytes !== null) {
+              console.log(
+                `[LKSignal] send #${idx} ${describeRequest(outBytes)} (${outBytes.byteLength} bytes)`,
+              );
+            } else if (data instanceof Blob) {
+              console.log(`[LKSignal] send #${idx} blob (${data.size} bytes)`);
             } else {
-              console.log(`[Elementium] WS send #${idx}: binary ${bytes.byteLength} bytes tag=${firstByte}`, bytes.slice(0, 32));
+              console.log(`[LKSignal] send #${idx} text (${String(data).length} chars)`);
             }
-          } else if (data instanceof Blob) {
-            console.log(`[Elementium] WS send #${idx}: blob ${data.size} bytes`);
-          } else if (ArrayBuffer.isView(data)) {
-            const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-            firstByte = bytes.length > 0 ? bytes[0] : -1;
-            if (idx < 5) {
-              console.log(`[Elementium] WS send #${idx}: view ${bytes.byteLength} bytes tag=${firstByte} FULL:`, Array.from(bytes));
-            } else {
-              console.log(`[Elementium] WS send #${idx}: view ${bytes.byteLength} bytes tag=${firstByte}`, bytes.slice(0, 32));
-            }
-          } else {
-            const str = String(data);
-            console.log(`[Elementium] WS send #${idx}: text ${str.length} chars`, str.slice(0, 200));
           }
 
           // Reorder logic: buffer publisher offers while subscriber answer is pending.
