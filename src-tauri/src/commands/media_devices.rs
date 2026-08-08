@@ -115,6 +115,94 @@ pub struct MediaState {
     /// handle to inherit a connection from. Remembering the room's sender here means a
     /// pipeline that starts at any point in a call is attached on startup.
     pub sfu_media_tx: Mutex<Option<tokio_mpsc::Sender<IoCommand>>>,
+    /// The screen share currently running, if any.
+    ///
+    /// Held separately from `pipelines` because a share owns something a capture pipeline
+    /// does not: a portal session, which has to be closed when the share ends. Keeping it
+    /// here is what makes teardown complete rather than approximate -- the previous code
+    /// dropped every handle to the session at the end of the function that created it, so
+    /// nothing ever told the portal the share was over.
+    pub share: Mutex<Option<ShareHandle>>,
+}
+
+/// A running screen share: the track it feeds, and the portal session behind it.
+pub struct ShareHandle {
+    pub track_id: String,
+    pub session: elementium_screen::ShareSession,
+}
+
+/// Start a video pipeline fed by a portal-granted screencast node.
+///
+/// The camera equivalent lives inside `get_user_media`; this is the same sequence with the
+/// device-release wait left out, since a screencast node has no exclusive hardware to free.
+///
+/// # Errors
+///
+/// Returns a description if the pipeline could not be recorded in [`MediaState`].
+pub fn start_screen_share_pipeline(
+    media_state: &MediaState,
+    video_frames: &VideoFrameBuffer,
+    session: &elementium_screen::ShareSession,
+) -> Result<String, String> {
+    let key = MediaTrackKey::screen_share();
+    let track_id = format!("video-{}", generate_track_id());
+
+    // Same inheritance as the camera path: a share restarted mid-call keeps feeding the
+    // connection it was already attached to, rather than going quiet until the next
+    // renegotiation happens to occur.
+    let previous = stop_pipeline_inheriting_connection(&media_state.pipelines, key);
+    let connection = connection_for_new_pipeline(previous.connection, media_state);
+
+    let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
+        Arc::new(Mutex::new(connection));
+    let encode_tx_clone = encode_tx.clone();
+    let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let keyframe_requested_clone = keyframe_requested.clone();
+    let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
+    let active_codec_clone = active_codec.clone();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+    let tid = track_id.clone();
+    let frames = video_frames.clone();
+    let node_id = session.node_id();
+    let span = tracing::Span::current();
+    std::thread::spawn(move || {
+        let _guard = span.enter();
+        video_pipeline_loop(
+            key,
+            &tid,
+            VideoCaptureSource::Screencast { node_id },
+            &frames,
+            &encode_tx_clone,
+            &keyframe_requested_clone,
+            &active_codec_clone,
+            &stop_rx,
+        );
+    });
+
+    media_state
+        .pipelines
+        .lock()
+        .map_err(|_| "pipeline map lock poisoned".to_owned())?
+        .insert(
+            key,
+            PipelineHandle {
+                key,
+                track_id: track_id.clone(),
+                stop_tx,
+                encode_tx,
+                extras: PipelineExtras::Video {
+                    keyframe_requested,
+                    active_codec,
+                },
+            },
+        );
+
+    if let Ok(mut tracks) = media_state.active_tracks.lock() {
+        tracks.push(TrackId(track_id.clone()));
+    }
+
+    Ok(track_id)
 }
 
 #[command]
@@ -340,17 +428,19 @@ pub async fn get_user_media(
                 tracing::info!("Waiting for previous camera to release device...");
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            camera_pipeline_loop(
+            video_pipeline_loop(
                 MediaTrackKey::camera(),
                 &tid,
+                VideoCaptureSource::Camera {
+                    width: req_width,
+                    height: req_height,
+                    fps: req_fps,
+                },
                 &video_frames,
                 &encode_tx_clone,
                 &keyframe_requested_clone,
                 &active_codec_clone,
                 &stop_rx,
-                req_width,
-                req_height,
-                req_fps,
             );
         });
 
@@ -399,6 +489,22 @@ pub async fn stop_track(
     {
         let _ = handle.stop_tx.send(());
         tracing::info!(%track_id, %key, "capture pipeline stopped");
+    }
+
+    // A share is one thing to the user, so it is one teardown: stopping its video track
+    // must also close the portal session, or the compositor goes on believing the share is
+    // live and the indicator stays lit after the call has moved on.
+    //
+    // Taken from under the lock before awaiting, for the same Send reason as in
+    // `get_display_media`.
+    let ended_share = media_state
+        .share
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take_if(|s| s.track_id == track_id.0));
+    if let Some(share) = ended_share {
+        share.session.close().await;
+        tracing::info!(%track_id, "screen share torn down");
     }
 
     if let Ok(mut tracks) = media_state.active_tracks.lock() {
@@ -636,39 +742,94 @@ fn bitrate_for(width: u32, height: u32) -> u32 {
     u32::try_from(kbps.clamp(300, 4000)).unwrap_or(2000)
 }
 
-/// Background thread: reads camera frames, writes RGBA to `VideoFrameBuffer` for
-/// preview, and optionally VP8-encodes + sends to a peer connection.
+/// What a video pipeline is capturing, and what it needs to open it.
+///
+/// The rest of the pipeline -- encoder negotiation, keyframe policy, pacing, preview,
+/// E2EE-bound dispatch -- is identical for a camera and a shared screen, so the difference
+/// is confined to this one enum rather than to a second copy of the loop.
+#[derive(Debug, Clone, Copy)]
+pub enum VideoCaptureSource {
+    /// A camera, found by enumeration.
+    Camera {
+        width: Option<u32>,
+        height: Option<u32>,
+        fps: u32,
+    },
+    /// A `PipeWire` node the desktop portal already granted for screen capture.
+    Screencast { node_id: u32 },
+}
+
+impl VideoCaptureSource {
+    /// The geometry to negotiate an encoder against, before the source has reported its
+    /// own.
+    ///
+    /// A share has no requested size -- the user picked a monitor or a window and its size
+    /// is whatever it is -- so 1920x1080 stands in until the first frame says otherwise.
+    /// This decides only whether a hardware encoder is size-capable, not what is captured.
+    const fn negotiation_geometry(self) -> (u32, u32) {
+        match self {
+            Self::Camera { width, height, .. } => {
+                (unwrap_or_const(width, 1280), unwrap_or_const(height, 720))
+            }
+            Self::Screencast { .. } => (1920, 1080),
+        }
+    }
+
+    /// Open the source.
+    fn open(
+        self,
+        target: elementium_codec::EncodeTarget,
+    ) -> Result<elementium_media::video_source::VideoSource, String> {
+        use elementium_media::video_source::VideoSource;
+        match self {
+            Self::Camera { width, height, fps } => VideoSource::start_at(width, height, fps, target),
+            Self::Screencast { node_id } => VideoSource::start_screencast(node_id, target),
+        }
+    }
+
+    /// What to call this in a log line.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Camera { .. } => "camera",
+            Self::Screencast { .. } => "screencast",
+        }
+    }
+}
+
+/// `Option::unwrap_or` is not `const`; this is.
+const fn unwrap_or_const(value: Option<u32>, fallback: u32) -> u32 {
+    match value {
+        Some(v) => v,
+        None => fallback,
+    }
+}
+
+/// Background thread: reads frames from a video source, writes RGBA to `VideoFrameBuffer`
+/// for preview, and optionally encodes + sends them to a peer connection.
+///
+/// Serves the camera and the screen share both. They differ in how the source is opened and
+/// in nothing else, so a second copy of this loop would only be a second place for every
+/// future encode fix to be applied -- or forgotten.
 #[allow(clippy::too_many_arguments)]
-fn camera_pipeline_loop(
+fn video_pipeline_loop(
     key: MediaTrackKey,
     track_id: &str,
+    source: VideoCaptureSource,
     video_frames: &VideoFrameBuffer,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
     active_codec: &Arc<ActiveCodec>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
-    req_width: Option<u32>,
-    req_height: Option<u32>,
-    req_fps: u32,
 ) {
-    // Prefers PipeWire, falls back to V4L2. On a desktop where PipeWire holds the camera,
-    // V4L2 cannot work at all -- see `VideoSource`.
-    // Which format is worth asking the camera for depends on where the frames will be
-    // encoded, and the answer is not a small difference: MJPEG is the most expensive
-    // format on offer when the CPU decodes it and the cheapest when the GPU does. The
-    // requested geometry is used because negotiation has to happen before the camera has
-    // reported its own -- it decides only whether a hardware encoder is size-capable.
-    let target = elementium_codec::EncodeTarget::negotiated(
-        active_codec.get(),
-        req_width.unwrap_or(1280),
-        req_height.unwrap_or(720),
-    );
-    // Once per camera pipeline, so "is the GPU doing this" is answerable by reading a log
-    // rather than by re-deriving the selection policy from the codec, the geometry and what
-    // the driver reported. The three fields are what the policy actually decided on, and
-    // `capture_preference` is what it will ask the camera for as a result -- the whole point
-    // of the negotiation being that MJPEG is the worst format in software and the best on a
-    // GPU that decodes it.
+    // Which format is worth asking the source for depends on where the frames will be
+    // encoded, and the answer is not a small difference: MJPEG is the most expensive format
+    // on offer when the CPU decodes it and the cheapest when the GPU does.
+    let (neg_width, neg_height) = source.negotiation_geometry();
+    let target = elementium_codec::EncodeTarget::negotiated(active_codec.get(), neg_width, neg_height);
+    // Once per pipeline, so "is the GPU doing this" is answerable by reading a log rather
+    // than by re-deriving the selection policy from the codec, the geometry and what the
+    // driver reported. The three fields are what the policy actually decided on, and
+    // `capture_preference` is what it will ask the source for as a result.
     tracing::info!(
         codec = active_codec.get().sdp_name(),
         backend = ?target.backend,
@@ -676,14 +837,18 @@ fn camera_pipeline_loop(
         gpu_jpeg_decode = target.gpu_jpeg_decode,
         capture_preference = ?elementium_codec::capture_format::preference(target),
         track_id = %track_id,
+        source = source.label(),
         "video encode target negotiated"
     );
-    let capturer = match elementium_media::video_source::VideoSource::start_at(
-        req_width, req_height, req_fps, target,
-    ) {
+    let capturer = match source.open(target) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(reason = %e, track_id = %track_id, "Failed to start camera");
+            tracing::error!(
+                reason = %e,
+                track_id = %track_id,
+                source = source.label(),
+                "failed to start video capture"
+            );
             return;
         }
     };
@@ -694,7 +859,8 @@ fn camera_pipeline_loop(
         height,
         backend = capturer.backend(),
         track_id = %track_id,
-        "Camera pipeline started"
+        source = source.label(),
+        "video pipeline started"
     );
 
     // The codec comes from SDP negotiation, so the capture loop must not name one. Held
@@ -712,7 +878,7 @@ fn camera_pipeline_loop(
 
     loop {
         if stop_rx.try_recv().is_ok() {
-            tracing::info!(track_id = %track_id, "Camera pipeline stopping");
+            tracing::info!(track_id = %track_id, "video pipeline stopping");
             // Clean up the frame buffer entry
             if let Ok(mut buf) = video_frames.lock() {
                 buf.remove(track_id);

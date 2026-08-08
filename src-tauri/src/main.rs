@@ -127,6 +127,7 @@ fn register_state(
         .manage(MediaState {
             active_tracks: Mutex::new(Vec::new()),
             pipelines: Mutex::new(std::collections::HashMap::new()),
+            share: Mutex::new(None),
             sfu_media_tx: Mutex::new(None),
         })
         .manage(protocols::VideoFrameState(video_frames.clone()))

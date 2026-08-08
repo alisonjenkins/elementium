@@ -21,6 +21,33 @@ interface NativeCaptureSource {
   kind: "monitor" | "window";
 }
 
+/** Response shape of the `get_display_media` command. */
+interface NativeDisplayMedia {
+  videoTrackId: NativeTrackId;
+  audioTrackId: NativeTrackId | null;
+  /** Which stream the backend actually captured for audio, or null if none was requested. */
+  audioScope: "desktop_mix" | "application" | null;
+  /**
+   * True when the caller asked to capture a single application's audio and the platform
+   * could not isolate it, so the backend captured the whole desktop mix instead. This is a
+   * privacy-relevant difference from what was requested and must be surfaced, not swallowed.
+   */
+  audioScopeFallback: boolean;
+}
+
+/**
+ * Prefix the backend puts on the one `get_display_media` failure that is not a fault: the
+ * user closed the system picker without choosing anything.
+ *
+ * An agreed sentinel rather than a pattern matched against the message text. The two sides
+ * have to distinguish "the user declined" from "the portal is broken" -- one is routine and
+ * one wants investigating -- and a regex over prose would keep working right up until
+ * somebody rewords an error, at which point every cancellation starts being logged as a
+ * failure with nothing to indicate the reporting changed. Kept in step with
+ * `PICKER_CANCELLED` in `src-tauri/src/commands/screen_capture.rs`.
+ */
+const PICKER_CANCELLED = "picker_cancelled";
+
 function debugLog(msg: string): void {
   console.log(`[Elementium] ${msg}`);
 }
@@ -112,71 +139,14 @@ export function setupMediaDevicesShim(): void {
         for (const tid of trackIds) {
           const id = tid;
           if (id.startsWith("audio-")) {
-            // Create a silent audio track (real audio is in Rust)
-            try {
-              const audioCtx = new AudioContext();
-              const oscillator = audioCtx.createOscillator();
-              const dest = audioCtx.createMediaStreamDestination();
-              oscillator.connect(dest);
-              oscillator.frequency.value = 0;
-              oscillator.start();
-              const audioTrack = dest.stream.getAudioTracks()[0];
-              if (audioTrack) {
-                stream.addTrack(audioTrack);
-              }
-              debugLog(`audio track added: ${audioTrack?.id}`);
-            } catch (e) {
-              debugLog(`audio track error: ${e}`);
+            const audioTrack = createSilentAudioTrack();
+            if (audioTrack) {
+              stream.addTrack(audioTrack);
             }
           } else if (id.startsWith("video-")) {
-            debugLog(`video track ${id}: creating canvas...`);
-            // Create a canvas-based video track fed by native camera frames
-            const canvas = document.createElement("canvas");
-            // Size the canvas to the real capture geometry *before* captureStream, which
-            // fixes the resulting track's frame size at the moment it is called. Resizing
-            // afterwards leaves the track describing one geometry while the backing store
-            // holds another: rows are then read at the wrong stride, so the picture shears
-            // into horizontal bands whose colours rotate as the byte offset drifts through
-            // the RGBA quad. That is a rendering fault, not a camera fault -- the captured
-            // frames are pixel-perfect.
-            const geometry = await firstFrameGeometry(id);
-            canvas.width = geometry?.width ?? 640;
-            canvas.height = geometry?.height ?? 480;
-            debugLog(`video track: canvas sized ${canvas.width}x${canvas.height}`);
-            // In the DOM, inside the viewport, but invisible.
-            //
-            // It has to be attached for `captureStream` to work reliably in WebKitGTK, and
-            // it is kept *within* the viewport deliberately: an element parked at -9999px
-            // is never painted, and a capture implementation that samples the compositor
-            // rather than the backing store can then return partially-updated tiles --
-            // which looks exactly like the horizontal banding being chased here. Zero
-            // opacity keeps it painted and unseen.
-            canvas.style.position = "fixed";
-            canvas.style.top = "0";
-            canvas.style.left = "0";
-            canvas.style.width = "1px";
-            canvas.style.height = "1px";
-            canvas.style.opacity = "0";
-            canvas.style.zIndex = "-1";
-            canvas.style.pointerEvents = "none";
-            (document.body || document.documentElement).appendChild(canvas);
-            debugLog("video track: canvas in DOM");
-            // Draw an initial black frame so captureStream has content immediately
-            const initCtx = canvas.getContext("2d");
-            if (initCtx) {
-              initCtx.fillStyle = "#000";
-              initCtx.fillRect(0, 0, canvas.width, canvas.height);
-            }
-            debugLog(`video track: captureStream available? ${typeof canvas.captureStream}`);
-            // Manually driven: a frame is emitted only once a draw has completed, so the
-            // track can never sample a half-written canvas. See `createCanvasTrack`.
-            const canvasTrack = createCanvasTrack(canvas);
-            const videoTrack = canvasTrack.track;
-            debugLog(`video track: captureStream returned track? ${!!videoTrack} readyState=${videoTrack?.readyState}`);
+            const videoTrack = await createNativeVideoTrack(id);
             if (videoTrack) {
               stream.addTrack(videoTrack);
-              // Start fetching real camera frames from the Rust backend
-              startLocalVideoFrameFetch(canvas, id, canvasTrack.present);
             }
           }
         }
@@ -189,37 +159,94 @@ export function setupMediaDevicesShim(): void {
       }
     },
 
-    async getDisplayMedia(_constraints?: DisplayMediaStreamOptions): Promise<MediaStream> {
-      console.log("[Elementium] getDisplayMedia called");
+    async getDisplayMedia(constraints?: DisplayMediaStreamOptions): Promise<MediaStream> {
+      console.log("[Elementium] getDisplayMedia called with:", constraints);
+
+      // The backend uses this as the guard on whether it opens any audio capture at all.
+      // Defaulting to false when the caller did not ask for audio matters: capturing audio
+      // nobody requested is a privacy failure, not a convenience.
+      const wantsAudio = !!constraints?.audio;
+
       try {
         // Get available capture sources
         const sources = await invoke<NativeCaptureSource[]>("get_capture_sources");
 
-        let sourceId = "default";
+        // An empty list is not "no sources exist" -- on Wayland it is returned *by design*
+        // (see get_capture_sources on the Rust side): the compositor owns source selection
+        // there and shows its own xdg-desktop-portal picker, so the application must not
+        // present one of its own. That means an empty list has to be passed through as an
+        // absent source id -- letting the portal take over -- rather than papered over with
+        // a fabricated "default" that no backend, portal or otherwise, actually defines.
+        let sourceId: string | undefined;
         if (sources.length > 0) {
           // Use the first monitor source, or the first available source
-          const monitor = sources.find(s => s.kind === "monitor");
+          const monitor = sources.find((s) => s.kind === "monitor");
           sourceId = (monitor || sources[0]).id;
         }
 
-        // Start screen capture for the selected source
-        const trackId = await invoke<NativeTrackId>("get_display_media", { sourceId });
-        const id = trackId;
+        debugLog(
+          `getDisplayMedia: calling invoke get_display_media (sourceId=${sourceId ?? "<portal picker>"}, audio=${wantsAudio})...`,
+        );
+        const result = await invoke<NativeDisplayMedia>("get_display_media", {
+          sourceId,
+          audio: wantsAudio,
+        });
+        debugLog(
+          `getDisplayMedia: got video=${result.videoTrackId} audio=${result.audioTrackId ?? "none"} ` +
+            `scope=${result.audioScope ?? "none"} fallback=${result.audioScopeFallback}`,
+        );
 
-        // Create a canvas-based MediaStream for the screen capture
+        if (result.audioScopeFallback) {
+          // The caller asked to capture a single application's audio and the platform could
+          // not isolate it, so the backend fell back to capturing the whole desktop mix
+          // instead -- audio from windows the user never agreed to share. That has to be
+          // disclosed rather than passed through silently as if it were what was requested.
+          console.warn(
+            "[Elementium] getDisplayMedia: requested application audio was unavailable; " +
+              "the backend fell back to capturing the full desktop audio mix instead.",
+          );
+        }
+
+        // Build the outgoing stream the same way getUserMedia does: a canvas-backed local
+        // preview for video (the wire is encoded from the native capture in Rust, not from
+        // this canvas), and a silent placeholder for audio (the real audio likewise lives
+        // in Rust). See createNativeVideoTrack / createSilentAudioTrack.
         const stream = new MediaStream();
-        const canvas = document.createElement("canvas");
-        canvas.width = 1920;
-        canvas.height = 1080;
-        const videoTrack = createCanvasTrack(canvas).track;
+
+        const videoTrack = await createNativeVideoTrack(result.videoTrackId);
         if (videoTrack) {
+          // Stopping a share from the Element Web UI has to reach the backend, or the
+          // native capture, its threads and its portal session all keep running after the
+          // page thinks the share ended.
+          wireStopToBackend(videoTrack, result.videoTrackId);
           stream.addTrack(videoTrack);
         }
 
-        console.log(`[Elementium] getDisplayMedia started with source: ${sourceId}, track: ${id}`);
+        if (wantsAudio && result.audioTrackId) {
+          const audioTrack = createSilentAudioTrack();
+          if (audioTrack) {
+            wireStopToBackend(audioTrack, result.audioTrackId);
+            stream.addTrack(audioTrack);
+          }
+        }
+        // If the caller did not ask for audio, or the backend could not provide it, no
+        // audio track is added -- silence here, not a silent placeholder standing in for
+        // audio nobody requested.
+
+        debugLog(`getDisplayMedia returning stream with ${stream.getTracks().length} tracks`);
         return stream;
       } catch (e) {
-        console.error("[Elementium] getDisplayMedia failed:", e);
+        // A cancelled picker is the ordinary way a user declines to share their screen, not
+        // a failure -- and unmodified Element Web code already expects it to surface as
+        // `NotAllowedError`, because that is what a real browser throws in this case. Logged
+        // separately from a genuine capture failure so "the user said no" and "the portal is
+        // broken" cannot be confused with each other while reading the log later.
+        const message = e instanceof Error ? e.message : String(e);
+        if (message.startsWith(PICKER_CANCELLED)) {
+          debugLog(`getDisplayMedia: picker cancelled: ${message}`);
+        } else {
+          console.error("[Elementium] getDisplayMedia failed:", e);
+        }
         throw new DOMException("Could not start screen capture", "NotAllowedError");
       }
     },
@@ -261,6 +288,108 @@ function extractConstraintValue(value: unknown): number | undefined {
     if ("exact" in obj) return obj.exact as number;
   }
   return undefined;
+}
+
+/**
+ * Create a silent placeholder audio track. The real audio for both the microphone
+ * (getUserMedia) and a screen/window share's captured audio (getDisplayMedia) lives
+ * entirely in Rust -- this track exists only so the page has a MediaStreamTrack object to
+ * hold, mute, and hand to the rest of the WebRTC stack; it carries no signal of its own.
+ */
+function createSilentAudioTrack(): MediaStreamTrack | null {
+  try {
+    const audioCtx = new AudioContext();
+    const oscillator = audioCtx.createOscillator();
+    const dest = audioCtx.createMediaStreamDestination();
+    oscillator.connect(dest);
+    oscillator.frequency.value = 0;
+    oscillator.start();
+    const audioTrack = dest.stream.getAudioTracks()[0] ?? null;
+    debugLog(`audio track added: ${audioTrack?.id}`);
+    return audioTrack;
+  } catch (e) {
+    debugLog(`audio track error: ${e}`);
+    return null;
+  }
+}
+
+/**
+ * Create a canvas-backed video track fed by native frames for `trackId`.
+ *
+ * Shared by getUserMedia (camera) and getDisplayMedia (screen/window share): both need the
+ * same sequence -- size the canvas from the real capture geometry *before* calling
+ * captureStream, attach it in-viewport at zero opacity, draw an initial frame, then pump
+ * real frames from Rust -- and both have independently hit the bugs that sequence avoids
+ * (see the comments below and in createCanvasTrack). Fixed once here rather than twice.
+ */
+async function createNativeVideoTrack(trackId: string): Promise<MediaStreamTrack | null> {
+  debugLog(`video track ${trackId}: creating canvas...`);
+  const canvas = document.createElement("canvas");
+  // Size the canvas to the real capture geometry *before* captureStream, which fixes the
+  // resulting track's frame size at the moment it is called. Resizing afterwards leaves the
+  // track describing one geometry while the backing store holds another: rows are then read
+  // at the wrong stride, so the picture shears into horizontal bands whose colours rotate as
+  // the byte offset drifts through the RGBA quad. That is a rendering fault, not a capture
+  // fault -- the captured frames are pixel-perfect.
+  const geometry = await firstFrameGeometry(trackId);
+  canvas.width = geometry?.width ?? 640;
+  canvas.height = geometry?.height ?? 480;
+  debugLog(`video track: canvas sized ${canvas.width}x${canvas.height}`);
+  // In the DOM, inside the viewport, but invisible.
+  //
+  // It has to be attached for `captureStream` to work reliably in WebKitGTK, and it is kept
+  // *within* the viewport deliberately: an element parked at -9999px is never painted, and a
+  // capture implementation that samples the compositor rather than the backing store can
+  // then return partially-updated tiles -- which looks exactly like the horizontal banding
+  // being chased here. Zero opacity keeps it painted and unseen.
+  canvas.style.position = "fixed";
+  canvas.style.top = "0";
+  canvas.style.left = "0";
+  canvas.style.width = "1px";
+  canvas.style.height = "1px";
+  canvas.style.opacity = "0";
+  canvas.style.zIndex = "-1";
+  canvas.style.pointerEvents = "none";
+  (document.body || document.documentElement).appendChild(canvas);
+  debugLog("video track: canvas in DOM");
+  // Draw an initial black frame so captureStream has content immediately
+  const initCtx = canvas.getContext("2d");
+  if (initCtx) {
+    initCtx.fillStyle = "#000";
+    initCtx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  debugLog(`video track: captureStream available? ${typeof canvas.captureStream}`);
+  // Manually driven: a frame is emitted only once a draw has completed, so the track can
+  // never sample a half-written canvas. See `createCanvasTrack`.
+  const canvasTrack = createCanvasTrack(canvas);
+  const videoTrack = canvasTrack.track;
+  debugLog(`video track: captureStream returned track? ${!!videoTrack} readyState=${videoTrack?.readyState}`);
+  if (videoTrack) {
+    // Start fetching real frames from the Rust backend
+    startLocalVideoFrameFetch(canvas, trackId, canvasTrack.present);
+  }
+  return videoTrack;
+}
+
+/**
+ * Make `track.stop()` also tear down the native capture behind it.
+ *
+ * `MediaStreamTrack.stop()` only stops the local (canvas or placeholder-audio) object;
+ * nothing about it reaches Rust on its own. Without this, ending a share from the Element
+ * Web UI leaves the native capture, its threads and (for a portal-backed share) its portal
+ * session running after the page believes it has stopped. `nativeTrackId` is the backend's
+ * id for the real capture, which is deliberately not the same as `track.id` (the canvas
+ * track's own, browser-assigned id) -- the wrong one would tell Rust to stop a capture that
+ * doesn't exist and leave the real one running regardless.
+ */
+function wireStopToBackend(track: MediaStreamTrack, nativeTrackId: string): void {
+  const originalStop = track.stop.bind(track);
+  track.stop = () => {
+    originalStop();
+    invoke("stop_track", { trackId: nativeTrackId }).catch((e) => {
+      console.error(`[Elementium] stop_track(${nativeTrackId}) failed:`, e);
+    });
+  };
 }
 
 /**
