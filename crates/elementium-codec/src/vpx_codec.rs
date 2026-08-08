@@ -113,12 +113,26 @@ impl Vp8Encoder {
                 VPX_ENCODER_ABI_VERSION as i32,
             );
             if ret != VPX_CODEC_OK {
+                // The geometry is named as a *cause* when it is the obvious one, because
+                // the bare failure sends people to the encoder when the fault is upstream.
+                // A zero size means nothing ever recorded a frame size -- capture or
+                // conversion failed earlier -- and an odd one means the capture handed over
+                // geometry VP8 cannot take. Both were real faults; both cost time reading
+                // "encoder_init" as an encoder problem.
+                let likely_cause = if width == 0 || height == 0 {
+                    "geometry was never set upstream; capture or conversion produced no sized frame"
+                } else if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+                    "VP8 requires even dimensions and this geometry is odd"
+                } else {
+                    "not a geometry problem; see the vpx error code"
+                };
                 tracing::error!(
                     width,
                     height,
                     bitrate_kbps,
                     error_kind = "encoder_init",
                     vpx_error_code = ?ret,
+                    likely_cause,
                     "Failed to initialize VP8 encoder"
                 );
                 return Err(format!("VP8 encoder init: {ret:?}"));
