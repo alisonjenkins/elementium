@@ -227,17 +227,43 @@ pub async fn create_offer(
     // `video` used to gate whether the camera was attached at all. It no longer can: a
     // connection carrying a screen share is a video connection whether or not the camera
     // is on, and the pipelines that exist are the authority on what is being captured.
-    if let Ok(pipelines) = media_state.pipelines.lock() {
-        for handle in pipelines.values() {
-            if handle.key.kind() == elementium_types::TrackKind::Video && !video {
-                continue;
-            }
-            if let Ok(mut encode_guard) = handle.encode_tx.lock() {
-                tracing::info!(pc_id = %pc_id, key = %handle.key, "Connecting capture pipeline to peer connection");
-                *encode_guard = Some(io_cmd_tx.clone());
+    // A failure to take this lock is reported, not skipped. Skipping attaches *nothing*:
+    // the call proceeds, every pipeline keeps capturing into a channel with no peer
+    // connection on the other end, and the user joins a call in which they are silent and
+    // invisible while everything reports success. That is the loudest possible symptom
+    // reached by the quietest possible path.
+    let mut attached = 0_usize;
+    match media_state.pipelines.lock() {
+        Ok(pipelines) => {
+            for handle in pipelines.values() {
+                if handle.key.kind() == elementium_types::TrackKind::Video && !video {
+                    continue;
+                }
+                match handle.encode_tx.lock() {
+                    Ok(mut encode_guard) => {
+                        tracing::info!(pc_id = %pc_id, key = %handle.key, "Connecting capture pipeline to peer connection");
+                        *encode_guard = Some(io_cmd_tx.clone());
+                        attached = attached.saturating_add(1);
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            pc_id = %pc_id,
+                            key = %handle.key,
+                            "a capture pipeline's connection slot is poisoned; this track \
+                             will not reach the call"
+                        );
+                    }
+                }
             }
         }
+        Err(_) => {
+            tracing::error!(
+                pc_id = %pc_id,
+                "the pipeline map is poisoned; no capture can be attached to this call"
+            );
+        }
     }
+    tracing::info!(pc_id = %pc_id, attached, "capture pipelines attached to the peer connection");
 
     // Convert data channel info
     let dc_infos: Vec<peer_connection::DataChannelInfo> = data_channels

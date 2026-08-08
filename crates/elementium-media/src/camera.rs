@@ -155,6 +155,9 @@ fn run_capture_loop(
     frame_tx: &mpsc::SyncSender<I420Frame>,
     stop_rx: &mpsc::Receiver<()>,
 ) {
+    // Undecodable frames since this capture started, so a camera that produces them
+    // constantly is distinguishable from one that hiccups once.
+    let mut undecodable: u64 = 0;
     loop {
         // Check for stop signal
         if stop_rx.try_recv().is_ok() {
@@ -170,6 +173,21 @@ fn run_capture_loop(
                 let raw = buffer.buffer();
 
                 let Some(rgba) = decode_frame_to_rgba(w, h, raw) else {
+                    // Counted and reported, unlike before. A camera whose frames all fail
+                    // to decode looks exactly like a camera producing nothing: the picture
+                    // freezes on its last good frame and this loop spins at 5ms forever.
+                    // The sibling `Err` branch below has always logged; this one did not,
+                    // so the more confusing of the two failures was the silent one.
+                    undecodable = undecodable.saturating_add(1);
+                    if undecodable == 1 || undecodable.is_multiple_of(100) {
+                        tracing::warn!(
+                            undecodable,
+                            width = w,
+                            height = h,
+                            bytes = raw.len(),
+                            "camera frame could not be decoded; the picture will not advance"
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 };
