@@ -120,7 +120,7 @@ negotiate on this machine. See research R9 for the measured evidence.
 - [X] T043 Handle a second share started while one is running in `src-tauri/src/commands/screen_capture.rs` — refuse or replace, defined either way, never two capturers contending for a portal session
 - [X] T044 [P] Check the negotiated encode target against full-monitor geometry using the T003 example and record the result in `specs/008-screen-share-capture/quickstart.md` — a 4K monitor through a path tuned for 1280x720 may fail at negotiation or produce unusable bitrates, and that must surface here rather than as a suspected transport fault
 - [X] T045 [P] **Passed 2026-08-08**: ten open/close cycles leave 0 `PipeWire` objects and 1 thread, with both metrics validated against their capturing state (1 object, 2 threads) so that a zero reading means something. Re-run the T001 teardown measurement over ten start/stop cycles and record the after-figure in `specs/008-screen-share-capture/quickstart.md` (SC-006)
-- [ ] T046 Verify `cargo clippy --workspace -- -D warnings` reports zero, `cargo test --workspace` passes, and `just test-frontend` passes, before the feature is called done
+- [X] T046 **Passed 2026-08-08** (clippy clean, workspace tests pass, tsc clean, 16/16 vitest). Verify `cargo clippy --workspace -- -D warnings` reports zero, `cargo test --workspace` passes, and `just test-frontend` passes, before the feature is called done
 
 ---
 
