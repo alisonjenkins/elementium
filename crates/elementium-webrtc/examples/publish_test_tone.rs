@@ -181,8 +181,13 @@ async fn publish_tracks(room: &mut LiveKitRoom, video: bool) {
         .expect("publish the audio track");
     if video {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        room.publish_track("video", "camera")
-            .expect("publish the video track");
+        room.publish_video_track(
+            "camera",
+            elementium_codec::VideoCodec::H264,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
+        )
+        .expect("publish the video track");
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
 }

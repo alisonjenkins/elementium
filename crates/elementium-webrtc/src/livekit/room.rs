@@ -424,10 +424,47 @@ impl LiveKitRoom {
     ///
     /// Returns `Err` if `kind` is unrecognized, or if sending the `AddTrack`
     /// request, creating the publisher offer, or sending the offer fails.
+    /// Publish a video track, declaring the codec and size it will actually carry.
+    ///
+    /// The SFU registers a video track as `video/VP8` unless told otherwise, and then
+    /// expects VP8 on the wire. Publishing H.264 against that declaration produces a track
+    /// the SFU accepts, counts, and never forwards decodably -- the publisher's own
+    /// counters show frames going out and no subscriber ever sees a picture.
+    ///
+    /// # Errors
+    ///
+    /// As [`LiveKitRoom::publish_track`].
+    pub fn publish_video_track(
+        &mut self,
+        source: &str,
+        codec: elementium_codec::VideoCodec,
+        width: u32,
+        height: u32,
+    ) -> Result<(), crate::error::WebRtcError> {
+        self.publish_track_inner("video", source, Some((codec, width, height)))
+    }
+
+    /// Publish a track by kind, without declaring a codec.
+    ///
+    /// Audio only, in practice: video needs [`LiveKitRoom::publish_video_track`], because a
+    /// video track the SFU is not told the codec of is registered as VP8.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `AddTrack` request or the offer cannot be sent.
     pub fn publish_track(
         &mut self,
         kind: &str,
         source: &str,
+    ) -> Result<(), crate::error::WebRtcError> {
+        self.publish_track_inner(kind, source, None)
+    }
+
+    fn publish_track_inner(
+        &mut self,
+        kind: &str,
+        source: &str,
+        video: Option<(elementium_codec::VideoCodec, u32, u32)>,
     ) -> Result<(), crate::error::WebRtcError> {
         let track_type: i32 = match kind {
             "audio" => TrackType::Audio.into(),
@@ -469,8 +506,21 @@ impl LiveKitRoom {
                     name: format!("{kind}_{source}"),
                     r#type: track_type,
                     source: track_source,
-                    width: if is_video { 640 } else { 0 },
-                    height: if is_video { 480 } else { 0 },
+                    // The size we actually publish, when the caller knows it. The old
+                    // hardcoded 640x480 was announced for every video track regardless, so
+                    // the SFU's view of the stream disagreed with the stream.
+                    width: video.map_or(0, |(_, w, _)| w),
+                    height: video.map_or(0, |(_, _, h)| h),
+                    // The codec, for the same reason. Without this the SFU assumes VP8.
+                    simulcast_codecs: video
+                        .map(|(codec, _, _)| {
+                            vec![livekit_protocol::SimulcastCodec {
+                                codec: codec.sdp_name().to_lowercase(),
+                                cid: cid.clone(),
+                                ..Default::default()
+                            }]
+                        })
+                        .unwrap_or_default(),
                     // How the SFU should handle a subscriber that cannot decode our codec.
                     //
                     // The case this exists for: a room where everyone supports AV1 gains a

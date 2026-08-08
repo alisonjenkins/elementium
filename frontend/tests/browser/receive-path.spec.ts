@@ -499,10 +499,10 @@ test.describe("browser receive path", () => {
   test("H.264 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
     test.fixme(
       true,
-      "Blocked on the publisher renegotiation bug: a second publish_track produces an " +
-        "answer whose mids the offer never had (\"Mid in answer is not in offer\"), and " +
-        "both tracks then fail to write. Publishing audio alone works, so this is " +
-        "renegotiation. See 005 T019.",
+      "Reaches the receiver and stops there: framesReceived is 0 while packetsReceived " +
+        "climbs and pliCount rises, so the depacketiser never assembles a picture. Not " +
+        "the E2EE keys (the worker reports no errors) and not the decoder (nothing gets " +
+        "that far). See 005 T020.",
     );
     const roomName = `elementium-h264-${Date.now()}`;
     console.log(`  room: ${roomName}`);
@@ -536,7 +536,11 @@ test.describe("browser receive path", () => {
       type VideoStats = {
         mimeType: string | null;
         packetsReceived: number;
+        framesReceived: number;
         framesDecoded: number;
+        framesDropped: number;
+        keyFramesDecoded: number;
+        pliCount: number;
         frameWidth: number;
         frameHeight: number;
       };
@@ -562,6 +566,13 @@ test.describe("browser receive path", () => {
       console.log(`  before: ${JSON.stringify(before)}`);
       console.log(`  after:  ${JSON.stringify(after)}`);
 
+      // Read before asserting anything: a decrypt failure inside livekit's worker reports
+      // itself here and nowhere else, and asserting first hides the one line that says why.
+      const errors = await page.evaluate(
+        () => (window as never as { __errors: string[] }).__errors,
+      );
+      console.log(`  page errors: ${JSON.stringify(errors)}`);
+
       expect(after.mimeType, "the SFU must have negotiated H.264, not VP8").toMatch(/H264/i);
       expect(
         after.packetsReceived - before.packetsReceived,
@@ -574,9 +585,6 @@ test.describe("browser receive path", () => {
       expect(after.frameWidth, "decoded width").toBe(320);
       expect(after.frameHeight, "decoded height").toBe(240);
 
-      const errors = await page.evaluate(
-        () => (window as never as { __errors: string[] }).__errors,
-      );
       expect(errors, "no E2EE worker errors").toEqual([]);
     } finally {
       publisher.stop();

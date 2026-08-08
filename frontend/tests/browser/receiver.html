@@ -190,7 +190,15 @@
         return {
           mimeType: codec?.mimeType ?? null,
           packetsReceived: inbound.packetsReceived ?? 0,
+          // `framesReceived` counts frames the depacketiser assembled; `framesDecoded`
+          // counts those the decoder accepted. The gap between them is the whole
+          // diagnosis: assembled-but-not-decoded is a bitstream the decoder rejects,
+          // never-assembled is packetisation or a decrypt that never completed a frame.
+          framesReceived: inbound.framesReceived ?? 0,
           framesDecoded: inbound.framesDecoded ?? 0,
+          framesDropped: inbound.framesDropped ?? 0,
+          keyFramesDecoded: inbound.keyFramesDecoded ?? 0,
+          pliCount: inbound.pliCount ?? 0,
           frameWidth: inbound.frameWidth ?? 0,
           frameHeight: inbound.frameHeight ?? 0,
         };
