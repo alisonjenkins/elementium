@@ -26,6 +26,59 @@ use crate::pipewire_nodes::PipewireError;
 /// 60 or more, which is why this is a default rather than a limit.
 pub const DEFAULT_CAPTURE_FPS: u32 = 30;
 
+/// What kind of source a stream is negotiating with.
+///
+/// Cameras and screens advertise genuinely different things, and a parameter set tuned for
+/// one excludes the other outright. Measured, not guessed: asking a 5120x1440 monitor for
+/// the camera parameters fails the whole connection with `no more input formats`, because
+/// the camera set caps size at 4096 and pins the frame rate to a range starting at 1/1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceProfile {
+    /// A camera: bounded resolution, and a rate it sustains continuously.
+    Camera,
+    /// A screen, window or application granted by the desktop portal.
+    ///
+    /// Two differences that both matter. Displays are far larger than cameras -- an
+    /// ultrawide is 5120 across and 8K is 7680 -- and compositors advertise a frame rate of
+    /// `0/1`, meaning *variable*: frames are produced when something changes, not on a
+    /// clock. A range starting at 1/1 excludes that, so a still screen matches nothing.
+    Screencast,
+}
+
+impl SourceProfile {
+    /// The largest frame this profile should agree to.
+    const fn max_size(self) -> libspa::utils::Rectangle {
+        match self {
+            // Bigger than any webcam, small enough to rule out a nonsense negotiation.
+            Self::Camera => libspa::utils::Rectangle { width: 4096, height: 4096 },
+            // 8K, which is past any display sold today and still a real bound.
+            Self::Screencast => libspa::utils::Rectangle { width: 7680, height: 4320 },
+        }
+    }
+
+    /// The lowest frame rate this profile should agree to.
+    ///
+    /// `0/1` is not "no frames": in `PipeWire` it means the source does not run on a clock.
+    /// Accepting it is what lets a screen that nobody is touching negotiate at all.
+    const fn min_framerate(self) -> libspa::utils::Fraction {
+        match self {
+            Self::Camera => libspa::utils::Fraction { num: 1, denom: 1 },
+            Self::Screencast => libspa::utils::Fraction { num: 0, denom: 1 },
+        }
+    }
+}
+
+/// Everything a stream needs to know before it negotiates.
+///
+/// One struct rather than three parameters threaded through four functions, which is what
+/// keeps the signatures inside the workspace's argument-count limit.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureRequest {
+    pub target_fps: u32,
+    pub target: elementium_codec::EncodeTarget,
+    pub profile: SourceProfile,
+}
+
 /// Frames buffered before the oldest is dropped.
 ///
 /// Small on purpose: video is only useful live, and a deep queue converts a slow consumer
@@ -710,6 +763,22 @@ impl PipewireCapturer {
         target_fps: u32,
         target: elementium_codec::EncodeTarget,
     ) -> Result<Self, PipewireError> {
+        Self::start_with(
+            node_id,
+            CaptureRequest {
+                target_fps,
+                target,
+                profile: SourceProfile::Camera,
+            },
+        )
+    }
+
+    /// Connect to a node with an explicit source profile.
+    ///
+    /// # Errors
+    ///
+    /// As [`PipewireCapturer::start`].
+    pub fn start_with(node_id: u32, request: CaptureRequest) -> Result<Self, PipewireError> {
         let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let negotiated = Arc::new(Mutex::new(Negotiated::default()));
@@ -723,8 +792,7 @@ impl PipewireCapturer {
             .spawn(move || {
                 run_stream(
                     node_id,
-                    target_fps,
-                    target,
+                    request,
                     &frame_tx,
                     stop_rx,
                     &thread_negotiated,
@@ -789,8 +857,7 @@ impl Drop for PipewireCapturer {
 #[allow(clippy::too_many_arguments)]
 fn run_stream(
     node_id: u32,
-    target_fps: u32,
-    target: elementium_codec::EncodeTarget,
+    request: CaptureRequest,
     frame_tx: &mpsc::SyncSender<CapturedFrame>,
     stop_rx: mpsc::Receiver<()>,
     negotiated: &Arc<Mutex<Negotiated>>,
@@ -829,9 +896,7 @@ fn run_stream(
         }
     };
 
-    if let Err(e) = attach_and_connect(
-        &stream, node_id, target_fps, target, negotiated, failed, frame_tx,
-    ) {
+    if let Err(e) = attach_and_connect(&stream, node_id, request, negotiated, failed, frame_tx) {
         let _ = ready_tx.send(Err(e));
         return;
     }
@@ -848,8 +913,7 @@ fn run_stream(
 fn attach_and_connect(
     stream: &pipewire::stream::StreamRc,
     node_id: u32,
-    target_fps: u32,
-    target: elementium_codec::EncodeTarget,
+    request: CaptureRequest,
     negotiated: &Arc<Mutex<Negotiated>>,
     failed: &Arc<std::sync::atomic::AtomicBool>,
     frame_tx: &mpsc::SyncSender<CapturedFrame>,
@@ -880,7 +944,7 @@ fn attach_and_connect(
     // the next rate a camera would plausibly run at, so a genuinely faster source is still
     // limited.
     let nominal_gap = 1_000_000_000_u64
-        .checked_div(u64::from(target_fps.max(1)))
+        .checked_div(u64::from(request.target_fps.max(1)))
         .unwrap_or(0);
     // How early a frame may arrive and still count for its slot.
     //
@@ -1065,7 +1129,7 @@ fn attach_and_connect(
             // Decoding here would be the single largest cost on this path and would be
             // thrown away immediately: the GPU decodes it again, properly, from the
             // compressed bytes.
-            if n.encoding == Encoding::Mjpeg && target.gpu_jpeg_decode {
+            if n.encoding == Encoding::Mjpeg && request.target.gpu_jpeg_decode {
                 let frame = CapturedFrame::Mjpeg {
                     data: bytes.to_vec(),
                     width: n.width,
@@ -1136,7 +1200,7 @@ fn attach_and_connect(
         })
         .register();
 
-    let mut params = format_params(target_fps, target);
+    let mut params = format_params(request);
     // Appended after the formats: the source reads both when the stream connects, and the
     // buffer constraint applies whichever format it settles on.
     params.push(buffers_param());
@@ -1227,8 +1291,8 @@ const fn spa_video_format(
 ///
 /// The proper fix is to read the node's own `EnumFormat` first and rank what it actually
 /// offers. That is worth doing and is not this.
-fn format_params(target_fps: u32, target: elementium_codec::EncodeTarget) -> Vec<Vec<u8>> {
-    let preference = elementium_codec::capture_format::preference(target);
+fn format_params(request: CaptureRequest) -> Vec<Vec<u8>> {
+    let preference = elementium_codec::capture_format::preference(request.target);
     let raw: Vec<libspa::param::video::VideoFormat> = preference
         .iter()
         .copied()
@@ -1242,13 +1306,13 @@ fn format_params(target_fps: u32, target: elementium_codec::EncodeTarget) -> Vec
 
     let mut params = Vec::with_capacity(2);
     if mjpeg_first {
-        params.push(mjpeg_format_param(target_fps));
+        params.push(mjpeg_format_param(request));
     }
     if !raw.is_empty() {
-        params.push(raw_format_param(target_fps, &raw));
+        params.push(raw_format_param(request, &raw));
     }
     if !mjpeg_first {
-        params.push(mjpeg_format_param(target_fps));
+        params.push(mjpeg_format_param(request));
     }
     params
 }
@@ -1321,8 +1385,14 @@ fn format_choice(formats: &[libspa::param::video::VideoFormat]) -> libspa::pod::
 }
 
 /// Ask for any of these raw pixel layouts, preferring the first.
-fn raw_format_param(target_fps: u32, formats: &[libspa::param::video::VideoFormat]) -> Vec<u8> {
+fn raw_format_param(
+    request: CaptureRequest,
+    formats: &[libspa::param::video::VideoFormat],
+) -> Vec<u8> {
     use libspa::pod::{object, property};
+    let target_fps = request.target_fps;
+    let max_size = request.profile.max_size();
+    let min_framerate = request.profile.min_framerate();
     let obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
         libspa::param::ParamType::EnumFormat,
@@ -1356,7 +1426,7 @@ fn raw_format_param(target_fps: u32, formats: &[libspa::param::video::VideoForma
             Rectangle,
             libspa::utils::Rectangle { width: 1280, height: 720 },
             libspa::utils::Rectangle { width: 160, height: 120 },
-            libspa::utils::Rectangle { width: 4096, height: 4096 }
+            max_size
         ),
         property!(
             libspa::param::format::FormatProperties::VideoFramerate,
@@ -1364,7 +1434,7 @@ fn raw_format_param(target_fps: u32, formats: &[libspa::param::video::VideoForma
             Range,
             Fraction,
             libspa::utils::Fraction { num: target_fps, denom: 1 },
-            libspa::utils::Fraction { num: 1, denom: 1 },
+            min_framerate,
             libspa::utils::Fraction { num: target_fps, denom: 1 }
         ),
     };
@@ -1375,8 +1445,11 @@ fn raw_format_param(target_fps: u32, formats: &[libspa::param::video::VideoForma
 ///
 /// No `VideoFormat` property: there is no pixel layout to state, and including one makes
 /// the parameter fail to match a camera that would otherwise have satisfied it.
-fn mjpeg_format_param(target_fps: u32) -> Vec<u8> {
+fn mjpeg_format_param(request: CaptureRequest) -> Vec<u8> {
     use libspa::pod::{object, property};
+    let target_fps = request.target_fps;
+    let max_size = request.profile.max_size();
+    let min_framerate = request.profile.min_framerate();
     let obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
         libspa::param::ParamType::EnumFormat,
@@ -1397,7 +1470,7 @@ fn mjpeg_format_param(target_fps: u32) -> Vec<u8> {
             Rectangle,
             libspa::utils::Rectangle { width: 1280, height: 720 },
             libspa::utils::Rectangle { width: 160, height: 120 },
-            libspa::utils::Rectangle { width: 4096, height: 4096 }
+            max_size
         ),
         property!(
             libspa::param::format::FormatProperties::VideoFramerate,
@@ -1405,7 +1478,7 @@ fn mjpeg_format_param(target_fps: u32) -> Vec<u8> {
             Range,
             Fraction,
             libspa::utils::Fraction { num: target_fps, denom: 1 },
-            libspa::utils::Fraction { num: 1, denom: 1 },
+            min_framerate,
             libspa::utils::Fraction { num: target_fps, denom: 1 }
         ),
     };

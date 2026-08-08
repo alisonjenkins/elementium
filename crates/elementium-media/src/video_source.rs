@@ -122,9 +122,15 @@ impl VideoSource {
         node_id: u32,
         target: elementium_codec::EncodeTarget,
     ) -> Result<Self, String> {
-        let capturer =
-            PipewireCapturer::start_at(node_id, crate::pipewire_capture::DEFAULT_CAPTURE_FPS, target)
-                .map_err(|e| e.to_string())?;
+        let capturer = PipewireCapturer::start_with(
+            node_id,
+            crate::pipewire_capture::CaptureRequest {
+                target_fps: crate::pipewire_capture::DEFAULT_CAPTURE_FPS,
+                target,
+                profile: crate::pipewire_capture::SourceProfile::Screencast,
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self::Pipewire(capturer))
     }
 
