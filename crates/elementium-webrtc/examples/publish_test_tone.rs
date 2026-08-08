@@ -187,11 +187,28 @@ async fn publish_tracks(room: &mut LiveKitRoom, codec: Option<elementium_codec::
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
+/// Which video codec to publish, if any.
+///
+/// A flag so the same harness can publish VP8, which is the control: if VP8 assembles at
+/// the receiver and H.264 does not, the fault is H.264-specific. If neither does, video
+/// publishing through this path has never worked -- and until this example existed nothing
+/// had ever tried it.
+fn requested_video_codec() -> Option<elementium_codec::VideoCodec> {
+    if std::env::args().any(|a| a == "--video-h264") {
+        Some(elementium_codec::VideoCodec::H264)
+    } else if std::env::args().any(|a| a == "--video-vp8") {
+        Some(elementium_codec::VideoCodec::Vp8)
+    } else {
+        None
+    }
+}
+
 /// The E2EE context this publisher encrypts with, seeded with its starting key.
 fn build_e2ee_context(
     identity: &str,
     material: &[u8],
     bad_frames: u64,
+    key_index: u8,
 ) -> elementium_e2ee::E2eeContext {
     let ctx = elementium_e2ee::E2eeContext::new(elementium_e2ee::E2eeOptions::default());
     ctx.set_local_identity(identity);
@@ -203,7 +220,11 @@ fn build_e2ee_context(
     } else {
         rotated_key(material, 0)
     };
-    ctx.set_key(identity, 0, &start);
+    // The starting index is a parameter because the frame trailer's last byte *is* the key
+    // index, and a zero there is a trailing zero on the NAL. Anything that trims those --
+    // an SFU, a depacketiser -- corrupts the trailer for index 0 and leaves every other
+    // index working, which is a difference only a run at a non-zero index can show.
+    ctx.set_key(identity, key_index, &start);
     ctx
 }
 
@@ -308,23 +329,14 @@ async fn main() {
     // from VP8's -- a different clear-header rule and RBSP-escaped ciphertext -- and that
     // contract was until now only checked against livekit's *source*. This is what checks
     // it against livekit's running worker.
-    // The codec is a flag so the same harness can publish VP8, which is the control: if
-    // VP8 assembles at the receiver and H.264 does not, the fault is H.264-specific. If
-    // neither does, video publishing through this path has never worked -- and until this
-    // example existed nothing had ever tried it.
-    let video_codec = if std::env::args().any(|a| a == "--video-h264") {
-        Some(elementium_codec::VideoCodec::H264)
-    } else if std::env::args().any(|a| a == "--video-vp8") {
-        Some(elementium_codec::VideoCodec::Vp8)
-    } else {
-        None
-    };
+    let video_codec = requested_video_codec();
 
     let base_key =
         arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
+    let key_index: u8 = arg("--key-index").and_then(|s| s.parse().ok()).unwrap_or(0);
     let ctx = base_key
         .as_ref()
-        .map(|material| build_e2ee_context(&identity, material, bad_frames));
+        .map(|material| build_e2ee_context(&identity, material, bad_frames, key_index));
     let policy = ctx.clone().map_or(
         EncryptionPolicy::ExplicitlyUnencrypted,
         EncryptionPolicy::Encrypted,
@@ -373,7 +385,7 @@ async fn main() {
     let mut video_encoder = video_codec.map(build_video_encoder);
     let mut video_sent: u64 = 0;
 
-    let mut key_index: u8 = 0;
+    let mut current_key_index: u8 = key_index;
     for i in 0..frames {
         ticker.tick().await;
 
@@ -392,9 +404,13 @@ async fn main() {
             && i.is_multiple_of(rotate_frames)
             && let (Some(ctx), Some(base)) = (ctx.as_ref(), base_key.as_ref())
         {
-            key_index = key_index.wrapping_add(1);
-            ctx.set_key(&identity, key_index, &rotated_key(base, key_index));
-            println!("ROTATED {key_index}");
+            current_key_index = current_key_index.wrapping_add(1);
+            ctx.set_key(
+                &identity,
+                current_key_index,
+                &rotated_key(base, current_key_index),
+            );
+            println!("ROTATED {current_key_index}");
         }
 
         if let Some(encoder) = video_encoder.as_mut() {

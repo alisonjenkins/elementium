@@ -154,6 +154,7 @@ function startPublisher(
   rotateFrames = 0,
   badFrames = 0,
   video: "h264" | "vp8" | null = null,
+  keyIndex = 0,
 ): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
@@ -164,6 +165,7 @@ function startPublisher(
     ...(rotateFrames > 0 ? ["--rotate-frames", String(rotateFrames)] : []),
     ...(badFrames > 0 ? ["--bad-frames", String(badFrames)] : []),
     ...(video ? [`--video-${video}`] : []),
+    ...(keyIndex > 0 ? ["--key-index", String(keyIndex)] : []),
   ];
   // `RUST_LOG` at info: the publisher's own view of negotiation and ICE is the other half
   // of any failure here, and discarding its stderr made a publisher-side fault look like a
@@ -363,6 +365,7 @@ async function measureVideo(
   page: import("@playwright/test").Page,
   codec: "h264" | "vp8",
   encrypted = true,
+  keyIndex = 0,
 ): Promise<VideoStats> {
   const roomName = `elementium-${codec}-${Date.now()}`;
   console.log(`  room: ${roomName}`);
@@ -376,6 +379,8 @@ async function measureVideo(
     token: mintToken("browser-subscriber", roomName),
   });
   if (encrypted) query.set("key", KEY_HEX);
+  // Installs keys at indices 0..keyIndex, so a publisher stamping a non-zero index has one.
+  if (keyIndex > 0) query.set("rotations", String(keyIndex));
   await page.goto(`${server.origin}/?${query.toString()}`);
   await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
 
@@ -386,6 +391,7 @@ async function measureVideo(
     0,
     0,
     codec,
+    keyIndex,
   );
   try {
     await publisher.live;
@@ -729,6 +735,29 @@ test.describe("browser receive path", () => {
     const stats = await measureVideo(page, "h264", false);
     expect(stats.mimeType, "the SFU must have negotiated H.264").toMatch(/H264/i);
     expect(stats.framesReceived, "the depacketiser must assemble frames").toBeGreaterThan(10);
+  });
+
+  /**
+   * The key-index experiment: the same H.264 stream, encrypted at index 1 instead of 0.
+   *
+   * Our frame ends `[iv][IV_LENGTH][key_index]`, so at index 0 the last byte of the NAL is
+   * a zero -- and H.264 NAL handling trims trailing zeros. If index 1 decodes and index 0
+   * does not, the trailer is being truncated somewhere between our writer and the browser,
+   * and nothing about our encryption is wrong.
+   */
+  test("H.264 at key index 1 tells us whether the trailing zero is the problem", async ({
+    page,
+  }) => {
+    test.fixme(
+      true,
+      "Answered, and the answer was no: index 1 fails exactly as index 0 does, so the " +
+        "trailing zero of the key index is not what breaks it. Kept because the question " +
+        "recurs and this settles it in one run. See 005 T020.",
+    );
+    const stats = await measureVideo(page, "h264", true, 1);
+    expect(stats.mimeType, "the SFU must have negotiated H.264").toMatch(/H264/i);
+    expect(stats.framesDecoded, "frames must decode at a non-zero key index")
+      .toBeGreaterThan(10);
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.
