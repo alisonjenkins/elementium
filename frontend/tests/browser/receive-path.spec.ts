@@ -605,11 +605,11 @@ test.describe("browser receive path", () => {
   test("H.264 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
     test.fixme(
       true,
-      "Our H.264 E2EE framing is wrong, and the two controls beside this one say so: VP8 " +
-        "with the same encryption assembles and decodes 204/204, and plain H.264 through " +
-        "the same path assembles 210 and decodes 209. Only H.264 *and* encryption fails, " +
-        "and the encrypted frame has the same Annex B NAL structure (7,8,5) as the plain " +
-        "one -- so it is not packetisation. See 005 T020.",
+      "The frame the browser receives is not the frame we send. Our encryption is not at " +
+        "fault: an encrypted frame taken straight from the encoder decrypts cleanly using " +
+        "livekit's own worker functions and key derivation (header 27, IV 12, kid 0, 1515 " +
+        "bytes recovered). In a real call the same worker reports 'InvalidKey: Decryption " +
+        "failed' on every frame, so something between the two alters the bytes. See 005 T020.",
     );
     const roomName = `elementium-h264-${Date.now()}`;
     console.log(`  room: ${roomName}`);

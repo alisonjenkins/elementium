@@ -140,6 +140,18 @@
       });
     }
 
+    // livekit's E2EE failures happen in a worker and reach the page only as this event.
+    // Without it a decrypt that fails on every frame looks exactly like a decoder that
+    // produces nothing, which is the difference the H.264 tests turn on.
+    window.__cryptoErrors = [];
+    room.on("encryptionError", (e) => {
+      window.__cryptoErrors.push(String(e?.message ?? e));
+      console.log(`encryptionError: ${e?.message ?? e}`);
+    });
+    for (const p of ["participantEncryptionStatusChanged", "trackSubscriptionFailed"]) {
+      room.on(p, (...a) => console.log(`${p}: ${a.map((x) => String(x?.message ?? x)).join(",")}`));
+    }
+
     room.on("trackSubscribed", (track) => {
       if (track.kind === "audio") {
         // Attaching matters: an unattached track is not pulled through the jitter buffer,
