@@ -84,8 +84,17 @@ export function setupConsoleBridge(): void {
     ] as unknown as IArguments);
   });
   window.addEventListener("unhandledrejection", (e) => {
-    send("error", [
-      `[UnhandledRejection] ${e.reason?.stack ?? String(e.reason)}`,
-    ] as unknown as IArguments);
+    // `describe`, not `e.reason.stack`.
+    //
+    // WebKit's `Error.stack` is the frames alone, with no `name: message` header — unlike
+    // V8, where the message is the first line. Logging the stack therefore threw away the
+    // one part that says what went wrong, and every rejection in this project's logs read
+    // as three anonymous frames into a minified bundle. The same mistake as reducing an
+    // Error to `{}` with `JSON.stringify`, twenty lines up, and just as effective at hiding
+    // a fault in someone else's code.
+    //
+    // The stack is kept too — `describe` appends the first frame — because for a rejection
+    // it is often the only thing that says *where*.
+    send("error", [`[UnhandledRejection] ${describe(e.reason)}`] as unknown as IArguments);
   });
 }
