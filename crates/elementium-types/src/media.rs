@@ -385,6 +385,154 @@ impl Default for VideoConstraints {
     }
 }
 
+/// Which m-line family a track belongs to.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackKind {
+    Audio,
+    Video,
+}
+
+impl TrackKind {
+    /// The name `LiveKit` uses for this kind, which is also what reaches the SFU.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+impl std::fmt::Display for TrackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a track is carrying, in `LiveKit`'s vocabulary.
+///
+/// The spellings are not ours to choose: they are matched verbatim against
+/// `TrackSource` in the `LiveKit` protocol when a track is published, so a rename here
+/// silently changes what every other participant's UI thinks the track is.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackSource {
+    Microphone,
+    Camera,
+    ScreenShare,
+    ScreenShareAudio,
+}
+
+impl TrackSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone",
+            Self::Camera => "camera",
+            Self::ScreenShare => "screen_share",
+            Self::ScreenShareAudio => "screen_share_audio",
+        }
+    }
+}
+
+impl std::fmt::Display for TrackSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which of a participant's own tracks a piece of media belongs to.
+///
+/// This exists because a user can send two video tracks at once -- their camera and their
+/// screen -- and encoded frames carry no other way to say which they are. Without it the
+/// send path has one mid per media kind, so screen frames are written to the camera's mid:
+/// the SFU accepts them, the sender's counters advance, and no participant ever sees a
+/// picture. That failure is indistinguishable from success from the sending side, which is
+/// why the identity is a type rather than a convention.
+///
+/// The pair is the key rather than a generated id on purpose. `LiveKit` derives a published
+/// track's `cid` as `{sid}-{kind}-{source}` and the SFU pairs that `cid` against the
+/// offer's msid to decide which m-line a track belongs to. Deriving our routing key from
+/// the same two values means the key we route on and the key the SFU pairs on cannot drift
+/// apart; a separate uuid would need mapping back to the `cid`, and that mapping is exactly
+/// where the drift would live.
+///
+/// Construction goes through the named constructors so nonsense pairings -- an audio
+/// camera, a video microphone -- cannot be built at all.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaTrackKey {
+    kind: TrackKind,
+    source: TrackSource,
+}
+
+impl MediaTrackKey {
+    /// The user's microphone.
+    #[must_use]
+    pub const fn microphone() -> Self {
+        Self {
+            kind: TrackKind::Audio,
+            source: TrackSource::Microphone,
+        }
+    }
+
+    /// The user's camera.
+    #[must_use]
+    pub const fn camera() -> Self {
+        Self {
+            kind: TrackKind::Video,
+            source: TrackSource::Camera,
+        }
+    }
+
+    /// The video of a shared screen, window or application.
+    #[must_use]
+    pub const fn screen_share() -> Self {
+        Self {
+            kind: TrackKind::Video,
+            source: TrackSource::ScreenShare,
+        }
+    }
+
+    /// The audio of a shared screen, window or application.
+    ///
+    /// Distinct from [`MediaTrackKey::microphone`] in both origin and lifetime: it belongs
+    /// to the share, stops with it, and is muted independently.
+    #[must_use]
+    pub const fn screen_share_audio() -> Self {
+        Self {
+            kind: TrackKind::Audio,
+            source: TrackSource::ScreenShareAudio,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> TrackKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TrackSource {
+        self.source
+    }
+
+    /// The `{kind}-{source}` tail of the `LiveKit` `cid` for this track.
+    ///
+    /// The publisher prefixes its own participant sid; this is the part that distinguishes
+    /// one of a participant's tracks from another, and is what makes camera and screen
+    /// share pair with different m-lines without any further bookkeeping.
+    #[must_use]
+    pub fn cid_suffix(self) -> String {
+        format!("{}-{}", self.kind.as_str(), self.source.as_str())
+    }
+}
+
+impl std::fmt::Display for MediaTrackKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.kind.as_str(), self.source.as_str())
+    }
+}
+
 /// Track identifier used across the IPC boundary.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackId(pub String);
@@ -459,6 +607,69 @@ pub struct CaptureSource {
 pub enum CaptureSourceKind {
     Monitor,
     Window,
+}
+
+#[cfg(test)]
+mod media_track_key_tests {
+    use super::{MediaTrackKey, TrackKind, TrackSource};
+
+    /// The four keys must be distinct, because the whole point is telling them apart.
+    ///
+    /// Specifically camera and screen share: they are both video, and treating them as one
+    /// is the defect this type exists to prevent.
+    #[test]
+    fn every_track_a_participant_can_send_has_its_own_key() {
+        let keys = [
+            MediaTrackKey::microphone(),
+            MediaTrackKey::camera(),
+            MediaTrackKey::screen_share(),
+            MediaTrackKey::screen_share_audio(),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in keys.iter().skip(i.saturating_add(1)) {
+                assert_ne!(a, b, "{a} and {b} must not collide");
+            }
+        }
+    }
+
+    /// The `cid` tail is what the SFU matches against the offer's msid to pair a published
+    /// track with an m-line. If two of our tracks produced the same tail, the pairing would
+    /// fall back to the server's guess by media kind and become order-dependent.
+    #[test]
+    fn the_cid_suffix_distinguishes_the_two_video_tracks() {
+        assert_eq!(MediaTrackKey::camera().cid_suffix(), "video-camera");
+        assert_eq!(
+            MediaTrackKey::screen_share().cid_suffix(),
+            "video-screen_share"
+        );
+        assert_ne!(
+            MediaTrackKey::camera().cid_suffix(),
+            MediaTrackKey::screen_share().cid_suffix()
+        );
+    }
+
+    /// These spellings are matched verbatim against the `LiveKit` protocol's own
+    /// `TrackSource` names when publishing. A rename here would compile and then quietly
+    /// publish every share as `Unknown`, which other clients render as an unlabelled track.
+    #[test]
+    fn the_source_names_match_livekits_vocabulary() {
+        assert_eq!(TrackSource::Microphone.as_str(), "microphone");
+        assert_eq!(TrackSource::Camera.as_str(), "camera");
+        assert_eq!(TrackSource::ScreenShare.as_str(), "screen_share");
+        assert_eq!(TrackSource::ScreenShareAudio.as_str(), "screen_share_audio");
+        assert_eq!(TrackKind::Audio.as_str(), "audio");
+        assert_eq!(TrackKind::Video.as_str(), "video");
+    }
+
+    /// Share audio is audio and share video is video -- the constructors pair them, so a
+    /// caller cannot ask for an audio camera or a video microphone.
+    #[test]
+    fn the_constructors_pair_each_source_with_its_own_kind() {
+        assert_eq!(MediaTrackKey::screen_share().kind(), TrackKind::Video);
+        assert_eq!(MediaTrackKey::screen_share_audio().kind(), TrackKind::Audio);
+        assert_eq!(MediaTrackKey::camera().kind(), TrackKind::Video);
+        assert_eq!(MediaTrackKey::microphone().kind(), TrackKind::Audio);
+    }
 }
 
 #[cfg(test)]
