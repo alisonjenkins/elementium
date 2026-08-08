@@ -159,6 +159,63 @@ it now makes first, and what it expects back, is the next thing to find out: ins
 shim to log every method and property access, and compare the two versions' call sequences
 directly.
 
+### Narrowed, 2026-08-08: it is not an exception, it is a protocol change
+
+The peer-connection trace (`ELEMENTIUM_TRACE_PC=1`) records every property read and method
+call in order. Per connection, on v1.12.25:
+
+```
+createDataChannel ×3
+addTransceiver ×6
+signalingState -> stable
+createOffer(0 args)
+   ← and nothing further, ever
+```
+
+`createOffer` is entered 3 times and **resolves 3 times**. `getTransceivers` is called
+**zero** times, and `setLocalDescription` zero times. That places the stall between
+`createOffer` resolving and `getPlaceholderMids()`, which is livekit's SDP munging — so the
+munging was the obvious suspect.
+
+**It is not.** Our real offer was run through livekit's own munge block —
+`sdp-transform`'s `parse`, `ensureIPAddrMatchVersion`, `ensureAudioNackAndStereo`, `write` —
+outside the browser. It completes cleanly:
+
+```
+section type=application mid=ofv rtp=0 fmtp=0
+section type=audio       mid=ATe rtp=1 fmtp=1
+section type=video       mid=Xpg rtp=2 fmtp=1
+munge ok
+```
+
+What the trace shows instead is the order of events, and it has changed:
+
+```
+Created SDP offer
+signal connecting to ws://localhost:7880/rtc/v1?access_token=…&join_request=CAES…
+signal connected
+```
+
+**The offer is created before the signalling socket opens, and travels inside it.** In
+livekit protocol 17 the client builds a `JoinRequest` carrying a `publisherOffer` and sends
+it as a base64 query parameter on the WebSocket URL (`SignalClient.ts`,
+`createJoinRequestConnectionParams`). The old flow — connect, then offer, then
+`setLocalDescription`, then exchange over the socket — is gone.
+
+So nothing is throwing and nothing is missing from our API surface. We are answering the
+calls of a handshake that no longer applies. `setLocalDescription` is never called because
+in this flow the client waits for the join response to carry the answer, and then applies
+both.
+
+That reframes T024. It is not "add a missing method"; it is a new connection flow to
+support, and the next thing to establish is what the SFU sends back in the join response to
+our offer — which needs the signalling messages logged, not the peer connection.
+
+Also visible in the trace, and worth noting before it is mistaken for a fault: our offer is
+now `a=recvonly` on both media lines where it used to be `a=sendrecv`. That is the same
+protocol-17 change — livekit pre-populates recvonly *placeholder* transceivers and replaces
+tracks into them later, which is what `placeholderMidsFromTransceivers` exists for.
+
 ### What this changes about the plan
 
 Nothing structural, and the ordering was right: the instrumentation from Phases 1 and 2 was
