@@ -227,7 +227,13 @@ Sink nodes carry no PID, as expected: a sink belongs to no single process. Captu
 desktop mix means capturing a sink's monitor, and needs no correlation at all — which is
 why it is sequenced first.
 
-## R9: the compositor offers DMA-BUF only — measured 2026-08-08, and it blocks US1
+## R9: the compositor offers DMA-BUF only — measured 2026-08-08, and it blocked US1
+
+> **Superseded the same day.** R9 and R10 below are the investigation as it stood before
+> DMA-BUF import existed. They are kept because the measurements are still the evidence for
+> why the code is shaped as it is — but where they say capture *cannot* read DMA-BUF, or
+> that US1 is blocked, read them as history: `SourceProfile::Screencast` now accepts
+> `DmaBuf` and imports it, and US1 is demonstrated end to end (quickstart Levels 2 and 4).
 
 Attempting a real capture through the finished pipeline fails at negotiation:
 
