@@ -16,5 +16,11 @@
     "noFallthroughCasesInSwitch": true,
     "outDir": "dist"
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Unit tests run under Node and use `node:fs` and `Buffer`; this project is the browser
+  // half and deliberately has no Node types, so type-checking them here would either fail
+  // or require putting Node globals within reach of shim code that must not use them.
+  // `tests/` (Playwright) sits outside `include` for the same reason. Vitest type-checks
+  // nothing, so a type error in a test surfaces when the test runs.
+  "exclude": ["src/**/*.test.ts"]
 }

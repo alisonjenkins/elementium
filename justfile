@@ -111,6 +111,10 @@ test-env-down:
 test-browser:
     cd frontend && pnpm exec playwright test
 
+# Unit tests for the pure parts of the shim. No homeserver, no browser, sub-second.
+test-frontend:
+    cd frontend && pnpm exec vitest run
+
 # Build release
 build:
     cargo tauri build
