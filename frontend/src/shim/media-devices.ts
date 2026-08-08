@@ -141,11 +141,19 @@ export function setupMediaDevicesShim(): void {
           if (id.startsWith("audio-")) {
             const audioTrack = createSilentAudioTrack();
             if (audioTrack) {
+              // Both directions reach Rust: stopping releases the device, and muting stops
+              // the media rather than only the icon. Neither happened before — a camera
+              // stayed lit after the UI said it was off, and a muted microphone kept being
+              // published.
+              wireStopToBackend(audioTrack, id);
+              wireMuteToBackend(audioTrack, "audio", "microphone");
               stream.addTrack(audioTrack);
             }
           } else if (id.startsWith("video-")) {
             const videoTrack = await createNativeVideoTrack(id);
             if (videoTrack) {
+              wireStopToBackend(videoTrack, id);
+              wireMuteToBackend(videoTrack, "video", "camera");
               stream.addTrack(videoTrack);
             }
           }
@@ -219,6 +227,7 @@ export function setupMediaDevicesShim(): void {
           // native capture, its threads and its portal session all keep running after the
           // page thinks the share ended.
           wireStopToBackend(videoTrack, result.videoTrackId);
+          wireMuteToBackend(videoTrack, "video", "screen_share");
           stream.addTrack(videoTrack);
         }
 
@@ -226,6 +235,7 @@ export function setupMediaDevicesShim(): void {
           const audioTrack = createSilentAudioTrack();
           if (audioTrack) {
             wireStopToBackend(audioTrack, result.audioTrackId);
+            wireMuteToBackend(audioTrack, "audio", "screen_share_audio");
             stream.addTrack(audioTrack);
           }
         }
@@ -390,6 +400,47 @@ function wireStopToBackend(track: MediaStreamTrack, nativeTrackId: string): void
       console.error(`[Elementium] stop_track(${nativeTrackId}) failed:`, e);
     });
   };
+}
+
+/**
+ * Make `track.enabled = false` actually stop the media.
+ *
+ * This is how every caller in this stack mutes: livekit-client and matrix-js-sdk both set
+ * `enabled` on the `MediaStreamTrack` they were handed. That object is a local preview —
+ * the frames and samples on the wire come from a capture pipeline in Rust, which has never
+ * seen it. So muting changed the icon and nothing else: the user believed they were muted
+ * and everyone else could still hear and see them.
+ *
+ * `enabled` is an accessor on `MediaStreamTrack.prototype`, so it is redefined on this
+ * instance: the original still governs the canvas preview (a muted camera should stop
+ * showing itself locally too), and the backend is told either way.
+ *
+ * Failures are logged loudly rather than swallowed. A mute that did not reach the backend
+ * is precisely the fault being fixed, and a silent catch here would restore it.
+ */
+function wireMuteToBackend(
+  track: MediaStreamTrack,
+  kind: "audio" | "video",
+  source: string,
+): void {
+  const proto = Object.getPrototypeOf(track) as object;
+  const original = Object.getOwnPropertyDescriptor(proto, "enabled");
+  if (!original?.get || !original.set) {
+    console.warn("[Elementium] MediaStreamTrack.enabled is not an accessor; mute will not reach the backend");
+    return;
+  }
+  const get = original.get.bind(track);
+  const set = original.set.bind(track);
+  Object.defineProperty(track, "enabled", {
+    configurable: true,
+    get,
+    set: (value: boolean) => {
+      set(value);
+      invoke("set_capture_muted", { kind, source, muted: !value }).catch((e) => {
+        console.error(`[Elementium] set_capture_muted(${kind}/${source}) failed:`, e);
+      });
+    },
+  });
 }
 
 /**

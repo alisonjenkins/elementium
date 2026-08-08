@@ -68,6 +68,15 @@ pub struct PipelineHandle {
     /// Set to enable encoding and sending to a peer connection.
     /// When `None`, the pipeline captures but does not encode or send.
     pub encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    /// Set while the user has this track muted.
+    ///
+    /// Muting has to stop the *media*, not just the icon. Element Call mutes by setting
+    /// `enabled = false` on the `MediaStreamTrack` it was handed, and that object is a
+    /// local preview -- the frames on the wire come from this pipeline, which knew nothing
+    /// about it. So a muted microphone kept being published: the user saw a muted icon and
+    /// everyone else kept hearing them. Checked in the capture loop rather than at the
+    /// channel, so a muted track also stops spending CPU on encoding nobody will receive.
+    pub muted: Arc<std::sync::atomic::AtomicBool>,
     pub extras: PipelineExtras,
 }
 
@@ -173,6 +182,8 @@ pub fn start_screen_share_pipeline(
     let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
     let active_codec_clone = active_codec.clone();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let muted_clone = Arc::clone(&muted);
 
     // Which capture source to open is decided by which backend granted the share -- a
     // PipeWire node to pull for the portal, a source id to hand X11's push capturer for
@@ -218,6 +229,7 @@ pub fn start_screen_share_pipeline(
         let _guard = span.enter();
         video_pipeline_loop(
             key,
+            &muted_clone,
             &tid,
             &capture_source,
             &frames,
@@ -239,6 +251,7 @@ pub fn start_screen_share_pipeline(
                 track_id: track_id.clone(),
                 stop_tx,
                 encode_tx,
+                muted,
                 extras: PipelineExtras::Video {
                     keyframe_requested,
                     active_codec,
@@ -286,11 +299,20 @@ pub fn start_screen_share_audio_pipeline(
         OpusEncoderConfig::default().expected_packet_loss_perc,
     ));
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let muted_clone = Arc::clone(&muted);
 
     let span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = span.enter();
-        screen_share_audio_capture_loop(key, node_id, source_kind, &encode_tx_clone, &stop_rx);
+        screen_share_audio_capture_loop(
+            key,
+            node_id,
+            source_kind,
+            &encode_tx_clone,
+            &muted_clone,
+            &stop_rx,
+        );
     });
 
     media_state
@@ -304,6 +326,7 @@ pub fn start_screen_share_audio_pipeline(
                 track_id: track_id.clone(),
                 stop_tx,
                 encode_tx,
+                muted,
                 extras: PipelineExtras::Audio { loss_estimate },
             },
         );
@@ -313,6 +336,50 @@ pub fn start_screen_share_audio_pipeline(
     }
 
     Ok(track_id)
+}
+
+/// Mute or unmute a capture pipeline, stopping the media rather than only the icon.
+///
+/// Element Call mutes by setting `enabled = false` on the `MediaStreamTrack` it was handed.
+/// That object is a local preview: the frames on the wire come from a capture pipeline in
+/// Rust which never saw it. So muting changed nothing anyone else could hear or see — the
+/// user got a muted icon and kept broadcasting. The shim now forwards the change here.
+///
+/// Signalling the SFU is a separate call (`livekit_set_track_muted`), because a mute has to
+/// stop the media whether or not a room is connected, and the media is the part that
+/// matters if only one of the two can happen.
+///
+/// # Errors
+///
+/// Returns an error if the kind/source pair is not one we publish, or if there is no
+/// pipeline for it — muting a track that is not running cannot be reported as done.
+// Tauri's IPC gives a command owned arguments and an owned `State` handle; taking them by
+// reference is not an option the macro offers.
+#[allow(clippy::needless_pass_by_value)]
+#[command]
+pub fn set_capture_muted(
+    media_state: State<'_, MediaState>,
+    kind: String,
+    source: String,
+    muted: bool,
+) -> Result<(), String> {
+    let key = super::livekit::track_key(&kind, &source)?;
+    // The flag is taken out from under the guard rather than used through it, so the lock
+    // is not held while anything else happens -- this runs on the IPC thread, and the
+    // capture loops take the same map.
+    let flag = {
+        let pipelines = media_state
+            .pipelines
+            .lock()
+            .map_err(|_| "pipeline map lock poisoned".to_owned())?;
+        pipelines.get(&key).map(|handle| Arc::clone(&handle.muted))
+    };
+    let Some(flag) = flag else {
+        return Err(format!("no capture pipeline is running for {key}"));
+    };
+    flag.store(muted, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(track = %key, muted, "capture mute state changed");
+    Ok(())
 }
 
 #[command]
@@ -395,13 +462,15 @@ fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
     ));
     let loss_estimate_clone = loss_estimate.clone();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let muted_clone = Arc::clone(&muted);
 
     // Inherits the call's correlation span so every event the thread emits carries the
     // same correlation_id.
     let audio_span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = audio_span.enter();
-        audio_capture_loop(key, &encode_tx_clone, &stop_rx, &loss_estimate_clone);
+        audio_capture_loop(key, &encode_tx_clone, &muted_clone, &stop_rx, &loss_estimate_clone);
     });
 
     if let Ok(mut pipelines) = media_state.pipelines.lock() {
@@ -412,6 +481,7 @@ fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
                 track_id: track_id.0.clone(),
                 stop_tx,
                 encode_tx,
+                muted,
                 extras: PipelineExtras::Audio { loss_estimate },
             },
         );
@@ -458,6 +528,33 @@ fn stop_pipeline_inheriting_connection(
     }
 }
 
+/// Stop any camera pipeline already running and inherit whatever it was feeding.
+///
+/// Returns whether one existed -- the caller waits for the device to release if so -- and
+/// the peer connection to adopt.
+///
+/// The inheritance matters for exactly the reason it does on the audio path: a camera
+/// restarted mid-call (device change, resolution change, track replacement) would otherwise
+/// sit disconnected until the next renegotiation, and the far end would see the video
+/// freeze with nothing in the log to explain it.
+fn take_over_camera_pipeline(
+    media_state: &MediaState,
+    track_id: &TrackId,
+) -> (bool, Option<tokio_mpsc::Sender<IoCommand>>) {
+    let previous =
+        stop_pipeline_inheriting_connection(&media_state.pipelines, MediaTrackKey::camera());
+    let had_previous = previous.existed;
+    let inherited_connection = connection_for_new_pipeline(previous.connection, media_state);
+    if inherited_connection.is_some() {
+        tracing::info!(
+            track_id = %track_id,
+            "Camera restarted mid-call; inheriting the existing peer connection"
+        );
+    }
+    (had_previous, inherited_connection)
+}
+
+
 #[command]
 pub async fn get_user_media(
     webrtc_state: State<'_, WebRtcState>,
@@ -500,23 +597,7 @@ pub async fn get_user_media(
             engine.video_frames.clone()
         };
 
-        // Stop any existing camera pipeline, inheriting whichever peer connection it was
-        // feeding, and note whether we need to wait for the device to release.
-        //
-        // The inheritance matters for exactly the reason it does on the audio path: a
-        // camera restarted mid-call (device change, resolution change, track replacement)
-        // would otherwise sit disconnected until the next renegotiation, and the far end
-        // would see the video freeze with nothing in the log to explain it.
-        let previous =
-            stop_pipeline_inheriting_connection(&media_state.pipelines, MediaTrackKey::camera());
-        let had_previous = previous.existed;
-        let inherited_connection = connection_for_new_pipeline(previous.connection, &media_state);
-        if inherited_connection.is_some() {
-            tracing::info!(
-                track_id = %track_id,
-                "Camera restarted mid-call; inheriting the existing peer connection"
-            );
-        }
+        let (had_previous, inherited_connection) = take_over_camera_pipeline(&media_state, &track_id);
 
         let req_width = video_constraints.width;
         let req_height = video_constraints.height;
@@ -534,6 +615,8 @@ pub async fn get_user_media(
         let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
         let active_codec_clone = active_codec.clone();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let muted_clone = Arc::clone(&muted);
         let tid = track_id.0.clone();
 
         // Start the camera pipeline on a background thread, inheriting the
@@ -558,6 +641,7 @@ pub async fn get_user_media(
             }
             video_pipeline_loop(
                 MediaTrackKey::camera(),
+                &muted_clone,
                 &tid,
                 &VideoCaptureSource::Camera {
                     width: req_width,
@@ -581,6 +665,7 @@ pub async fn get_user_media(
                     track_id: track_id.0.clone(),
                     stop_tx,
                     encode_tx,
+                    muted,
                     extras: PipelineExtras::Video {
                         keyframe_requested,
                         active_codec,
@@ -1131,6 +1216,43 @@ fn release_preview(video_frames: &VideoFrameBuffer, track_id: &str) {
     }
 }
 
+/// Whether a captured frame should be dropped because the user has this track muted.
+///
+/// Frames are drained from the capture first and discarded here. Draining keeps the
+/// source's queue from backing up, so unmuting resumes on a live frame rather than
+/// replaying a stale one; discarding here rather than at the channel means a muted track
+/// also stops spending CPU encoding what nobody will receive.
+fn dropped_because_muted(muted: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+    muted.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the capture has failed outright, reported once with what it was feeding.
+///
+/// A shared window closing, or a monitor being unplugged, errors the stream rather than
+/// ending it: `try_recv` simply keeps returning `None`, which is also what a perfectly
+/// healthy screencast of a static window does between damage events. Without this the
+/// pipeline spins forever on a dead source, publishing nothing, logging nothing, and
+/// looking to every counter like an idle share.
+fn source_died(
+    capturer: &elementium_media::video_source::VideoSource,
+    source: &VideoCaptureSource,
+    track_id: &str,
+    frame_count: u64,
+) -> bool {
+    if !capturer.failed() {
+        return false;
+    }
+    tracing::error!(
+        track_id = %track_id,
+        source = source.label(),
+        frame_count,
+        "video capture failed; the source is gone and the pipeline is stopping"
+    );
+    true
+}
+
+
+
 /// Background thread: reads frames from a video source, writes RGBA to `VideoFrameBuffer`
 /// for preview, and optionally encodes + sends them to a peer connection.
 ///
@@ -1140,6 +1262,7 @@ fn release_preview(video_frames: &VideoFrameBuffer, track_id: &str) {
 #[allow(clippy::too_many_arguments)]
 fn video_pipeline_loop(
     key: MediaTrackKey,
+    muted: &Arc<std::sync::atomic::AtomicBool>,
     track_id: &str,
     source: &VideoCaptureSource,
     video_frames: &VideoFrameBuffer,
@@ -1210,24 +1333,16 @@ fn video_pipeline_loop(
             break;
         }
 
-        // A shared window closing, or a monitor being unplugged, errors the stream rather
-        // than ending it: `try_recv` simply keeps returning `None`, which is also what a
-        // perfectly healthy screencast of a static window does between damage events.
-        // Without this check the pipeline spins forever on a dead source, publishing
-        // nothing, logging nothing, and looking to every counter like an idle share.
-        if capturer.failed() {
-            tracing::error!(
-                track_id = %track_id,
-                source = source.label(),
-                frame_count,
-                "video capture failed; the source is gone and the pipeline is stopping"
-            );
+        if source_died(&capturer, source, track_id, frame_count) {
             release_preview(video_frames, track_id);
             break;
         }
 
         if let Some(frame) = capturer.try_recv() {
             frame_count = frame_count.wrapping_add(1);
+            if dropped_because_muted(muted) {
+                continue;
+            }
             if frame_count <= 3 || frame_count.is_multiple_of(100) {
                 // Named by source, not "Camera": this loop serves the screen share too, and
                 // this is the one line that says frames are flowing. Calling a share's
@@ -1886,6 +2001,7 @@ fn retune_fec_if_needed(
 fn audio_capture_loop(
     key: MediaTrackKey,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    muted: &Arc<std::sync::atomic::AtomicBool>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     loss_estimate: &Arc<NetworkLossEstimate>,
 ) {
@@ -1962,6 +2078,13 @@ fn audio_capture_loop(
         }
 
         if let Some(frame) = capturer.try_recv() {
+            // Dropped here, before resampling, encoding or any chance of reaching a peer
+            // connection. A muted microphone that still publishes is the worst version of
+            // this codebase's recurring failure: the user has an icon telling them they are
+            // silent, and everyone else can hear them.
+            if muted.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             let mut data = frame.data;
 
             // Point 1: exactly what the microphone produced, before we touch it.
@@ -2026,6 +2149,7 @@ fn screen_share_audio_capture_loop(
     node_id: u32,
     source_kind: elementium_media::pipewire_audio::AudioSourceKind,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
+    muted: &Arc<std::sync::atomic::AtomicBool>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
 ) {
     use elementium_media::pipewire_audio::{PipewireAudioCapture, TARGET_SAMPLE_RATE};
@@ -2081,6 +2205,11 @@ fn screen_share_audio_capture_loop(
         // Folded to mono for the same reason the microphone is: Opus here is always
         // negotiated mono (OUTBOUND_CHANNELS), so a stereo source has to be reduced before
         // framing regardless of how many channels PipeWire negotiated for it.
+        if muted.load(std::sync::atomic::Ordering::Relaxed) {
+            // Dropped before it is encoded, and before it can reach a peer connection: a
+            // muted microphone that still publishes is the failure this exists to remove.
+            continue;
+        }
         let mono = elementium_media::audio_capture::downmix_to_mono(&frame.data, frame.channels);
         accumulator.extend_from_slice(&mono);
 
