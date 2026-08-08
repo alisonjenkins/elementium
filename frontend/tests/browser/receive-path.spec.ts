@@ -153,7 +153,7 @@ function startPublisher(
   keyHex?: string,
   rotateFrames = 0,
   badFrames = 0,
-  video = false,
+  video: "h264" | "vp8" | null = null,
 ): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
@@ -163,7 +163,7 @@ function startPublisher(
     ...(keyHex ? ["--key-hex", keyHex] : []),
     ...(rotateFrames > 0 ? ["--rotate-frames", String(rotateFrames)] : []),
     ...(badFrames > 0 ? ["--bad-frames", String(badFrames)] : []),
-    ...(video ? ["--video-h264"] : []),
+    ...(video ? [`--video-${video}`] : []),
   ];
   // `RUST_LOG` at info: the publisher's own view of negotiation and ICE is the other half
   // of any failure here, and discarding its stderr made a publisher-side fault look like a
@@ -338,6 +338,112 @@ async function measure(
   }
 }
 
+
+type VideoStats = {
+  mimeType: string | null;
+  packetsReceived: number;
+  framesReceived: number;
+  framesDecoded: number;
+  framesDropped: number;
+  keyFramesDecoded: number;
+  pliCount: number;
+  frameWidth: number;
+  frameHeight: number;
+};
+
+/**
+ * Publish encrypted video of one codec and measure what the browser made of it.
+ *
+ * Deltas across a settled window, as the audio measurement does, and the same distinction
+ * it draws: `framesReceived` counts what the depacketiser assembled, `framesDecoded` what
+ * the decoder accepted. A frame whose E2EE framing is wrong still arrives and still counts
+ * in `packetsReceived`, so that counter can never be the assertion.
+ */
+async function measureVideo(
+  page: import("@playwright/test").Page,
+  codec: "h264" | "vp8",
+  encrypted = true,
+): Promise<VideoStats> {
+  const roomName = `elementium-${codec}-${Date.now()}`;
+  console.log(`  room: ${roomName}`);
+  const server = await startPageServer();
+
+  page.on("console", (m) => console.log(`  [page:${m.type()}] ${m.text()}`));
+  page.on("pageerror", (e) => console.log(`  [page:error] ${e.message}`));
+
+  const query = new URLSearchParams({
+    url: SFU_WS,
+    token: mintToken("browser-subscriber", roomName),
+  });
+  if (encrypted) query.set("key", KEY_HEX);
+  await page.goto(`${server.origin}/?${query.toString()}`);
+  await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
+
+  const publisher = startPublisher(
+    roomName,
+    20,
+    encrypted ? KEY_HEX : undefined,
+    0,
+    0,
+    codec,
+  );
+  try {
+    await publisher.live;
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            () => (window as never as { __videoSubscribed: boolean }).__videoSubscribed,
+          ),
+        { timeout: 30_000, message: "the browser never subscribed to the published video" },
+      )
+      .toBe(true);
+
+    const read = async (): Promise<VideoStats> => {
+      let last = "not attempted";
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const s = await page.evaluate(() =>
+          (window as never as {
+            __videoStats: () => Promise<VideoStats | { error: string }>;
+          }).__videoStats(),
+        );
+        if (!("error" in s)) return s;
+        last = s.error;
+        await page.waitForTimeout(500);
+      }
+      throw new Error(`could not read video stats after 10s: ${last}`);
+    };
+
+    await page.waitForTimeout(5_000);
+    const before = await read();
+    await page.waitForTimeout(8_000);
+    const after = await read();
+    console.log(`  before: ${JSON.stringify(before)}`);
+    console.log(`  after:  ${JSON.stringify(after)}`);
+
+    const errors = await page.evaluate(
+      () => (window as never as { __errors: string[] }).__errors,
+    );
+    console.log(`  page errors: ${JSON.stringify(errors)}`);
+    expect(errors, "no E2EE worker errors").toEqual([]);
+
+    return {
+      mimeType: after.mimeType,
+      packetsReceived: after.packetsReceived - before.packetsReceived,
+      framesReceived: after.framesReceived - before.framesReceived,
+      framesDecoded: after.framesDecoded - before.framesDecoded,
+      framesDropped: after.framesDropped - before.framesDropped,
+      keyFramesDecoded: after.keyFramesDecoded - before.keyFramesDecoded,
+      pliCount: after.pliCount,
+      frameWidth: after.frameWidth,
+      frameHeight: after.frameHeight,
+    };
+  } finally {
+    publisher.stop();
+    server.close();
+  }
+}
+
 /**
  * Assert the browser reconstructed the stream rather than merely receiving it.
  *
@@ -499,10 +605,11 @@ test.describe("browser receive path", () => {
   test("H.264 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
     test.fixme(
       true,
-      "Reaches the receiver and stops there: framesReceived is 0 while packetsReceived " +
-        "climbs and pliCount rises, so the depacketiser never assembles a picture. Not " +
-        "the E2EE keys (the worker reports no errors) and not the decoder (nothing gets " +
-        "that far). See 005 T020.",
+      "Our H.264 E2EE framing is wrong, and the two controls beside this one say so: VP8 " +
+        "with the same encryption assembles and decodes 204/204, and plain H.264 through " +
+        "the same path assembles 210 and decodes 209. Only H.264 *and* encryption fails, " +
+        "and the encrypted frame has the same Annex B NAL structure (7,8,5) as the plain " +
+        "one -- so it is not packetisation. See 005 T020.",
     );
     const roomName = `elementium-h264-${Date.now()}`;
     console.log(`  room: ${roomName}`);
@@ -519,7 +626,7 @@ test.describe("browser receive path", () => {
     await page.goto(`${server.origin}/?${query.toString()}`);
     await expect.poll(() => page.textContent("#state"), { timeout: 20_000 }).toBe("connected");
 
-    const publisher = startPublisher(roomName, 20, KEY_HEX, 0, 0, true);
+    const publisher = startPublisher(roomName, 20, KEY_HEX, 0, 0, "h264");
     try {
       await publisher.live;
 
@@ -590,6 +697,38 @@ test.describe("browser receive path", () => {
       publisher.stop();
       server.close();
     }
+  });
+
+  /**
+   * CONTROL for the H.264 test: the same publisher, the same E2EE, VP8 instead.
+   *
+   * If VP8 assembles and H.264 does not, the fault is H.264-specific -- its framing, its
+   * packetisation, or its parameter sets. If neither assembles, video publishing through
+   * this path has never worked at all, and the H.264 test says nothing about H.264.
+   *
+   * Worth having permanently rather than as a one-off: it is the only thing that can tell
+   * "our H.264 is wrong" from "our video publishing is wrong", and that question will come
+   * back every time either changes.
+   */
+  test("control: VP8 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
+    const stats = await measureVideo(page, "vp8");
+    expect(stats.mimeType, "the SFU must have negotiated VP8").toMatch(/VP8/i);
+    expect(stats.framesReceived, "the depacketiser must assemble frames").toBeGreaterThan(10);
+    expect(stats.framesDecoded, "livekit's worker must decrypt them into pictures")
+      .toBeGreaterThan(10);
+  });
+
+  /**
+   * CONTROL: H.264 with no encryption at all.
+   *
+   * Separates "our H.264 bitstream and packetisation" from "our H.264 E2EE framing". Both
+   * produce the same symptom -- packets arrive, no frame is assembled -- and nothing else
+   * distinguishes them.
+   */
+  test("control: plain H.264 assembles at the receiver", async ({ page }) => {
+    const stats = await measureVideo(page, "h264", false);
+    expect(stats.mimeType, "the SFU must have negotiated H.264").toMatch(/H264/i);
+    expect(stats.framesReceived, "the depacketiser must assemble frames").toBeGreaterThan(10);
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.

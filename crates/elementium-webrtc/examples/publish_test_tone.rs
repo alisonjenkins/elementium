@@ -176,18 +176,13 @@ fn checkerboard(width: u32, height: u32, step: u32) -> elementium_types::I420Fra
 /// Spaced rather than issued back to back: each publish triggers its own offer/answer, and
 /// two in flight at once left the second answer describing mids the first offer never had.
 #[allow(clippy::expect_used)]
-async fn publish_tracks(room: &mut LiveKitRoom, video: bool) {
+async fn publish_tracks(room: &mut LiveKitRoom, codec: Option<elementium_codec::VideoCodec>) {
     room.publish_track("audio", "microphone")
         .expect("publish the audio track");
-    if video {
+    if let Some(codec) = codec {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        room.publish_video_track(
-            "camera",
-            elementium_codec::VideoCodec::H264,
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT,
-        )
-        .expect("publish the video track");
+        room.publish_video_track("camera", codec, VIDEO_WIDTH, VIDEO_HEIGHT)
+            .expect("publish the video track");
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
@@ -217,9 +212,9 @@ fn build_e2ee_context(
 /// Panics rather than degrading if there is none: a run asked for video, and publishing
 /// silence in its place would make the test report a framing failure it never tested.
 #[allow(clippy::expect_used)]
-fn build_video_encoder() -> elementium_codec::NegotiatedEncoder {
+fn build_video_encoder(codec: elementium_codec::VideoCodec) -> elementium_codec::NegotiatedEncoder {
     elementium_codec::NegotiatedEncoder::new(
-        elementium_codec::VideoCodec::H264,
+        codec,
         elementium_codec::EncoderConfig {
             width: VIDEO_WIDTH,
             height: VIDEO_HEIGHT,
@@ -227,7 +222,7 @@ fn build_video_encoder() -> elementium_codec::NegotiatedEncoder {
             max_framerate: 25,
         },
     )
-    .expect("an H.264 encoder")
+    .expect("a video encoder for the requested codec")
 }
 
 /// Encode and send one video frame, on every second audio tick.
@@ -241,6 +236,7 @@ async fn send_video_frame(
     encoder: &mut elementium_codec::NegotiatedEncoder,
     room: &LiveKitRoom,
     tick: u64,
+    codec: elementium_codec::VideoCodec,
 ) -> u64 {
     if !tick.is_multiple_of(2) {
         return 0;
@@ -255,7 +251,7 @@ async fn send_video_frame(
     let mut sent: u64 = 0;
     for packet in packets {
         if room
-            .write_video(packet.data, elementium_codec::VideoCodec::H264)
+            .write_video(packet.data, codec)
             .await
             .is_ok()
         {
@@ -312,7 +308,17 @@ async fn main() {
     // from VP8's -- a different clear-header rule and RBSP-escaped ciphertext -- and that
     // contract was until now only checked against livekit's *source*. This is what checks
     // it against livekit's running worker.
-    let video = std::env::args().any(|a| a == "--video-h264");
+    // The codec is a flag so the same harness can publish VP8, which is the control: if
+    // VP8 assembles at the receiver and H.264 does not, the fault is H.264-specific. If
+    // neither does, video publishing through this path has never worked -- and until this
+    // example existed nothing had ever tried it.
+    let video_codec = if std::env::args().any(|a| a == "--video-h264") {
+        Some(elementium_codec::VideoCodec::H264)
+    } else if std::env::args().any(|a| a == "--video-vp8") {
+        Some(elementium_codec::VideoCodec::Vp8)
+    } else {
+        None
+    };
 
     let base_key =
         arg("--key-hex").map(|hex| decode_hex(&hex).expect("--key-hex must be valid hex"));
@@ -340,7 +346,7 @@ async fn main() {
     // Settle signaling before publishing: SignalSender::send is fire-and-forget, so an
     // AddTrack sent too early can be lost with no error surfaced.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    publish_tracks(&mut room_conn, video).await;
+    publish_tracks(&mut room_conn, video_codec).await;
 
     // Tell the driving test we are live, so it can stop guessing at timing.
     println!("PUBLISHING");
@@ -364,7 +370,7 @@ async fn main() {
     let mut ticker = tokio::time::interval(Duration::from_millis(20));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
 
-    let mut video_encoder = video.then(build_video_encoder);
+    let mut video_encoder = video_codec.map(build_video_encoder);
     let mut video_sent: u64 = 0;
 
     let mut key_index: u8 = 0;
@@ -392,8 +398,9 @@ async fn main() {
         }
 
         if let Some(encoder) = video_encoder.as_mut() {
-            video_sent =
-                video_sent.saturating_add(send_video_frame(encoder, &room_conn, i).await);
+            let codec = video_codec.unwrap_or(elementium_codec::VideoCodec::Vp8);
+            video_sent = video_sent
+                .saturating_add(send_video_frame(encoder, &room_conn, i, codec).await);
         }
 
         let frame = tone_frame(sample_index);
@@ -412,7 +419,7 @@ async fn main() {
     // The receiving side reads this to compute a delivery ratio against what we actually
     // put on the wire, rather than against what it hoped we would.
     println!("SENT {sent}");
-    if video {
+    if video_codec.is_some() {
         println!("VIDEO_SENT {video_sent}");
     }
     room_conn.disconnect().await;

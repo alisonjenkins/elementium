@@ -707,11 +707,36 @@ pub fn write_video(
     // stream the receiver decodes as VP8 and cannot make sense of, with nothing on either
     // side reporting an error.
     let wanted = str0m_codec(codec);
-    let pt = writer
+    // Not simply the first payload type of the right codec.
+    //
+    // str0m offers seven H.264 payload types, alternating `packetization-mode` 1 and 0, and
+    // its packetiser emits FU-A for any NAL larger than the MTU -- which every keyframe is.
+    // A receiver that negotiated mode 0 is entitled to drop every fragment, and does: the
+    // packets arrive and are counted, no frame is ever assembled, and the receiver asks for
+    // a keyframe forever. Nothing on the sending side notices, because all it did was hand
+    // bytes to a writer that accepted them.
+    //
+    // So prefer a payload type that permits fragmentation, and fall back only if the far
+    // end negotiated nothing else.
+    let params: Vec<_> = writer
         .payload_params()
-        .find(|p| p.spec().codec == wanted)
-        .map(str0m::format::PayloadParams::pt)
+        .filter(|p| p.spec().codec == wanted)
+        .collect();
+    let fragmentable = params
+        .iter()
+        .find(|p| p.spec().format.packetization_mode != Some(0));
+    let chosen = fragmentable
+        .or_else(|| params.first())
         .ok_or_else(|| format!("No {} payload type negotiated", codec.sdp_name()))?;
+    if fragmentable.is_none() {
+        tracing::warn!(
+            pc_id = %pc.id,
+            pt = ?chosen.pt(),
+            "the only negotiated H.264 payload type forbids fragmentation; frames larger \
+             than the MTU will not be reassembled by the receiver"
+        );
+    }
+    let pt = chosen.pt();
 
     // The RTP timestamp must describe when the frame was *captured*, on the 90kHz clock.
     //
