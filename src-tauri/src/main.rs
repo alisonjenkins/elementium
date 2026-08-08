@@ -126,8 +126,7 @@ fn register_state(
         .manage(WebRtcState(Arc::new(Mutex::new(engine))))
         .manage(MediaState {
             active_tracks: Mutex::new(Vec::new()),
-            camera: Mutex::new(None),
-            audio_capture: Mutex::new(None),
+            pipelines: Mutex::new(std::collections::HashMap::new()),
             sfu_media_tx: Mutex::new(None),
         })
         .manage(protocols::VideoFrameState(video_frames.clone()))

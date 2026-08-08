@@ -150,25 +150,23 @@ fn adopt_idle_pipelines(media_state: &MediaState, state: &WebRtcState, pc_id: &s
     };
     drop(engine);
 
-    if let Ok(guard) = media_state.audio_capture.lock()
-        && let Some(ref audio) = *guard
-        && let Ok(mut slot) = audio.encode_tx.lock()
-        && slot.is_none()
-    {
-        *slot = Some(io_cmd_tx.clone());
-        tracing::info!(
-            pc_id,
-            "unattached microphone adopted by a new peer connection"
-        );
-    }
-
-    if let Ok(guard) = media_state.camera.lock()
-        && let Some(ref camera) = *guard
-        && let Ok(mut slot) = camera.encode_tx.lock()
-        && slot.is_none()
-    {
-        *slot = Some(io_cmd_tx);
-        tracing::info!(pc_id, "unattached camera adopted by a new peer connection");
+    // Every idle pipeline, not two named ones. A user who starts a share before the call
+    // connects has three or four running, and adopting only "the camera" and "the
+    // microphone" would leave the share capturing into a channel with no far end.
+    let Ok(pipelines) = media_state.pipelines.lock() else {
+        return;
+    };
+    for handle in pipelines.values() {
+        if let Ok(mut slot) = handle.encode_tx.lock()
+            && slot.is_none()
+        {
+            *slot = Some(io_cmd_tx.clone());
+            tracing::info!(
+                pc_id,
+                key = %handle.key,
+                "unattached capture pipeline adopted by a new peer connection"
+            );
+        }
     }
 }
 
@@ -224,23 +222,21 @@ pub async fn create_offer(
         .ok_or("Peer connection not found")
         .map(|managed| (managed.handle.clone(), managed.io_cmd_tx.clone()))?;
 
-    // Connect audio capture pipeline to this PC's I/O channel
-    if let Ok(audio_guard) = media_state.audio_capture.lock()
-        && let Some(ref audio) = *audio_guard
-        && let Ok(mut encode_guard) = audio.encode_tx.lock()
-    {
-        tracing::info!(pc_id = %pc_id, "Connecting audio pipeline to peer connection");
-        *encode_guard = Some(io_cmd_tx.clone());
-    }
-
-    // If video is included, connect the camera pipeline to this PC's I/O channel
-    if video
-        && let Ok(cam_guard) = media_state.camera.lock()
-        && let Some(ref cam) = *cam_guard
-        && let Ok(mut encode_guard) = cam.encode_tx.lock()
-    {
-        tracing::info!(pc_id = %pc_id, "Connecting camera pipeline to peer connection");
-        *encode_guard = Some(io_cmd_tx);
+    // Connect every running capture pipeline to this PC's I/O channel.
+    //
+    // `video` used to gate whether the camera was attached at all. It no longer can: a
+    // connection carrying a screen share is a video connection whether or not the camera
+    // is on, and the pipelines that exist are the authority on what is being captured.
+    if let Ok(pipelines) = media_state.pipelines.lock() {
+        for handle in pipelines.values() {
+            if handle.key.kind() == elementium_types::TrackKind::Video && !video {
+                continue;
+            }
+            if let Ok(mut encode_guard) = handle.encode_tx.lock() {
+                tracing::info!(pc_id = %pc_id, key = %handle.key, "Connecting capture pipeline to peer connection");
+                *encode_guard = Some(io_cmd_tx.clone());
+            }
+        }
     }
 
     // Convert data channel info
@@ -457,15 +453,27 @@ fn route_pc_event(
 /// exactly that: PLIs at 06:16:14, :14.6, :15.2, :18.6, :21.7 with nothing in between.
 fn request_camera_keyframe(app: &AppHandle, pc_id: &str, mid: &str) {
     let media_state = app.state::<MediaState>();
-    let Ok(guard) = media_state.camera.lock() else {
+    let Ok(pipelines) = media_state.pipelines.lock() else {
         return;
     };
-    let Some(ref camera) = *guard else {
-        tracing::debug!(pc_id, mid, "keyframe requested with no camera running");
+    // Asked of every video pipeline rather than of the one this mid belongs to.
+    //
+    // Resolving mid to track would mean reaching into the peer connection's published-mid
+    // map from here, and the cost of not doing so is one extra keyframe on the other
+    // track. The cost of getting it wrong in the other direction is a receiver that asks
+    // for a keyframe forever and never gets one, which is an indefinite black picture.
+    let mut asked = 0_usize;
+    for handle in pipelines.values() {
+        if let Some((keyframe_requested, _)) = handle.video() {
+            keyframe_requested.store(true, Ordering::Relaxed);
+            asked = asked.saturating_add(1);
+        }
+    }
+    if asked == 0 {
+        tracing::debug!(pc_id, mid, "keyframe requested with no video running");
         return;
-    };
-    camera.keyframe_requested.store(true, Ordering::Relaxed);
-    tracing::debug!(pc_id, mid, "keyframe request passed to the camera encoder");
+    }
+    tracing::debug!(pc_id, mid, asked, "keyframe request passed to video encoders");
 }
 
 /// Feed loss measured by the peers back into the Opus encoder's FEC sizing.
@@ -492,23 +500,29 @@ fn record_outbound_loss(
         return;
     };
     let media_state = app.state::<MediaState>();
-    let Ok(guard) = media_state.audio_capture.lock() else {
+    let Ok(pipelines) = media_state.pipelines.lock() else {
         return;
     };
-    let Some(ref audio) = *guard else {
-        return;
-    };
-    audio.loss_estimate.observe(fraction);
-    tracing::debug!(
-        pc_id,
-        mid,
-        reported_loss = fraction,
-        smoothed_perc = audio.loss_estimate.percent(),
-        rtt_ms = ?rtt_ms,
-        packets,
-        nacks,
-        "Outbound loss measured from RTCP receiver report"
-    );
+    // Every audio pipeline: loss is a property of the link, not of one track, so the
+    // microphone and a shared application's audio are both encoding over the same
+    // conditions and both want their FEC sized for them.
+    for handle in pipelines.values() {
+        let Some(loss_estimate) = handle.loss_estimate() else {
+            continue;
+        };
+        loss_estimate.observe(fraction);
+        tracing::debug!(
+            pc_id,
+            mid,
+            key = %handle.key,
+            reported_loss = fraction,
+            smoothed_perc = loss_estimate.percent(),
+            rtt_ms = ?rtt_ms,
+            packets,
+            nacks,
+            "Outbound loss measured from RTCP receiver report"
+        );
+    }
 }
 
 async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {

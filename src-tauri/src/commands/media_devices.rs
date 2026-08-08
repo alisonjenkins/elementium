@@ -5,6 +5,7 @@
 // statement-scoped `#[allow]` cannot reach it — verified empirically), hence the
 // module-level allow here rather than the usual per-item scoping.
 #![allow(clippy::unreachable)]
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tauri::{State, command};
@@ -16,53 +17,96 @@ use elementium_codec::{
 use elementium_media::audio_capture::AudioCapturer;
 use elementium_media::device_enumeration;
 use elementium_types::observability::CorrelationId;
-use elementium_types::{AudioFrame, MediaConstraints, MediaDevice, NetworkLossEstimate, TrackId};
+use elementium_types::{
+    AudioFrame, MediaConstraints, MediaDevice, MediaTrackKey, NetworkLossEstimate, TrackId,
+};
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
 use super::LockExt;
 use super::webrtc::WebRtcState;
 use crate::protocols::VideoFrameState;
 
-/// Handle to a running camera pipeline.
-pub struct CameraPipelineHandle {
-    pub track_id: String,
-    pub stop_tx: std::sync::mpsc::Sender<()>,
-    /// Set to enable VP8 encoding and sending to a peer connection.
-    /// When `None`, the pipeline only writes RGBA frames for preview.
-    pub encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
-    /// Set when a receiver sends an RTCP keyframe request (PLI/FIR).
-    ///
-    /// A level rather than an event, like `loss_estimate` on the audio handle: several
-    /// receivers asking at once still means "one keyframe, now", and the encoder thread
-    /// only cares about the latest state. Cleared when the keyframe is produced.
-    pub keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
-    /// The codec the SFU currently wants from us, which can change mid-call.
-    pub active_codec: Arc<ActiveCodec>,
+/// The parts of a pipeline handle that only one kind of pipeline has.
+///
+/// An enum rather than a pile of `Option` fields so that "the camera's keyframe flag" and
+/// "the microphone's loss estimate" cannot be asked for on the wrong pipeline and silently
+/// answered `None`.
+pub enum PipelineExtras {
+    Audio {
+        /// Measured outbound packet loss, fed from RTCP receiver reports.
+        ///
+        /// Written by whoever observes `PcEvent::EgressStats`, read by the capture thread
+        /// to size the Opus encoder's FEC redundancy. Shared rather than passed through
+        /// the command channel because it is a continuously-updated level, not an event:
+        /// the capture thread only cares about the latest value.
+        loss_estimate: Arc<NetworkLossEstimate>,
+    },
+    Video {
+        /// Set when a receiver sends an RTCP keyframe request (PLI/FIR).
+        ///
+        /// A level rather than an event, like `loss_estimate` on the audio side: several
+        /// receivers asking at once still means "one keyframe, now", and the encoder
+        /// thread only cares about the latest state. Cleared when the keyframe is
+        /// produced.
+        keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+        /// The codec the SFU currently wants from us, which can change mid-call.
+        active_codec: Arc<ActiveCodec>,
+    },
 }
 
-/// Handle to a running audio capture pipeline.
-pub struct AudioCaptureHandle {
+/// Handle to one running capture pipeline.
+///
+/// One type for microphone, camera and screen share, because everything that operates on a
+/// running pipeline -- stopping it, attaching it to a call, handing its connection to a
+/// replacement -- is the same operation regardless of what it captures. The differences
+/// live in [`PipelineExtras`].
+pub struct PipelineHandle {
+    /// Which of the user's tracks this pipeline feeds. Its identity everywhere.
+    pub key: MediaTrackKey,
     pub track_id: String,
     pub stop_tx: std::sync::mpsc::Sender<()>,
-    /// Set to enable Opus encoding and sending to a peer connection.
-    /// When `None`, the pipeline captures but doesn't encode/send.
+    /// Set to enable encoding and sending to a peer connection.
+    /// When `None`, the pipeline captures but does not encode or send.
     pub encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
-    /// Measured outbound packet loss, fed from RTCP receiver reports.
-    ///
-    /// Written by whoever observes `PcEvent::EgressStats`, read by the capture thread to
-    /// size the Opus encoder's FEC redundancy. Shared rather than passed through the
-    /// command channel because it is a continuously-updated level, not an event: the
-    /// capture thread only cares about the latest value.
-    pub loss_estimate: Arc<NetworkLossEstimate>,
+    pub extras: PipelineExtras,
+}
+
+impl PipelineHandle {
+    /// The keyframe flag and codec, if this is a video pipeline.
+    #[must_use]
+    pub const fn video(&self) -> Option<(&Arc<std::sync::atomic::AtomicBool>, &Arc<ActiveCodec>)> {
+        match &self.extras {
+            PipelineExtras::Video {
+                keyframe_requested,
+                active_codec,
+            } => Some((keyframe_requested, active_codec)),
+            PipelineExtras::Audio { .. } => None,
+        }
+    }
+
+    /// The measured outbound loss, if this is an audio pipeline.
+    #[must_use]
+    pub const fn loss_estimate(&self) -> Option<&Arc<NetworkLossEstimate>> {
+        match &self.extras {
+            PipelineExtras::Audio { loss_estimate } => Some(loss_estimate),
+            PipelineExtras::Video { .. } => None,
+        }
+    }
 }
 
 /// State for active media tracks (audio capture, video capture, etc.).
 pub struct MediaState {
     pub active_tracks: Mutex<Vec<TrackId>>,
-    /// Active camera pipeline (at most one camera at a time).
-    pub camera: Mutex<Option<CameraPipelineHandle>>,
-    /// Active audio capture pipeline (at most one mic at a time).
-    pub audio_capture: Mutex<Option<AudioCaptureHandle>>,
+    /// Every running capture pipeline, by the track it feeds.
+    ///
+    /// Was two `Option` slots, one for the camera and one for the microphone. That shape
+    /// could not express a user sharing their screen while their camera is on -- the share
+    /// would have had to evict the camera -- and a call UI showing a participant's camera
+    /// replaced by their screen, rather than alongside it, is visibly wrong.
+    ///
+    /// At most one pipeline per key, which keeps "two cameras" impossible while making
+    /// "camera and screen" expressible.
+    pub pipelines: Mutex<HashMap<MediaTrackKey, PipelineHandle>>,
     /// Where captured media goes for the currently-connected SFU room, if any.
     ///
     /// Publishing a track attaches whatever pipeline is running at that moment, but the
@@ -92,34 +136,6 @@ pub async fn enumerate_devices() -> Result<Vec<MediaDevice>, String> {
     }
 
     Ok(devices)
-}
-
-/// A capture pipeline that can be stopped and whose peer connection can be handed on.
-///
-/// Implemented by both the audio and camera handles so the restart logic below is written
-/// once. They had this bug independently and identically; sharing the code is what stops
-/// them acquiring it again independently.
-trait CapturePipeline {
-    fn stop_sender(&self) -> &std::sync::mpsc::Sender<()>;
-    fn connection(&self) -> &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>;
-}
-
-impl CapturePipeline for AudioCaptureHandle {
-    fn stop_sender(&self) -> &std::sync::mpsc::Sender<()> {
-        &self.stop_tx
-    }
-    fn connection(&self) -> &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> {
-        &self.encode_tx
-    }
-}
-
-impl CapturePipeline for CameraPipelineHandle {
-    fn stop_sender(&self) -> &std::sync::mpsc::Sender<()> {
-        &self.stop_tx
-    }
-    fn connection(&self) -> &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> {
-        &self.encode_tx
-    }
 }
 
 /// What was found when replacing a capture pipeline.
@@ -156,10 +172,12 @@ fn connection_for_new_pipeline(
 /// Replaces whatever was running and takes over its connection, so a mid-call restart
 /// keeps sending -- see [`stop_pipeline_inheriting_connection`].
 fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
+    let key = MediaTrackKey::microphone();
     let track_id = TrackId(format!("audio-{}", generate_track_id()));
     tracing::info!(track_id = %track_id, "Starting audio capture");
 
-    let previous = stop_pipeline_inheriting_connection(&media_state.audio_capture);
+    let previous =
+        stop_pipeline_inheriting_connection(&media_state.pipelines, MediaTrackKey::microphone());
     let connection = connection_for_new_pipeline(previous.connection, media_state);
     if connection.is_some() {
         tracing::info!(
@@ -185,16 +203,20 @@ fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
     let audio_span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = audio_span.enter();
-        audio_capture_loop(&encode_tx_clone, &stop_rx, &loss_estimate_clone);
+        audio_capture_loop(key, &encode_tx_clone, &stop_rx, &loss_estimate_clone);
     });
 
-    if let Ok(mut audio) = media_state.audio_capture.lock() {
-        *audio = Some(AudioCaptureHandle {
-            track_id: track_id.0.clone(),
-            stop_tx,
-            encode_tx,
-            loss_estimate,
-        });
+    if let Ok(mut pipelines) = media_state.pipelines.lock() {
+        pipelines.insert(
+            MediaTrackKey::microphone(),
+            PipelineHandle {
+                key: MediaTrackKey::microphone(),
+                track_id: track_id.0.clone(),
+                stop_tx,
+                encode_tx,
+                extras: PipelineExtras::Audio { loss_estimate },
+            },
+        );
     }
 
     if let Ok(mut tracks) = media_state.active_tracks.lock() {
@@ -214,23 +236,24 @@ fn start_audio_pipeline(media_state: &MediaState) -> TrackId {
 /// `skipped_not_connected` simply climbed forever while `sent_frames` stayed at zero. The
 /// far end hears the speaker cut out, or the camera freeze, mid-call for no visible
 /// reason.
-fn stop_pipeline_inheriting_connection<H: CapturePipeline>(
-    slot: &Mutex<Option<H>>,
+fn stop_pipeline_inheriting_connection(
+    pipelines: &Mutex<HashMap<MediaTrackKey, PipelineHandle>>,
+    key: MediaTrackKey,
 ) -> StoppedPipeline {
-    let Ok(mut guard) = slot.lock() else {
+    let Ok(mut guard) = pipelines.lock() else {
         return StoppedPipeline {
             existed: false,
             connection: None,
         };
     };
-    let Some(old) = guard.take() else {
+    let Some(old) = guard.remove(&key) else {
         return StoppedPipeline {
             existed: false,
             connection: None,
         };
     };
-    let _ = old.stop_sender().send(());
-    let connection = old.connection().lock().ok().and_then(|c| c.clone());
+    let _ = old.stop_tx.send(());
+    let connection = old.encode_tx.lock().ok().and_then(|c| c.clone());
     StoppedPipeline {
         existed: true,
         connection,
@@ -276,7 +299,8 @@ pub async fn get_user_media(
         // camera restarted mid-call (device change, resolution change, track replacement)
         // would otherwise sit disconnected until the next renegotiation, and the far end
         // would see the video freeze with nothing in the log to explain it.
-        let previous = stop_pipeline_inheriting_connection(&media_state.camera);
+        let previous =
+            stop_pipeline_inheriting_connection(&media_state.pipelines, MediaTrackKey::camera());
         let had_previous = previous.existed;
         let inherited_connection = connection_for_new_pipeline(previous.connection, &media_state);
         if inherited_connection.is_some() {
@@ -317,6 +341,7 @@ pub async fn get_user_media(
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
             camera_pipeline_loop(
+                MediaTrackKey::camera(),
                 &tid,
                 &video_frames,
                 &encode_tx_clone,
@@ -330,14 +355,20 @@ pub async fn get_user_media(
         });
 
         // Store the camera pipeline handle
-        if let Ok(mut cam) = media_state.camera.lock() {
-            *cam = Some(CameraPipelineHandle {
-                track_id: track_id.0.clone(),
-                stop_tx,
-                encode_tx,
-                keyframe_requested,
-                active_codec,
-            });
+        if let Ok(mut pipelines) = media_state.pipelines.lock() {
+            pipelines.insert(
+                MediaTrackKey::camera(),
+                PipelineHandle {
+                    key: MediaTrackKey::camera(),
+                    track_id: track_id.0.clone(),
+                    stop_tx,
+                    encode_tx,
+                    extras: PipelineExtras::Video {
+                        keyframe_requested,
+                        active_codec,
+                    },
+                },
+            );
         }
 
         if let Ok(mut tracks) = media_state.active_tracks.lock() {
@@ -356,24 +387,18 @@ pub async fn stop_track(
 ) -> Result<(), String> {
     tracing::info!(%track_id, "Stopping track");
 
-    // If this is the camera track, stop the pipeline
-    if track_id.0.starts_with("video-")
-        && let Ok(mut cam) = media_state.camera.lock()
-        && let Some(ref handle) = *cam
-        && handle.track_id == track_id.0
+    // Found by the track id the caller holds rather than by guessing the pipeline from the
+    // id's prefix: with more than one pipeline of a kind running, "starts with video-" no
+    // longer identifies which one, and stopping a share would have stopped the camera.
+    if let Ok(mut pipelines) = media_state.pipelines.lock()
+        && let Some(key) = pipelines
+            .iter()
+            .find(|(_, h)| h.track_id == track_id.0)
+            .map(|(k, _)| *k)
+        && let Some(handle) = pipelines.remove(&key)
     {
         let _ = handle.stop_tx.send(());
-        *cam = None;
-    }
-
-    // If this is an audio track, stop the audio capture pipeline
-    if track_id.0.starts_with("audio-")
-        && let Ok(mut audio) = media_state.audio_capture.lock()
-        && let Some(ref handle) = *audio
-        && handle.track_id == track_id.0
-    {
-        let _ = handle.stop_tx.send(());
-        *audio = None;
+        tracing::info!(%track_id, %key, "capture pipeline stopped");
     }
 
     if let Ok(mut tracks) = media_state.active_tracks.lock() {
@@ -615,6 +640,7 @@ fn bitrate_for(width: u32, height: u32) -> u32 {
 /// preview, and optionally VP8-encodes + sends to a peer connection.
 #[allow(clippy::too_many_arguments)]
 fn camera_pipeline_loop(
+    key: MediaTrackKey,
     track_id: &str,
     video_frames: &VideoFrameBuffer,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
@@ -739,7 +765,7 @@ fn camera_pipeline_loop(
             if should_encode && last_encode.elapsed() >= MIN_ENCODE_INTERVAL {
                 last_encode = std::time::Instant::now();
                 encode_and_send_video_frame(
-                    track_id,
+                    PipelineId { key, track_id },
                     &frame,
                     &mut encoder,
                     &mut last_keyframe,
@@ -839,6 +865,7 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 /// captured frame for the length of a call, so the calls are statically dispatched and
 /// inlinable, and the bound documents that the body depends on nothing but the interface.
 fn encode_and_send<E: VideoEncoder>(
+    key: MediaTrackKey,
     encoder: &mut E,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
@@ -868,7 +895,7 @@ fn encode_and_send<E: VideoEncoder>(
                 && let Some(tx) = guard.as_ref()
             {
                 for packet in packets {
-                    let _ = tx.try_send(IoCommand::WriteVideo(packet.data, codec));
+                    let _ = tx.try_send(IoCommand::WriteVideo(key, packet.data, codec));
                 }
             }
         }
@@ -876,9 +903,20 @@ fn encode_and_send<E: VideoEncoder>(
     }
 }
 
+/// Which pipeline a frame belongs to.
+///
+/// The routing key and the IPC track id always travel together -- one addresses the m-line
+/// the frame is written to, the other the preview buffer the webview reads -- so they are
+/// passed as one thing rather than as two parameters that could disagree.
+#[derive(Clone, Copy)]
+struct PipelineId<'a> {
+    key: MediaTrackKey,
+    track_id: &'a str,
+}
+
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
 fn encode_and_send_video_frame(
-    track_id: &str,
+    id: PipelineId<'_>,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encoder: &mut Option<NegotiatedEncoder>,
     last_keyframe: &mut std::time::Instant,
@@ -902,9 +940,9 @@ fn encode_and_send_video_frame(
     // A freshly built encoder emits a keyframe on its own, so only ask when it is one we
     // were already using.
     if existed {
-        maybe_request_keyframe(track_id, enc, last_keyframe, keyframe_requested);
+        maybe_request_keyframe(id.track_id, enc, last_keyframe, keyframe_requested);
     }
-    encode_and_send(enc, frame, encode_tx);
+    encode_and_send(id.key, enc, frame, encode_tx);
 }
 
 /// Counters for one run of [`audio_capture_loop`], so a silent far end is diagnosable.
@@ -1068,6 +1106,7 @@ struct FrameEncodeCtx<'a> {
 
 /// Encode one 20ms frame and hand it to the peer connection, updating counters.
 fn encode_and_send_frame(
+    key: MediaTrackKey,
     ctx: &mut FrameEncodeCtx<'_>,
     frame_data: Vec<f32>,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
@@ -1116,7 +1155,7 @@ fn encode_and_send_frame(
                 &encoded_frame,
                 ctx.frame_samples,
             );
-            match deliver(encode_tx, IoCommand::WriteAudio(encoded_frame)) {
+            match deliver(encode_tx, IoCommand::WriteAudio(key, encoded_frame)) {
                 Delivery::Sent => stats.sent = stats.sent.saturating_add(1),
                 Delivery::Full => {
                     stats.dropped_channel_full = stats.dropped_channel_full.saturating_add(1);
@@ -1281,6 +1320,7 @@ fn retune_fec_if_needed(
 /// Background thread: captures mic audio, Opus-encodes, and sends to a peer
 /// connection when `encode_tx` is connected (deferred connection pattern).
 fn audio_capture_loop(
+    key: MediaTrackKey,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     loss_estimate: &Arc<NetworkLossEstimate>,
@@ -1391,7 +1431,7 @@ fn audio_capture_loop(
                     channels: OUTBOUND_CHANNELS,
                     frame_samples,
                 };
-                encode_and_send_frame(&mut ctx, frame_data, encode_tx, &mut stats);
+                encode_and_send_frame(key, &mut ctx, frame_data, encode_tx, &mut stats);
 
                 retune_fec_if_needed(&mut encoder, loss_estimate, &mut stats);
 
@@ -1550,13 +1590,16 @@ mod active_codec_tests {
 #[allow(clippy::expect_used)]
 mod delivery_tests {
     use super::{Delivery, deliver};
-    use elementium_types::PlaintextMedia;
+    use elementium_types::{MediaTrackKey, PlaintextMedia};
     use elementium_webrtc::engine::IoCommand;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc as tokio_mpsc;
 
     fn frame() -> IoCommand {
-        IoCommand::WriteAudio(PlaintextMedia::from_encoder(vec![1, 2, 3]))
+        IoCommand::WriteAudio(
+            MediaTrackKey::microphone(),
+            PlaintextMedia::from_encoder(vec![1, 2, 3]),
+        )
     }
 
     /// The ordinary case: a live consumer takes the frame.

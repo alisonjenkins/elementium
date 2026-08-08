@@ -12,7 +12,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, command};
 use tracing::Instrument;
 
-use elementium_types::CorrelationId;
+use elementium_types::{CorrelationId, MediaTrackKey};
 use elementium_webrtc::engine::VideoFrameBuffer;
 use elementium_webrtc::livekit::room::{LiveKitRoom, RoomEvent};
 
@@ -146,14 +146,34 @@ pub async fn livekit_publish_track(
     kind: String,
     source: String,
 ) -> Result<(), String> {
+    let key = track_key(&kind, &source)?;
     let room = get_room(&state, &room_id)?;
     let media_tx = {
         let mut room = room.lock().await;
-        room.publish_track(&kind, &source)?;
+        room.publish_track(key)?;
         room.media_sender()
     };
-    attach_capture_pipeline(&media_state, media_tx, &kind);
+    attach_capture_pipeline(&media_state, media_tx, key);
     Ok(())
+}
+
+/// Resolve the kind/source pair the frontend sends into a track identity.
+///
+/// Rejected rather than defaulted when the pair is not one we publish. The old code mapped
+/// an unrecognised source to `TrackSource::Unknown` and carried on, which produces a track
+/// the SFU accepts and every other client renders as an unlabelled stream -- a failure that
+/// only shows up in somebody else's UI.
+fn track_key(kind: &str, source: &str) -> Result<MediaTrackKey, String> {
+    let key = match (kind, source) {
+        ("audio", "microphone") => MediaTrackKey::microphone(),
+        ("video", "camera") => MediaTrackKey::camera(),
+        ("video", "screen_share") => MediaTrackKey::screen_share(),
+        ("audio", "screen_share_audio") => MediaTrackKey::screen_share_audio(),
+        _ => return Err(format!("not a publishable track: {kind}/{source}")),
+    };
+    debug_assert_eq!(key.kind().as_str(), kind);
+    debug_assert_eq!(key.source().as_str(), source);
+    Ok(key)
 }
 
 /// Whether we are willing to publish `codec` in a room with this encryption setting.
@@ -193,24 +213,34 @@ fn apply_publish_codec(media_state: &MediaState, codec: &str, encrypted: bool) {
         return;
     }
 
-    let Ok(guard) = media_state.camera.lock() else {
+    let Ok(pipelines) = media_state.pipelines.lock() else {
         return;
     };
-    let Some(camera) = guard.as_ref() else {
+    // Applied to every video pipeline: the SFU's codec preference is a property of the
+    // room, so a camera and a screen share published into it are subject to the same
+    // answer, and leaving one on the old codec would publish a track nobody can decode.
+    let mut changed = 0_usize;
+    for handle in pipelines.values() {
+        let Some((_, active_codec)) = handle.video() else {
+            continue;
+        };
+        if active_codec.get() == codec {
+            continue;
+        }
+        active_codec.set(codec);
+        changed = changed.saturating_add(1);
+        tracing::info!(
+            codec = codec.sdp_name(),
+            key = %handle.key,
+            "switching publish codec at the SFU's request"
+        );
+    }
+    if changed == 0 {
         tracing::debug!(
             codec = codec.sdp_name(),
-            "codec change with no camera running"
+            "codec change with no video pipeline to apply it to"
         );
-        return;
-    };
-    if camera.active_codec.get() == codec {
-        return;
     }
-    camera.active_codec.set(codec);
-    tracing::info!(
-        codec = codec.sdp_name(),
-        "switching publish codec at the SFU's request"
-    );
 }
 
 /// Point the running capture pipeline for `kind` at this room, so its encoded frames
@@ -224,21 +254,14 @@ fn apply_publish_codec(media_state: &MediaState, codec: &str, encrypted: bool) {
 fn attach_capture_pipeline(
     media_state: &MediaState,
     media_tx: tokio::sync::mpsc::Sender<elementium_webrtc::engine::IoCommand>,
-    kind: &str,
+    key: MediaTrackKey,
 ) {
-    let connection = match kind {
-        "audio" => media_state
-            .audio_capture
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|a| a.encode_tx.clone())),
-        "video" => media_state
-            .camera
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|c| c.encode_tx.clone())),
-        _ => None,
-    };
+    let kind = key.kind().as_str();
+    let connection = media_state
+        .pipelines
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&key).map(|h| h.encode_tx.clone()));
 
     // Remembered for pipelines that have not started yet: joining a call muted publishes
     // the microphone track long before `getUserMedia` opens the device.
@@ -249,6 +272,7 @@ fn attach_capture_pipeline(
     let Some(connection) = connection else {
         tracing::warn!(
             kind,
+            %key,
             "published a track with no capture pipeline running; nothing will be sent \
              until the pipeline starts and is attached"
         );
@@ -257,7 +281,7 @@ fn attach_capture_pipeline(
 
     if let Ok(mut guard) = connection.lock() {
         *guard = Some(media_tx);
-        tracing::info!(kind, "capture pipeline attached to the SFU room");
+        tracing::info!(kind, %key, "capture pipeline attached to the SFU room");
     }
 }
 
@@ -311,22 +335,11 @@ fn detach_capture_pipelines(media_state: &MediaState) {
     if let Ok(mut guard) = media_state.sfu_media_tx.lock() {
         *guard = None;
     }
-    for slot in [
-        media_state
-            .audio_capture
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|a| a.encode_tx.clone())),
-        media_state
-            .camera
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|c| c.encode_tx.clone())),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Ok(mut guard) = slot.lock() {
+    let Ok(pipelines) = media_state.pipelines.lock() else {
+        return;
+    };
+    for handle in pipelines.values() {
+        if let Ok(mut guard) = handle.encode_tx.lock() {
             *guard = None;
         }
     }
