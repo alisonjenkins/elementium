@@ -105,6 +105,14 @@ element-web-sync version:
 element-web-rebase version:
     ./scripts/element-web-rebase.sh {{version}}
 
+# Turn a carried commit into a branch that can be opened as a pull request.
+#
+# Branches from the upstream tag the patches are rebased onto and cherry-picks the one
+# commit. Never pushes -- the remote is someone's account, and Element Web requires a CLA
+# signed personally before a pull request can merge.
+element-web-pr commit:
+    ./scripts/element-web-pr.sh {{commit}}
+
 # Leave and forget every room the test participants are in.
 #
 # Each provision creates a room and each call test creates another, so they pile up. The
