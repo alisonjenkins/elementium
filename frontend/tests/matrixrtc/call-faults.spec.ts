@@ -142,9 +142,14 @@ test.describe("MatrixRTC call faults", () => {
    */
   test("the room these tests use is encrypted", async ({ browser }) => {
     const env = await fixture();
+    // A fresh login, like every other test here. The fixture names one device per provision,
+    // and a new browser context around it is a device the homeserver holds keys for against
+    // a crypto store that no longer has them -- the client never finishes starting, and the
+    // room never appears.
+    const [who] = await freshSessions(1);
     const context = await browser.newContext();
     try {
-      const p = await openRoom(context, server!, env.participants[0]!, env.room_id);
+      const p = await openRoom(context, server!, who!, env.room_id);
       const encrypted = await p.page.evaluate((roomId) => {
         const peg = (window as unknown as Record<string, unknown>)["mxMatrixClientPeg"] as
           | { get?: () => { isRoomEncrypted?: (id: string) => boolean } | null }

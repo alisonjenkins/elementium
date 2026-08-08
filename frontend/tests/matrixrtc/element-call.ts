@@ -61,17 +61,20 @@ async function recordPeerConnections(page: Page): Promise<void> {
  * there is nothing to do and nothing to fail.
  */
 async function dismissToasts(page: Page): Promise<void> {
-  // Two of them, and more than once: "Verify this session" arrives after the initial sync,
-  // and "Enable desktop notifications" replaces it. Both are alerts over the room, so the
-  // composer never becomes visible and the failure reads as "the room never loaded".
-  for (let i = 0; i < 4; i++) {
+  // Raced against the room appearing rather than waited on. Two toasts can show up --
+  // "Verify this session" after the initial sync, then "Enable desktop notifications" -- and
+  // waiting a fixed period for each cost half a minute per participant on the runs where
+  // neither appeared, which is most of them. Three participants of that pushed the call
+  // tests past their budget.
+  const composer = page.getByRole("textbox", { name: /message|send a message/i }).first();
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    if (await composer.isVisible().catch(() => false)) return;
     const button = page.getByRole("button", { name: /^(later|skip|dismiss)$/i }).first();
-    try {
-      await button.waitFor({ timeout: 8_000 });
-      await button.click();
-    } catch {
-      return;
+    if (await button.isVisible().catch(() => false)) {
+      await button.click().catch(() => undefined);
     }
+    await page.waitForTimeout(500);
   }
 }
 
