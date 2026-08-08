@@ -35,7 +35,7 @@ jpeg-encoder = "0.7.1"
 # elementium-screen already makes, but depending on that crate from here would be a
 # dependency in the wrong direction (elementium-screen depends on elementium-media, not the
 # other way round), so the example makes the portal call directly instead.
-ashpd = { version = "0.11", features = ["tokio"] }
+ashpd = { version = "0.13", features = ["tokio", "screencast"] }
 tokio = { workspace = true }
 
 [lints]

@@ -27,25 +27,31 @@ use std::time::{Duration, Instant};
 /// unbounded, since a timeout would cancel a dialog someone was still reading.
 #[cfg(target_os = "linux")]
 async fn request_screencast_node() -> Result<u32, String> {
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+    use ashpd::desktop::screencast::{
+        CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions,
+    };
+    use ashpd::desktop::CreateSessionOptions;
 
     let proxy = Screencast::new().await.map_err(|e| e.to_string())?;
-    let session = proxy.create_session().await.map_err(|e| e.to_string())?;
+    let session = proxy
+        .create_session(CreateSessionOptions::default())
+        .await
+        .map_err(|e| e.to_string())?;
 
     proxy
         .select_sources(
             &session,
-            CursorMode::Embedded,
-            SourceType::Monitor | SourceType::Window,
-            false,
-            None,
-            ashpd::desktop::PersistMode::DoNot,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Embedded)
+                .set_sources(SourceType::Monitor | SourceType::Window)
+                .set_multiple(false)
+                .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
         )
         .await
         .map_err(|e| e.to_string())?;
 
     let response = proxy
-        .start(&session, None)
+        .start(&session, None, StartCastOptions::default())
         .await
         .map_err(|e| e.to_string())?
         .response()

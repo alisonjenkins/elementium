@@ -105,8 +105,8 @@ pub struct ShareSession {
 /// The portal handles that have to outlive the call that created them.
 #[cfg(target_os = "linux")]
 struct PortalSession {
-    proxy: ashpd::desktop::screencast::Screencast<'static>,
-    session: ashpd::desktop::Session<'static, ashpd::desktop::screencast::Screencast<'static>>,
+    proxy: ashpd::desktop::screencast::Screencast,
+    session: ashpd::desktop::Session<ashpd::desktop::screencast::Screencast>,
 }
 
 impl ShareSession {
@@ -181,7 +181,10 @@ impl Drop for ShareSession {
 /// the specific stage that failed -- see [`ShareError`].
 #[cfg(target_os = "linux")]
 pub async fn start_share() -> Result<ShareSession, ShareError> {
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+    use ashpd::desktop::screencast::{
+        CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions,
+    };
+    use ashpd::desktop::CreateSessionOptions;
 
     tracing::info!("requesting a screencast session from the XDG desktop portal");
 
@@ -189,30 +192,30 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
         .await
         .map_err(|e| ShareError::NoBackend(e.to_string()))?;
     let session = proxy
-        .create_session()
+        .create_session(CreateSessionOptions::default())
         .await
         .map_err(|e| ShareError::Portal(e.to_string()))?;
 
     proxy
         .select_sources(
             &session,
-            CursorMode::Embedded,
-            // Both, so the compositor's picker can offer window selection where it has it.
-            // Which of the two the user actually chose comes back on the stream.
-            SourceType::Monitor | SourceType::Window,
-            // Single source: the rest of the pipeline publishes one video track.
-            false,
-            None,
-            // Not persisted. A restore token would let a later share reuse this grant
-            // without asking, and silently re-sharing a screen on the strength of a
-            // decision made in an earlier session is not a default worth having.
-            ashpd::desktop::PersistMode::DoNot,
+            SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Embedded)
+                // Both, so the compositor's picker can offer window selection where it has it.
+                // Which of the two the user actually chose comes back on the stream.
+                .set_sources(SourceType::Monitor | SourceType::Window)
+                // Single source: the rest of the pipeline publishes one video track.
+                .set_multiple(false)
+                // Not persisted. A restore token would let a later share reuse this grant
+                // without asking, and silently re-sharing a screen on the strength of a
+                // decision made in an earlier session is not a default worth having.
+                .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
         )
         .await
         .map_err(|e| ShareError::Portal(e.to_string()))?;
 
     let response = proxy
-        .start(&session, None)
+        .start(&session, None, StartCastOptions::default())
         .await
         .map_err(|e| ShareError::Portal(e.to_string()))?
         .response()
