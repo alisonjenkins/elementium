@@ -74,6 +74,33 @@ encode target is logged. `unusable=0`.
 **Watch for**: a monitor is not a 1280x720 webcam. If the negotiated target or the encoder
 rejects the geometry, that surfaces here rather than as a black remote view.
 
+**Also look at the picture**, which counters cannot do for you:
+
+```sh
+CAPTURE_DUMP=/tmp/share.pgm nix develop -c cargo run -p elementium-media \
+  --example capture_attribution -- --screen
+```
+
+A DMA-BUF read with the wrong stride, or a tiled buffer read as if it were linear,
+delivers frames at the right rate and the right size, full of noise. Every counter above
+passes in that state.
+
+**Recorded 2026-08-08** (niri, `xdg-desktop-portal-gnome`, one shared window):
+
+| | |
+|---|---|
+| negotiated | 1880x1446 `Raw(Bgrx)`, DMA-BUF |
+| frames received | 56–64 over ~15s |
+| delivered rate | 3.8–4.3fps against 30 requested |
+| `unusable` | 0 |
+| dumped frame | the shared window, sharp, correctly strided |
+
+The delivered rate is *not* a fault and this is the entry worth reading twice. A
+compositor emits on damage, not on a clock — it advertises `framerate=0/1` for exactly
+that reason — so a mostly-static window produces a few frames a second and a scrolling one
+produces thirty. Judging this path by fps against the requested rate, the way the camera
+path is judged, would report a healthy share as broken.
+
 ---
 
 ## Level 3 — Teardown leaves nothing behind
