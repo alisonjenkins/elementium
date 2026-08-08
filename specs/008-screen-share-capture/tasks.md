@@ -174,3 +174,17 @@ without consequence.
 **Phase 4 and Phase 6** are the smaller remainder. Phase 6 in particular may reduce to very
 little or prove awkward depending on how much of `x11.rs` still works — it is sequenced last
 deliberately so that finding out does not block anything.
+
+---
+
+## Phase 8: Convergence
+
+Appended 2026-08-08 after assessing the code against spec, plan and tasks. Everything here
+is remaining work the earlier phases did not cover, ordered by severity.
+
+- [ ] T051 Name the source in the frame-flow log line in `src-tauri/src/commands/media_devices.rs` per FR-012 (partial) — `video_pipeline_loop` serves the camera and the screen share, and logs `"Camera frame received"` for both. The one diagnostic that says frames are flowing names the wrong device for half its callers, so grepping a log for a share's health finds camera lines or nothing
+- [ ] T052 Verify SC-004 end to end and record it in `specs/008-screen-share-capture/quickstart.md` (missing) — share audio is captured, keyed `screen_share_audio`, and publishable, but no run has confirmed a tone from the shared source reaching a receiver, nor that muting the microphone silences only speech. Publishing without hearing is exactly the shape of failure this feature exists to remove
+- [ ] T053 Exercise the `audio: false` branch of `get_display_media` in `src-tauri/src/commands/screen_capture.rs` against the running app and record it (partial, SC-005 / T037) — the opt-out is currently proven only for the capture path via the example, which never asks for audio at all. The guard a user's choice actually flows through is untested, and this is a privacy claim
+- [ ] T054 Measure SC-002 (missing) — "content changed on the shared source is visible to the receiver within one second" has no measurement anywhere. A damage-driven screencast makes this less obvious than it sounds: the clock starts at the damage event, not at a frame tick
+- [ ] T055 [US4] Run the X11 path against a real X11 display (partial) — `crates/elementium-screen/src/x11.rs` and the push-fed `VideoSource` compile and unit-test, but no X11 session has ever exercised them. Until then US4 is written, not delivered
+- [ ] T056 Reconcile T025 (partial) — the attended SC-001 browser test in `frontend/tests/browser/receive-path.spec.ts` already asserts a receiver's `framesDecoded` keeps climbing, which is what T025 asked for; the checkbox is still open
