@@ -101,6 +101,44 @@ that reason — so a mostly-static window produces a few frames a second and a s
 produces thirty. Judging this path by fps against the requested rate, the way the camera
 path is judged, would report a healthy share as broken.
 
+### Full-monitor geometry (T044), measured 2026-08-08
+
+Run the Level 2 command and choose the **whole screen** at the picker, not a window. On a
+5120x1440 ultrawide:
+
+| | |
+|---|---|
+| negotiated | 5120x1440 `Raw(Bgrx)`, DMA-BUF |
+| frames received | 23 over 14.0s |
+| delivered rate | 1.6fps against 30 requested |
+| dumped frame | the full desktop, sharp, correctly strided |
+
+Nothing about the larger geometry needed handling: the same DMA-BUF path that reads a
+1880x1446 window reads a 7.4-megapixel monitor, because the extent is derived from
+`stride x height` rather than assumed.
+
+Ignore the example's "process CPU per frame" at this rate — with 23 frames in 14 seconds it
+is process startup divided by a handful of frames, not the cost of a frame.
+
+The encoder's half is asserted separately, without needing a person at a picker:
+
+```sh
+nix develop -c cargo test -p elementium-codec --test full_monitor_geometry
+```
+
+VP8 initialises at 5120x1440 and produces a keyframe from the first frame, and a frame of
+different geometry is refused rather than misread. That is the failure worth ruling out: an
+encoder that accepted a resized frame against its old configuration would read the planes
+at the wrong stride and emit a sheared picture at a perfectly healthy frame rate.
+
+**One finding to be aware of rather than to fix now.** `bitrate_for` in
+`src-tauri/src/commands/media_devices.rs` targets ~0.1 bits per pixel per frame at 30fps
+and clamps to 4000kbps. A 5120x1440 monitor asks for ~22Mbps by that rule, so **the clamp
+binds and a full ultrawide share gets 4Mbps**. For a desktop that is usually fine — screen
+content is highly compressible and a damage-driven screencast rarely reaches 30fps, so the
+real bits-per-frame is several times the nominal figure. It would *not* be fine for a share
+of full-motion video, which is the case to measure before raising it.
+
 ---
 
 ## Level 3 — Teardown leaves nothing behind
@@ -180,6 +218,16 @@ pw-dump | python3 -c "import json,sys; [print(o['id'], (o.get('info') or {}).get
 Start a share **without** requesting audio and confirm no new input stream belonging to
 this application appears. Reading the code and concluding no stream was opened is not
 sufficient evidence for a privacy claim — the audio graph is the authority.
+
+**Measured 2026-08-08, video-only capture**: twelve audio streams present in the graph
+before, the same twelve — by id, not merely by count — during a running screen capture. No
+stream was created.
+
+Stated precisely, because this is a privacy claim and the difference matters: this
+exercised the *capture path* via the Level 2 example, which never requests audio at all. It
+demonstrates that capturing a screen does not itself open an audio stream. It does **not**
+yet exercise the `audio: false` branch of `get_display_media`, which is the guard a user's
+opt-out actually flows through. That check still needs the running app.
 
 **Scope disclosure**: when application audio was requested and the desktop mix was
 captured instead, confirm the response carries `audioScopeFallback: true` and that this
