@@ -46,6 +46,27 @@ fn enabled() -> bool {
     })
 }
 
+/// Create a dump file only this user can read, refusing to follow an existing path.
+///
+/// This file holds decoded call audio -- someone's voice -- at a name anyone can predict,
+/// in a directory everyone can write to. `File::create` gave it mode 0644 and happily
+/// followed a symlink someone else had planted, which is both a disclosure and a way to
+/// have this process overwrite a file it should not. The camera preview dump next door
+/// already writes 0600 for the same reason; this now matches it.
+///
+/// `create_new` means a stale dump from a previous run is an error rather than something to
+/// clobber, and it is what makes the symlink case fail instead of succeed.
+fn create_private(path: &str) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn registry() -> &'static Mutex<HashMap<String, DumpState>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, DumpState>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -71,7 +92,7 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
             let path = format!("/tmp/elementium_audio_dump_{stream_key}.f32le");
-            match File::create(&path) {
+            match create_private(&path) {
                 Ok(file) => {
                     tracing::info!(
                         stream_key,
@@ -87,7 +108,13 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
                     })
                 }
                 Err(e) => {
-                    tracing::error!(stream_key, path, error = %e, "ELEMENTIUM_AUDIO_DUMP: failed to create dump file");
+                    tracing::error!(
+                        stream_key,
+                        path,
+                        error = %e,
+                        "ELEMENTIUM_AUDIO_DUMP: failed to create dump file (it must not \
+                         already exist -- remove the previous one to record again)"
+                    );
                     return;
                 }
             }
