@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
+import { frameBytes } from "./frame-payload";
 import {
   describeJoinRequest,
   describeRequest,
@@ -553,7 +554,10 @@ class ElementiumRTCPeerConnection extends EventTarget {
       const started = Date.now();
 
       try {
-        const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
+        // The same coercion the self-view needs: this is the remote participant's
+        // renderer, and it is a second copy of the same loop -- which is how the black
+        // tile survived the first fix.
+        const buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
         if (buf && buf.byteLength > 8) {
           const view = new DataView(buf);
           const width = view.getUint32(0, true);

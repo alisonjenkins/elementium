@@ -5,6 +5,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvasTrack } from "./canvas-track";
+import { frameBytes } from "./frame-payload";
 
 /**
  * Notice devices appearing and disappearing, and tell listeners.
@@ -570,44 +571,6 @@ function wireMuteToBackend(
 /// Target preview period: 30fps is plenty for a self-view and halves the IPC volume of 60.
 const TARGET_FRAME_MS = 33;
 
-/** Logged once, so a transport that changed shape says so rather than going quiet. */
-let framePayloadShapeReported = false;
-
-/**
- * Coerce whatever the IPC handed back into an `ArrayBuffer`.
- *
- * `get_video_frame` returns raw bytes, and how those arrive depends on which IPC transport
- * the webview ended up using. Tauri's custom-protocol IPC delivers an `ArrayBuffer`; its
- * postMessage fallback -- which WebKitGTK forces whenever the page is served over http,
- * because it refuses a custom-scheme fetch from an http origin -- delivers the same bytes
- * as an ordinary array of numbers.
- *
- * Assuming the first shape cost a working camera. `buf.byteLength` on an array is
- * `undefined`, `undefined > 8` is false, and the fetch loop skipped every frame without
- * incrementing a single counter: 29fps fetched, `drawn=0`, no error, nothing in any log to
- * say the preview had stopped being a preview. Accepting either shape is a one-line
- * question and removes the whole class.
- */
-function frameBytes(value: unknown): ArrayBuffer | null {
-  if (!framePayloadShapeReported) {
-    framePayloadShapeReported = true;
-    const shape = value instanceof ArrayBuffer
-      ? "ArrayBuffer"
-      : ArrayBuffer.isView(value)
-        ? `${value.constructor.name} view`
-        : Array.isArray(value)
-          ? `Array(${value.length})`
-          : typeof value;
-    console.log(`[Elementium] video frame IPC payload arrives as ${shape}`);
-  }
-  if (value instanceof ArrayBuffer) return value;
-  if (ArrayBuffer.isView(value)) {
-    return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
-  }
-  if (Array.isArray(value)) return new Uint8Array(value).buffer;
-  return null;
-}
-
 // Measured on this machine: PipeWire negotiated the camera 3.35s after getUserMedia was
 // called, so a 3s probe missed the first frame by 350ms and fell back to 640x480 for the
 // whole session. The camera cannot be hurried; the probe can wait.
@@ -635,7 +598,6 @@ async function firstFrameGeometry(
   debugLog(`firstFrameGeometry: no frame within ${timeoutMs}ms for ${trackId}`);
   return null;
 }
-
 
 function startLocalVideoFrameFetch(
   canvas: HTMLCanvasElement,

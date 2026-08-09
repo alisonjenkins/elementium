@@ -13,15 +13,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-/** The production coercion, kept in step with `frameBytes` in media-devices.ts. */
-function frameBytes(value: unknown): ArrayBuffer | null {
-  if (value instanceof ArrayBuffer) return value;
-  if (ArrayBuffer.isView(value)) {
-    return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
-  }
-  if (Array.isArray(value)) return new Uint8Array(value).buffer;
-  return null;
-}
+import { frameBytes } from "./frame-payload";
 
 /** The production prototype walk, kept in step with `enabledDescriptor`. */
 function enabledDescriptor(track: object): PropertyDescriptor | undefined {
