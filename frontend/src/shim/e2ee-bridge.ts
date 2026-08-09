@@ -344,16 +344,95 @@ function handleSetKey(data: SetKeyMessage): void {
 /**
  * Message kinds seen but not acted on, reported once each.
  *
- * Only `init` and `setKey` are handled. Whether that is sufficient is not something this
- * file can assert on its own -- and a real call showed why it matters: inbound frames
- * carried key indices 3 and 6 while every key this bridge ever saw was at index 0, 1 or 4,
- * with no key ever failing to be recovered. Either livekit never told the worker about
- * those keys, or it told it by a route this ignores.
+ * This is the fallback for kinds this bridge has no specific opinion about -- either
+ * because they were not found anywhere in the shipped Element Call bundle (`setKeyIndex`,
+ * `encodeOptions`, `enableKeyManagement` -- livekit-client's protocol lists them, but
+ * grepping `index-ZYqhOGev.js` turned up no trace, so nothing here assumes a shape for
+ * them rather than guess one), or because a future livekit-client version adds one nobody
+ * has looked at yet. `removeTransform` and `ratchetRequest`/`ratchetKey` are handled
+ * explicitly below and never reach this branch.
  *
  * Kinds only. Never payloads: a `setKey` payload holds key material, and one careless log
  * line puts a call's encryption key on disk.
  */
 const unhandledKinds = new Set<string>();
+
+/**
+ * Track unsubscribe, forwarded to the worker as `{kind: "removeTransform", data:
+ * {participantIdentity, trackId}}` (see `E2eeManager`'s `TrackUnsubscribed` handler in the
+ * bundle). It means livekit-client is tearing down the encryption transform for a track
+ * that is going away, so no more frames for it should be treated as this participant's
+ * current key.
+ *
+ * There is no `e2ee_*` Tauri command for this (checked `src-tauri/src/commands/e2ee.rs`:
+ * only `e2ee_init`, `e2ee_set_key`, `e2ee_set_local_identity`, `e2ee_set_sif_trailer`
+ * exist), so nothing is invoked here -- inventing one would typecheck fine and fail at
+ * runtime. What the native side would need, if this ever becomes a real gap: a way to stop
+ * associating a specific `trackId` with a participant's key, e.g. an `e2ee_remove_track`
+ * command taking `(participant, trackId)` that clears any per-track decrypt state. Today
+ * `E2eeContext::set_key` is keyed by participant identity, not by track, so a stale track
+ * mapping is not currently known to cause misdecryption -- this is a documented gap, not a
+ * confirmed bug.
+ */
+function handleRemoveTransform(data: Record<string, unknown>): void {
+  const participant = typeof data["participantIdentity"] === "string" ? data["participantIdentity"] : "";
+  const trackId = typeof data["trackId"] === "string" ? data["trackId"] : "";
+  console.log(
+    `[Elementium] E2EE removeTransform for participant="${participant}" track="${trackId}" -- ` +
+      `known unimplemented: no native command exists to un-associate this track. See the ` +
+      `comment on handleRemoveTransform for what one would need to do.`,
+  );
+}
+
+/**
+ * A request (main thread -> worker) to advance a participant's key by one ratchet step,
+ * posted as `{kind: "ratchetRequest", data: {participantIdentity, keyIndex}}` (see the
+ * bundle's `ratchetKey`-calling path). It carries no key material -- only which key to
+ * advance -- because the worker derives the new key itself via HKDF from the one it
+ * already holds.
+ *
+ * Deliberately not forwarded, with one caveat worth stating rather than glossing. The
+ * native side does perform the same HKDF ratchet -- `e2ee_init` sends `ratchet_window_size`
+ * and `ratchet_salt` with `auto_ratchet: true`, and Element Call supplies a window of 10 at
+ * runtime (a real call logs `E2EE context initialized ratchet_window_size=10`; do not read
+ * this off the bundle, which contains 0, 8 and 10 and settles nothing).
+ *
+ * But it ratchets *reactively*: `decrypt_frame` walks the chain forward only after a frame
+ * fails to decrypt, and commits the advanced key once one succeeds. So where this request
+ * asks the worker to advance a key deliberately, our side arrives at the same key by
+ * failing on one frame first. Equivalent in the end, one frame later. If a dropped frame at
+ * each rotation ever matters, this is the message that would fix it.
+ */
+function handleRatchetRequest(data: Record<string, unknown>): void {
+  const participant = typeof data["participantIdentity"] === "string" ? data["participantIdentity"] : "";
+  const keyIndex = typeof data["keyIndex"] === "number" ? data["keyIndex"] : undefined;
+  console.log(
+    `[Elementium] E2EE ratchetRequest for participant="${participant}" index=${keyIndex} -- ` +
+      `not forwarded: the native backend ratchets the same chain on its own, reactively, ` +
+      `when a frame fails to decrypt.`,
+  );
+}
+
+/**
+ * The worker's *reply* to a ratchet request, posted as `{kind: "ratchetKey", data:
+ * {participantIdentity, keyIndex, ratchetResult}}` -- but posted the other way, from
+ * inside the worker via its own `self.postMessage`, not from the main thread into it.
+ * This bridge only hooks `Worker.prototype.postMessage`, which is the main-thread-to-worker
+ * direction, so in practice this kind should never reach `interceptE2eeWorkerMessage` at
+ * all. Named explicitly (rather than left to the generic fallback) so that if it ever does
+ * show up -- e.g. some future code path posts it through the hooked constructor -- the log
+ * says why nothing happens, instead of just "kind not forwarded".
+ */
+function handleRatchetKeyReply(data: Record<string, unknown>): void {
+  const participant = typeof data["participantIdentity"] === "string" ? data["participantIdentity"] : "";
+  const keyIndex = typeof data["keyIndex"] === "number" ? data["keyIndex"] : undefined;
+  console.log(
+    `[Elementium] E2EE ratchetKey reply seen for participant="${participant}" index=${keyIndex} ` +
+      `-- unexpected (this is normally worker-to-main, not posted through the hooked ` +
+      `Worker.prototype.postMessage); ignored, and its payload is never logged since ` +
+      `ratchetResult is derived key material.`,
+  );
+}
 
 /**
  * Forward the SFU's "server injected frame" marker.
@@ -393,6 +472,12 @@ export function interceptE2eeWorkerMessage(message: unknown): void {
     handleSetKey(data as SetKeyMessage);
   } else if (kind === "setSifTrailer") {
     handleSifTrailer(data);
+  } else if (kind === "removeTransform") {
+    handleRemoveTransform(data);
+  } else if (kind === "ratchetRequest") {
+    handleRatchetRequest(data);
+  } else if (kind === "ratchetKey") {
+    handleRatchetKeyReply(data);
   } else if (typeof kind === "string" && !unhandledKinds.has(kind)) {
     // Once per kind, so a per-frame message cannot flood the log.
     unhandledKinds.add(kind);
