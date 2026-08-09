@@ -347,7 +347,15 @@ pub struct MediaConstraints {
     pub video: Option<VideoConstraints>,
 }
 
+/// A name the page spells differently does not fail here -- it silently arrives as `None`.
+///
+/// Every field is `Option`, so without `camelCase` the page's `deviceId`,
+/// `echoCancellation`, `noiseSuppression` and `autoGainControl` all landed as `None`: every
+/// microphone choice and every processing flag `getUserMedia` asked for was discarded and
+/// the default device opened instead. `width`/`height` were the only constraints that ever
+/// worked, because those two words are spelled the same either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioConstraints {
     pub device_id: Option<String>,
     pub echo_cancellation: Option<bool>,
@@ -366,7 +374,9 @@ impl Default for AudioConstraints {
     }
 }
 
+/// See [`AudioConstraints`] on why `camelCase` is load-bearing here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VideoConstraints {
     pub device_id: Option<String>,
     pub width: Option<u32>,
@@ -544,7 +554,14 @@ impl std::fmt::Display for TrackId {
 }
 
 /// ICE candidate exchanged during signaling.
+///
+/// `camelCase` for the same reason as [`AudioConstraints`]: the shim sends the DOM's own
+/// `RTCIceCandidateInit`, whose keys are `sdpMid` and `sdpMLineIndex`. Nothing reads either
+/// field today -- the candidate string carries what the peer connection needs -- so this
+/// was silently discarding two values no one missed rather than breaking anything. Fixed
+/// so the first reader does not inherit a field that is always `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IceCandidate {
     pub candidate: String,
     pub sdp_mid: Option<String>,
@@ -790,5 +807,69 @@ mod i420_frame_tests {
         assert_eq!(frame.uv_stride(), 4);
         assert_eq!(frame.y().len(), 64);
         assert_eq!(frame.timestamp_us(), 5);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod ipc_constraint_tests {
+    use super::{IceCandidate, MediaConstraints};
+
+    /// The exact payload `frontend/src/shim/media-devices.ts` builds for `get_user_media`,
+    /// copied from a real session log rather than paraphrased -- paraphrasing it is how the
+    /// mismatch survived, since a hand-written `snake_case` fixture would have passed against
+    /// the broken code.
+    ///
+    /// Every field is `Option`, so a name mismatch is not a deserialization error: it is a
+    /// silent `None`. This test therefore asserts on the values, not on `is_ok()`.
+    #[test]
+    fn the_shims_camel_case_constraints_survive_the_ipc_boundary() {
+        let payload = r#"{
+            "audio": {
+                "deviceId": "default",
+                "echoCancellation": true,
+                "noiseSuppression": true,
+                "autoGainControl": false
+            },
+            "video": {
+                "deviceId": "video-input-pw-245",
+                "width": 1280,
+                "height": 720,
+                "frameRate": 30
+            }
+        }"#;
+
+        let parsed: MediaConstraints =
+            serde_json::from_str(payload).expect("the shim's own payload must deserialize");
+
+        let audio = parsed.audio.expect("audio was requested");
+        assert_eq!(audio.device_id.as_deref(), Some("default"));
+        assert_eq!(audio.echo_cancellation, Some(true));
+        assert_eq!(audio.noise_suppression, Some(true));
+        // Deliberately `false`, not `true`: a default-shaped value would pass even if the
+        // field never arrived.
+        assert_eq!(audio.auto_gain_control, Some(false));
+
+        let video = parsed.video.expect("video was requested");
+        assert_eq!(video.device_id.as_deref(), Some("video-input-pw-245"));
+        assert_eq!(video.width, Some(1280));
+        assert_eq!(video.height, Some(720));
+        assert_eq!(video.frame_rate, Some(30.0));
+    }
+
+    /// The DOM's `RTCIceCandidateInit`, as the shim forwards it.
+    #[test]
+    fn an_ice_candidate_keeps_its_sdp_mid_and_m_line_index() {
+        let payload = r#"{
+            "candidate": "candidate:1 1 udp 2130706431 10.0.0.1 30002 typ host",
+            "sdpMid": "pOM",
+            "sdpMLineIndex": 0
+        }"#;
+
+        let parsed: IceCandidate =
+            serde_json::from_str(payload).expect("the shim's own payload must deserialize");
+
+        assert_eq!(parsed.sdp_mid.as_deref(), Some("pOM"));
+        assert_eq!(parsed.sdp_m_line_index, Some(0));
     }
 }
