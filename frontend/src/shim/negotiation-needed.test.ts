@@ -16,15 +16,48 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoked: { cmd: string; args: unknown }[] = [];
 
+/**
+ * Set to hold `create_offer` open, so a test can act in the window between the backend
+ * being asked for an SDP and answering. That window is where the fault lived: a track
+ * published inside it is in no offer, and whether its request survives depends on when the
+ * shim decides what its offer covers.
+ */
+let holdCreateOffer: { promise: Promise<void>; release: () => void } | null = null;
+let holdSetLocal: { promise: Promise<void>; release: () => void } | null = null;
+
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args: unknown) => {
     invoked.push({ cmd, args });
     if (cmd === "create_peer_connection") return Promise.resolve({ id: "pc-test" });
-    if (cmd === "create_offer") return Promise.resolve({ sdpType: "offer", sdp: "v=0\r\n" });
+    if (cmd === "create_offer") {
+      const offer = { sdpType: "offer", sdp: "v=0\r\n" };
+      const held = holdCreateOffer;
+      if (held) return held.promise.then(() => offer);
+      return Promise.resolve(offer);
+    }
     if (cmd === "create_answer") return Promise.resolve({ sdpType: "answer", sdp: "v=0\r\n" });
+    if (cmd === "set_local_description" && holdSetLocal) {
+      return holdSetLocal.promise.then(() => null);
+    }
     return Promise.resolve(null);
   },
 }));
+
+/** Make a command wait until the returned function is called. */
+function hold(which: "offer" | "setLocal"): () => void {
+  let release: () => void = () => {};
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const gate = { promise, release };
+  if (which === "offer") holdCreateOffer = gate;
+  else holdSetLocal = gate;
+  return () => {
+    if (which === "offer") holdCreateOffer = null;
+    else holdSetLocal = null;
+    release();
+  };
+}
 
 // The shim reaches for these when a track arrives; none of it runs in these tests, but the
 // module is imported as a whole, so the environment has to hold them.
@@ -136,6 +169,44 @@ describe("negotiationneeded", () => {
 
     await pc.setRemoteDescription({ type: "answer", sdp: "v=0\r\n" });
     await settle();
+    expect(events()).toBe(1);
+  });
+
+  it("keeps a request the offer being built could not have included", async () => {
+    // The sequence a real call produced, and the reason a microphone stayed unpublished
+    // while every other part of this machinery worked:
+    //
+    //   a description is being applied     -> a new request is held rather than served
+    //   the backend is building an offer   -> what it will describe is already fixed
+    //   the track is published             -> in neither
+    //   the offer comes back and is applied
+    //
+    // Recording what the offer covers *after* its await counted that late request as
+    // covered, so applying the offer cleared it and nothing ever asked again. The count has
+    // to be taken when the backend is asked, not when it answers.
+    const { pc, events } = await connection();
+    const firstOffer = await pc.createOffer();
+
+    const releaseLocal = hold("setLocal");
+    const releaseOffer = hold("offer");
+    const applying = pc.setLocalDescription(firstOffer);
+    const building = pc.createOffer();
+    await settle();
+
+    // Published into that window: held, because a description is in flight.
+    pc.addTransceiver("audio", { direction: "sendonly" });
+    await settle();
+    expect(events()).toBe(0);
+
+    releaseLocal();
+    await applying;
+    releaseOffer();
+    const secondOffer = await building;
+
+    await pc.setLocalDescription(secondOffer);
+    await pc.setRemoteDescription({ type: "answer", sdp: "v=0\r\n" });
+    await settle();
+    // Neither offer describes the audio track, so its request must have survived both.
     expect(events()).toBe(1);
   });
 

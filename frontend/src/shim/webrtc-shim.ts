@@ -798,6 +798,13 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   async createOffer(_options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
     console.log(`[Elementium] createOffer: pcId=${this.pcId} hasVideo=${this._hasVideo} dc=${this._pendingDataChannels.length} tc=${this._pendingTransceivers.length}`);
+    // Captured here, not after the await. What the offer describes is the transceivers
+    // being handed over on the next line -- anything requested while the backend builds the
+    // SDP is *not* in it. Recording the count afterwards counted those late requests as
+    // described, so applying the offer discarded them and the track they belonged to waited
+    // for an offer that had already gone without it. That is how the microphone stayed
+    // unpublished on a call where every other part of this machinery worked.
+    const describesSeq = this._negotiationRequestSeq;
     const desc = await invoke<NativeSessionDescription>("create_offer", {
       pcId: this.pcId,
       includeVideo: this._hasVideo,
@@ -807,8 +814,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // Clear pending lists after they've been applied
     this._pendingDataChannels = [];
     this._pendingTransceivers = [];
-    // What this offer describes, so applying it clears only the requests it answers.
-    this._offerDescribesSeq = this._negotiationRequestSeq;
+    this._offerDescribesSeq = describesSeq;
     console.log(`[Elementium] createOffer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
     if (sdpTracingEnabled()) console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
     return sessionDescription(desc, "offer");
