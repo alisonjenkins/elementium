@@ -36,13 +36,21 @@ The later connections carry almost nothing.
   track that has stopped never stops its loop, so every reconnect adds another 29 IPC calls
   a second, permanently. Ours, small.
 
-- [ ] **R3. Why the call reconnects at all is not established.** Each teardown is preceded
-  by `[UnhandledRejection] Error: No changes to apply`, and beside it
-  `[EncryptionManager] No matching RTC membership for k…`. That string is in neither our
-  source nor the shipped bundle by search, so who throws it is genuinely unknown and must
-  not be guessed at: the fix is different depending on whether Element Call is churning its
-  own membership or our shim is provoking it. Needs a trace of the rejection rather than
-  more log reading. **This is the root; R1 and R2 only make it survivable.**
+- [ ] **R3. ROOT CAUSE FOUND, not yet fixed: `No changes to apply` is ours.**
+  `crates/elementium-webrtc/src/peer_connection.rs`, in `create_offer`:
+  `api.apply().ok_or("No changes to apply")?`. str0m returns `None` from `apply()` when the
+  requested changes leave the session unchanged -- a re-offer whose transceivers already
+  exist -- and we turn that into an error. It crosses the IPC as a rejected promise,
+  livekit-client reads the negotiation as failed, and the call reconnects. Three times in
+  seventy seconds.
+
+  I said earlier this string was "in neither our source nor the shipped bundle by search".
+  That was wrong: the search was for the message as thrown, and it is built here from a
+  string literal. It was found by reading `create_offer` for an unrelated reason.
+
+  The fix is not simply to ignore `None`: `createOffer` has to return an offer describing
+  the current state, so the last offer needs to be kept and returned when nothing changed.
+  **This is the root; R1 and R2 only make it survivable.**
 
 - [ ] **R4. Video quality does not recover after a restart.** 640 kbps to 1.5 Mbps measured
   against a 2764 kbps target at 720p30, with the encoder recreated on every reconnect and
@@ -57,7 +65,13 @@ The later connections carry almost nothing.
   interaction: at 720p60 on software VP8 this is a real CPU load, where the VAAPI H.264
   encoder -- unblocked earlier today -- would absorb it comfortably.
 
-- [ ] **R6. The screen share carries the camera picture.** The far end sees the shared-screen
+- [x] **R6. FIXED. The screen share carried the camera picture.** Confirmed exactly as
+  guessed and then some: `TransceiverInfo::from_js` chose the key from the media kind alone,
+  so *every* sending video transceiver was `video/camera`. `send_mids` keeps the first
+  m-line offered for a key, so the second video track had no m-line at all and the first
+  claimed the camera's slot whichever track it was. The key now comes from the track's
+  source, which the shim knew and was discarding. Original note follows. **The screen share
+  carried the camera picture.** The far end sees the shared-screen
   tile showing the sender's webcam, not their screen, while the sender's own camera tile is
   black. Two video tracks, and the frames are going to the wrong one. First place to look is
   `send_mids` in `peer_connection.rs`: `MediaAdded` inserts under `default_key_for(kind)`,
