@@ -47,6 +47,70 @@ pub fn unencrypted_bytes(frame: &[u8]) -> Option<usize> {
     None
 }
 
+/// The most extra clear bytes `ELEMENTIUM_H264_CLEAR_EXTRA` may ask for.
+///
+/// The knob exists to find where a receiver stops reading the slice header, not to hand a
+/// diagnostic run an unbounded amount of plaintext. Nothing upstream capped it before; this
+/// is a guess at "far more than a slice header could plausibly need", not a measured limit.
+const MAX_CLEAR_EXTRA_BYTES: usize = 64;
+
+/// The outcome of reading `ELEMENTIUM_H264_CLEAR_EXTRA`: the value to use, and a line to
+/// log once if the environment needs explaining -- unset or valid-and-zero warrant nothing.
+struct ClearExtraOutcome {
+    bytes: usize,
+    warning: Option<String>,
+}
+
+/// Parse and bound `ELEMENTIUM_H264_CLEAR_EXTRA`'s raw value.
+///
+/// Split out from the process-environment read so the parsing and bounding can be tested
+/// directly: mutating `std::env` from a test races every other test in the same binary, and
+/// this is the part actually worth testing.
+///
+/// A value that fails to parse is reported and ignored (falls back to zero) rather than
+/// silently defaulted, so a typo is visible instead of just quietly encrypting normally. A
+/// value that parses but exceeds [`MAX_CLEAR_EXTRA_BYTES`] is capped there and reported,
+/// rather than rejected outright, so an overshoot still says something about where the
+/// receiver stops being confused.
+fn parse_extra_clear_bytes(raw: Option<&str>) -> ClearExtraOutcome {
+    let no_change = || ClearExtraOutcome {
+        bytes: 0,
+        warning: None,
+    };
+    let Some(raw) = raw else {
+        return no_change();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return no_change();
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) => no_change(),
+        Ok(requested) if requested <= MAX_CLEAR_EXTRA_BYTES => ClearExtraOutcome {
+            bytes: requested,
+            warning: Some(format!(
+                "ELEMENTIUM_H264_CLEAR_EXTRA={requested} is widening every outgoing H.264 \
+                 frame's plaintext header by {requested} bytes beyond livekit's framing; a \
+                 real livekit peer will not be able to decrypt this stream"
+            )),
+        },
+        Ok(requested) => ClearExtraOutcome {
+            bytes: MAX_CLEAR_EXTRA_BYTES,
+            warning: Some(format!(
+                "ELEMENTIUM_H264_CLEAR_EXTRA={requested} exceeds the {MAX_CLEAR_EXTRA_BYTES}-\
+                 byte cap; using {MAX_CLEAR_EXTRA_BYTES} instead of the requested value"
+            )),
+        },
+        Err(_) => ClearExtraOutcome {
+            bytes: 0,
+            warning: Some(format!(
+                "ELEMENTIUM_H264_CLEAR_EXTRA={trimmed:?} is not a byte count; ignoring it and \
+                 leaving the clear header at its normal size"
+            )),
+        },
+    }
+}
+
 /// Extra slice bytes to leave in the clear, for diagnosis only.
 ///
 /// Chromium assembles no frames at all from our encrypted H.264 -- not even with its
@@ -56,12 +120,21 @@ pub fn unencrypted_bytes(frame: &[u8]) -> Option<usize> {
 /// is reading further into the slice header than the two bytes livekit leaves it.
 ///
 /// Never set in normal operation: any value but zero puts plaintext on the wire and makes
-/// us disagree with livekit's own framing, so a peer could not decrypt us.
+/// us disagree with livekit's own framing, so a peer could not decrypt us. Read once and
+/// cached rather than parsed on every frame -- this sits on the per-frame hot path, and an
+/// environment lookup has no business there when the answer cannot change mid-process.
 fn extra_clear_bytes() -> usize {
-    std::env::var("ELEMENTIUM_H264_CLEAR_EXTRA")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var("ELEMENTIUM_H264_CLEAR_EXTRA").ok();
+        let outcome = parse_extra_clear_bytes(raw.as_deref());
+        if let Some(warning) = outcome.warning {
+            // Said once, because get_or_init runs the closure at most once per process --
+            // a machine running with this set should say so once, loudly, not stay quiet.
+            tracing::warn!("{warning}");
+        }
+        outcome.bytes
+    })
 }
 
 /// Offsets of every NAL header byte in an Annex B stream.
@@ -316,5 +389,81 @@ mod tests {
 
     fn contains_start_code(data: &[u8]) -> bool {
         data.windows(3).any(|w| w == [0, 0, 0] || w == [0, 0, 1])
+    }
+
+    /// [`parse_extra_clear_bytes`] rather than [`extra_clear_bytes`] itself: the latter reads
+    /// `std::env`, and mutating process environment from a test races every other test in
+    /// this binary under a parallel runner.
+    mod clear_extra_parsing {
+        use super::{ClearExtraOutcome, MAX_CLEAR_EXTRA_BYTES, parse_extra_clear_bytes};
+
+        #[test]
+        fn unset_is_zero_and_quiet() {
+            let ClearExtraOutcome { bytes, warning } = parse_extra_clear_bytes(None);
+            assert_eq!(bytes, 0);
+            assert!(warning.is_none());
+        }
+
+        #[test]
+        fn empty_string_is_zero_and_quiet() {
+            // An exported-but-empty variable, e.g. `FOO= cmd`, should behave like unset.
+            let ClearExtraOutcome { bytes, warning } = parse_extra_clear_bytes(Some(""));
+            assert_eq!(bytes, 0);
+            assert!(warning.is_none());
+        }
+
+        #[test]
+        fn explicit_zero_is_zero_and_quiet() {
+            // Zero changes nothing, so it does not warrant the "plaintext is wider" warning.
+            let ClearExtraOutcome { bytes, warning } = parse_extra_clear_bytes(Some("0"));
+            assert_eq!(bytes, 0);
+            assert!(warning.is_none());
+        }
+
+        #[test]
+        fn an_in_range_value_is_used_and_warned_about() {
+            let ClearExtraOutcome { bytes, warning } = parse_extra_clear_bytes(Some("5"));
+            assert_eq!(bytes, 5);
+            // A nonzero value must warn; module-level `unwrap_used` allow covers this.
+            let warning = warning.unwrap();
+            assert!(warning.contains("ELEMENTIUM_H264_CLEAR_EXTRA=5"));
+            assert!(warning.contains('5'));
+        }
+
+        #[test]
+        fn the_upper_bound_itself_is_accepted_without_capping() {
+            let expected = format!("{MAX_CLEAR_EXTRA_BYTES}");
+            let ClearExtraOutcome { bytes, warning } =
+                parse_extra_clear_bytes(Some(expected.as_str()));
+            assert_eq!(bytes, MAX_CLEAR_EXTRA_BYTES);
+            assert!(warning.is_some());
+        }
+
+        #[test]
+        fn an_oversized_value_is_capped_and_reports_the_cap() {
+            let requested = MAX_CLEAR_EXTRA_BYTES.saturating_add(1000);
+            let ClearExtraOutcome { bytes, warning } =
+                parse_extra_clear_bytes(Some(&requested.to_string()));
+            assert_eq!(bytes, MAX_CLEAR_EXTRA_BYTES);
+            // An oversized value must warn; module-level `unwrap_used` allow covers this.
+            let warning = warning.unwrap();
+            assert!(warning.contains(&requested.to_string()));
+            assert!(warning.contains(&MAX_CLEAR_EXTRA_BYTES.to_string()));
+        }
+
+        #[test]
+        fn unparsable_values_are_ignored_and_reported() {
+            for junk in ["not-a-number", "-1", "3.5", "0x10"] {
+                let ClearExtraOutcome { bytes, warning } = parse_extra_clear_bytes(Some(junk));
+                assert_eq!(bytes, 0, "junk input {junk:?} must fall back to zero");
+                assert!(warning.is_some(), "junk input {junk:?} must be reported");
+            }
+        }
+
+        #[test]
+        fn surrounding_whitespace_is_tolerated() {
+            let ClearExtraOutcome { bytes, .. } = parse_extra_clear_bytes(Some("  7  "));
+            assert_eq!(bytes, 7);
+        }
     }
 }
