@@ -53,12 +53,64 @@ collected here because they were all found in the same session.
   stay in that state silently. Whatever the fix, `skipped_not_connected` climbing past a
   threshold deserves a warning in its own right.
 
+- [ ] **M5. Our key is distributed once, at join, and never again -- which is what freezes
+  the far end mid-call.** The strongest lead in this file, and the likely cause of both "they
+  cannot see me" and "they cannot hear me".
+
+  Every `setKey` that reached the backend in one call:
+
+  | time | participant | index |
+  |---|---|---:|
+  | 18:43:52 | `xDoYzMrXlX` (us) | 0 |
+  | 18:45:23 | `Ji1WSmp16W` (our own browser, second device) | 11 |
+  | 18:45:25 | `CJu6o8gDTf` | 11 |
+  | 18:45:27 | `NQYgk79Mqj` | 34 |
+  | 18:45:27 | `UNtCLxEwoA` | 5 |
+
+  A participant joined at 18:45:23. Our last decodable outbound frame is in the window ending
+  18:45:22. Exactly one batch of to-device messages leaves this client all call --
+  `Sending batch of 4 to-device messages with ID 38`, at 18:43:52 -- and none at 18:45:23.
+
+  **The mechanism is missed *distribution*, not the missed rotation.** A first reading blamed
+  our key index staying at 0, and that reading is wrong: frames name their key index in the
+  trailer and receivers retain old ring slots, so a peer that already holds index 0 keeps
+  decrypting us regardless of whether we rotate. Only a peer that never received our key at
+  all sees a frozen picture while our encoder runs perfectly -- which is exactly what a
+  joiner we never sent to would see. Reviewed against `RTCEncryptionManager`,
+  `ParticipantKeyHandler` and `matrixKeyProvider.ts`.
+
+  Confirmed rather than assumed:
+  - The shipped bundle really is `RTCEncryptionManager` (`keyRotationGracePeriodMs` is
+    present in `index-ZYqhOGev.js`), so its rotation rules are the ones in force. A JOIN
+    re-distributes the existing key inside a 10s grace period and rotates outside it; ours
+    was 91s old, so a rotation *and* a distribution were both due and neither happened.
+  - The bridge is not dropping anything. Element Call's key provider only ever calls
+    `onSetEncryptionKey`, never `ratchetKey`, so zero `ratchetRequest` messages is normal and
+    not evidence of a missed route. The only unforwarded worker messages all call were
+    `enable` and `updateCodec`.
+
+  So the fault is upstream of the bridge, in this client's MatrixRTC membership handling:
+  `onMembershipsUpdate` appears not to fire (or to diff to nothing) after the initial join.
+  The room carries dozens of stale `LEFT` membership events for our user, one per past
+  device, which is the obvious suspect for a broken changed-memberships diff.
+
+  Next: instrument `MatrixRTCSession`'s membership callbacks in the webview to see whether
+  the update fires at all, and whether the stale entries break the diff.
+
 - [ ] **M4. Other participants' keys arrive up to 36 seconds after joining, or not at all.**
   Joined at 18:14:52; the first key belonging to anyone else arrived at 18:15:28, and a third
   participant's at 18:15:33. 4,400 frames were dropped undecryptable in between, which is
   every remote camera black for over half a minute.
 
   Not a decryption bug: the native keyring is 256 slots per participant with a working
-  ratchet, and the moment keys landed everything decoded. The gap is that joining does not
-  fetch the keys of participants already in the room -- we wait for the next rotation to
-  happen to include us.
+  ratchet, and the moment keys landed everything decoded.
+
+  Nor, on review, is it fixable from our side by asking. Key acquisition in this protocol is
+  pure push -- `RTCEncryptionManager` has no request mechanism, and a joiner waits to be sent
+  keys when *existing members' clients* observe its membership. A 36s gap therefore means
+  remote clients saw our membership event that late, which points at membership propagation
+  (see [M5]) rather than at our keyring. Related: frames arriving at one index below the one
+  we hold are protocol-expected for a few seconds after a sender rotates -- the sender keeps
+  transmitting on the previous index for `useKeyDelay = 5000`ms -- and dropping them is the
+  conformant response, since indices are independent keys and index N-1 is not derivable
+  from N. Thousands of them is not expected and is worth a second look once M5 is fixed.
