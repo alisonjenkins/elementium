@@ -94,6 +94,26 @@ The later connections carry almost nothing.
   "asks permission then shares without asking what" would suggest. Needs a log of an actual
   share attempt on a build that has R6 in it before anything is changed here.
 
+## The 11:50 call, on the build with R3 in it
+
+R3 is **confirmed fixed**: not one `No changes to apply` in the whole session, against four
+in the session before. The reconnects continued, from a different and older cause.
+
+- [x] **R8. FIXED. Publishing never asked for an offer.** Every transceiver in that session
+  was `RecvOnly` -- the microphone and the camera were never published at all, which is why
+  the participant tile showed a muted icon: it was correct. Four sendonly audio transceivers
+  and one video were *requested* by livekit-client, and none reached an offer.
+
+  `addTransceiver` recorded the transceiver for the next offer and fired nothing;
+  `addTrack` was a stub that did not even record. `negotiationneeded` was fired only by
+  `restartIce`. livekit-client's publisher is driven entirely by that event, so it waited,
+  timed out at fifteen seconds, logged `negotiation disconnected`, and rebuilt the room --
+  eight times in ninety seconds, each peer connection lasting 15.0 to 15.3 seconds. The
+  regularity is what gave it away: a network fault is not punctual.
+
+  This is older than R3 and was hidden by it. While every re-offer failed, the reconnects
+  themselves produced the offers that carried the published tracks.
+
 ## Fixed on 2026-08-09, after this list was written
 
 - **The remote participant's video was a black tile.** Rust decoded every frame and answered
