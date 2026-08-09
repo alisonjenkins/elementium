@@ -13,6 +13,7 @@ import { setupConsoleBridge } from "./console-bridge";
 import { setupE2eeBridge } from "./e2ee-bridge";
 import { setupMembershipLog } from "./membership-log";
 import { setupWidgetApiLog } from "./widget-api-log";
+import { setupWebCodecsProbe } from "./webcodecs-probe";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 import { install, isPatched, record } from "./install-report";
 
@@ -70,6 +71,18 @@ install(
   () =>
     Boolean(
       (window as unknown as Record<string, unknown>)["__elementium_membership_logged"],
+    ),
+);
+
+// Whether the page can decode video itself, which decides whether remote video has to keep
+// crossing the boundary as RGBA. Observation only -- nothing depends on the answer yet.
+install(
+  "webcodecs-probe",
+  "VideoDecoder support",
+  setupWebCodecsProbe,
+  () =>
+    Boolean(
+      (globalThis as unknown as Record<string, unknown>)["__elementium_webcodecs_probed"],
     ),
 );
 
