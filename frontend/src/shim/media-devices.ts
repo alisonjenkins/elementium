@@ -172,17 +172,17 @@ export function setupMediaDevicesShim(): void {
       const nativeConstraints = {
         audio: constraints?.audio ? {
           deviceId: typeof constraints.audio === "object" ?
-            (constraints.audio as MediaTrackConstraints).deviceId as string | undefined : undefined,
+            extractDeviceId((constraints.audio as MediaTrackConstraints).deviceId) : undefined,
           echoCancellation: typeof constraints.audio === "object" ?
-            (constraints.audio as MediaTrackConstraints).echoCancellation as boolean | undefined : true,
+            extractBooleanConstraint((constraints.audio as MediaTrackConstraints).echoCancellation, true) : true,
           noiseSuppression: typeof constraints.audio === "object" ?
-            (constraints.audio as MediaTrackConstraints).noiseSuppression as boolean | undefined : true,
+            extractBooleanConstraint((constraints.audio as MediaTrackConstraints).noiseSuppression, true) : true,
           autoGainControl: typeof constraints.audio === "object" ?
-            (constraints.audio as MediaTrackConstraints).autoGainControl as boolean | undefined : true,
+            extractBooleanConstraint((constraints.audio as MediaTrackConstraints).autoGainControl, true) : true,
         } : null,
         video: constraints?.video ? {
           deviceId: typeof constraints.video === "object" ?
-            (constraints.video as MediaTrackConstraints).deviceId as string | undefined : undefined,
+            extractDeviceId((constraints.video as MediaTrackConstraints).deviceId) : undefined,
           width: typeof constraints.video === "object" ?
             extractConstraintValue((constraints.video as MediaTrackConstraints).width) : undefined,
           height: typeof constraints.video === "object" ?
@@ -373,6 +373,45 @@ function mapDeviceKind(kind: string): MediaDeviceKind {
     case "videoInput": return "videoinput";
     default: return "audioinput";
   }
+}
+
+/**
+ * Extract a device id from a `ConstrainDOMString`, which is not always a string.
+ *
+ * The DOM lets `deviceId` be a bare string, `{exact}`, `{ideal}`, or an array of any of
+ * those. This shim used to cast it straight to `string | undefined` and hand it to Rust,
+ * which declares it as `Option<String>` -- so an object would fail IPC deserialization and
+ * throw `NotAllowedError` for the whole `getUserMedia` call, not just for the device
+ * preference. Element Call passes a plain string, which is the only reason that never
+ * fired; matrix-js-sdk's `MediaHandler` builds `{exact: ...}`, and it is in the same
+ * bundle.
+ *
+ * `exact` is preferred over `ideal` because it is a requirement rather than a preference,
+ * and the first entry of an array is taken as the most-preferred one.
+ */
+function extractDeviceId(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return extractDeviceId(value[0]);
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if ("exact" in obj) return extractDeviceId(obj["exact"]);
+    if ("ideal" in obj) return extractDeviceId(obj["ideal"]);
+  }
+  return undefined;
+}
+
+/**
+ * Extract a boolean from a `ConstrainBoolean`, which has the same shape problem as
+ * `deviceId` above: `{exact: true}` is legal and would reach Rust as an object.
+ */
+function extractBooleanConstraint(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if ("exact" in obj) return extractBooleanConstraint(obj["exact"], fallback);
+    if ("ideal" in obj) return extractBooleanConstraint(obj["ideal"], fallback);
+  }
+  return fallback;
 }
 
 /**
