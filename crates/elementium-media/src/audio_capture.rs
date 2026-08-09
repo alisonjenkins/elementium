@@ -5,14 +5,28 @@ use cpal::{SampleFormat, Stream};
 use elementium_types::AudioFrame;
 use thiserror::Error;
 
+/// Split from the original two variants (`Config`, `Stream`).
+///
+/// `Stream` conflated two distinct `cpal` calls -- building the stream and starting it -- with
+/// two different error types, so a caller matching on it could not tell which had failed.
+/// `Config` conflated a real `cpal` failure with "the device's sample format is one we do not
+/// decode", which has no `cpal` error behind it at all -- it is our own format table being
+/// incomplete, not the device misbehaving.
 #[derive(Error, Debug)]
 pub enum CaptureError {
     #[error("No input device available")]
     NoDevice,
     #[error("Failed to get device config: {0}")]
-    Config(String),
-    #[error("Failed to build stream: {0}")]
-    Stream(String),
+    Config(#[source] cpal::DefaultStreamConfigError),
+    /// The device's sample format has no decode path in [`build_stream`]. Not a `cpal`
+    /// failure -- `cpal` reported the format successfully; this crate just does not handle
+    /// it (only `F32`/`I16`/`U16` are, `F64` and others are not).
+    #[error("Unsupported audio sample format: {0:?}")]
+    UnsupportedSampleFormat(SampleFormat),
+    #[error("Failed to build audio stream: {0}")]
+    BuildStream(#[source] cpal::BuildStreamError),
+    #[error("Failed to start audio stream: {0}")]
+    Play(#[source] cpal::PlayStreamError),
 }
 
 /// Captures audio from the default input device.
@@ -80,7 +94,7 @@ fn input_config(
                 error = %e,
                 "Failed to get audio input device config"
             );
-            CaptureError::Config(e.to_string())
+            CaptureError::Config(e)
         })
 }
 
@@ -175,7 +189,7 @@ impl AudioCapturer {
                     error_kind = "unsupported_sample_format",
                     "Unsupported audio sample format"
                 );
-                return Err(CaptureError::Config("unsupported sample format".into()));
+                return Err(CaptureError::UnsupportedSampleFormat(sample_format));
             }
         }
         .map_err(|e| {
@@ -197,7 +211,7 @@ impl AudioCapturer {
                 error = %e,
                 "Failed to start audio input stream"
             );
-            CaptureError::Stream(e.to_string())
+            CaptureError::Play(e)
         })?;
 
         tracing::info!(
@@ -334,7 +348,7 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
             err_fn,
             None,
         )
-        .map_err(|e| CaptureError::Stream(e.to_string()))?;
+        .map_err(CaptureError::BuildStream)?;
 
     Ok(stream)
 }
@@ -714,5 +728,47 @@ mod downmix_tests {
     fn a_full_scale_signal_cannot_clip() {
         let out = downmix_to_mono(&[1.0, 1.0, -1.0, -1.0], 2);
         assert!(out.iter().all(|s| (-1.0..=1.0).contains(s)), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod capture_error_tests {
+    use super::CaptureError;
+
+    /// Pins the split of the old single `Config(String)`: a `cpal` config failure must carry
+    /// the real `DefaultStreamConfigError` as its source, not just a rendered message.
+    #[test]
+    fn config_failure_carries_the_cpal_error_as_its_source() {
+        let err = CaptureError::Config(cpal::DefaultStreamConfigError::DeviceNotAvailable);
+        assert!(matches!(err, CaptureError::Config(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// A sample format `cpal` reports successfully but this crate has no decode path for is
+    /// not a `cpal` failure at all -- it must be its own variant with no source, distinct from
+    /// `Config`, which was the old (wrong) home for this string.
+    #[test]
+    fn unsupported_sample_format_has_no_underlying_source() {
+        let err = CaptureError::UnsupportedSampleFormat(cpal::SampleFormat::F64);
+        assert!(matches!(err, CaptureError::UnsupportedSampleFormat(_)));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    /// Pins the split of the old single `Stream(String)`: building the stream and starting it
+    /// are two different `cpal` calls with two different error types, and must be
+    /// distinguishable -- `BuildStream` for the former.
+    #[test]
+    fn build_stream_failure_carries_the_cpal_error_as_its_source() {
+        let err = CaptureError::BuildStream(cpal::BuildStreamError::DeviceNotAvailable);
+        assert!(matches!(err, CaptureError::BuildStream(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// The other half of the same split: starting an already-built stream (`Stream::play`).
+    #[test]
+    fn play_failure_carries_the_cpal_error_as_its_source() {
+        let err = CaptureError::Play(cpal::PlayStreamError::DeviceNotAvailable);
+        assert!(matches!(err, CaptureError::Play(_)));
+        assert!(std::error::Error::source(&err).is_some());
     }
 }

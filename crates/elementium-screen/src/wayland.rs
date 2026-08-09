@@ -43,17 +43,28 @@ impl WaylandCapturer {
 /// are possible when several outputs are picked; the first is used, because everything
 /// above this expects a single video track.
 #[cfg(target_os = "linux")]
-async fn request_screencast_node() -> Result<u32, String> {
+async fn request_screencast_node() -> Result<u32, ElementiumError> {
     use ashpd::desktop::screencast::{
         CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions,
     };
     use ashpd::desktop::CreateSessionOptions;
 
-    let proxy = Screencast::new().await.map_err(|e| e.to_string())?;
+    // Every `ashpd::Error` here is boxed as `ElementiumError::Backend`'s real, walkable
+    // source rather than stringified -- see that variant's doc for why boxing (not
+    // `elementium-types` naming `ashpd::Error` directly) is the right shape at this
+    // dependency boundary.
+    let backend = |description: &'static str| {
+        move |e: ashpd::Error| ElementiumError::Backend {
+            description: format!("{description}: {e}"),
+            cause: Box::new(e),
+        }
+    };
+
+    let proxy = Screencast::new().await.map_err(backend("screencast portal unavailable"))?;
     let session = proxy
         .create_session(CreateSessionOptions::default())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(backend("could not create portal session"))?;
 
     proxy
         .select_sources(
@@ -66,20 +77,24 @@ async fn request_screencast_node() -> Result<u32, String> {
                 .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(backend("portal rejected the source selection request"))?;
 
     let response = proxy
         .start(&session, None, StartCastOptions::default())
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(backend("portal rejected the start request"))?
         .response()
-        .map_err(|e| e.to_string())?;
+        .map_err(backend("portal exchange failed"))?;
 
     response
         .streams()
         .first()
         .map(ashpd::desktop::screencast::Stream::pipe_wire_node_id)
-        .ok_or_else(|| "the portal returned no streams; the picker was probably cancelled".to_owned())
+        .ok_or_else(|| {
+            ElementiumError::InvalidSource(
+                "the portal returned no streams; the picker was probably cancelled".to_owned(),
+            )
+        })
 }
 
 impl ScreenCapturer for WaylandCapturer {
@@ -97,20 +112,19 @@ impl ScreenCapturer for WaylandCapturer {
     ) -> Result<(), ElementiumError> {
         tracing::info!("Requesting a screencast session from the XDG desktop portal");
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| ElementiumError::ScreenCapture(format!("runtime: {e}")))?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
-        let node_id = runtime.block_on(request_screencast_node()).map_err(|e| {
-            tracing::warn!(reason = %e, "Screencast portal request failed");
-            ElementiumError::ScreenCapture(e)
-        })?;
+        let node_id = runtime
+            .block_on(request_screencast_node())
+            .inspect_err(|e| tracing::warn!(reason = %e, "Screencast portal request failed"))?;
 
         tracing::info!(node_id, "Portal granted a screencast stream");
 
         let capture = elementium_media::pipewire_capture::PipewireCapturer::start(node_id)
-            .map_err(|e| ElementiumError::ScreenCapture(e.to_string()))?;
+            .map_err(|e| ElementiumError::Backend {
+                description: format!("PipeWire screencast capture failed: {e}"),
+                cause: Box::new(e),
+            })?;
 
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
@@ -132,8 +146,7 @@ impl ScreenCapturer for WaylandCapturer {
                 }
                 capture.stop();
                 tracing::info!("Wayland screencast pump stopped");
-            })
-            .map_err(|e| ElementiumError::ScreenCapture(format!("thread: {e}")))?;
+            })?;
 
         Ok(())
     }

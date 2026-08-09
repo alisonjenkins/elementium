@@ -5,12 +5,28 @@ use std::sync::mpsc;
 use elementium_types::I420Frame;
 
 /// Error type for camera operations.
+///
+/// Split from a single `Camera(String)` catch-all: enumeration, opening a device, and
+/// starting its stream are three different `nokhwa` calls with three different remedies (no
+/// hardware at all vs. a device present but rejecting the requested format vs. a device that
+/// opened but would not start), and each now carries the underlying [`nokhwa::NokhwaError`]
+/// as its source instead of only that error's rendered message.
 #[derive(Debug, thiserror::Error)]
 pub enum CameraError {
     #[error("No camera found")]
     NoCameraFound,
-    #[error("Camera error: {0}")]
-    Camera(String),
+    #[error("failed to enumerate cameras: {0}")]
+    Enumerate(#[source] nokhwa::NokhwaError),
+    #[error("failed to open camera: {0}")]
+    Open(#[source] nokhwa::NokhwaError),
+    #[error("failed to start camera stream: {0}")]
+    OpenStream(#[source] nokhwa::NokhwaError),
+    /// The background thread that owns the (non-`Send`) `nokhwa::Camera` exited before it
+    /// reported whether initialization succeeded -- e.g. it panicked. Not a `nokhwa` failure:
+    /// there is no `NokhwaError` to wrap, only the fact that the initialization channel
+    /// closed with nothing sent.
+    #[error("camera capture thread died during initialization")]
+    ThreadDied,
 }
 
 /// Captures video frames from a camera device.
@@ -37,8 +53,7 @@ static LOGGED_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// interface, which has zero supported formats) -- callers should try each in order and fall
 /// through to the next on failure rather than assuming the first entry is a working camera.
 fn candidate_camera_indices() -> Result<Vec<u32>, CameraError> {
-    let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
-        .map_err(|e| CameraError::Camera(e.to_string()))?;
+    let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(CameraError::Enumerate)?;
     if cameras.is_empty() {
         return Err(CameraError::NoCameraFound);
     }
@@ -273,7 +288,7 @@ impl CameraCapturer {
                         error = %e,
                         "Failed to open camera device"
                     );
-                    let _ = init_tx.send(Err(CameraError::Camera(e.to_string())));
+                    let _ = init_tx.send(Err(CameraError::Open(e)));
                     return;
                 }
             };
@@ -287,7 +302,7 @@ impl CameraCapturer {
                     error = %e,
                     "Failed to open camera stream"
                 );
-                let _ = init_tx.send(Err(CameraError::Camera(e.to_string())));
+                let _ = init_tx.send(Err(CameraError::OpenStream(e)));
                 return;
             }
 
@@ -315,7 +330,7 @@ impl CameraCapturer {
                 error_kind = "thread_died",
                 "Camera thread died during initialization"
             );
-            CameraError::Camera("Camera thread died during init".into())
+            CameraError::ThreadDied
         })??;
 
         Ok(Self {
@@ -397,4 +412,52 @@ fn yuyv_to_rgba(width: u32, height: u32, yuyv: &[u8]) -> Vec<u8> {
     }
 
     rgba
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::CameraError;
+
+    /// Pins the split of the old single `Camera(String)` catch-all: opening a device must
+    /// report `Open` and must keep the underlying `nokhwa` error walkable via `source()`,
+    /// not just folded into a rendered message.
+    #[test]
+    fn open_failure_carries_the_nokhwa_error_as_its_source() {
+        let inner = nokhwa::NokhwaError::OpenDeviceError("cam0".into(), "busy".into());
+        let err = CameraError::Open(inner);
+        assert!(matches!(err, CameraError::Open(_)));
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "Open must preserve its nokhwa cause via #[source], not swallow it"
+        );
+    }
+
+    /// The other half of the same split: starting the stream is a different `nokhwa` call
+    /// than opening the device, and must be distinguishable from `Open`.
+    #[test]
+    fn open_stream_failure_carries_the_nokhwa_error_as_its_source() {
+        let inner = nokhwa::NokhwaError::OpenStreamError("format rejected".into());
+        let err = CameraError::OpenStream(inner);
+        assert!(matches!(err, CameraError::OpenStream(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// Enumeration failing (no backend, permission denied, etc.) is a third distinct `nokhwa`
+    /// call and must not be folded into `Open`/`OpenStream`.
+    #[test]
+    fn enumerate_failure_carries_the_nokhwa_error_as_its_source() {
+        let inner = nokhwa::NokhwaError::GeneralError("no backend".into());
+        let err = CameraError::Enumerate(inner);
+        assert!(matches!(err, CameraError::Enumerate(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// The background thread dying before it reports success/failure has no `nokhwa` error to
+    /// wrap at all -- it must be its own variant, not a stringified `Camera(String)`.
+    #[test]
+    fn thread_died_has_no_underlying_source() {
+        let err = CameraError::ThreadDied;
+        assert!(matches!(err, CameraError::ThreadDied));
+        assert!(std::error::Error::source(&err).is_none());
+    }
 }

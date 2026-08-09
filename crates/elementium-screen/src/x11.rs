@@ -101,8 +101,18 @@ impl ScreenCapturer for X11Capturer {
         // when the truth is sharing is not available at all. Either call failing alone
         // is tolerated and logged, matching the existing per-item skip-and-continue
         // behaviour above.
-        if let (Some(m), Some(_)) = (&monitor_err, &window_err) {
-            return Err(ElementiumError::ScreenCapture(describe_environment_error(m)));
+        // Both independently hit the X server and both failed; `xcap::XCapError` is not
+        // `Clone`, so `monitor_err` (not `window_err`) is the one carried as the real cause
+        // below -- matching the pre-existing behaviour of `describe_environment_error(m)`,
+        // which only ever looked at the monitor side.
+        if window_err.is_some()
+            && let Some(monitor_err) = monitor_err.take()
+        {
+            let description = describe_environment_error(&monitor_err);
+            return Err(ElementiumError::Backend {
+                description,
+                cause: Box::new(monitor_err),
+            });
         }
         if let Some(e) = &monitor_err {
             tracing::warn!(error = %e, "Could not enumerate X11 monitors");
@@ -173,8 +183,7 @@ impl ScreenCapturer for X11Capturer {
                 }
 
                 tracing::info!("X11 capture stopped");
-            })
-            .map_err(|e| ElementiumError::ScreenCapture(format!("could not spawn X11 capture thread: {e}")))?;
+            })?;
 
         Ok(())
     }
@@ -204,17 +213,14 @@ fn parse_source_id(source_id: &str) -> Result<(SourceIdKind, u32), ElementiumErr
         .map(|s| (SourceIdKind::Monitor, s))
         .or_else(|| source_id.strip_prefix("window-").map(|s| (SourceIdKind::Window, s)))
         .ok_or_else(|| {
-            ElementiumError::ScreenCapture(format!(
+            ElementiumError::InvalidSource(format!(
                 "unrecognised source id {source_id:?}: expected a \"monitor-\" or \"window-\" prefix"
             ))
         })?;
 
-    let id = id_str.parse::<u32>().map_err(|e| {
-        let kind_name = match kind {
-            SourceIdKind::Monitor => "monitor",
-            SourceIdKind::Window => "window",
-        };
-        ElementiumError::ScreenCapture(format!("invalid {kind_name} source id {source_id:?}: {e}"))
+    let id = id_str.parse::<u32>().map_err(|cause| ElementiumError::MalformedSourceId {
+        source_id: source_id.to_owned(),
+        cause,
     })?;
 
     Ok((kind, id))
@@ -240,10 +246,12 @@ fn describe_environment_error(err: &xcap::XCapError) -> String {
 /// `capture_monitor` for the per-frame lookup inside the running loop -- one lookup, two
 /// callers with different tolerances for the result.
 fn find_monitor(target_id: u32) -> Result<xcap::Monitor, ElementiumError> {
-    let monitors = xcap::Monitor::all()
-        .map_err(|e| ElementiumError::ScreenCapture(describe_environment_error(&e)))?;
+    let monitors = xcap::Monitor::all().map_err(|e| ElementiumError::Backend {
+        description: describe_environment_error(&e),
+        cause: Box::new(e),
+    })?;
     monitors.into_iter().find(|m| m.id().is_ok_and(|id| id == target_id)).ok_or_else(|| {
-        ElementiumError::ScreenCapture(format!(
+        ElementiumError::InvalidSource(format!(
             "no monitor with id {target_id} was found; the source list may be stale"
         ))
     })
@@ -252,10 +260,12 @@ fn find_monitor(target_id: u32) -> Result<xcap::Monitor, ElementiumError> {
 /// Find the window with the given id, or say precisely why it could not be found. Same
 /// reasoning as `find_monitor`.
 fn find_window(target_id: u32) -> Result<xcap::Window, ElementiumError> {
-    let windows = xcap::Window::all()
-        .map_err(|e| ElementiumError::ScreenCapture(describe_environment_error(&e)))?;
+    let windows = xcap::Window::all().map_err(|e| ElementiumError::Backend {
+        description: describe_environment_error(&e),
+        cause: Box::new(e),
+    })?;
     windows.into_iter().find(|w| w.id().is_ok_and(|id| id == target_id)).ok_or_else(|| {
-        ElementiumError::ScreenCapture(format!(
+        ElementiumError::InvalidSource(format!(
             "no window with id {target_id} was found; the source list may be stale"
         ))
     })

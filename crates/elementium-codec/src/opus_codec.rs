@@ -1,12 +1,20 @@
 use elementium_types::{AudioFrame, PlaintextMedia};
 use thiserror::Error;
 
+/// `UnsupportedChannels` is split out of the old `Encoder(String)`/`Decoder(String)`.
+///
+/// An unsupported channel count is our own validation, checked before any `opus` call is
+/// made, and has no `opus::Error` behind it -- `channels` is the whole fact. `Encoder`/
+/// `Decoder` keep the real [`opus::Error`] (which already names the failing `opus` function
+/// and a description) as their source, rather than only its rendered message.
 #[derive(Error, Debug)]
 pub enum OpusError {
+    #[error("unsupported channel count: {0} (must be 1 or 2)")]
+    UnsupportedChannels(u16),
     #[error("Opus encoder error: {0}")]
-    Encoder(String),
+    Encoder(#[source] opus::Error),
     #[error("Opus decoder error: {0}")]
-    Decoder(String),
+    Decoder(#[source] opus::Error),
 }
 
 /// Tuning applied to a new [`OpusEncoder`], beyond libopus's defaults.
@@ -94,9 +102,7 @@ impl OpusEncoder {
                     error_kind = "unsupported_channels",
                     "Opus encoder: unsupported channel count"
                 );
-                return Err(OpusError::Encoder(format!(
-                    "unsupported channel count: {channels}"
-                )));
+                return Err(OpusError::UnsupportedChannels(channels));
             }
         };
 
@@ -109,7 +115,7 @@ impl OpusEncoder {
                     error = %e,
                     "Failed to initialize Opus encoder"
                 );
-                OpusError::Encoder(e.to_string())
+                OpusError::Encoder(e)
             })?;
 
         let apply =
@@ -123,7 +129,7 @@ impl OpusEncoder {
                         error = %e,
                         "Failed to apply Opus encoder setting"
                     );
-                    OpusError::Encoder(format!("{setting}: {e}"))
+                    OpusError::Encoder(e)
                 })
             };
 
@@ -172,7 +178,7 @@ impl OpusEncoder {
                 error = %e,
                 "Failed to update Opus expected packet loss"
             );
-            OpusError::Encoder(format!("packet_loss_perc: {e}"))
+            OpusError::Encoder(e)
         })
     }
 
@@ -196,7 +202,7 @@ impl OpusEncoder {
                     error = %e,
                     "Opus encode failed"
                 );
-                OpusError::Encoder(e.to_string())
+                OpusError::Encoder(e)
             })?;
         output.truncate(len);
         Ok(PlaintextMedia::from_encoder(output))
@@ -237,9 +243,7 @@ impl OpusDecoder {
                     error_kind = "unsupported_channels",
                     "Opus decoder: unsupported channel count"
                 );
-                return Err(OpusError::Decoder(format!(
-                    "unsupported channel count: {channels}"
-                )));
+                return Err(OpusError::UnsupportedChannels(channels));
             }
         };
 
@@ -251,7 +255,7 @@ impl OpusDecoder {
                 error = %e,
                 "Failed to initialize Opus decoder"
             );
-            OpusError::Decoder(e.to_string())
+            OpusError::Decoder(e)
         })?;
 
         Ok(Self {
@@ -288,7 +292,7 @@ impl OpusDecoder {
                     error = %e,
                     "Opus decode failed"
                 );
-                OpusError::Decoder(e.to_string())
+                OpusError::Decoder(e)
             })?;
         output.truncate(decoded.saturating_mul(channels));
 
@@ -316,7 +320,7 @@ impl OpusDecoder {
     pub fn packet_sample_count(&self, packet: &PlaintextMedia) -> Result<usize, OpusError> {
         self.inner
             .get_nb_samples(packet.as_bytes())
-            .map_err(|e| OpusError::Decoder(e.to_string()))
+            .map_err(OpusError::Decoder)
     }
 
     /// Synthesize a concealment frame for a lost packet, using Opus's built-in packet-loss
@@ -350,7 +354,7 @@ impl OpusDecoder {
                     error = %e,
                     "Opus packet-loss concealment failed"
                 );
-                OpusError::Decoder(e.to_string())
+                OpusError::Decoder(e)
             })?;
         output.truncate(decoded.saturating_mul(channels));
 
@@ -649,26 +653,46 @@ mod tests {
         }
     }
 
+    /// Updated for the `UnsupportedChannels` split: an unsupported channel count is our own
+    /// validation, not an `opus::Error`, so it must no longer come back wrapped in `Encoder`.
     #[test]
     fn encoder_rejects_unsupported_channel_count() {
         for channels in [0u16, 3, 6] {
-            let result = OpusEncoder::new(48000, channels);
+            let result = OpusEncoder::new(48000, channels).err();
             assert!(
-                matches!(result, Err(OpusError::Encoder(_))),
-                "expected Encoder error for channels={channels}"
+                matches!(result, Some(OpusError::UnsupportedChannels(c)) if c == channels),
+                "expected UnsupportedChannels({channels}) for channels={channels}, got {result:?}"
             );
         }
     }
 
+    /// Updated for the `UnsupportedChannels` split: see `encoder_rejects_unsupported_channel_count`.
     #[test]
     fn decoder_rejects_unsupported_channel_count() {
         for channels in [0u16, 3, 6] {
-            let result = OpusDecoder::new(48000, channels);
+            let result = OpusDecoder::new(48000, channels).err();
             assert!(
-                matches!(result, Err(OpusError::Decoder(_))),
-                "expected Decoder error for channels={channels}"
+                matches!(result, Some(OpusError::UnsupportedChannels(c)) if c == channels),
+                "expected UnsupportedChannels({channels}) for channels={channels}, got {result:?}"
             );
         }
+    }
+
+    /// New variant: a real `opus` failure (as opposed to our own channel-count validation)
+    /// must keep the underlying `opus::Error` walkable as a source, not just its message.
+    #[test]
+    fn encoder_init_failure_carries_the_opus_error_as_its_source() {
+        // Sample rate 0 is rejected by libopus itself (BadArg), not by this crate's own
+        // channel-count check, so it exercises the `Encoder(#[source] opus::Error)` path.
+        let result = OpusEncoder::new(0, 1).err();
+        let is_encoder_error_with_source = matches!(
+            &result,
+            Some(err @ OpusError::Encoder(_)) if std::error::Error::source(err).is_some()
+        );
+        assert!(
+            is_encoder_error_with_source,
+            "expected an Encoder error with a preserved opus::Error source for sample_rate=0"
+        );
     }
 }
 

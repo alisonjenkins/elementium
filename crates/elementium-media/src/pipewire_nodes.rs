@@ -35,19 +35,44 @@ pub struct PipewireVideoSource {
 }
 
 /// Errors from talking to `PipeWire`.
+///
+/// `Init`/`Connect` now carry the real [`pipewire::Error`] rather than its rendered message.
+/// `SpawnThread` and `StreamSetup` are new: the stream-opening paths (`pipewire_audio`,
+/// `pipewire_capture`) used to fold "the OS refused to spawn our background thread" and "the
+/// `PipeWire` connection failed" into these same two variants under a stringified message --
+/// two failures with nothing in common (one never touches `PipeWire` at all) sharing a name.
 #[derive(Debug, thiserror::Error)]
 pub enum PipewireError {
     #[error("PipeWire initialisation failed: {0}")]
-    Init(String),
+    Init(#[source] pipewire::Error),
     #[error("PipeWire connection failed: {0}")]
-    Connect(String),
+    Connect(#[source] pipewire::Error),
     /// Enumeration ran but its result cannot be trusted.
     ///
     /// Distinct from an empty list, which is a legitimate answer meaning the machine has no
     /// such device. This says we do not know, and a caller that shows "no devices" for it
-    /// would be reporting a fact it does not have.
-    #[error("PipeWire enumeration failed: {0}")]
-    Enumerate(String),
+    /// would be reporting a fact it does not have. No `#[source]`: a poisoned `Mutex` lock
+    /// carries a `PoisonError` that borrows the guard and cannot outlive this function, so
+    /// there is nothing to attach as a source -- `kind` (a label, not a cause) is the whole
+    /// fact available here.
+    #[error("PipeWire enumeration failed: the {kind} enumeration thread panicked; the list is unknown")]
+    Enumerate { kind: &'static str },
+    /// The OS refused to spawn the background thread that owns a `PipeWire` stream
+    /// connection. Not a `PipeWire` failure at all -- nothing PipeWire-related has run yet.
+    #[error("failed to spawn PipeWire stream thread: {0}")]
+    SpawnThread(#[source] std::io::Error),
+    /// The stream-connect thread reported (or timed out reporting) whether its connection to
+    /// `PipeWire` succeeded.
+    ///
+    /// The underlying [`pipewire::Error`] cannot cross the `mpsc` channel back to the caller
+    /// (it is produced deep inside a `PipeWire` callback on the stream thread and is not moved
+    /// across threads by this crate's channel plumbing), so it is logged with
+    /// `tracing::error!` where it actually occurs and only its rendered message travels here
+    /// -- along with the timeout case below, which has no underlying error type to wrap at
+    /// all. `reason` is genuinely the whole fact available at this call site, not a
+    /// stand-in for a cause that could have been preserved.
+    #[error("PipeWire stream setup failed: {reason}")]
+    StreamSetup { reason: String },
 }
 
 /// How long to let the registry settle before returning what it announced.
@@ -66,16 +91,11 @@ const ENUMERATION_SETTLE: Duration = Duration::from_millis(300);
 pub fn list_video_sources() -> Result<Vec<PipewireVideoSource>, PipewireError> {
     pipewire::init();
 
-    let mainloop = pipewire::main_loop::MainLoopRc::new(None)
-        .map_err(|e| PipewireError::Init(e.to_string()))?;
-    let context = pipewire::context::ContextRc::new(&mainloop, None)
-        .map_err(|e| PipewireError::Init(e.to_string()))?;
-    let core = context
-        .connect_rc(None)
-        .map_err(|e| PipewireError::Connect(e.to_string()))?;
-    let registry = core
-        .get_registry_rc()
-        .map_err(|e| PipewireError::Connect(e.to_string()))?;
+    let mainloop = pipewire::main_loop::MainLoopRc::new(None).map_err(PipewireError::Init)?;
+    let context =
+        pipewire::context::ContextRc::new(&mainloop, None).map_err(PipewireError::Init)?;
+    let core = context.connect_rc(None).map_err(PipewireError::Connect)?;
+    let registry = core.get_registry_rc().map_err(PipewireError::Connect)?;
 
     let found: Arc<Mutex<Vec<PipewireVideoSource>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&found);
@@ -107,9 +127,7 @@ pub fn list_video_sources() -> Result<Vec<PipewireVideoSource>, PipewireError> {
     let sources = match found.lock() {
         Ok(list) => list.clone(),
         Err(_) => {
-            return Err(PipewireError::Enumerate(
-                "the enumeration thread panicked; the video source list is unknown".to_owned(),
-            ));
+            return Err(PipewireError::Enumerate { kind: "video" });
         }
     };
     tracing::info!(count = sources.len(), "PipeWire video sources enumerated");
@@ -222,16 +240,11 @@ impl AudioSourceClass {
 pub fn list_audio_sources() -> Result<Vec<PipewireAudioSource>, PipewireError> {
     pipewire::init();
 
-    let mainloop = pipewire::main_loop::MainLoopRc::new(None)
-        .map_err(|e| PipewireError::Init(e.to_string()))?;
-    let context = pipewire::context::ContextRc::new(&mainloop, None)
-        .map_err(|e| PipewireError::Init(e.to_string()))?;
-    let core = context
-        .connect_rc(None)
-        .map_err(|e| PipewireError::Connect(e.to_string()))?;
-    let registry = core
-        .get_registry_rc()
-        .map_err(|e| PipewireError::Connect(e.to_string()))?;
+    let mainloop = pipewire::main_loop::MainLoopRc::new(None).map_err(PipewireError::Init)?;
+    let context =
+        pipewire::context::ContextRc::new(&mainloop, None).map_err(PipewireError::Init)?;
+    let core = context.connect_rc(None).map_err(PipewireError::Connect)?;
+    let registry = core.get_registry_rc().map_err(PipewireError::Connect)?;
 
     let found: Arc<Mutex<Vec<PipewireAudioSource>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&found);
@@ -261,9 +274,7 @@ pub fn list_audio_sources() -> Result<Vec<PipewireAudioSource>, PipewireError> {
     let sources = match found.lock() {
         Ok(list) => list.clone(),
         Err(_) => {
-            return Err(PipewireError::Enumerate(
-                "the enumeration thread panicked; the audio source list is unknown".to_owned(),
-            ));
+            return Err(PipewireError::Enumerate { kind: "audio" });
         }
     };
     tracing::info!(count = sources.len(), "PipeWire audio sources enumerated");
@@ -355,5 +366,61 @@ mod tests {
         );
         assert_eq!(AudioSourceClass::from_media_class("Video/Source"), None);
         assert_eq!(AudioSourceClass::from_media_class(""), None);
+    }
+}
+
+#[cfg(test)]
+mod pipewire_error_tests {
+    use super::PipewireError;
+
+    /// `Init` now carries the real `pipewire::Error` rather than its rendered message.
+    #[test]
+    fn init_failure_carries_the_pipewire_error_as_its_source() {
+        let err = PipewireError::Init(pipewire::Error::CreationFailed);
+        assert!(matches!(err, PipewireError::Init(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// `Connect` is a distinct call (`connect_rc`/`get_registry_rc`) from `Init`
+    /// (`MainLoopRc::new`/`ContextRc::new`) and must stay distinguishable.
+    #[test]
+    fn connect_failure_carries_the_pipewire_error_as_its_source() {
+        let err = PipewireError::Connect(pipewire::Error::NoMemory);
+        assert!(matches!(err, PipewireError::Connect(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// A poisoned enumeration lock has no `Error` object to preserve as a source (the
+    /// `PoisonError` borrows the guard and cannot outlive the function that produced it), so
+    /// `kind` is the whole fact -- this pins that `Enumerate` still names which enumeration
+    /// (video vs. audio) failed.
+    #[test]
+    fn enumerate_failure_names_which_enumeration_panicked() {
+        let err = PipewireError::Enumerate { kind: "video" };
+        assert!(matches!(err, PipewireError::Enumerate { kind: "video" }));
+        assert!(std::error::Error::source(&err).is_none());
+        assert!(err.to_string().contains("video"));
+    }
+
+    /// New variant: the OS refusing to spawn the stream-connect thread is not a `PipeWire`
+    /// failure (nothing PipeWire-related has run yet) and must not be folded into `Init`.
+    #[test]
+    fn spawn_thread_failure_carries_the_io_error_as_its_source() {
+        let err = PipewireError::SpawnThread(std::io::Error::other("no threads left"));
+        assert!(matches!(err, PipewireError::SpawnThread(_)));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// New variant: the stream-connect thread's report (or its timeout) crosses an `mpsc`
+    /// channel that cannot carry a `pipewire::Error`, so only its rendered message survives --
+    /// a genuine fact, not a cause being discarded for convenience (the real error is logged
+    /// where it occurs, inside `run_stream`).
+    #[test]
+    fn stream_setup_failure_has_no_underlying_source() {
+        let err = PipewireError::StreamSetup {
+            reason: "stream setup timed out".to_owned(),
+        };
+        assert!(matches!(err, PipewireError::StreamSetup { .. }));
+        assert!(std::error::Error::source(&err).is_none());
     }
 }

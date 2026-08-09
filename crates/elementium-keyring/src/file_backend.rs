@@ -38,13 +38,11 @@ impl FileBackend {
         let key = if path.exists() {
             let data = fs::read(&path)?;
             if data.len() < SALT_LEN + NONCE_LEN {
-                return Err(SecretStoreError::Decryption(
-                    "secrets file too short".into(),
-                ));
+                return Err(SecretStoreError::TruncatedFile(data.len()));
             }
             let salt = data
                 .get(..SALT_LEN)
-                .ok_or_else(|| SecretStoreError::Decryption("secrets file too short".into()))?;
+                .ok_or(SecretStoreError::TruncatedFile(data.len()))?;
             derive_key(password, salt)?
         } else {
             // New file — generate salt + write empty store
@@ -74,9 +72,7 @@ impl FileBackend {
 
         let data = fs::read(&self.path)?;
         if data.len() < SALT_LEN + NONCE_LEN {
-            return Err(SecretStoreError::Decryption(
-                "secrets file too short".into(),
-            ));
+            return Err(SecretStoreError::TruncatedFile(data.len()));
         }
 
         let nonce_start = SALT_LEN;
@@ -84,19 +80,19 @@ impl FileBackend {
 
         let nonce_bytes = data
             .get(nonce_start..ciphertext_start)
-            .ok_or_else(|| SecretStoreError::Decryption("secrets file too short".into()))?;
+            .ok_or(SecretStoreError::TruncatedFile(data.len()))?;
         #[allow(deprecated)]
         let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
         let ciphertext = data
             .get(ciphertext_start..)
-            .ok_or_else(|| SecretStoreError::Decryption("secrets file too short".into()))?;
+            .ok_or(SecretStoreError::TruncatedFile(data.len()))?;
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_slice())
-            .map_err(|e| SecretStoreError::Decryption(e.to_string()))?;
+            .map_err(SecretStoreError::InvalidKeyLength)?;
 
         let plaintext = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| SecretStoreError::Decryption(e.to_string()))?;
+            .map_err(SecretStoreError::Decryption)?;
 
         let map: HashMap<String, String> = serde_json::from_slice(&plaintext)?;
         Ok(map)
@@ -125,17 +121,17 @@ impl FileBackend {
         let nonce: Nonce<Aes256Gcm> = aes_gcm::aead::Generate::generate();
 
         let cipher = Aes256Gcm::new_from_slice(self.key.as_slice())
-            .map_err(|e| SecretStoreError::Encryption(e.to_string()))?;
+            .map_err(SecretStoreError::InvalidKeyLength)?;
 
         let ciphertext = cipher
             .encrypt(&nonce, plaintext.as_ref())
-            .map_err(|e| SecretStoreError::Encryption(e.to_string()))?;
+            .map_err(SecretStoreError::Encryption)?;
 
         // Build output: [salt][nonce][ciphertext]
         let capacity = SALT_LEN
             .checked_add(NONCE_LEN)
             .and_then(|n| n.checked_add(ciphertext.len()))
-            .ok_or_else(|| SecretStoreError::Encryption("output size overflow".into()))?;
+            .ok_or(SecretStoreError::OutputTooLarge)?;
         let mut output = Vec::with_capacity(capacity);
         output.extend_from_slice(&salt);
         output.extend_from_slice(&nonce);
@@ -189,7 +185,7 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; KEY
     let mut key = zeroize::Zeroizing::new([0u8; KEY_LEN]);
     Argon2::default()
         .hash_password_into(password.as_bytes(), salt, key.as_mut_slice())
-        .map_err(|e| SecretStoreError::KeyDerivation(e.to_string()))?;
+        .map_err(SecretStoreError::KeyDerivation)?;
     Ok(key)
 }
 
@@ -227,11 +223,17 @@ mod tests {
         backend.set("mx_access_token", "syt_secret123")?;
         backend.set("mx_pickle_key", "pickle!")?;
 
+        // This test function returns `Result` (clippy forbids `assert!`/`panic!` inside one:
+        // `panic_in_result_fn`), so failures are reported via `Err`, not a panic. The old
+        // `check()` misused `SecretStoreError::Decryption` for this -- a String standing in
+        // for "this assertion failed", not a decryption cause -- and no longer compiles now
+        // that `Decryption` wraps a real `aes_gcm::Error`. `Io` is a generic, already-`String`
+        // -free carrier that fits this purely test-local use.
         let check = |cond: bool, msg: &str| -> Result<()> {
             if cond {
                 Ok(())
             } else {
-                Err(SecretStoreError::Decryption(msg.to_string()))
+                Err(SecretStoreError::Io(std::io::Error::other(msg.to_owned())))
             }
         };
 

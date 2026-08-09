@@ -207,14 +207,14 @@ impl Default for E2eeOptions {
 }
 
 /// Errors from E2EE operations.
+///
+/// `NoKey` was removed here: it was never constructed anywhere in the crate (the actual "no
+/// key" conditions all return `Ok(None)`, a legitimate passthrough state, not an error -- see
+/// `encrypt_frame`'s and `decrypt_frame`'s `no_key_for_participant`/`no_current_key` branches).
 #[derive(Debug, thiserror::Error)]
 pub enum E2eeError {
-    #[error("no key available for participant {0:?} at index {1}")]
-    NoKey(String, u8),
     #[error("frame too short to contain E2EE metadata ({0} bytes)")]
     FrameTooShort(usize),
-    #[error("decryption failed: {0}")]
-    DecryptionFailed(String),
     /// The frame trailer's `IV_LENGTH` byte was not 12.
     ///
     /// livekit only ever emits 12, and this byte is attacker-controlled, so anything else
@@ -223,6 +223,23 @@ pub enum E2eeError {
     UnsupportedIvLength(u8),
     #[error("internal E2EE lock was poisoned by a panic in another thread")]
     LockPoisoned,
+    /// The key held for `participant` at `key_index` (and every key reached by ratcheting
+    /// from it, if enabled) failed to authenticate this frame.
+    ///
+    /// Split from the old single `DecryptionFailed(String)`: this is one participant's key
+    /// failing, as opposed to [`Self::AllKeysFailed`], which is every known participant's
+    /// key failing. AES-GCM's own error carries no diagnostic information by design (leaking
+    /// *why* authentication failed is itself an oracle), so there is no `#[source]` to wrap
+    /// here -- `participant` and `key_index` are the whole fact, not a stand-in for a cause.
+    #[error("no key held by participant {participant:?} at index {key_index} decrypted this frame")]
+    KeyDidNotDecrypt { participant: String, key_index: u8 },
+    /// No participant key known to this context decrypted the frame at all.
+    ///
+    /// Split from the old single `DecryptionFailed(String)`: this is `decrypt_frame_any`
+    /// exhausting every known participant, as opposed to [`Self::KeyDidNotDecrypt`], which
+    /// names the one participant whose key was tried and failed.
+    #[error("no known participant key decrypted this frame ({participants_tried} tried)")]
+    AllKeysFailed { participants_tried: usize },
 }
 
 /// A ring of encryption keys for a single participant.
@@ -853,7 +870,7 @@ impl E2eeContext {
     /// # Errors
     ///
     /// Returns [`E2eeError::LockPoisoned`] if the internal lock was poisoned, or
-    /// [`E2eeError::DecryptionFailed`] if no known participant's key(s) could
+    /// [`E2eeError::AllKeysFailed`] if no known participant's key(s) could
     /// decrypt the frame.
     pub fn decrypt_frame_any(
         &self,
@@ -927,10 +944,9 @@ impl E2eeContext {
             );
         }
 
-        Err(E2eeError::DecryptionFailed(format!(
-            "tried {} participants, none could decrypt",
-            participants.len()
-        )))
+        Err(E2eeError::AllKeysFailed {
+            participants_tried: participants.len(),
+        })
     }
 
     /// Record the SFU's server-injected-frame marker.
@@ -976,7 +992,7 @@ impl E2eeContext {
     /// Returns [`E2eeError::FrameTooShort`] if the frame is too small to contain
     /// the E2EE metadata, [`E2eeError::UnsupportedIvLength`] if the trailer's
     /// `IV_LENGTH` byte is not 12, [`E2eeError::LockPoisoned`] if the internal lock
-    /// was poisoned, or [`E2eeError::DecryptionFailed`] if AES-GCM decryption
+    /// was poisoned, or [`E2eeError::KeyDidNotDecrypt`] if AES-GCM decryption
     /// fails for every key tried (including the ratchet window, if enabled).
     pub fn decrypt_frame(
         &self,
@@ -1088,9 +1104,10 @@ impl E2eeContext {
             ratchet_window_size = options.ratchet_window_size,
             "E2EE key did not decrypt this frame"
         );
-        Err(E2eeError::DecryptionFailed(format!(
-            "participant={participant}, key_index={key_index}"
-        )))
+        Err(E2eeError::KeyDidNotDecrypt {
+            participant: participant.to_string(),
+            key_index: key_index.as_wire_byte(),
+        })
     }
 }
 
@@ -1601,6 +1618,67 @@ mod tests {
             MediaKind::Audio,
         );
         assert!(matches!(result, Err(E2eeError::FrameTooShort(_))));
+    }
+
+    /// Pins the split of the old single `DecryptionFailed(String)`: a real, well-formed
+    /// frame that a *known* participant's key still fails to authenticate must come back as
+    /// `KeyDidNotDecrypt`, not the "no known participant at all" case.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn wrong_key_for_known_participant_reports_key_did_not_decrypt() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"alice-key-material-1234567890ab");
+        let encrypted = ctx
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(b"frame".to_vec()),
+                MediaKind::Audio,
+            )
+            .expect("encrypt should succeed");
+
+        // "bob" is a known participant (has a key ring entry) but was never given the key
+        // that encrypted this frame, so decryption must fail with an identified participant
+        // and key index -- not the "nobody known could decrypt this" case.
+        ctx.set_key("bob", 0, b"bob-key-material-abcdefghijklmn");
+        let result = ctx.decrypt_frame(&encrypted, "bob", MediaKind::Audio);
+        assert!(
+            matches!(
+                result,
+                Err(E2eeError::KeyDidNotDecrypt { ref participant, key_index: 0 })
+                    if participant == "bob"
+            ),
+            "expected KeyDidNotDecrypt for a known participant with the wrong key, got {result:?}"
+        );
+    }
+
+    /// Pins the other half of the same split: at least one participant key is known, but
+    /// none of them decrypt the frame (as opposed to none being known at all -- that case is
+    /// `Ok(None)`, a legitimate "nothing to try yet" state, not an error; see the
+    /// `participants.is_empty()` branch of `decrypt_frame_any`). Every known participant's
+    /// key failing must report `AllKeysFailed`, distinct from one participant's key failing.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn every_known_participant_key_failing_reports_all_keys_failed() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"alice-key-material-1234567890ab");
+        let encrypted = ctx
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(b"frame".to_vec()),
+                MediaKind::Audio,
+            )
+            .expect("encrypt should succeed");
+
+        // The receiver knows a key for "carol" -- some other participant, never the sender --
+        // so the participant list is non-empty but nothing in it decrypts this frame.
+        let receiver = E2eeContext::new(E2eeOptions::default());
+        receiver.set_local_identity("bob");
+        receiver.set_key("carol", 0, b"carol-key-material-1234567890a");
+        let result = receiver.decrypt_frame_any(&encrypted, MediaKind::Audio);
+        assert!(
+            matches!(result, Err(E2eeError::AllKeysFailed { participants_tried: 1 })),
+            "expected AllKeysFailed when every known participant's key fails, got {result:?}"
+        );
     }
 
     #[test]

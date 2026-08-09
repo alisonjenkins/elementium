@@ -11,7 +11,7 @@ pub struct KeyringBackend;
 /// Build an OS-keyring `Entry` for `key`, mapping the (rare, environment-level)
 /// construction failure into our own error type.
 fn entry(key: &str) -> Result<Entry> {
-    Entry::new(SERVICE_NAME, key).map_err(|e| SecretStoreError::Keyring(e.to_string()))
+    Entry::new(SERVICE_NAME, key).map_err(SecretStoreError::Keyring)
 }
 
 impl KeyringBackend {
@@ -29,21 +29,17 @@ impl KeyringBackend {
 
         entry
             .set_password(test_value)
-            .map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+            .map_err(SecretStoreError::Keyring)?;
 
-        let readback = entry
-            .get_password()
-            .map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+        let readback = entry.get_password().map_err(SecretStoreError::Keyring)?;
 
         if readback != test_value {
-            return Err(SecretStoreError::Keyring(
-                "keyring probe readback mismatch".into(),
-            ));
+            return Err(SecretStoreError::ProbeMismatch);
         }
 
         entry
             .delete_credential()
-            .map_err(|e| SecretStoreError::Keyring(e.to_string()))?;
+            .map_err(SecretStoreError::Keyring)?;
 
         debug!("OS keyring backend available");
         Ok(Self)
@@ -59,7 +55,7 @@ impl SecretStore for KeyringBackend {
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => {
                 warn!("keyring get({key}) failed: {e}");
-                Err(SecretStoreError::Keyring(e.to_string()))
+                Err(SecretStoreError::Keyring(e))
             }
         }
     }
@@ -67,9 +63,7 @@ impl SecretStore for KeyringBackend {
     fn set(&self, key: &str, value: &str) -> Result<()> {
         let entry = entry(key)?;
 
-        entry
-            .set_password(value)
-            .map_err(|e| SecretStoreError::Keyring(e.to_string()))
+        entry.set_password(value).map_err(SecretStoreError::Keyring)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -77,7 +71,7 @@ impl SecretStore for KeyringBackend {
 
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()), // already gone
-            Err(e) => Err(SecretStoreError::Keyring(e.to_string())),
+            Err(e) => Err(SecretStoreError::Keyring(e)),
         }
     }
 

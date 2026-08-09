@@ -128,7 +128,7 @@ impl PipewireAudioCapture {
                     &ready_tx,
                 );
             })
-            .map_err(|e| PipewireError::Init(e.to_string()))?;
+            .map_err(PipewireError::SpawnThread)?;
 
         match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(Self {
@@ -138,10 +138,10 @@ impl PipewireAudioCapture {
                 failed,
                 dropped,
             }),
-            Ok(Err(e)) => Err(PipewireError::Connect(e)),
-            Err(e) => Err(PipewireError::Connect(format!(
-                "audio stream setup timed out: {e}"
-            ))),
+            Ok(Err(reason)) => Err(PipewireError::StreamSetup { reason }),
+            Err(e) => Err(PipewireError::StreamSetup {
+                reason: format!("audio stream setup timed out: {e}"),
+            }),
         }
     }
 

@@ -13,7 +13,9 @@ tracing = { workspace = true }
 
 # Crypto for file backend
 aes-gcm = "0.11"
-argon2 = "0.5"
+# "std" is required for `argon2::Error: std::error::Error`, needed to wrap it as a
+# `SecretStoreError::KeyDerivation`'s `#[source]` instead of only its rendered message.
+argon2 = { version = "0.5", features = ["std"] }
 rand = "0.8"
 zeroize = "1"
 

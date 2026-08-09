@@ -25,24 +25,45 @@ use elementium_types::CaptureSourceKind;
 /// `Cancelled` is separated from the rest because it is not a fault: it is a person
 /// deciding not to share, which is an ordinary outcome that must not be logged, reported or
 /// counted as a failure.
+///
+/// `NoBackend` and `Portal` are `#[cfg(target_os = "linux")]`-split between a real
+/// [`ashpd::Error`] (Linux, where a portal is expected to exist and the failure has a cause
+/// worth preserving) and a fixed fact (every other platform, which has no capture
+/// implementation at all and so nothing to wrap -- see the non-Linux `start_share`/
+/// `start_x11_share` stubs below). The old single `NoBackend(String)` folded both into one
+/// stringified message, which lost the Linux case's cause entirely.
 #[derive(Debug, thiserror::Error)]
 pub enum ShareError {
     /// The user dismissed the system picker without choosing a source.
     #[error("{PICKER_CANCELLED}: the screen-share picker was dismissed without a selection")]
     Cancelled,
-    /// No way to capture the screen exists on this system.
+    /// No portal could be reached, on the one platform (Linux) where this crate expects one.
     ///
-    /// Names what is missing rather than failing generically, because the difference
-    /// between "no portal is running" and "the portal refused" is the difference between a
-    /// misconfigured desktop and a bug.
+    /// Distinct from "the portal refused" ([`Self::Portal`]): this is a misconfigured or
+    /// missing desktop, not the portal itself objecting to the request.
+    #[cfg(target_os = "linux")]
     #[error("no screen capture backend available: {0}")]
-    NoBackend(String),
+    NoBackend(#[source] ashpd::Error),
+    /// This platform has no screen capture implementation at all.
+    ///
+    /// macOS and Windows capture are out of scope for this feature; this is what stops the
+    /// frontend showing a black rectangle instead of a named error. Not `ashpd::Error`-backed
+    /// like the Linux [`Self::NoBackend`]: `ashpd` is a Linux-only dependency, so there is
+    /// nothing here to wrap, only the fact that this platform was never implemented.
+    #[cfg(not(target_os = "linux"))]
+    #[error("no screen capture backend available: screen sharing is implemented for Linux only")]
+    NoBackend,
     /// The portal was reachable but the exchange failed.
+    #[cfg(target_os = "linux")]
     #[error("screen capture portal error: {0}")]
-    Portal(String),
+    Portal(#[source] ashpd::Error),
     /// The granted source could not be opened.
-    #[error("could not open the granted capture source: {0}")]
-    Capture(String),
+    ///
+    /// Currently only reached by the X11 path's missing-source-id check (see
+    /// [`start_x11_share`]), which has no underlying error to wrap -- the caller simply never
+    /// supplied the id `get_capture_sources` requires. `reason` is that whole fact.
+    #[error("could not open the granted capture source: {reason}")]
+    Capture { reason: String },
 }
 
 /// Marker the frontend matches to tell a declined share from a broken one.
@@ -200,11 +221,11 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
 
     let proxy = Screencast::new()
         .await
-        .map_err(|e| ShareError::NoBackend(e.to_string()))?;
+        .map_err(ShareError::NoBackend)?;
     let session = proxy
         .create_session(CreateSessionOptions::default())
         .await
-        .map_err(|e| ShareError::Portal(e.to_string()))?;
+        .map_err(ShareError::Portal)?;
     tracing::info!(
         elapsed_ms = %step.elapsed().as_millis(),
         "portal screencast session created"
@@ -227,7 +248,7 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
                 .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
         )
         .await
-        .map_err(|e| ShareError::Portal(e.to_string()))?;
+        .map_err(ShareError::Portal)?;
     tracing::info!(
         elapsed_ms = %step.elapsed().as_millis(),
         "portal accepted the source selection request"
@@ -237,7 +258,7 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
     let response = proxy
         .start(&session, None, StartCastOptions::default())
         .await
-        .map_err(|e| ShareError::Portal(e.to_string()))?
+        .map_err(ShareError::Portal)?
         .response()
         .map_err(|_| ShareError::Cancelled)?;
     tracing::info!(
@@ -277,9 +298,7 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
 /// rectangle this whole feature exists to remove.
 #[cfg(not(target_os = "linux"))]
 pub async fn start_share() -> Result<ShareSession, ShareError> {
-    Err(ShareError::NoBackend(
-        "screen sharing is implemented for Linux only".to_owned(),
-    ))
+    Err(ShareError::NoBackend)
 }
 
 /// Recover the kind a `get_capture_sources`-issued X11 id encodes, from its prefix.
@@ -314,12 +333,10 @@ fn x11_source_kind(source_id: &str) -> Option<CaptureSourceKind> {
 /// [`ShareError::Capture`] if no source id was given.
 #[cfg(target_os = "linux")]
 pub fn start_x11_share(source_id: Option<&str>) -> Result<ShareSession, ShareError> {
-    let source_id = source_id.ok_or_else(|| {
-        ShareError::Capture(
-            "an X11 share needs a source id from get_capture_sources; there is no picker to \
-             fall back on"
-                .to_owned(),
-        )
+    let source_id = source_id.ok_or_else(|| ShareError::Capture {
+        reason: "an X11 share needs a source id from get_capture_sources; there is no picker \
+                 to fall back on"
+            .to_owned(),
     })?;
 
     let source_kind = x11_source_kind(source_id);
@@ -342,9 +359,7 @@ pub fn start_x11_share(source_id: Option<&str>) -> Result<ShareSession, ShareErr
 /// Always [`ShareError::NoBackend`].
 #[cfg(not(target_os = "linux"))]
 pub fn start_x11_share(_source_id: Option<&str>) -> Result<ShareSession, ShareError> {
-    Err(ShareError::NoBackend(
-        "screen sharing is implemented for Linux only".to_owned(),
-    ))
+    Err(ShareError::NoBackend)
 }
 
 #[cfg(test)]
@@ -401,17 +416,71 @@ mod tests {
     }
 
     /// Cancellation must not be confusable with a real failure, in either direction.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_genuine_failure_does_not_look_like_a_cancellation() {
         for err in [
-            ShareError::NoBackend("no portal".to_owned()),
-            ShareError::Portal("dbus died".to_owned()),
-            ShareError::Capture("node gone".to_owned()),
+            ShareError::NoBackend(ashpd::Error::NoResponse),
+            ShareError::Portal(ashpd::Error::NoResponse),
+            ShareError::Capture {
+                reason: "node gone".to_owned(),
+            },
         ] {
             assert!(
                 !err.to_string().starts_with(PICKER_CANCELLED),
                 "{err} must not be mistaken for the user declining"
             );
         }
+    }
+
+    /// Non-Linux counterpart of the above: `NoBackend` here has no `ashpd::Error` to carry
+    /// (see the type's doc comment), so it is exercised separately from the Linux case.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_genuine_failure_does_not_look_like_a_cancellation() {
+        for err in [
+            ShareError::NoBackend,
+            ShareError::Capture {
+                reason: "node gone".to_owned(),
+            },
+        ] {
+            assert!(
+                !err.to_string().starts_with(PICKER_CANCELLED),
+                "{err} must not be mistaken for the user declining"
+            );
+        }
+    }
+
+    /// Pins the split of the old single `NoBackend(String)`/`Portal(String)`: on Linux, both
+    /// must preserve the real `ashpd::Error` as a walkable source rather than only its
+    /// rendered message.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_backend_and_portal_failures_carry_the_ashpd_error_as_their_source() {
+        let no_backend = ShareError::NoBackend(ashpd::Error::NoResponse);
+        assert!(std::error::Error::source(&no_backend).is_some());
+
+        let portal = ShareError::Portal(ashpd::Error::NoResponse);
+        assert!(std::error::Error::source(&portal).is_some());
+    }
+
+    /// The non-Linux stub has nothing to wrap -- `ashpd` is a Linux-only dependency -- so its
+    /// `NoBackend` must have no source at all, matching `CameraError::ThreadDied`'s reasoning
+    /// for the same shape of "no cause exists to preserve".
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_no_backend_has_no_underlying_source() {
+        assert!(std::error::Error::source(&ShareError::NoBackend).is_none());
+    }
+
+    /// `Capture`'s only real construction site (`start_x11_share`'s missing-source-id check)
+    /// has no underlying error either: the caller simply never supplied a required value.
+    #[test]
+    fn capture_failure_has_no_underlying_source_and_names_the_reason() {
+        let err = ShareError::Capture {
+            reason: "node gone".to_owned(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+        assert!(err.to_string().contains("node gone"));
     }
 }
