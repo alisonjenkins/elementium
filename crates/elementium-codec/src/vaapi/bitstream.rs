@@ -107,6 +107,22 @@ impl BitWriter {
         }
     }
 
+    /// How many bits have been written.
+    ///
+    /// Needed when a rewrite has to land on exactly the bit position the original ended
+    /// at, so that everything after it can be copied across untouched.
+    #[must_use]
+    pub fn len_bits(&self) -> usize {
+        let whole = self.bytes.len().saturating_mul(8);
+        if self.used == 0 {
+            whole
+        } else {
+            whole
+                .saturating_sub(8)
+                .saturating_add(usize::from(self.used))
+        }
+    }
+
     /// The bytes written so far.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
@@ -131,6 +147,12 @@ impl<'a> BitReader<'a> {
     #[must_use]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
+    }
+
+    /// How many bits have been consumed, from the start of the data.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.pos
     }
 
     /// How many bits remain unread.

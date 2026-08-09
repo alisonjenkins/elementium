@@ -20,6 +20,7 @@ pub mod image;
 pub mod jpeg;
 pub mod jpeg_headers;
 pub mod resource;
+pub mod slice_header;
 pub mod status;
 pub mod vpp;
 

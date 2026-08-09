@@ -608,6 +608,26 @@ impl H264Encoder {
                 *byte = ((ref_idc & 0x3) << 5) | (nal_type & 0x1F);
             }
         }
+
+        // Make the keyframe survive encryption.
+        //
+        // Under livekit's E2EE only two bytes of the slice stay in the clear, and a
+        // receiver reads `pic_parameter_set_id` out of them before it decrypts anything.
+        // The driver's `slice_type` is wide enough to push that id into the ciphertext, at
+        // which cost the receiver drops every keyframe and assembles nothing at all. See
+        // `slice_header` for the arithmetic. Unconditional rather than only when
+        // encrypting: the rewrite is a no-op to a decoder, and an encoder that emits one
+        // stream when encrypted and another when not is an encoder whose plaintext tests
+        // say nothing about its encrypted output.
+        if let (true, Some(rewritten)) = (
+            keyframe,
+            super::slice_header::move_pps_id_into_the_clear(
+                &out,
+                LOG2_MAX_FRAME_NUM_MINUS4.saturating_add(4),
+            ),
+        ) {
+            return rewritten;
+        }
         out
     }
 
