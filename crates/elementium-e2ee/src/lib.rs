@@ -842,9 +842,12 @@ impl E2eeContext {
             )));
         }
 
-        let participants: Vec<ParticipantId> = {
+        let (participants, local_identity): (Vec<ParticipantId>, Option<ParticipantId>) = {
             let inner = self.lock_read()?;
-            inner.key_manager.participants.keys().cloned().collect()
+            (
+                inner.key_manager.participants.keys().cloned().collect(),
+                inner.key_manager.local_identity.clone(),
+            )
         };
 
         if participants.is_empty() {
@@ -855,7 +858,13 @@ impl E2eeContext {
             return Ok(None);
         }
 
-        for participant in &participants {
+        // Exclude our own identity from the candidates actually tried: an inbound frame
+        // that "decrypts" under our own key is not one we should accept, and matching it
+        // here would be the same mistake as the reverse -- a remote key landing under
+        // `local_identity` and silently becoming the key we encrypt outbound media with.
+        // The emptiness check above still covers "we know no keys at all"; this only
+        // narrows which of the known keys are candidates for an *inbound* frame.
+        for participant in participants.iter().filter(|id| Some(*id) != local_identity.as_ref()) {
             if let Ok(Some(decrypted)) = self.decrypt_frame(frame, participant.as_str(), kind) {
                 return Ok(Some(decrypted));
             }
@@ -1733,6 +1742,34 @@ mod tests {
         // distinguishes them, not the fact that decryption did not work.
         let ordinary = WireMedia::from_network(vec![0x11; 40]);
         assert!(ctx.decrypt_frame_any(&ordinary, MediaKind::Audio).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn decrypt_frame_any_never_tries_the_local_identity() {
+        // A frame encrypted with our own key is not a frame anyone should have sent us.
+        // `decrypt_frame_any` iterates every participant with a key ring; before this
+        // fix that included `local_identity`, so a frame we ourselves encrypted would
+        // "decrypt" trivially against our own key and be handed back as if a peer sent
+        // it. With the local identity excluded, only `bob`'s (different) key is tried,
+        // and it does not match, so the frame is correctly reported as undecryptable.
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, b"alices-own-key-material-1234567");
+        ctx.set_key("bob", 0, b"bobs-completely-different-key12");
+
+        let own_frame = ctx
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(b"outbound-audio".to_vec()),
+                MediaKind::Audio,
+            )
+            .expect("alice's own key encrypts outbound frames");
+
+        let result = ctx.decrypt_frame_any(&own_frame, MediaKind::Audio);
+        assert!(
+            result.is_err(),
+            "a frame encrypted under our own key must never be accepted as inbound"
+        );
     }
 
     #[test]
