@@ -11,10 +11,16 @@ deliberately reproduced upstream quirks, 256 key slots, server-injected frames r
 before any decrypt is attempted. Several of these are pinned by vectors computed
 independently of the implementation, which is why this section is short.
 
-**Ratcheting being off is not a fault.** `default_ratchet_window()` is 0, and Element Call's
-shipped bundle configures `ratchetWindowSize: 0` with `keyringSize: 256` — our defaults
-match the peer we actually talk to. Recorded here because "ratcheting is disabled" reads
-like a bug and is not one.
+**Ratcheting is on, with a window of 10.** Worth stating carefully, because I got it wrong
+once in this session by reading the shipped bundle instead of the running app. The bundle
+contains `ratchetWindowSize` values of 0, 8 and 10, so grepping it proves nothing about
+which is used; the log settles it — `E2EE context initialized ratchet_window_size=10`. Our
+`default_ratchet_window()` of 0 therefore only applies when no options arrive at all, which
+is not the case in a real call. `keyringSize: 256` does match our 256 slots.
+
+A consequence: a frame whose key index we hold no material for cannot be ratcheted to, since
+ratcheting walks forward from the material stored at that same index. Her index-5 frames
+were unreachable no matter the window.
 
 ## What the call showed
 
@@ -30,9 +36,9 @@ Inbound is not broken, it is starved: the moment a key we could use arrived, dec
 worked and kept working. The far end's steady keyframe requests are the mirror image —
 a receiver holding RTP it cannot decrypt.
 
-## Open
+## Findings — all closed, 2026-08-09
 
-- [ ] **E1. 897 dropped frames that nobody would have heard, reported as if they were lost
+- [x] **E1. FIXED. 897 dropped frames that nobody would have heard, reported as if they were lost
   speech.** Traced, and it is not what it looked like. Identity parsing is not slow: it is
   set 111ms after the SFU WebSocket opens. The socket simply does not open until 12:00:01,
   while capture starts at 11:59:45 and Element Call attaches the pipelines to a peer
@@ -47,7 +53,7 @@ a receiver holding RTP it cannot decrypt.
   is pre-join. The startup hold is a separate question and, given the above, probably not
   worth lengthening.
 
-- [ ] **E2. A key stored under the local identity would be used to decrypt inbound frames.**
+- [x] **E2. FIXED. A key stored under the local identity would be used to decrypt inbound frames.**
   `decrypt_frame_any` collects every participant in the ring and tries each, with no filter
   excluding the local identity, and `e2ee_set_key` accepts any caller-supplied participant
   string without checking it against the identity we set. Nothing in the IPC boundary stops
@@ -55,31 +61,39 @@ a receiver holding RTP it cannot decrypt.
   become the key we encrypt with. No evidence it has happened; the point is that nothing
   would stop it or say so.
 
-- [ ] **E3. An environment variable can widen the plaintext header at runtime.**
+- [x] **E3. FIXED. An environment variable can widen the plaintext header at runtime.**
   `h264::extra_clear_bytes()` reads `ELEMENTIUM_H264_CLEAR_EXTRA` on every frame — a hot-path
   `env::var` and parse, and, more to the point, a live knob that leaves more of each frame
   unencrypted and breaks wire compatibility with a real LiveKit peer. A debug aid should not
   be reachable in a release build, and certainly not per frame.
 
-- [ ] **E4. The key bridge drops every worker message except three.** `init`, `setKey` and
+- [x] **E4. FIXED. The key bridge drops every worker message except three.** `init`, `setKey` and
   `setSifTrailer` are forwarded; `removeTransform`, `setKeyIndex`, `ratchetRequest`,
   `encodeOptions` and `enableKeyManagement` fall into a branch that logs the kind once and
   returns. Two of those matter: `removeTransform` means stop encrypting a track that has
   gone away, and a key index that advances without new key material is invisible to us.
   Small, and it removes a class of silent divergence.
 
-- [ ] **E5. `auto_ratchet` is dead config.** Deserialized, stored, never read; only
+- [x] **E5. FIXED. `auto_ratchet` is dead config.** Deserialized, stored, never read; only
   `ratchet_window_size > 0` gates anything. It reads like a toggle and is not one. Also
   `IV_SIZE`'s doc comment describes `MAX_KEYS` — a copy-paste that will mislead the next
   person to touch the trailer.
 
-- [ ] **E6. We cannot yet prove where key delivery fails.** Her keys 0–5 never reached us and
-  ours may never have reached her; the one to-device batch we sent went out at 11:59:50,
-  before she was there. That is Element Call and matrix-js-sdk territory rather than ours,
-  but we currently cannot tell "never sent" from "sent and lost" from "arrived and dropped".
-  Wanted: a periodic reconciliation of the key indices seen on inbound frames against the
-  indices we hold, per participant, so the next call answers this instead of suggesting it.
-  No key material, only participants, indices and counts.
+- [x] **E6. ANSWERED — the reconciliation already existed, and it is decisive.** I proposed
+  building this before checking whether it was there. `decrypt_frame_any` already logs the
+  frame's key index beside a full inventory of every key held, precisely so that "their key
+  never reached us" and "we hold the wrong key for that index" can be told apart. The call
+  says:
+
+      frame_key_index: 5   keys_held: @alijenkins:…:xDoYzMrXlX@0:bab66d82
+
+  One key, ours. Nothing for `@lace` at any index. Since the bridge forwards every `setKey`
+  it is given, Element Call never handed us one until 12:01:22. So the fault is not in the
+  native crypto, not in the key ring, and not in the bridge: **no key for the remote
+  participant was ever delivered to the application** for the first 92 seconds.
+
+  That moves the question to Element Call's key distribution over Matrix to-device, which is
+  the next thing to look at, and out of this file.
 
 ## Checked and not a fault
 
@@ -88,4 +102,4 @@ a receiver holding RTP it cannot decrypt.
   her key arrives and is successfully forwarded: the SDK does not recognise
   `io.element.call.encryption_keys` as a known to-device type. Delivery worked, it was late.
   Flagged as suspicious earlier in the session; it is not.
-- **Ratcheting disabled.** Matches Element Call's own configuration.
+- **A ratchet window of 0 in the shipped bundle.** Not what runs: Element Call sends 10.
