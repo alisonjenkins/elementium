@@ -1342,7 +1342,12 @@ pub fn poll_once(
                 }
             }
             Ok(Output::Event(event)) => {
-                tracing::info!(pc_id = %pc.id, ?event, "str0m event");
+                // `debug`, not `info`: this fires for every str0m event on every connection,
+                // which on one 53-second call produced thousands of lines interleaved with
+                // `UDP received` below -- most of a 30MB log file that a reader had to wade
+                // through to find the handful of lines that actually mattered. `RUST_LOG`
+                // still reaches it (see `docs/observability.md`); the default level does not.
+                tracing::debug!(pc_id = %pc.id, ?event, "str0m event");
                 if let Some(announcement) = announce_track_on_first_media(pc, &event) {
                     events.push(announcement);
                 }
@@ -1465,7 +1470,12 @@ fn recv_and_feed_as(
                 || pc.recv_log_count.is_multiple_of(100)
                 || pkt_type != "STUN"
             {
-                tracing::info!(pc_id = %pc.id, %source, len, count = pc.recv_log_count, pkt_type, "UDP received");
+                // `debug`, not `info` -- same reasoning as `str0m event` above. Every non-STUN
+                // packet (i.e. every audio/video/RTCP datagram) reached this line unthrottled,
+                // which is the other half of the same call's flood: 7,533 combined `UDP
+                // received`/`str0m event` lines in 53 seconds. The throttling above still
+                // shapes what a developer sees once they turn this back on with `RUST_LOG`.
+                tracing::debug!(pc_id = %pc.id, %source, len, count = pc.recv_log_count, pkt_type, "UDP received");
             }
             // Resolve 0.0.0.0 → actual interface IP so str0m can match
             // the destination to our registered ICE candidate and generate
