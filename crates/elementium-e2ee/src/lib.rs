@@ -460,7 +460,22 @@ pub struct E2eeContext {
     /// once every key has been accounted for. Without it this would take a mutex on every
     /// frame of every call for a measurement that is made once per key.
     awaiting_first_use: Arc<std::sync::atomic::AtomicUsize>,
+    /// Outbound frames refused so far because no local identity is known yet.
+    ///
+    /// Counted rather than each one reported, because this is the normal state of affairs
+    /// during a join and not a fault. Element Call attaches the capture pipelines to a peer
+    /// connection of its own several seconds before the SFU session exists, and the identity
+    /// only arrives with the SFU's `JoinResponse`; every frame written in between lands here.
+    /// One call produced 897 of them in thirteen seconds -- 897 warnings for a connection
+    /// that never carried the call, drowning the encrypt failures that do mean something.
+    no_identity_frames: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// How often to report outbound frames refused for want of a local identity.
+///
+/// The first is always reported, so the condition is never invisible; after that one in
+/// this many, which is the same rate the encrypt-failure path in `e2ee_io` uses.
+const NO_IDENTITY_REPORT_EVERY: u64 = 500;
 
 struct E2eeContextInner {
     key_manager: KeyManager,
@@ -488,6 +503,7 @@ impl Clone for E2eeContext {
             undecryptable_frames: Arc::clone(&self.undecryptable_frames),
             first_use: Arc::clone(&self.first_use),
             awaiting_first_use: Arc::clone(&self.awaiting_first_use),
+            no_identity_frames: Arc::clone(&self.no_identity_frames),
         }
     }
 }
@@ -506,6 +522,7 @@ impl E2eeContext {
             undecryptable_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             first_use: Arc::new(Mutex::new(HashMap::new())),
             awaiting_first_use: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            no_identity_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -713,10 +730,22 @@ impl E2eeContext {
 
         // Get the local participant's current key index
         let Some(identity) = inner.key_manager.local_identity.clone() else {
-            tracing::warn!(
-                reason = "no_local_identity",
-                "E2EE dropping outbound frame: local identity not set"
-            );
+            // Reported on the first frame and then every 500th, matching how the other
+            // encrypt failures on this path are throttled. See `no_identity_frames`: this is
+            // the ordinary state of a join, not a fault, and reporting each one buries the
+            // failures that are.
+            let dropped = self
+                .no_identity_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            if dropped == 1 || dropped.is_multiple_of(NO_IDENTITY_REPORT_EVERY) {
+                tracing::warn!(
+                    reason = "no_local_identity",
+                    dropped,
+                    "E2EE dropping outbound frames: no local identity yet (normal until the \
+                     SFU's JoinResponse arrives)"
+                );
+            }
             return None;
         };
 
