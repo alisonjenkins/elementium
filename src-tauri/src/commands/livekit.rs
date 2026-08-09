@@ -109,15 +109,8 @@ pub async fn livekit_connect(
                     // who is subscribed, so when it says the room has moved to a codec the
                     // encoder must follow -- otherwise a participant who cannot decode our
                     // stream simply sees nothing, with nothing to explain it.
-                    if let RoomEvent::PublishCodecChanged {
-                        codec, encrypted, ..
-                    } = &event
-                    {
-                        apply_publish_codec(
-                            &app_for_codec.state::<MediaState>(),
-                            codec,
-                            *encrypted,
-                        );
+                    if let RoomEvent::PublishCodecChanged { codec, .. } = &event {
+                        apply_publish_codec(&app_for_codec.state::<MediaState>(), codec);
                     }
                     let event_name = match &event {
                         RoomEvent::ParticipantJoined { .. } => "livekit-participant-joined",
@@ -210,28 +203,12 @@ pub(super) fn track_key(kind: &str, source: &str) -> Result<MediaTrackKey, Strin
     Ok(key)
 }
 
-/// Whether we are willing to publish `codec` in a room with this encryption setting.
-///
-/// H.264 is refused under end-to-end encryption, whatever the SFU asks for. Measured, not
-/// assumed: our encrypted H.264 is decoded by another Elementium peer through the same SFU,
-/// and two browsers manage the combination between themselves, but a browser receiving it
-/// from us assembles no frame at all -- it counts every packet and shows a black tile.
-/// Until that is understood, following the SFU would trade a working stream for a silent
-/// failure, and the SFU cannot know the difference: the frames it forwards are correct by
-/// every measure available to it, which is why its own stats show the keyframes arriving.
-///
-/// Unencrypted rooms are unaffected. There H.264 reaches a browser intact and the hardware
-/// encoder is worth having.
-const fn safe_to_publish(codec: elementium_codec::VideoCodec, encrypted: bool) -> bool {
-    !(encrypted && matches!(codec, elementium_codec::VideoCodec::H264))
-}
-
 /// Tell the capture pipeline which codec the SFU wants from now on.
 ///
 /// The pipeline rebuilds its encoder on the next frame. Nothing is renegotiated and the
 /// track is not restarted: a late participant who cannot decode the current codec must not
 /// cost everyone else an interruption.
-fn apply_publish_codec(media_state: &MediaState, codec: &str, encrypted: bool) {
+fn apply_publish_codec(media_state: &MediaState, codec: &str) {
     let Some(codec) = elementium_codec::VideoCodec::from_mime(codec) else {
         tracing::warn!(
             codec,
@@ -239,14 +216,6 @@ fn apply_publish_codec(media_state: &MediaState, codec: &str, encrypted: bool) {
         );
         return;
     };
-    if !safe_to_publish(codec, encrypted) {
-        tracing::info!(
-            codec = codec.sdp_name(),
-            "the SFU asked for a codec this room cannot carry safely; staying on the current one"
-        );
-        return;
-    }
-
     let Ok(pipelines) = media_state.pipelines.lock() else {
         return;
     };
@@ -396,23 +365,3 @@ fn get_room(
         .ok_or_else(|| format!("Room not found: {room_id}"))
 }
 
-#[cfg(test)]
-mod publish_codec_tests {
-    use super::safe_to_publish;
-    use elementium_codec::VideoCodec;
-
-    /// The one combination measured not to work: our H.264, encrypted, to a browser.
-    #[test]
-    fn h264_is_refused_in_an_encrypted_room() {
-        assert!(!safe_to_publish(VideoCodec::H264, true));
-    }
-
-    /// Everything else the SFU can ask for is still followed. Refusing more than the one
-    /// broken combination would give up the hardware encoder for no reason.
-    #[test]
-    fn every_other_combination_is_followed() {
-        assert!(safe_to_publish(VideoCodec::H264, false));
-        assert!(safe_to_publish(VideoCodec::Vp8, true));
-        assert!(safe_to_publish(VideoCodec::Vp8, false));
-    }
-}
