@@ -21,6 +21,23 @@ pub struct AudioCapturer {
     receiver: mpsc::Receiver<AudioFrame>,
     sample_rate: u32,
     channels: u16,
+    device_id: String,
+}
+
+impl Drop for AudioCapturer {
+    /// cpal logs nothing when a `Stream` is dropped -- it just stops calling back, silently.
+    /// That silence is what let a pipeline restart open a second stream on the same input
+    /// while the first was still alive: nothing said the first had ended, or when. Logged
+    /// unconditionally rather than throttled: this fires once per capturer, not once per
+    /// audio callback.
+    fn drop(&mut self) {
+        tracing::info!(
+            device_id = %self.device_id,
+            sample_rate = self.sample_rate,
+            channels = self.channels,
+            "audio capturer dropped; input stream released"
+        );
+    }
 }
 
 /// Choose the capture format for `device`, preferring Opus's own sample rate.
@@ -195,6 +212,7 @@ impl AudioCapturer {
             receiver: rx,
             sample_rate,
             channels,
+            device_id,
         })
     }
 
@@ -259,6 +277,7 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
     channels: u16,
 ) -> Result<Stream, CaptureError> {
     let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
+    let device_id_for_zero_check = device_id.clone();
     let err_fn = move |err| {
         tracing::error!(
             device_id = %device_id,
@@ -273,11 +292,26 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
     // Reported once rather than per callback: the condition is permanent and this runs in a
     // real-time audio thread.
     let consumer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A device that stops feeding this stream -- the two-streams-on-one-input fault this
+    // module now guards against on the handover path -- produces no error and no log of its
+    // own; cpal keeps calling back, just with nothing in it. These three track how long that
+    // has been going on so it can be reported once it means something, and reset (and
+    // re-armed) the moment real samples return.
+    let zero_streak_since = std::sync::Mutex::new(None::<std::time::Instant>);
+    let zero_streak_buffers = std::sync::atomic::AtomicU64::new(0);
+    let zero_streak_reported = std::sync::atomic::AtomicBool::new(false);
     let stream = device
         .build_input_stream(
             config,
             move |data: &[T], _info: &cpal::InputCallbackInfo| {
                 let samples: Vec<f32> = data.iter().map(|&s| s.into()).collect();
+                note_zero_streak(
+                    &samples,
+                    &device_id_for_zero_check,
+                    &zero_streak_since,
+                    &zero_streak_buffers,
+                    &zero_streak_reported,
+                );
                 // A failed send means the consumer is gone while cpal keeps calling this
                 // every few milliseconds: the microphone is live and nothing is listening.
                 // Reported once — this is a real-time audio callback, and logging per frame
@@ -303,6 +337,62 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
         .map_err(|e| CaptureError::Stream(e.to_string()))?;
 
     Ok(stream)
+}
+
+/// How long an input stream must deliver nothing but zeros before it is worth a log line.
+///
+/// Not the same question `MonoFold`'s decay answers -- that reports a fold's memory of a
+/// peak that has already gone stale. This looks at the raw samples cpal handed the
+/// callback, so it catches a stream that has stopped being fed at all (two capturers
+/// contending for one input is exactly this: the loser gets called back on schedule with
+/// nothing in the buffer) rather than a quiet room.
+const ZERO_STREAK_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Below this magnitude a sample counts as exact silence rather than noise. Far tighter
+/// than [`LIVE_CHANNEL_PEAK`]: this only needs to catch the literal zeros a starved
+/// callback delivers, not decide whether someone is speaking.
+const ZERO_SAMPLE_EPSILON: f32 = 1e-9;
+
+/// Update the running zero-sample streak for one capture callback, logging once when it has
+/// lasted long enough to mean the device stopped, not just paused between words.
+///
+/// Resets and re-arms on the first non-zero buffer, so a second stall later in the same
+/// call is still reported rather than being silenced forever by the first one.
+fn note_zero_streak(
+    samples: &[f32],
+    device_id: &str,
+    since: &std::sync::Mutex<Option<std::time::Instant>>,
+    buffers: &std::sync::atomic::AtomicU64,
+    reported: &std::sync::atomic::AtomicBool,
+) {
+    let all_zero = samples.iter().all(|s| s.abs() <= ZERO_SAMPLE_EPSILON);
+    if !all_zero {
+        if let Ok(mut guard) = since.lock() {
+            *guard = None;
+        }
+        buffers.store(0, std::sync::atomic::Ordering::Relaxed);
+        reported.store(false, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    let Ok(mut guard) = since.lock() else {
+        return;
+    };
+    let started = *guard.get_or_insert_with(std::time::Instant::now);
+    let streak = buffers.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+    let elapsed = started.elapsed();
+    if elapsed >= ZERO_STREAK_WARN_AFTER
+        && !reported.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            device_id = %device_id,
+            zero_buffers = streak,
+            streak_ms = elapsed.as_millis(),
+            "audio input stream has delivered only zero samples for a sustained period; \
+             the device may have stopped feeding this capture (e.g. another stream still \
+             holds it)"
+        );
+    }
 }
 
 /// Fold an interleaved capture buffer down to a single channel by averaging.

@@ -40,6 +40,14 @@ pub enum PipelineExtras {
         /// the command channel because it is a continuously-updated level, not an event:
         /// the capture thread only cares about the latest value.
         loss_estimate: Arc<NetworkLossEstimate>,
+        /// Fires once this pipeline's capturer has actually dropped and released the
+        /// device, so a replacement pipeline can wait for it instead of racing it.
+        ///
+        /// Only the microphone path (`start_audio_pipeline`) populates this: it is the only
+        /// audio pipeline that owns a `cpal::Stream`, which is the thing that needs to be
+        /// gone before the next one opens the same device. Screen-share audio reads from
+        /// `PipeWire`, which does not have this contention, so it leaves this `None`.
+        release_rx: Option<std::sync::mpsc::Receiver<()>>,
     },
     Video {
         /// Set when a receiver sends an RTCP keyframe request (PLI/FIR).
@@ -106,7 +114,7 @@ impl PipelineHandle {
     #[must_use]
     pub const fn loss_estimate(&self) -> Option<&Arc<NetworkLossEstimate>> {
         match &self.extras {
-            PipelineExtras::Audio { loss_estimate } => Some(loss_estimate),
+            PipelineExtras::Audio { loss_estimate, .. } => Some(loss_estimate),
             PipelineExtras::Video { .. } => None,
         }
     }
@@ -352,7 +360,11 @@ pub fn start_screen_share_audio_pipeline(
                 stop_tx,
                 encode_tx,
                 muted,
-                extras: PipelineExtras::Audio { loss_estimate },
+                // No `cpal::Stream` to hand off here -- see the field's doc comment.
+                extras: PipelineExtras::Audio {
+                    loss_estimate,
+                    release_rx: None,
+                },
             },
         );
 
@@ -575,6 +587,10 @@ struct StoppedPipeline {
     existed: bool,
     /// The peer connection the old pipeline was feeding, to hand to its replacement.
     connection: Option<tokio_mpsc::Sender<IoCommand>>,
+    /// The old pipeline's device-release acknowledgement, if it was a microphone pipeline
+    /// (see [`PipelineExtras::Audio::release_rx`]). The caller waits on this before opening
+    /// the same device again, rather than racing the old capturer's drop.
+    release_rx: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 /// The connection a freshly-started pipeline should feed.
@@ -596,10 +612,55 @@ fn connection_for_new_pipeline(
     })
 }
 
+/// The two channels `audio_capture_loop` needs to hand a pipeline over cleanly, bundled so
+/// the function stays within the workspace's argument-count lint: a stop signal in, and a
+/// release acknowledgement out once the capturer backing it has actually dropped.
+struct AudioCaptureHandoff {
+    stop_rx: std::sync::mpsc::Receiver<()>,
+    release_tx: std::sync::mpsc::Sender<()>,
+}
+
+/// The longest a new microphone pipeline waits for the previous one to confirm its capturer
+/// has dropped before opening the device anyway.
+///
+/// An upper bound only, not the expected wait: the acknowledgement normally arrives as soon
+/// as the old capture thread next wakes from its 5ms sleep and drops its `cpal::Stream`, well
+/// under this. Sized the same order of magnitude as the camera path's fixed 500ms sleep
+/// (empirically enough for the OS to let a device go) so a genuinely wedged old thread does
+/// not stall the new one indefinitely -- a call with the wrong timing beats a call with no
+/// microphone at all, but the miss is logged rather than silent.
+const AUDIO_HANDOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Wait for a stopped microphone pipeline's capturer to actually release the device,
+/// bounded so a wedged shutdown cannot hang the caller forever.
+///
+/// Pure and independent of [`MediaState`] so the handover ordering itself is testable
+/// without spinning up real pipelines or real audio hardware: see the tests below.
+///
+/// Returns whether the acknowledgement arrived before `timeout` elapsed. `false` means the
+/// caller should proceed anyway -- but the miss belongs in the log, since it means the two
+/// capture streams may briefly have overlapped, which is the fault this function exists to
+/// prevent.
+fn wait_for_capturer_release(
+    release_rx: &std::sync::mpsc::Receiver<()>,
+    timeout: std::time::Duration,
+) -> bool {
+    release_rx.recv_timeout(timeout).is_ok()
+}
+
 /// Start (or restart) the microphone pipeline, returning the new track's id.
 ///
 /// Replaces whatever was running and takes over its connection, so a mid-call restart
 /// keeps sending -- see [`stop_pipeline_inheriting_connection`].
+///
+/// Waits for the previous capturer to confirm it released the device before opening it
+/// again (see [`wait_for_capturer_release`]). Before this, the new capture thread was
+/// spawned the instant `stop_tx` was sent, with no wait for the old thread to actually drop
+/// its `cpal::Stream` -- so two streams could briefly hold the same physical input, and the
+/// loser (observed to be the *new* stream, not the old one) got called back on schedule with
+/// nothing in the buffer: `input_peak` and `channel_peaks` at exactly zero from the first
+/// frame, while the encoder kept running and `sent` climbed. That is a live pipeline
+/// publishing silence, with nothing in the log to say why.
 fn start_audio_pipeline(
     media_state: &MediaState,
     device_index: Option<usize>,
@@ -611,6 +672,17 @@ fn start_audio_pipeline(
 
     let previous =
         stop_pipeline_inheriting_connection(&media_state.pipelines, MediaTrackKey::microphone());
+    if let Some(release_rx) = previous.release_rx {
+        let acked = wait_for_capturer_release(&release_rx, AUDIO_HANDOVER_TIMEOUT);
+        if !acked {
+            tracing::warn!(
+                track_id = %track_id,
+                timeout_ms = AUDIO_HANDOVER_TIMEOUT.as_millis(),
+                "previous microphone capturer did not confirm release before the handover \
+                 timeout; opening the new device anyway"
+            );
+        }
+    }
     let connection = connection_for_new_pipeline(previous.connection, media_state);
     if connection.is_some() {
         tracing::info!(
@@ -630,8 +702,13 @@ fn start_audio_pipeline(
     ));
     let loss_estimate_clone = loss_estimate.clone();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let muted_clone = Arc::clone(&muted);
+    let handoff = AudioCaptureHandoff {
+        stop_rx,
+        release_tx,
+    };
 
     // Inherits the call's correlation span so every event the thread emits carries the
     // same correlation_id.
@@ -644,7 +721,7 @@ fn start_audio_pipeline(
             auto_gain,
             &encode_tx_clone,
             &muted_clone,
-            &stop_rx,
+            &handoff,
             &loss_estimate_clone,
         );
     });
@@ -658,7 +735,10 @@ fn start_audio_pipeline(
                 stop_tx,
                 encode_tx,
                 muted,
-                extras: PipelineExtras::Audio { loss_estimate },
+                extras: PipelineExtras::Audio {
+                    loss_estimate,
+                    release_rx: Some(release_rx),
+                },
             },
         );
     }
@@ -688,19 +768,26 @@ fn stop_pipeline_inheriting_connection(
         return StoppedPipeline {
             existed: false,
             connection: None,
+            release_rx: None,
         };
     };
     let Some(old) = guard.remove(&key) else {
         return StoppedPipeline {
             existed: false,
             connection: None,
+            release_rx: None,
         };
     };
     let _ = old.stop_tx.send(());
     let connection = old.encode_tx.lock().ok().and_then(|c| c.clone());
+    let release_rx = match old.extras {
+        PipelineExtras::Audio { release_rx, .. } => release_rx,
+        PipelineExtras::Video { .. } => None,
+    };
     StoppedPipeline {
         existed: true,
         connection,
+        release_rx,
     }
 }
 
@@ -2629,7 +2716,7 @@ fn audio_capture_loop(
     auto_gain: bool,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     muted: &Arc<std::sync::atomic::AtomicBool>,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
+    handoff: &AudioCaptureHandoff,
     loss_estimate: &Arc<NetworkLossEstimate>,
 ) {
     let capturer = match AudioCapturer::start_on_device(device_index) {
@@ -2698,7 +2785,7 @@ fn audio_capture_loop(
     let mut loopback_decoder = make_loopback_decoder(opus_rate, OUTBOUND_CHANNELS);
 
     loop {
-        if stop_rx.try_recv().is_ok() {
+        if handoff.stop_rx.try_recv().is_ok() {
             tracing::info!(
                 captured_frames = stats.captured,
                 encoded_frames = stats.encoded,
@@ -2777,6 +2864,13 @@ fn audio_capture_loop(
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+
+    // Dropped explicitly, before the acknowledgement, rather than left to fall out of scope
+    // at the end of the function: that ordering is what makes the send below a true promise
+    // that the device is free, not just "we are about to try to free it." `AudioCapturer`'s
+    // `Drop` impl logs this too, so a stall here is diagnosable from either side.
+    drop(capturer);
+    let _ = handoff.release_tx.send(());
 }
 
 /// Background thread: captures share audio from one `PipeWire` node, `Opus`-encodes, and
@@ -3036,6 +3130,57 @@ mod camera_device_id_tests {
     fn a_malformed_pipewire_id_resolves_to_nothing() {
         assert_eq!(camera_node_id(Some("video-input-pw-")), None);
         assert_eq!(camera_node_id(Some("video-input-pw-abc")), None);
+    }
+}
+
+/// Pins the ordering fix for a real fault: a microphone restart used to spawn the new
+/// capture thread (which opens the device again) the instant `stop_tx` was sent, with no
+/// wait for the old thread to drop its `cpal::Stream`. Two streams briefly held the same
+/// input, and the loser was fed nothing -- `input_peak`/`channel_peaks` pinned at exactly
+/// zero from its first frame while `sent` kept climbing, so the far end heard silence with
+/// a perfectly healthy-looking pipeline. `wait_for_capturer_release` is the piece of that
+/// fix that can be tested without real audio hardware: whether a pipeline restart blocks on
+/// the previous capturer's acknowledgement, and gives up after a bounded timeout rather than
+/// hanging forever if it never comes. The full end-to-end claim -- that two `cpal::Stream`s
+/// can no longer contend for one physical device -- is not testable here: that requires a
+/// real input device and observing what cpal actually delivers to two overlapping streams,
+/// which is exactly the scenario this fix prevents from ever occurring in the running
+/// pipeline, not something a unit test can construct.
+#[cfg(test)]
+mod audio_handover_tests {
+    use super::wait_for_capturer_release;
+    use std::time::Duration;
+
+    /// The common case: the old capturer drops and acknowledges well inside the timeout.
+    #[test]
+    fn returns_true_once_the_acknowledgement_arrives() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = tx.send(());
+        });
+        assert!(
+            wait_for_capturer_release(&rx, Duration::from_millis(500)),
+            "an acknowledgement sent well inside the timeout must be observed"
+        );
+    }
+
+    /// The fault this whole change addresses: nothing ever released the device. The wait
+    /// must give up at the timeout rather than blocking the new pipeline forever.
+    #[test]
+    fn returns_false_and_does_not_exceed_the_timeout_when_no_acknowledgement_arrives() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        // Kept alive so `recv_timeout` times out rather than seeing the channel close.
+        let _keep_open = tx;
+        let timeout = Duration::from_millis(60);
+        let started = std::time::Instant::now();
+        let acked = wait_for_capturer_release(&rx, timeout);
+        let elapsed = started.elapsed();
+        assert!(!acked, "no acknowledgement was ever sent");
+        assert!(
+            elapsed < timeout.saturating_mul(3),
+            "the wait must be bounded by the timeout, not hang: took {elapsed:?}"
+        );
     }
 }
 
