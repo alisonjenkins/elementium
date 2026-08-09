@@ -74,15 +74,33 @@ pub(crate) fn encrypt_or_drop(
     };
     ctx.encrypt_frame(&data, kind).map_or_else(
         || {
-            tracing::warn!(
-                reason = "e2ee_encrypt_failed",
-                label,
-                "Dropping outbound frame: E2EE encryption failed"
-            );
+            report_encrypt_failure(label);
             None
         },
         Some,
     )
+}
+
+/// How many dropped frames pass between reports once the first few are past.
+///
+/// A failure here is per frame: fifty audio frames a second, indefinitely. One real call
+/// wrote this warning 44,743 times, which buried every other line in the log at exactly
+/// the moment the log was the only way to find out what was wrong. The first few are what
+/// tell you it started; a running count is what tells you it never stopped.
+const ENCRYPT_FAILURE_REPORT_EVERY: u64 = 500;
+
+/// Report a frame that could not be encrypted, without flooding the log.
+fn report_encrypt_failure(label: &str) {
+    static FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 3 || count.is_multiple_of(ENCRYPT_FAILURE_REPORT_EVERY) {
+        tracing::warn!(
+            reason = "e2ee_encrypt_failed",
+            label,
+            dropped_so_far = count.saturating_add(1),
+            "Dropping outbound frame: E2EE encryption failed"
+        );
+    }
 }
 
 /// Carry a non-media event across the encryption boundary unchanged.
