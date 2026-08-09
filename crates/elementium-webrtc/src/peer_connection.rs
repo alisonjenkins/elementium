@@ -737,8 +737,15 @@ pub fn create_offer(
 pub fn create_answer(
     pc: &mut PeerConnectionInner,
 ) -> Result<SessionDescription, crate::error::WebRtcError> {
+    // Clone, not take. The DOM permits `createAnswer()` to be called more than once while
+    // still in `have-remote-offer` -- nothing about a second call is a fresh negotiation --
+    // but `take()` here emptied the cache on the first read, so the second call found
+    // nothing and failed with "No cached answer" even though the offer it was answering was
+    // still the one in force. The cache is invalidated instead in
+    // `set_remote_description`, at the point a *different* remote description actually
+    // supersedes it.
     pc.cached_answer
-        .take()
+        .clone()
         .ok_or_else(|| "No cached answer — call set_remote_description(offer) first".into())
 }
 
@@ -752,6 +759,14 @@ pub fn set_remote_description(
     pc: &mut PeerConnectionInner,
     desc: &SessionDescription,
 ) -> Result<Option<SessionDescription>, crate::error::WebRtcError> {
+    // The cached answer describes the offer that produced it. As soon as another remote
+    // description -- offer or answer -- is applied, that offer is no longer the one in
+    // force, and a later `createAnswer()` must not hand back a stale answer for a
+    // negotiation that has already moved on. This is where the cache gets invalidated now,
+    // rather than by `create_answer` consuming it on read: consuming it on read is what
+    // made the DOM's second `createAnswer()` call fail. The `Offer` arm below repopulates
+    // it with the fresh answer.
+    pc.cached_answer = None;
     match desc.sdp_type {
         SdpType::Offer => {
             // Log the setup direction from the remote offer
@@ -2340,6 +2355,35 @@ mod tests {
         assert!(
             result.is_ok(),
             "an answer to the offer already in force is not a fault: {result:?}"
+        );
+    }
+
+    /// `createAnswer()` may be called more than once while still in `have-remote-offer` --
+    /// the DOM permits it -- and both calls must return the same answer. `take()` on
+    /// `pc.cached_answer` emptied the cache on the first read, so the second call failed
+    /// with "No cached answer" even though nothing about the negotiation had changed.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn create_answer_can_be_called_twice_after_one_remote_offer() {
+        let mut offering = create_peer_connection("offerer".to_owned());
+        let tcs = [TransceiverInfo::from_js(
+            "audio",
+            Some("sendonly"),
+            None,
+            Some("microphone"),
+        )];
+        let offer = create_offer(&mut offering, &[], &tcs).expect("offer");
+
+        let mut answering = create_peer_connection("answerer".to_owned());
+        set_remote_description(&mut answering, &offer).expect("accept the remote offer");
+
+        let first = create_answer(&mut answering).expect("first createAnswer call");
+        let second =
+            create_answer(&mut answering).expect("second createAnswer call must also succeed");
+
+        assert_eq!(
+            first.sdp, second.sdp,
+            "both calls must describe the same negotiated answer"
         );
     }
 

@@ -20,13 +20,41 @@ use livekit_protocol::{SignalRequest, SignalResponse};
 
 #[derive(Error, Debug)]
 pub enum SignalError {
-    #[error("Connection failed: {0}")]
-    Connection(String),
-    #[error("WebSocket error: {0}")]
-    WebSocket(String),
-    #[error("Protocol error: {0}")]
-    Protocol(String),
-    #[error("Send channel closed")]
+    /// The configured SFU URL is not a URL at all (e.g. missing scheme, malformed
+    /// percent-encoding). `url::ParseError` is the actual diagnosis -- "Invalid SFU URL"
+    /// alone told a caller nothing beyond what they already knew.
+    #[error("invalid SFU URL {url:?}")]
+    InvalidUrl {
+        url: String,
+        #[source]
+        source: url::ParseError,
+    },
+    /// `Url::set_scheme` refused to rewrite `http`/`https` to `ws`/`wss`.
+    ///
+    /// The `url` crate reports this as a bare `Err(())` -- it only happens for a
+    /// "cannot-be-a-base" URL (no `//` authority, e.g. `https:opaque-thing` rather than
+    /// `https://host/...`), and carries no lower-level cause to preserve. The rejected URL
+    /// and the scheme change attempted are the whole diagnosis.
+    #[error("SFU URL {url:?} has no authority to rewrite scheme {from:?} to {to:?}")]
+    SchemeRewriteRejected {
+        url: String,
+        from: &'static str,
+        to: &'static str,
+    },
+    /// The SFU URL's scheme was not one this client can dial.
+    #[error("unsupported SFU URL scheme {scheme:?} (expected http, https, ws, or wss)")]
+    UnsupportedScheme { scheme: String },
+    /// The WebSocket handshake to the SFU (TCP connect, TLS, or HTTP Upgrade) failed.
+    ///
+    /// This is the failure that, reported as a bare string with no source and no tracing
+    /// call, once read so much like something livekit-client itself would emit that it was
+    /// blamed on the SFU's JS client for hours -- see Constitution Principle I. Keeping the
+    /// real `tungstenite::Error` here is what lets a caller (or a human reading the log)
+    /// tell a DNS failure from a TLS failure from a rejected upgrade.
+    #[error("WebSocket handshake with the SFU failed")]
+    Handshake(#[source] tokio_tungstenite::tungstenite::Error),
+    /// The writer task has stopped, so the outgoing signal channel is closed.
+    #[error("signal send channel closed")]
     ChannelClosed,
 }
 
@@ -68,8 +96,9 @@ impl SignalClient {
     ///
     /// # Errors
     ///
-    /// Returns [`SignalError::Connection`] if `sfu_url` is invalid or the
-    /// WebSocket handshake fails.
+    /// Returns [`SignalError::InvalidUrl`], [`SignalError::SchemeRewriteRejected`], or
+    /// [`SignalError::UnsupportedScheme`] if `sfu_url` is invalid, and
+    /// [`SignalError::Handshake`] if the WebSocket handshake fails.
     pub async fn connect(sfu_url: &str, token: &str) -> Result<Self, SignalError> {
         let ws_url = build_ws_url(sfu_url, token)?;
         tracing::info!(url = %redact_token(&ws_url), "connect attempt started");
@@ -78,9 +107,7 @@ impl SignalClient {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(reason = %e, "signaling connect failed");
-                return Err(SignalError::Connection(format!(
-                    "WebSocket connect failed: {e}"
-                )));
+                return Err(SignalError::Handshake(e));
             }
         };
 
@@ -150,25 +177,36 @@ impl SignalClient {
 ///
 /// # Errors
 ///
-/// Returns [`SignalError::Connection`] if `sfu_url` fails to parse or its
-/// scheme cannot be converted to a WebSocket scheme.
+/// Returns [`SignalError::InvalidUrl`] if `sfu_url` fails to parse,
+/// [`SignalError::SchemeRewriteRejected`] if its scheme cannot be rewritten to a WebSocket
+/// scheme, or [`SignalError::UnsupportedScheme`] if it names neither `http(s)` nor `ws(s)`.
 fn build_ws_url(sfu_url: &str, token: &str) -> Result<String, SignalError> {
-    let mut url = Url::parse(sfu_url)
-        .map_err(|e| SignalError::Connection(format!("Invalid SFU URL: {e}")))?;
+    let mut url = Url::parse(sfu_url).map_err(|e| SignalError::InvalidUrl {
+        url: sfu_url.to_owned(),
+        source: e,
+    })?;
 
     // Ensure we use wss:// scheme
     match url.scheme() {
         "https" => url
             .set_scheme("wss")
-            .map_err(|()| SignalError::Connection("Failed to set scheme".into()))?,
+            .map_err(|()| SignalError::SchemeRewriteRejected {
+                url: sfu_url.to_owned(),
+                from: "https",
+                to: "wss",
+            })?,
         "http" => url
             .set_scheme("ws")
-            .map_err(|()| SignalError::Connection("Failed to set scheme".into()))?,
+            .map_err(|()| SignalError::SchemeRewriteRejected {
+                url: sfu_url.to_owned(),
+                from: "http",
+                to: "ws",
+            })?,
         "wss" | "ws" => {}
         s => {
-            return Err(SignalError::Connection(format!(
-                "Unsupported URL scheme: {s}"
-            )));
+            return Err(SignalError::UnsupportedScheme {
+                scheme: s.to_owned(),
+            });
         }
     }
 
@@ -290,7 +328,9 @@ async fn ws_reader_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ws_url, redact_token};
+    use super::{SignalClient, SignalError, SignalRequest, build_ws_url, redact_token};
+    use livekit_protocol::signal_request;
+    use tokio::sync::mpsc;
 
     /// A token that appears in the URL must not appear in what gets logged.
     ///
@@ -318,5 +358,71 @@ mod tests {
     #[test]
     fn an_unparseable_url_is_not_echoed_back() {
         assert_eq!(redact_token("not a url at all"), "<unparseable url>");
+    }
+
+    /// An `sfu_url` that isn't a URL at all must surface as `InvalidUrl` with the real
+    /// `url::ParseError` attached, not a paraphrase of it.
+    ///
+    /// Before this variant existed, every parse failure collapsed into
+    /// `Connection(format!("Invalid SFU URL: {e}"))` -- a caller could not match on it, and
+    /// the underlying `ParseError` was only reachable by re-parsing the `Display` string.
+    #[test]
+    fn an_unparseable_sfu_url_is_reported_as_invalid_url_with_its_source() {
+        let err = build_ws_url("not a url at all", "tok").expect_err("must fail to parse");
+        match err {
+            SignalError::InvalidUrl { url, source } => {
+                assert_eq!(url, "not a url at all");
+                // The point of the variant: the real parse error is still there to walk.
+                let _: &dyn std::error::Error = &source;
+            }
+            other => panic!("expected InvalidUrl, got {other:?}"),
+        }
+    }
+
+    /// A scheme this client cannot dial (anything but http/https/ws/wss) must surface as
+    /// `UnsupportedScheme` naming the scheme it saw, not a formatted sentence a caller would
+    /// have to parse back apart to find out what was wrong.
+    #[test]
+    fn an_unsupported_scheme_is_reported_by_name() {
+        let err = build_ws_url("ftp://example.com", "tok").expect_err("ftp is not dialable");
+        match err {
+            SignalError::UnsupportedScheme { scheme } => assert_eq!(scheme, "ftp"),
+            other => panic!("expected UnsupportedScheme, got {other:?}"),
+        }
+    }
+
+    /// The signal channel closing while a caller still expects it open must surface as
+    /// `ChannelClosed`, not an unwrap panic or a swallowed `Err(())`.
+    #[test]
+    fn send_after_the_writer_task_is_gone_reports_channel_closed() {
+        let (tx, rx) = mpsc::unbounded_channel::<SignalRequest>();
+        drop(rx); // stands in for the writer task having stopped
+        let sender = super::SignalSender { tx };
+
+        let err = sender
+            .send(signal_request::Message::Leave(
+                livekit_protocol::LeaveRequest::default(),
+            ))
+            .expect_err("no receiver is listening");
+        assert!(matches!(err, SignalError::ChannelClosed));
+    }
+
+    /// A WebSocket handshake that fails (here: nothing listening on the far end) must
+    /// surface as `Handshake` carrying the real `tungstenite::Error`, not a bare string
+    /// indistinguishable from a message livekit-client itself might emit -- the exact shape
+    /// of the fault Constitution Principle I was ratified over.
+    #[tokio::test]
+    async fn a_refused_handshake_is_reported_as_handshake_with_its_source() {
+        // Port 0 is never a real listener; connecting to it fails immediately at the
+        // transport level, well before any WebSocket upgrade is attempted.
+        let err = SignalClient::connect("http://127.0.0.1:0", "tok")
+            .await
+            .expect_err("nothing is listening");
+        match err {
+            SignalError::Handshake(source) => {
+                let _: &dyn std::error::Error = &source;
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
     }
 }
