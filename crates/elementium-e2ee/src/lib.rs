@@ -50,9 +50,7 @@ use sha2::Sha256;
 /// Maximum number of keys per participant in a key ring.
 const MAX_KEYS: usize = 256;
 
-/// Maximum number of keys per participant in a key ring, as a `u8`.
-///
-/// Size of AES-GCM initialization vector.
+/// Size of the AES-GCM initialization vector (nonce), in bytes.
 const IV_SIZE: usize = 12;
 
 /// [`IV_SIZE`] as it appears on the wire, in the frame trailer's `IV_LENGTH` byte.
