@@ -541,7 +541,21 @@ fn video_input_devices() -> Vec<MediaDevice> {
 /// different enumeration and cannot be resolved to a node — the capture path then keeps its
 /// existing behaviour of taking the first source that works.
 fn camera_node_id(device_id: Option<&str>) -> Option<u32> {
-    device_id?.strip_prefix("video-input-pw-")?.parse().ok()
+    let requested = device_id?;
+    if let Some(node) = requested.strip_prefix("video-input-pw-").and_then(|n| n.parse().ok()) {
+        return Some(node);
+    }
+    // Every other id shape reaches here, and the capture path then takes the first camera
+    // that opens -- which for a `video-input-N` id from the nokhwa fallback means the user
+    // picked a camera and silently got whichever one came first. Saying so costs one line
+    // and turns "the picker does nothing on this machine" from a mystery into a log entry.
+    tracing::warn!(
+        device_id = %requested,
+        reason = "unresolvable_camera_id",
+        "cannot resolve this camera id to a PipeWire node; capture will use the first \
+         camera that opens, which may not be the one that was chosen"
+    );
+    None
 }
 
 #[command]
