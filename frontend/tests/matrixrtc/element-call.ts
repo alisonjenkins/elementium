@@ -27,6 +27,18 @@ export interface InboundAudio {
   silentConcealedSamples: number;
 }
 
+/** Inbound video as the receiving browser reports it. */
+export interface InboundVideo {
+  ssrc: number;
+  /** Pictures the decoder actually produced. The number a person watching sees move. */
+  framesDecoded: number;
+  /** How many of those were keyframes. A healthy stream's keyframes are a rounding error. */
+  keyFramesDecoded: number;
+  framesReceived: number;
+  framesDropped: number;
+  bytesReceived: number;
+}
+
 /**
  * Record every `RTCPeerConnection` the page creates, before Element Call can make one.
  *
@@ -183,6 +195,39 @@ export async function inboundAudio(p: Participant): Promise<InboundAudio[]> {
     }
     return out;
   }) as Promise<InboundAudio[]>;
+}
+
+/**
+ * Inbound video streams this participant is receiving, one per remote publisher.
+ *
+ * `framesDecoded` rather than `framesReceived` or `packetsReceived`, because the fault this
+ * exists for produced healthy numbers for both: a far end that could decode our keyframes and
+ * nothing else showed about twenty frames a minute of picture while every counter on the
+ * sending side, and every packet counter on the receiving side, looked exactly like a working
+ * call. `keyFramesDecoded` comes with it because the ratio is the actual signal -- a stream
+ * where nearly every decoded frame is a keyframe is a stream whose delta frames are being
+ * thrown away.
+ */
+export async function inboundVideo(p: Participant): Promise<InboundVideo[]> {
+  return p.widget().evaluate(async () => {
+    const store = window as unknown as { __pcs?: RTCPeerConnection[] };
+    const out: InboundVideo[] = [];
+    for (const pc of store.__pcs ?? []) {
+      const report = await pc.getStats();
+      report.forEach((r: Record<string, unknown>) => {
+        if (r["type"] !== "inbound-rtp" || r["kind"] !== "video") return;
+        out.push({
+          ssrc: Number(r["ssrc"] ?? 0),
+          framesDecoded: Number(r["framesDecoded"] ?? 0),
+          keyFramesDecoded: Number(r["keyFramesDecoded"] ?? 0),
+          framesReceived: Number(r["framesReceived"] ?? 0),
+          framesDropped: Number(r["framesDropped"] ?? 0),
+          bytesReceived: Number(r["bytesReceived"] ?? 0),
+        });
+      });
+    }
+    return out;
+  }) as Promise<InboundVideo[]>;
 }
 
 /**
