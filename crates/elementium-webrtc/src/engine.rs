@@ -14,6 +14,34 @@ use crate::peer_connection::{
     self, PcEvent, PeerConnectionHandle, discover_and_add_srflx, lock_pc,
 };
 
+/// Bind a UDP socket at `addr` and look up its local address, tagging any failure with
+/// which `role` the socket was being set up for.
+///
+/// Shared by [`WebRtcEngine::create_connection`] and
+/// [`crate::livekit::transport::Transport::new_with_e2ee`] -- see
+/// [`crate::error::SocketRole`] for why the sharing is safe under constitution principle
+/// I. `addr` is a parameter (production callers always pass `"0.0.0.0:0"`) so a test can
+/// force a genuine bind failure by colliding two sockets on the same fixed address,
+/// rather than asserting on a hand-constructed error value.
+pub(crate) fn bind_socket(
+    addr: &str,
+    role: crate::error::SocketRole,
+) -> Result<(UdpSocket, std::net::SocketAddr), crate::error::SocketSetupError> {
+    let socket = UdpSocket::bind(addr).map_err(|source| crate::error::SocketSetupError {
+        role,
+        step: crate::error::SocketSetupStep::Bind,
+        source,
+    })?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(|source| crate::error::SocketSetupError {
+            role,
+            step: crate::error::SocketSetupStep::LocalAddr,
+            source,
+        })?;
+    Ok((socket, local_addr))
+}
+
 /// ICE server configuration (STUN/TURN) passed from the signaling layer.
 #[derive(Debug, Clone)]
 pub struct IceServerConfig {
@@ -137,9 +165,7 @@ impl WebRtcEngine {
         let mut pc_inner = peer_connection::create_peer_connection(id.clone());
 
         // Bind a UDP socket for this connection
-        let socket =
-            UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Failed to bind socket: {e}"))?;
-        let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
+        let (socket, local_addr) = bind_socket("0.0.0.0:0", crate::error::SocketRole::Connection)?;
 
         // Add the socket address as a local ICE candidate (host)
         peer_connection::add_local_candidate(&mut pc_inner, local_addr);
@@ -730,5 +756,58 @@ mod audio_pace_tests {
     fn disabled_pacing_always_sends() {
         let decision = decide_audio_pace(false, Duration::from_millis(1), 1, false);
         assert_eq!(decision, AudioPaceDecision::Send);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod socket_setup_tests {
+    use super::bind_socket;
+    use crate::error::{SocketRole, SocketSetupError, SocketSetupStep};
+
+    /// A genuine bind failure (two sockets fighting over the same fixed address, rather
+    /// than the ephemeral `0.0.0.0:0` every real caller uses) must surface as
+    /// `SocketSetupError::Bind` naming the role that was being set up, with the real
+    /// `io::Error` still attached -- not a formatted string a caller could not match on.
+    #[test]
+    fn colliding_on_a_fixed_port_is_reported_as_a_bind_failure() {
+        let holder = std::net::UdpSocket::bind("127.0.0.1:0").expect("first bind must succeed");
+        let addr = holder.local_addr().expect("bound socket has a local addr");
+
+        let result = bind_socket(&addr.to_string(), SocketRole::Publisher);
+        assert!(
+            matches!(
+                result,
+                Err(SocketSetupError {
+                    role: SocketRole::Publisher,
+                    step: SocketSetupStep::Bind,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// A clean bind (the common case) must hand back a working socket and its real local
+    /// address, not just avoid erroring.
+    #[test]
+    fn a_clean_bind_reports_its_own_local_address() {
+        let (socket, addr) =
+            bind_socket("127.0.0.1:0", SocketRole::Connection).expect("ephemeral bind must succeed");
+        assert_eq!(socket.local_addr().expect("bound socket has a local addr"), addr);
+    }
+
+    /// `role` and `step` must both reach the message, not just one of them -- a reader
+    /// diagnosing a `Transport` with three sockets needs to know which failed and how.
+    #[test]
+    fn the_role_and_step_both_reach_the_message() {
+        let err = SocketSetupError {
+            role: SocketRole::Subscriber,
+            step: SocketSetupStep::LocalAddr,
+            source: std::io::Error::other("simulated"),
+        };
+        let text = err.to_string();
+        assert!(text.contains("subscriber"), "{text}");
+        assert!(text.contains("local address lookup"), "{text}");
     }
 }

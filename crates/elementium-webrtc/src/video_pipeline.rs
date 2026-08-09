@@ -34,18 +34,19 @@ impl VideoPipeline {
 
     /// Start the playback (decode) pipeline: peer connection → VP8 decode → frame buffer.
     ///
-    /// # Errors
-    ///
-    /// This implementation currently always returns `Ok`, but the signature
-    /// is fallible to allow future validation to reject the request.
+    /// Decode failures inside the spawned thread are logged and skipped per-frame (see
+    /// the `tracing::error!`/`tracing::debug!` calls below), never returned: the thread
+    /// runs independently of this call and outlives it. A `Result` that could never be
+    /// `Err` taught every caller to write dead error-handling around it -- see
+    /// `specs/BACKLOG-2026-08-09-errors.md` X4.
     pub fn start_playback(
         &mut self,
         event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
         frame_buffer: VideoFrameBuffer,
         pc_id: String,
-    ) -> Result<(), String> {
+    ) {
         if self.playback_active {
-            return Ok(());
+            return;
         }
         self.playback_active = true;
 
@@ -129,8 +130,6 @@ impl VideoPipeline {
                 }
             }
         });
-
-        Ok(())
     }
 
     #[must_use]

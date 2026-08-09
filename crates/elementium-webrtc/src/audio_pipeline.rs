@@ -69,16 +69,12 @@ fn is_decodable_opus(
 /// concurrently, a real confirmed cause of audio glitching separate from decode
 /// correctness.
 ///
-/// # Errors
-///
-/// This function currently always succeeds; failures inside the spawned playback thread
-/// (decoder setup) are logged rather than propagated, since the thread runs independently
-/// of the caller.
-pub fn start_playback(
-    event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
-    pc_id: String,
-    player: AudioSink,
-) -> Result<(), String> {
+/// Failures inside the spawned playback thread (decoder setup) are logged rather than
+/// propagated, since the thread runs independently of the caller and outlives this call --
+/// there is no `Err` this function can ever produce. A `Result` that is always `Ok` taught
+/// every caller to write error handling that could never run; see
+/// `specs/BACKLOG-2026-08-09-errors.md` X4.
+pub fn start_playback(event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>, pc_id: String, player: AudioSink) {
     std::thread::spawn(move || {
         // AudioSink::play() resamples/remixes to the device's actual negotiated
         // rate/channels internally, so the decoder can stay fixed at Opus's native
@@ -224,6 +220,4 @@ pub fn start_playback(
             }
         }
     });
-
-    Ok(())
 }

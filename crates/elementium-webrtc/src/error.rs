@@ -232,6 +232,120 @@ pub enum IoLoopErrorKind {
     Socket(#[source] std::io::Error),
 }
 
+/// Which UDP socket a [`SocketSetupError`] was setting up.
+///
+/// Shared by [`crate::engine::WebRtcEngine::create_connection`] (one socket per
+/// connection) and [`crate::livekit::transport::Transport::new_with_e2ee`] (one socket
+/// each for the publisher and subscriber `PeerConnection`s). All three bind and inspect a
+/// `UdpSocket` the same way and every caller reacts to a failure the same way (log and
+/// propagate), so constitution principle I permits sharing the type -- but "socket setup
+/// failed" alone would not say which of up to three sockets a single `Transport` owns
+/// failed, so `role` carries that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketRole {
+    /// [`crate::engine::WebRtcEngine::create_connection`]'s single socket.
+    Connection,
+    /// The `LiveKit` publisher `PeerConnection`'s socket.
+    Publisher,
+    /// The `LiveKit` subscriber `PeerConnection`'s socket.
+    Subscriber,
+}
+
+impl std::fmt::Display for SocketRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Connection => "connection",
+            Self::Publisher => "publisher",
+            Self::Subscriber => "subscriber",
+        })
+    }
+}
+
+/// Which step of setting up a UDP socket failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketSetupStep {
+    /// `UdpSocket::bind` itself failed (e.g. the address is already in use).
+    Bind,
+    /// `bind` succeeded but `UdpSocket::local_addr` failed to report the address bound.
+    LocalAddr,
+}
+
+impl std::fmt::Display for SocketSetupStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bind => "bind",
+            Self::LocalAddr => "local address lookup",
+        })
+    }
+}
+
+/// Failure surface shared by every UDP socket a connection or transport sets up. See
+/// [`SocketRole`] for why sharing is permitted here.
+#[derive(Debug, Error)]
+#[error("{role} socket {step} failed")]
+pub struct SocketSetupError {
+    pub role: SocketRole,
+    pub step: SocketSetupStep,
+    #[source]
+    pub source: std::io::Error,
+}
+
+/// Failure surface: [`crate::livekit::transport::Transport::set_subscriber_offer`].
+#[derive(Debug, Error)]
+pub enum SubscriberOfferError {
+    /// `set_remote_description` accepted the SFU's offer but produced no answer. X6
+    /// (`specs/BACKLOG-2026-08-09-errors.md`): this is *not* the "no pending offer"
+    /// condition that caused the 2026-08-09 outage -- an `Offer` always yields
+    /// `Ok(Some(answer))` from `set_remote_description`, so `Ok(None)` reaching here would
+    /// itself be a bug in that invariant, worth surfacing as a hard error rather than
+    /// silently treating the subscription as complete when it never produced anything to
+    /// send back to the SFU.
+    #[error("SFU offer produced no answer")]
+    NoAnswerProduced,
+}
+
+/// Which room operation sharing the [`SignalingError`] failure surface produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalingOperation {
+    /// [`crate::livekit::room::LiveKitRoom::connect`] failed to reach the SFU at all.
+    Connect,
+    /// [`crate::livekit::room::LiveKitRoom`]'s renegotiation path failed to send a
+    /// publisher offer.
+    SendPublisherOffer,
+    /// Publishing a track failed to send its `AddTrack` request.
+    SendAddTrack,
+    /// [`crate::livekit::room::LiveKitRoom::set_track_muted`] failed to send a `Mute`
+    /// request.
+    SendMute,
+}
+
+impl std::fmt::Display for SignalingOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Connect => "connect",
+            Self::SendPublisherOffer => "send_publisher_offer",
+            Self::SendAddTrack => "publish_track",
+            Self::SendMute => "set_track_muted",
+        })
+    }
+}
+
+/// Failure surface shared by every place `LiveKitRoom` talks to the SFU's signaling
+/// channel (connect, and every `SignalSender::send`).
+///
+/// Sharing is permitted under constitution principle I: every one of these is "the
+/// signaling channel to the SFU did not accept this", every caller's reaction is to log
+/// and propagate the failure, and `operation` keeps a log line naming which of the four
+/// distinct things that were being attempted actually failed -- exactly the field the
+/// constitution's amendment on 2026-08-09 requires of a shared surface.
+#[derive(Debug, Error)]
+#[error("{operation}: signaling failed")]
+pub struct SignalingError {
+    pub operation: SignalingOperation,
+    #[source]
+    pub source: crate::livekit::signaling::SignalError,
+}
+
 /// Errors from the native WebRTC / `LiveKit` transport layer.
 #[derive(Debug, Error)]
 pub enum WebRtcError {
@@ -286,47 +400,18 @@ pub enum WebRtcError {
     /// Timed out waiting for an expected response.
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
-    /// SDP offer/answer construction or application failed.
-    #[error("SDP error: {0}")]
-    Sdp(String),
     /// ICE candidate parsing/application failed.
     #[error("ICE candidate error: {0}")]
     IceCandidate(String),
-    /// Socket bind/IO failure.
-    #[error("socket error: {0}")]
-    Socket(String),
+    /// A UDP socket for a connection or transport could not be bound or inspected.
+    #[error(transparent)]
+    Socket(#[from] SocketSetupError),
+    /// [`crate::livekit::transport::Transport::set_subscriber_offer`] failed.
+    #[error(transparent)]
+    Sdp(#[from] SubscriberOfferError),
     /// `LiveKit` signaling (WebSocket) failure.
-    #[error("signaling error: {0}")]
-    Signaling(String),
-    /// Any other internal failure not worth a dedicated variant (mostly wrapped
-    /// `str0m`/FFI error text) -- still a real error value, just not one callers
-    /// currently need to distinguish by kind.
-    #[error("{0}")]
-    Other(String),
-}
-
-impl WebRtcError {
-    /// Build an [`WebRtcError::Other`] from any displayable error/message.
-    pub fn other(msg: impl std::fmt::Display) -> Self {
-        Self::Other(msg.to_string())
-    }
-}
-
-/// Lets the many pre-existing `Err("literal")`/`.ok_or("literal")?` call sites in this
-/// crate keep compiling unchanged after their surrounding functions were retyped from
-/// `Result<_, String>` to `Result<_, WebRtcError>` -- each such literal is a genuine,
-/// specific error message that just hasn't been promoted to its own variant yet.
-impl From<&str> for WebRtcError {
-    fn from(s: &str) -> Self {
-        Self::Other(s.to_string())
-    }
-}
-
-/// Same rationale as `From<&str>`, for the `format!(...)`-built error strings.
-impl From<String> for WebRtcError {
-    fn from(s: String) -> Self {
-        Self::Other(s)
-    }
+    #[error(transparent)]
+    Signaling(#[from] SignalingError),
 }
 
 /// Lets `?` keep working unchanged at every `Result<_, String>` Tauri command boundary

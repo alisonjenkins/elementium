@@ -86,14 +86,9 @@ impl Transport {
         // Create Publisher PC
         let pub_id = format!("{room_id}-pub");
         let mut pub_inner = peer_connection::create_peer_connection(pub_id);
-        let pub_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
-            tracing::error!(reason = %e, "transport connect failed");
-            format!("Bind pub socket: {e}")
-        })?;
-        let pub_addr = pub_socket.local_addr().map_err(|e| {
-            tracing::error!(reason = %e, "transport connect failed");
-            e.to_string()
-        })?;
+        let (pub_socket, pub_addr) =
+            crate::engine::bind_socket("0.0.0.0:0", crate::error::SocketRole::Publisher)
+                .inspect_err(|e| tracing::error!(reason = %e, "transport connect failed"))?;
         peer_connection::add_local_candidate(&mut pub_inner, pub_addr);
         // STUN discovery for publisher
         if let Some(servers) = ice_servers {
@@ -105,14 +100,9 @@ impl Transport {
         // Create Subscriber PC
         let sub_id = format!("{room_id}-sub");
         let mut sub_inner = peer_connection::create_peer_connection(sub_id);
-        let sub_socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
-            tracing::error!(reason = %e, "transport connect failed");
-            format!("Bind sub socket: {e}")
-        })?;
-        let sub_addr = sub_socket.local_addr().map_err(|e| {
-            tracing::error!(reason = %e, "transport connect failed");
-            e.to_string()
-        })?;
+        let (sub_socket, sub_addr) =
+            crate::engine::bind_socket("0.0.0.0:0", crate::error::SocketRole::Subscriber)
+                .inspect_err(|e| tracing::error!(reason = %e, "transport connect failed"))?;
         peer_connection::add_local_candidate(&mut sub_inner, sub_addr);
         // STUN discovery for subscriber
         if let Some(servers) = ice_servers {
@@ -223,7 +213,7 @@ impl Transport {
         let answer = peer_connection::set_remote_description(&mut guard, offer)?;
         drop(guard);
         answer.ok_or_else(|| {
-            crate::error::WebRtcError::Sdp("expected answer from subscriber offer".to_string())
+            crate::error::WebRtcError::Sdp(crate::error::SubscriberOfferError::NoAnswerProduced)
         })
     }
 
@@ -627,4 +617,26 @@ async fn transport_dispatch(
         }
     }
     tracing::info!("Transport dispatch ended");
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod subscriber_offer_error_tests {
+    use crate::error::{SubscriberOfferError, WebRtcError};
+
+    /// `set_subscriber_offer` cannot genuinely reach `NoAnswerProduced` through real
+    /// `peer_connection::set_remote_description` calls -- its `Offer` arm always returns
+    /// `Ok(Some(answer))` (see the X6 note on `SubscriberOfferError` in `error.rs`), so
+    /// there is no live path to drive this test through. Constructed directly instead,
+    /// same rationale as `SignalError::SchemeRewriteRejected` in `signaling.rs`: this
+    /// pins the variant and its `#[from]` conversion into `WebRtcError::Sdp`, not a
+    /// message.
+    #[test]
+    fn no_answer_produced_converts_into_the_sdp_variant() {
+        let err = WebRtcError::from(SubscriberOfferError::NoAnswerProduced);
+        assert!(
+            matches!(err, WebRtcError::Sdp(SubscriberOfferError::NoAnswerProduced)),
+            "{err:?}"
+        );
+    }
 }

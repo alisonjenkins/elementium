@@ -234,7 +234,10 @@ fn send_publisher_offer(
             ..Default::default()
         }))
         .map_err(|e| {
-            crate::error::WebRtcError::Signaling(format!("failed to send publisher offer: {e}"))
+            crate::error::WebRtcError::Signaling(crate::error::SignalingError {
+                operation: crate::error::SignalingOperation::SendPublisherOffer,
+                source: e,
+            })
         })
 }
 
@@ -296,9 +299,12 @@ impl LiveKitRoom {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(reason = %e, "signaling connect failed");
-                return Err(crate::error::WebRtcError::Signaling(format!(
-                    "connect failed: {e}"
-                )));
+                return Err(crate::error::WebRtcError::Signaling(
+                    crate::error::SignalingError {
+                        operation: crate::error::SignalingOperation::Connect,
+                        source: e,
+                    },
+                ));
             }
         };
 
@@ -525,7 +531,12 @@ impl LiveKitRoom {
             .send(signal_request::Message::Mute(
                 livekit_protocol::MuteTrackRequest { sid, muted },
             ))
-            .map_err(|e| crate::error::WebRtcError::Signaling(e.to_string()))
+            .map_err(|e| {
+                crate::error::WebRtcError::Signaling(crate::error::SignalingError {
+                    operation: crate::error::SignalingOperation::SendMute,
+                    source: e,
+                })
+            })
     }
 
     /// # Errors
@@ -616,9 +627,12 @@ impl LiveKitRoom {
                 }))
         {
             tracing::error!(reason = %e, "publish track failed");
-            return Err(crate::error::WebRtcError::Signaling(format!(
-                "failed to send AddTrack: {e}"
-            )));
+            return Err(crate::error::WebRtcError::Signaling(
+                crate::error::SignalingError {
+                    operation: crate::error::SignalingOperation::SendAddTrack,
+                    source: e,
+                },
+            ));
         }
 
         tracing::info!(cid = %cid, kind, source, "AddTrack cid, also used as the offer msid track id");
@@ -1502,6 +1516,75 @@ mod media_forwarder_tests {
             Some(TransportCommand::WriteVideo(..)) => "WriteVideo",
             Some(TransportCommand::Shutdown) => "Shutdown",
             None => "channel closed",
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod signaling_error_tests {
+    use crate::error::{SignalingError, SignalingOperation, WebRtcError};
+    use crate::e2ee_io::EncryptionPolicy;
+    use crate::livekit::signaling::SignalError;
+    use elementium_types::CorrelationId;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// `connect` fails before any network I/O when `sfu_url` does not parse -- real,
+    /// live-triggered failure, not a constructed value: `build_ws_url` rejects the URL
+    /// synchronously inside `SignalClient::connect`, and `connect` must wrap that as
+    /// `SignalingError { operation: Connect, .. }`, naming which of the room's several
+    /// signaling operations actually failed.
+    #[tokio::test]
+    async fn an_unparseable_sfu_url_reports_connect_as_the_failed_operation() {
+        let video_frames = Arc::new(Mutex::new(HashMap::new()));
+        let result = super::LiveKitRoom::connect(
+            "not a url at all",
+            "token",
+            video_frames,
+            CorrelationId::new(),
+            EncryptionPolicy::ExplicitlyUnencrypted,
+        )
+        .await;
+
+        match result {
+            Ok(_) => panic!("an unparseable SFU URL must not connect"),
+            Err(WebRtcError::Signaling(SignalingError {
+                operation: SignalingOperation::Connect,
+                source: SignalError::InvalidUrl { .. },
+            })) => {}
+            Err(other) => panic!("expected Signaling(Connect/InvalidUrl), got {other:?}"),
+        }
+    }
+
+    /// The other three signaling operations (`send_publisher_offer`, `AddTrack`,
+    /// `Mute`) all fail the same way in production -- the writer task is gone, so
+    /// `SignalSender::send` reports `ChannelClosed` -- and only `operation` tells them
+    /// apart afterwards. Constructing `SignalError::ChannelClosed` directly here (rather
+    /// than driving a real send failure) is necessary, not just convenient:
+    /// `SignalSender`'s `tx` field is private to `signaling.rs`, which is off-limits to
+    /// this change, so there is no way to hand a closed sender to `room.rs` without a
+    /// live SFU connection to sever. This still pins the one thing `room.rs` owns: that
+    /// each of the three operations converts into its own named variant, not a shared
+    /// unlabelled one.
+    #[test]
+    fn each_signaling_send_names_its_own_operation() {
+        for operation in [
+            SignalingOperation::SendPublisherOffer,
+            SignalingOperation::SendAddTrack,
+            SignalingOperation::SendMute,
+        ] {
+            let err = WebRtcError::from(SignalingError {
+                operation,
+                source: SignalError::ChannelClosed,
+            });
+            match err {
+                WebRtcError::Signaling(SignalingError {
+                    operation: got,
+                    source: SignalError::ChannelClosed,
+                }) => assert_eq!(got, operation),
+                other => panic!("expected Signaling({operation:?}), got {other:?}"),
+            }
         }
     }
 }
