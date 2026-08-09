@@ -16,7 +16,13 @@
 //! `#[ignore]` because it needs a working VAAPI device: it is a diagnosis, and a machine
 //! without a GPU should not fail the suite over one.
 
-#![allow(clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::doc_markdown,
+    clippy::as_conversions
+)]
 
 use elementium_codec::{EncoderConfig, NegotiatedEncoder, VideoCodec, VideoEncoder};
 use elementium_e2ee::{E2eeContext, E2eeOptions, MediaKind};
@@ -165,7 +171,11 @@ fn real_encrypted_keyframes_produce_well_formed_stap_a() {
             // thing the synthetic fixture got wrong, so it is worth seeing even on a pass.
             if described < 3 {
                 described = described.saturating_add(1);
-                let head: String = plain.iter().take(40).map(|b| format!("{b:02x}")).collect();
+                let head = plain.iter().take(40).fold(String::new(), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut acc, "{b:02x}");
+                    acc
+                });
                 println!("frame {step}: {} bytes plain, NALs {plain_nalus:?}, head {head}", plain.len());
                 println!("  plain packets:     {:?}", describe(&plain_packets));
                 println!(
@@ -176,10 +186,10 @@ fn real_encrypted_keyframes_produce_well_formed_stap_a() {
             }
 
             for (i, p) in encrypted_packets.iter().enumerate() {
-                if p.first().is_some_and(|b| b & 0x1F == STAP_A) {
-                    if let Err(why) = stap_a_tiles_exactly(p) {
-                        faults.push(format!("frame {step}, packet {i}: {why}"));
-                    }
+                if p.first().is_some_and(|b| b & 0x1F == STAP_A)
+                    && let Err(why) = stap_a_tiles_exactly(p)
+                {
+                    faults.push(format!("frame {step}, packet {i}: {why}"));
                 }
             }
         }

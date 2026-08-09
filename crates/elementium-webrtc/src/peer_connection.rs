@@ -1090,6 +1090,9 @@ pub fn poll_once(
             }
             Ok(Output::Event(event)) => {
                 tracing::info!(pc_id = %pc.id, ?event, "str0m event");
+                if let Some(announcement) = announce_track_on_first_media(pc, &event) {
+                    events.push(announcement);
+                }
                 if let Some(pc_event) = handle_str0m_event(pc, event) {
                     events.push(pc_event);
                 }
@@ -1472,6 +1475,65 @@ fn note_ice_state(pc: &mut PeerConnectionInner, mapped: IceState) {
 /// payload, and because every codec it does not recognise has its own reason for
 /// arriving -- RED, RTX and an outright unknown are three different situations that
 /// happen to reach the same place.
+/// Announce a remote track the first time media actually arrives on its mid.
+///
+/// `Event::MediaAdded` is str0m's announcement, and it fires only for m-lines the *remote*
+/// side introduced. When we are the offerer -- which is every call through the Element Call
+/// widget, because it adds its own receiving transceivers -- str0m has nothing to tell us:
+/// we asked for those m-lines ourselves. So `MediaAdded` never fired once in a real call,
+/// `RemoteTrackAdded` was never produced, the shim never built a renderer for the remote
+/// video, and nothing ever read the frames.
+///
+/// The failure was invisible from every side that could have reported it. The far end's
+/// video arrived (2350 reassembled frames in one call), was decrypted, was decoded, and was
+/// written into the display buffer under a key no one asked for. The remote participant
+/// was simply never shown.
+///
+/// Keyed on media arriving rather than on the SDP, because that is the fact that matters
+/// and it holds however the m-line came to exist: a mid carrying media is a track worth
+/// showing, whoever offered it.
+fn announce_track_on_first_media(
+    pc: &mut PeerConnectionInner,
+    event: &Event,
+) -> Option<WirePcEvent> {
+    let Event::MediaData(data) = event else {
+        return None;
+    };
+    let kind = if data.params.spec().codec == Codec::Opus {
+        MediaKind::Audio
+    } else {
+        MediaKind::Video
+    };
+    if !is_first_media_for_mid(&mut pc.remote_mids, data.mid, kind) {
+        return None;
+    }
+    tracing::info!(
+        pc_id = %pc.id,
+        mid = %data.mid,
+        ?kind,
+        "remote track announced from its first media, having never been announced by SDP"
+    );
+    Some(PcEvent::RemoteTrackAdded {
+        mid: data.mid.to_string(),
+        kind: match kind {
+            MediaKind::Audio => "audio".to_string(),
+            MediaKind::Video => "video".to_string(),
+        },
+    })
+}
+
+/// Record a mid as announced, reporting whether this call was the first to do so.
+///
+/// `remote_mids` is also what `Event::MediaAdded` fills in, so a track the SDP did announce
+/// is not announced a second time when its media arrives.
+fn is_first_media_for_mid(
+    announced: &mut HashMap<Mid, MediaKind>,
+    mid: Mid,
+    kind: MediaKind,
+) -> bool {
+    announced.insert(mid, kind).is_none()
+}
+
 fn media_data_event(
     pc: &mut PeerConnectionInner,
     data: str0m::media::MediaData,
@@ -1894,6 +1956,39 @@ pub(crate) fn discover_and_add_srflx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every remote track has to be announced, and announced once.
+    ///
+    /// str0m announces only the m-lines the *remote* side introduced, and in a call driven
+    /// by the Element Call widget every m-line is one we offered -- so nothing was ever
+    /// announced, no renderer was ever built, and the far end's video was decoded into a
+    /// buffer no one read. Announcing on first media covers that; announcing again on
+    /// every subsequent packet would rebuild the renderer sixty times a second.
+    #[test]
+    fn a_mid_is_announced_exactly_once() {
+        let mut announced = HashMap::new();
+        let video = Mid::from("n89");
+        let audio = Mid::from("XPq");
+
+        assert!(is_first_media_for_mid(&mut announced, video, MediaKind::Video));
+        assert!(!is_first_media_for_mid(&mut announced, video, MediaKind::Video));
+        assert!(!is_first_media_for_mid(&mut announced, video, MediaKind::Video));
+
+        // A second track on the same connection is its own announcement: on an SFU every
+        // participant arrives on one connection, told apart only by mid.
+        assert!(is_first_media_for_mid(&mut announced, audio, MediaKind::Audio));
+        assert!(!is_first_media_for_mid(&mut announced, audio, MediaKind::Audio));
+    }
+
+    /// A track the SDP announced must not be announced a second time when media arrives.
+    #[test]
+    fn a_track_already_announced_by_sdp_is_not_announced_again() {
+        let mut announced = HashMap::new();
+        let mid = Mid::from("n89");
+        // What `Event::MediaAdded` does.
+        announced.insert(mid, MediaKind::Video);
+        assert!(!is_first_media_for_mid(&mut announced, mid, MediaKind::Video));
+    }
 
     /// Regression test for a real incident: a poisoned PC lock (a previous holder
     /// panicked while holding it) must not cascade the panic to every subsequent

@@ -31,7 +31,7 @@ const STAP_A: u8 = 24;
 const MTU: usize = 1200;
 
 /// `ParseStapAStartOffsets` from `video_rtp_depacketizer_h264.cc`, which is the thing that
-/// logged "Incorrect StapA packet": walk the length prefixes and require that they land
+/// logged "Incorrect `StapA` packet": walk the length prefixes and require that they land
 /// exactly on the end of the payload.
 fn stap_a_tiles_exactly(payload: &[u8]) -> Result<usize, String> {
     // Past the STAP-A NAL header byte.
