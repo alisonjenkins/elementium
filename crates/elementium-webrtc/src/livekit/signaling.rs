@@ -52,7 +52,10 @@ pub enum SignalError {
     /// real `tungstenite::Error` here is what lets a caller (or a human reading the log)
     /// tell a DNS failure from a TLS failure from a rejected upgrade.
     #[error("WebSocket handshake with the SFU failed")]
-    Handshake(#[source] tokio_tungstenite::tungstenite::Error),
+    // Boxed: `tungstenite::Error` is >130 bytes on its own, which would make every
+    // `Result<_, SignalError>` that large even on the success path -- clippy's
+    // `result_large_err` catches exactly this.
+    Handshake(#[source] Box<tokio_tungstenite::tungstenite::Error>),
     /// The writer task has stopped, so the outgoing signal channel is closed.
     #[error("signal send channel closed")]
     ChannelClosed,
@@ -107,7 +110,7 @@ impl SignalClient {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(reason = %e, "signaling connect failed");
-                return Err(SignalError::Handshake(e));
+                return Err(SignalError::Handshake(Box::new(e)));
             }
         };
 
@@ -327,6 +330,10 @@ async fn ws_reader_loop(
 }
 
 #[cfg(test)]
+// Matches the precedent in `room.rs`'s test module: `expect`/`panic` on a clearly-labelled
+// test assertion is the idiomatic way to fail a test with a message, and the workspace lint
+// otherwise exists to keep them out of the paths users actually run.
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{SignalClient, SignalError, SignalRequest, build_ws_url, redact_token};
     use livekit_protocol::signal_request;
@@ -415,9 +422,12 @@ mod tests {
     async fn a_refused_handshake_is_reported_as_handshake_with_its_source() {
         // Port 0 is never a real listener; connecting to it fails immediately at the
         // transport level, well before any WebSocket upgrade is attempted.
-        let err = SignalClient::connect("http://127.0.0.1:0", "tok")
-            .await
-            .expect_err("nothing is listening");
+        // `SignalClient` deliberately has no `Debug` impl (it owns live channels and a
+        // task handle, not inspectable state), so `expect_err`/`unwrap_err` cannot be
+        // used here; match out the `Err` directly instead.
+        let Err(err) = SignalClient::connect("http://127.0.0.1:0", "tok").await else {
+            panic!("nothing is listening on port 0");
+        };
         match err {
             SignalError::Handshake(source) => {
                 let _: &dyn std::error::Error = &source;
