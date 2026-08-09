@@ -124,7 +124,15 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
     let state = match reg.entry(stream_key.to_string()) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
-            let path = format!("/tmp/elementium_audio_dump_{stream_key}.f32le");
+            // Rate and channel count in the name, because the file has no header and is
+            // unplayable without them. They were previously only in this log line, so
+            // listening to a dump meant going to find it -- and guessing wrong produces
+            // noise or a chipmunk, which is indistinguishable from the audio fault the dump
+            // was taken to investigate. `just audio-dumps` converts these to WAV by parsing
+            // exactly this filename.
+            let path = format!(
+                "/tmp/elementium_audio_dump_{stream_key}_{sample_rate}hz_{channels}ch.f32le"
+            );
             match create_private(&path) {
                 Ok(file) => {
                     tracing::info!(

@@ -195,3 +195,35 @@ clean:
 # Enter nix dev shell
 shell:
     nix develop
+
+# Turn the raw audio dumps into WAV files you can play.
+#
+# `ELEMENTIUM_AUDIO_DUMP=1` (or `touch /tmp/ELEMENTIUM_AUDIO_DUMP`, which needs no restart)
+# makes the capture path write headerless f32 at three points: `capture-raw` is what the
+# microphone produced, `capture-encoder-in` is the frame handed to Opus after gain and
+# resampling, and `capture-loopback` is our own encoder's output decoded back -- which is
+# the closest thing to what the far end actually hears.
+#
+# Listen to those three in order and the question "is the bad audio ours or theirs" answers
+# itself, which no amount of reading counters has managed.
+audio-dumps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    found=0
+    for f in /tmp/elementium_audio_dump_*.f32le; do
+        found=1
+        # The rate and channel count are in the name precisely so this can be automatic.
+        base="$(basename "$f" .f32le)"
+        rate="$(sed -n 's/.*_\([0-9]\+\)hz_.*/\1/p' <<<"$base")"
+        ch="$(sed -n 's/.*_\([0-9]\+\)ch$/\1/p' <<<"$base")"
+        if [ -z "$rate" ] || [ -z "$ch" ]; then
+            echo "skipping $f: no rate/channels in the name (dump predates this format)" >&2
+            continue
+        fi
+        ffmpeg -loglevel error -y -f f32le -ar "$rate" -ac "$ch" -i "$f" "/tmp/$base.wav"
+        echo "$(du -h "/tmp/$base.wav" | cut -f1)	/tmp/$base.wav"
+    done
+    if [ "$found" = 0 ]; then
+        echo "No dumps in /tmp. Set ELEMENTIUM_AUDIO_DUMP=1 or touch /tmp/ELEMENTIUM_AUDIO_DUMP, then make a call." >&2
+    fi
