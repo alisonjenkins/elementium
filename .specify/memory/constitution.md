@@ -4,8 +4,16 @@
 
 ### I. Errors Name Their Cause (NON-NEGOTIABLE)
 
-Every fallible function returns an error type of its own: one enum per function, one variant
-per distinct thing that can fail, and each variant carries the underlying error as a source.
+Every fallible function returns an error type of its own: one enum per **failure surface**,
+one variant per distinct thing that can fail, and each variant carries the underlying error
+as a source.
+
+A failure surface is usually a single function. It may be shared by two or more only when
+*every* caller handles *every* variant identically — `write_audio` and `write_video` fail in
+the same ways and each caller drops the frame and continues, so one enum serves both.
+Anything less than identical handling means separate enums. This wording replaces a stricter
+"one enum per function", which manufactured the near-duplicate code the principle exists to
+prevent.
 
 - **No stringly errors.** `ok_or("something went wrong")`, `map_err(|e| format!(...))` and
   `Box<dyn Error>` at a fallible boundary all destroy the cause. A caller cannot match on a
@@ -104,4 +112,4 @@ rewritten or the principle is amended deliberately — not waived in passing.
 Amendments are made when a failure teaches something general. Each principle here was
 written after it was paid for.
 
-**Version**: 1.0.0 | **Ratified**: 2026-08-09 | **Last Amended**: 2026-08-09
+**Version**: 1.1.0 | **Ratified**: 2026-08-09 | **Last Amended**: 2026-08-09
