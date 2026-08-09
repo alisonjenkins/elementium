@@ -275,6 +275,16 @@ pub struct PeerConnectionInner {
     /// forward to the page. See [`DataChannelEvent`] for why this is a separate queue
     /// rather than more `PcEvent` variants.
     pub data_channel_events: Vec<DataChannelEvent>,
+    /// Events produced as a side effect of handling another one, drained by `poll_once`.
+    ///
+    /// `handle_str0m_event` returns at most one event, but a single ICE transition produces
+    /// two: the ICE state itself and the connection state derived from it. The DOM fires
+    /// both, so both are delivered rather than one being chosen.
+    pub pending_events: Vec<WirePcEvent>,
+    /// The connection state last reported to the page.
+    ///
+    /// Held so a transition can be recognised as one; see `set_connection_state`.
+    pub connection_state: PeerConnectionState,
 }
 
 /// Thread-safe handle to a peer connection.
@@ -343,6 +353,8 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         data_channels: HashMap::new(),
         data_channel_labels: HashMap::new(),
         data_channel_events: Vec::new(),
+        pending_events: Vec::new(),
+        connection_state: PeerConnectionState::New,
     }
 }
 
@@ -1157,8 +1169,25 @@ pub fn poll_once(
                 if let Some(pc_event) = handle_str0m_event(pc, event) {
                     events.push(pc_event);
                 }
+                events.append(&mut pc.pending_events);
             }
             Ok(Output::Timeout(deadline)) => {
+                // The disconnection grace is checked here because this is the only place
+                // that runs while nothing is happening -- and nothing happening is exactly
+                // the symptom. The clock was already being started and cleared correctly;
+                // `ice_disconnect_expired` simply had no caller, so a connection could sit
+                // disconnected forever while the page was still told it was connected.
+                if ice_disconnect_expired(pc.ice_disconnected_since, Instant::now())
+                    && let Some(event) = set_connection_state(pc, PeerConnectionState::Failed)
+                {
+                    tracing::warn!(
+                        pc_id = %pc.id,
+                        grace_secs = ICE_DISCONNECT_GRACE.as_secs(),
+                        reason = "ice_disconnect_grace_expired",
+                        "ICE never recovered; reporting the connection as failed"
+                    );
+                    events.push(event);
+                }
                 return Ok((events, deadline));
             }
             Err(e) => {
@@ -1498,6 +1527,71 @@ pub fn ice_disconnect_expired(since: Option<Instant>, now: Instant) -> bool {
     since.is_some_and(|t| now.saturating_duration_since(t) >= ICE_DISCONNECT_GRACE)
 }
 
+/// Move the connection to `next`, returning the event to forward if it actually changed.
+///
+/// `RTCPeerConnection.connectionState` is what a page watches to know the call is in
+/// trouble, and Element Call drives its reconnect UI from it. Nothing produced this event:
+/// the shim assigned `"connected"` once, from the DTLS-established event, and the property
+/// never moved again for the life of the connection. A transport could die completely and
+/// the page would go on believing it was connected.
+///
+/// Only emitted on a real transition, because `connectionstatechange` firing with an
+/// unchanged state is noise a listener has to filter.
+fn set_connection_state(
+    pc: &mut PeerConnectionInner,
+    next: PeerConnectionState,
+) -> Option<WirePcEvent> {
+    if pc.connection_state == next {
+        return None;
+    }
+    tracing::info!(
+        pc_id = %pc.id,
+        from = ?pc.connection_state,
+        to = ?next,
+        "peer connection state changed"
+    );
+    pc.connection_state = next;
+    Some(PcEvent::ConnectionStateChange(next))
+}
+
+/// The connection state an ICE state implies.
+///
+/// ICE is the only signal available here: str0m's `IceConnectionState` has no `Failed` and
+/// no `Closed`, so those two arrive from elsewhere -- `failed` when the disconnection grace
+/// expires, `closed` when the connection is torn down.
+const fn connection_state_for(ice: IceState) -> PeerConnectionState {
+    match ice {
+        IceState::New => PeerConnectionState::New,
+        IceState::Checking => PeerConnectionState::Connecting,
+        IceState::Connected | IceState::Completed => PeerConnectionState::Connected,
+        IceState::Disconnected => PeerConnectionState::Disconnected,
+        // Not reachable from str0m today; mapped anyway so that if it ever becomes
+        // reachable it does not silently mean nothing.
+        IceState::Failed => PeerConnectionState::Failed,
+        IceState::Closed => PeerConnectionState::Closed,
+    }
+}
+
+/// Apply an ICE transition from str0m and return the ICE event to forward.
+///
+/// The connection-state change it implies is queued on `pending_events` rather than
+/// returned, because both are delivered: a page may listen for either, and the DOM fires
+/// both.
+fn note_ice_transition(pc: &mut PeerConnectionInner, state: IceConnectionState) -> WirePcEvent {
+    let mapped = match state {
+        IceConnectionState::New => IceState::New,
+        IceConnectionState::Checking => IceState::Checking,
+        IceConnectionState::Connected => IceState::Connected,
+        IceConnectionState::Completed => IceState::Completed,
+        IceConnectionState::Disconnected => IceState::Disconnected,
+    };
+    note_ice_state(pc, mapped);
+    if let Some(event) = set_connection_state(pc, connection_state_for(mapped)) {
+        pc.pending_events.push(event);
+    }
+    PcEvent::IceConnectionStateChange(mapped)
+}
+
 /// Record an ICE state transition, starting or clearing the disconnection clock.
 fn note_ice_state(pc: &mut PeerConnectionInner, mapped: IceState) {
     match mapped {
@@ -1671,17 +1765,7 @@ fn media_data_event(
 
 fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<WirePcEvent> {
     match event {
-        Event::IceConnectionStateChange(state) => {
-            let mapped = match state {
-                IceConnectionState::New => IceState::New,
-                IceConnectionState::Checking => IceState::Checking,
-                IceConnectionState::Connected => IceState::Connected,
-                IceConnectionState::Completed => IceState::Completed,
-                IceConnectionState::Disconnected => IceState::Disconnected,
-            };
-            note_ice_state(pc, mapped);
-            Some(PcEvent::IceConnectionStateChange(mapped))
-        }
+        Event::IceConnectionStateChange(state) => Some(note_ice_transition(pc, state)),
         Event::Connected => {
             tracing::info!(pc_id = %pc.id, "DTLS/ICE connection established");
             Some(PcEvent::Connected)
@@ -2128,6 +2212,73 @@ mod tests {
             let guard = lock_pc(&handle);
             assert_eq!(guard.id, "test-pc");
         }
+    }
+
+    /// `connectionState` is what a page watches to know the call is in trouble, and
+    /// Element Call drives its reconnect UI from it. Nothing in this crate ever produced
+    /// the event: the shim assigned "connected" once and the property never moved again,
+    /// so a transport could die completely with the page none the wiser. Pins that an ICE
+    /// transition now produces the derived connection state alongside it.
+    #[test]
+    fn an_ice_transition_also_reports_the_connection_state() {
+        let mut pc = create_peer_connection("test".to_owned());
+        assert_eq!(pc.connection_state, PeerConnectionState::New);
+
+        let ice = note_ice_transition(&mut pc, IceConnectionState::Checking);
+        assert!(matches!(ice, PcEvent::IceConnectionStateChange(IceState::Checking)));
+        assert_eq!(pc.connection_state, PeerConnectionState::Connecting);
+        assert_eq!(pc.pending_events.len(), 1, "the derived change must be queued too");
+
+        pc.pending_events.clear();
+        note_ice_transition(&mut pc, IceConnectionState::Connected);
+        assert_eq!(pc.connection_state, PeerConnectionState::Connected);
+        assert_eq!(pc.pending_events.len(), 1);
+    }
+
+    /// `connectionstatechange` firing with an unchanged state is noise every listener then
+    /// has to filter, and ICE reports `Completed` after `Connected` on a perfectly ordinary
+    /// connection -- both of which mean "connected".
+    #[test]
+    fn an_unchanged_connection_state_is_not_reported_again() {
+        let mut pc = create_peer_connection("test".to_owned());
+        note_ice_transition(&mut pc, IceConnectionState::Connected);
+        pc.pending_events.clear();
+
+        note_ice_transition(&mut pc, IceConnectionState::Completed);
+
+        assert_eq!(pc.connection_state, PeerConnectionState::Connected);
+        assert!(pc.pending_events.is_empty(), "Completed after Connected is not a change");
+    }
+
+    /// The grace period existed, was started and cleared correctly, and had no caller:
+    /// `ice_disconnect_expired` was dead machinery, so a connection could sit disconnected
+    /// forever while the page was still being told it was connected. str0m has no ICE
+    /// `Failed` state of its own, so this expiry is the only route to reporting one.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn an_expired_disconnection_becomes_a_failed_connection() {
+        let mut pc = create_peer_connection("test".to_owned());
+        note_ice_transition(&mut pc, IceConnectionState::Connected);
+        note_ice_transition(&mut pc, IceConnectionState::Disconnected);
+        assert_eq!(pc.connection_state, PeerConnectionState::Disconnected);
+
+        let since = pc.ice_disconnected_since;
+        assert!(since.is_some(), "the disconnection clock must be running");
+        assert!(
+            !ice_disconnect_expired(since, Instant::now()),
+            "a fresh disconnection is not yet a failure"
+        );
+
+        let later = Instant::now()
+            .checked_add(ICE_DISCONNECT_GRACE)
+            .expect("an instant one grace period from now");
+        assert!(ice_disconnect_expired(since, later));
+
+        let event = set_connection_state(&mut pc, PeerConnectionState::Failed);
+        assert!(matches!(
+            event,
+            Some(PcEvent::ConnectionStateChange(PeerConnectionState::Failed))
+        ));
     }
 
     /// Pins the media/control split `engine::io_loop` routes on: exactly `AudioData` and
