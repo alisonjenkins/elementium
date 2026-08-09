@@ -481,10 +481,21 @@ async function createNativeVideoTrack(trackId: string): Promise<MediaStreamTrack
  * track's own, browser-assigned id) -- the wrong one would tell Rust to stop a capture that
  * doesn't exist and leave the real one running regardless.
  */
+/**
+ * Preview loops, by the track they are drawing, so stopping a track can stop its loop.
+ *
+ * Without this the loop outlives the track: a stopper was written and never called, so
+ * every reconnect left another fetch running at 30 IPC calls a second, for the life of the
+ * page. One session had three of them polling for tracks that no longer existed.
+ */
+const previewStoppers = new Map<string, () => void>();
+
 function wireStopToBackend(track: MediaStreamTrack, nativeTrackId: string): void {
   const originalStop = track.stop.bind(track);
   track.stop = () => {
     originalStop();
+    previewStoppers.get(nativeTrackId)?.();
+    previewStoppers.delete(nativeTrackId);
     invoke("stop_track", { trackId: nativeTrackId }).catch((e) => {
       console.error(`[Elementium] stop_track(${nativeTrackId}) failed:`, e);
     });
@@ -731,6 +742,11 @@ function startLocalVideoFrameFetch(
   timerId = setTimeout(fetchLoop, TARGET_FRAME_MS);
 
   // Store cleanup reference on the canvas for stop_track
+  previewStoppers.set(trackId, () => {
+    running = false;
+    if (timerId !== null) clearTimeout(timerId);
+    debugLog(`preview loop for ${trackId} stopped with its track`);
+  });
   (canvas as unknown as Record<string, unknown>).__stopFetch = () => {
     running = false;
     if (timerId !== null) clearTimeout(timerId);
