@@ -691,7 +691,7 @@ struct Routing<'a> {
 fn route_pc_event(
     event: PcEvent,
     routing: &Routing<'_>,
-    dropped_audio_events: &mut u64,
+    stats: &mut ForwardStats,
 ) -> Option<WebRtcEvent> {
     let pc_id = routing.pc_id;
     match event {
@@ -723,26 +723,29 @@ fn route_pc_event(
             data,
             contiguous,
         } => {
+            // Counted, not logged: at fifty packets a second per track, a line per drop
+            // costs more than the drop it reports (see the same lesson in `engine.rs`'s
+            // `dropped_events`). `ForwardStats::report` carries the count instead.
             let ev = PcEvent::AudioData {
-                mid: mid.clone(),
+                mid,
                 data,
                 contiguous,
             };
             if routing.audio_tx.try_send(ev).is_err() {
-                *dropped_audio_events = dropped_audio_events.saturating_add(1);
-                tracing::warn!(
-                    pc_id,
-                    mid,
-                    dropped_audio_events = *dropped_audio_events,
-                    "AudioData dropped: audio_tx full"
-                );
+                stats.dropped_audio = stats.dropped_audio.saturating_add(1);
             }
             None
         }
         PcEvent::VideoData { mid, data, codec } => {
-            let _ = routing
+            // Was `let _ =`: video dropped between here and the decoder was invisible, so a
+            // decoder that could not keep up looked exactly like a peer that sent nothing.
+            if routing
                 .video_tx
-                .try_send(PcEvent::VideoData { mid, data, codec });
+                .try_send(PcEvent::VideoData { mid, data, codec })
+                .is_err()
+            {
+                stats.dropped_video = stats.dropped_video.saturating_add(1);
+            }
             None
         }
         PcEvent::EgressStats {
@@ -842,20 +845,111 @@ fn record_outbound_loss(
     }
 }
 
+/// How many media events to take in one batch before yielding to the other select arms.
+///
+/// The channel's own capacity, so a full channel empties in a single pass. The per-pass
+/// costs this loop pays -- polling the other arms, and previously three mutex acquisitions
+/// and a hash lookup -- were once paid *per event*, which is what put a ceiling on the
+/// drain rate well below the rate a remote participant's video arrives at.
+const MEDIA_DRAIN_BATCH: usize = 256;
+
+/// How often to check the connection for queued data-channel events and for liveness.
+///
+/// Data-channel events are not on a channel of their own: they queue on the connection and
+/// must be picked up under its lock -- the same lock the I/O loop holds while decrypting
+/// and depacketising inbound media. Taking it per media event made the forwarder and the
+/// producer contend for it thousands of times a second. At this cadence they contend fifty
+/// times a second instead, and the added latency is bounded by this interval.
+const DATA_CHANNEL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How often to report forwarder throughput. See [`ForwardStats`].
+const FORWARD_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the forwarder managed to move, so a stall is visible as a number rather than
+/// inferred from the absence of pictures.
+///
+/// Every field here answers a question that was previously unanswerable from a log: how
+/// much got through, whether it arrived in drainable batches or one at a time, and where it
+/// was lost if it was lost. The video drop count in particular replaces a bare `let _ =`.
+#[derive(Default)]
+struct ForwardStats {
+    media_events: u64,
+    control_events: u64,
+    batches: u64,
+    max_batch: usize,
+    dropped_audio: u64,
+    dropped_video: u64,
+}
+
+impl ForwardStats {
+    /// Report and reset, so each line describes the interval it covers rather than all of
+    /// time -- a cumulative counter cannot show that a stall started.
+    fn report(&mut self, pc_id: &str, elapsed: std::time::Duration) {
+        // Silence is the healthy state for an idle connection and there is nothing to say
+        // about it. Reporting only when something moved (or was lost) keeps the interval
+        // line meaningful instead of one every ten seconds per connection forever.
+        if self.media_events == 0 && self.control_events == 0 && self.dropped_video == 0 {
+            return;
+        }
+        // Integer throughout: a rate is easier to read than a count and an interval, and
+        // the workspace forbids `as` conversions, which is the only cheap way to a float
+        // here.
+        let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX).max(1);
+        let per_sec = self
+            .media_events
+            .saturating_mul(1000)
+            .checked_div(millis)
+            .unwrap_or(0);
+        tracing::info!(
+            pc_id,
+            media_events = self.media_events,
+            media_per_sec = per_sec,
+            control_events = self.control_events,
+            batches = self.batches,
+            max_batch = self.max_batch,
+            dropped_audio = self.dropped_audio,
+            dropped_video = self.dropped_video,
+            "Inbound event forwarding"
+        );
+        *self = Self::default();
+    }
+}
+
 async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // Create relay channels for audio and video playback pipelines
     let (audio_tx, audio_rx) = tokio_mpsc::channel::<PcEvent>(256);
     let (video_tx, video_rx) = tokio_mpsc::channel::<PcEvent>(256);
 
-    // Get video frame buffer and the shared audio output stream from the engine. The
-    // audio player is shared across every PeerConnection this engine manages (not one
-    // per connection) -- see `WebRtcEngine::shared_audio_player` for why.
-    let (video_frames, shared_player) = {
+    // Take the event receivers, the video frame buffer and the shared audio output stream
+    // from the engine, once. The audio player is shared across every PeerConnection this
+    // engine manages (not one per connection) -- see `WebRtcEngine::shared_audio_player`.
+    //
+    // The receivers are *moved* here rather than borrowed per event: owning them is what
+    // lets this loop wait on `recv()` instead of polling `try_recv()` behind a mutex, and
+    // waiting is what removes both the 10ms idle sleep and the spin that starved the
+    // runtime whenever media was flowing.
+    let (video_frames, shared_player, receivers, handle) = {
         let Ok(engine) = state.0.lock() else {
             return;
         };
-        (engine.video_frames.clone(), engine.shared_audio_player())
+        let Some(managed) = engine.get(pc_id) else {
+            return;
+        };
+        let Some(receivers) = managed.take_receivers() else {
+            tracing::error!(pc_id, "event forwarding is already running for this connection");
+            return;
+        };
+        (
+            engine.video_frames.clone(),
+            engine.shared_audio_player(),
+            receivers,
+            managed.handle.clone(),
+        )
     };
+    let elementium_webrtc::engine::PcReceivers {
+        mut event_rx,
+        mut control_rx,
+    } = receivers;
 
     // Start audio playback pipeline (receives Opus → decodes → cpal output)
     let audio_rx = Arc::new(Mutex::new(audio_rx));
@@ -881,99 +975,165 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // Infallible, for the same reason as the audio pipeline above.
     video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string());
 
-    // Count of `PcEvent::AudioData` dropped because `audio_tx` (this loop -> the audio
-    // playback thread, capacity 256) was full -- another gap invisible to str0m's own
-    // `MediaData::contiguous` flag, since the drop happens after str0m already emitted a
-    // complete, contiguous event.
-    let mut dropped_audio_events: u64 = 0;
+    let routing = Routing {
+        app,
+        pc_id,
+        audio_tx: &audio_tx,
+        video_tx: &video_tx,
+    };
+    let mut metrics = ForwardStats::default();
+    let mut last_report = tokio::time::Instant::now();
+
+    // Ticks even when no media is flowing, because it is also this loop's liveness check:
+    // the media and control channels close when the I/O loop exits, but a connection
+    // removed from the engine while its I/O loop lingers would otherwise leave this task
+    // forwarding to nobody.
+    let mut housekeeping = tokio::time::interval(DATA_CHANNEL_POLL);
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // A closed channel yields `None` immediately and forever. Without these the matching
+    // select arm would be re-polled every iteration and complete instantly, turning
+    // shutdown into a hot spin -- the exact failure this rewrite exists to remove.
+    let mut media_open = true;
+    let mut control_open = true;
 
     loop {
-        let Some((event, control_events, dc_events)) = drain_pc_queues(state, pc_id) else {
-            return;
-        };
+        tokio::select! {
+            // Control first, deliberately. These are the transitions media is *about* --
+            // a track added, a connection state changed -- and a burst of media must never
+            // delay one. `biased` makes that a guarantee rather than a coin flip.
+            biased;
 
-        let routing = Routing {
-            app,
-            pc_id,
-            audio_tx: &audio_tx,
-            video_tx: &video_tx,
-        };
-        let mut sent_anything = false;
+            control = control_rx.recv(), if control_open => {
+                match control {
+                    Some(event) => drain_control(event, &mut control_rx, &routing, &mut metrics),
+                    None => control_open = false,
+                }
+            }
 
-        if let Some(pc_event) = event {
-            sent_anything = true;
-            route_and_emit(pc_event, &routing, &mut dropped_audio_events);
-        }
+            media = event_rx.recv(), if media_open => {
+                match media {
+                    Some(event) => drain_media(event, &mut event_rx, &routing, &mut metrics),
+                    None => media_open = false,
+                }
+            }
 
-        // Every pending control event, not just one -- unlike the bounded media event
-        // above, there is no backpressure concern in taking them as fast as they arrive,
-        // and draining the whole queue here (in the order `try_recv` returns them, which
-        // is arrival order) is what keeps them in the order they happened.
-        for control_event in control_events {
-            sent_anything = true;
-            route_and_emit(control_event, &routing, &mut dropped_audio_events);
-        }
-
-        for dc_event in dc_events {
-            sent_anything = true;
-            emit_to_frontend(app, pc_id, &data_channel_event_to_webrtc(pc_id, dc_event));
-        }
-
-        if !sent_anything {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            _ = housekeeping.tick() => {
+                if !drain_data_channels(state, app, pc_id, &handle) {
+                    return;
+                }
+                let elapsed = last_report.elapsed();
+                if elapsed >= FORWARD_REPORT_EVERY {
+                    metrics.report(pc_id, elapsed);
+                    last_report = tokio::time::Instant::now();
+                }
+                // Both event sources are gone and nothing more can arrive. Returning here
+                // rather than lingering is what stops a reconnect from leaving a forwarder
+                // per closed connection behind it.
+                if !media_open && !control_open {
+                    metrics.report(pc_id, last_report.elapsed());
+                    tracing::info!(pc_id, "event forwarding stopped: both event channels closed");
+                    return;
+                }
+            }
         }
     }
+}
+
+/// Forward one control event and everything queued behind it, in arrival order.
+///
+/// Unlike media there is no backpressure concern in taking these as fast as they arrive:
+/// the channel is unbounded precisely because none of them may be dropped.
+fn drain_control(
+    first: PcEvent,
+    control_rx: &mut tokio_mpsc::UnboundedReceiver<PcEvent>,
+    routing: &Routing<'_>,
+    metrics: &mut ForwardStats,
+) {
+    metrics.control_events = metrics.control_events.saturating_add(1);
+    route_and_emit(first, routing, metrics);
+    while let Ok(event) = control_rx.try_recv() {
+        metrics.control_events = metrics.control_events.saturating_add(1);
+        route_and_emit(event, routing, metrics);
+    }
+}
+
+/// Forward one media event and up to [`MEDIA_DRAIN_BATCH`] more queued behind it.
+///
+/// Bounded rather than unbounded so a saturated channel cannot hold this task in a loop
+/// indefinitely while control events and data channels wait: the cap is the channel's own
+/// capacity, so a full channel still empties in one pass, but a producer faster than this
+/// consumer cannot starve the other select arms.
+fn drain_media(
+    first: PcEvent,
+    event_rx: &mut tokio_mpsc::Receiver<PcEvent>,
+    routing: &Routing<'_>,
+    metrics: &mut ForwardStats,
+) {
+    route_and_emit(first, routing, metrics);
+    let mut batch = 1usize;
+    while batch < MEDIA_DRAIN_BATCH {
+        let Ok(event) = event_rx.try_recv() else {
+            break;
+        };
+        route_and_emit(event, routing, metrics);
+        batch = batch.saturating_add(1);
+    }
+    metrics.media_events = metrics
+        .media_events
+        .saturating_add(u64::try_from(batch).unwrap_or(u64::MAX));
+    metrics.batches = metrics.batches.saturating_add(1);
+    metrics.max_batch = metrics.max_batch.max(batch);
+}
+
+/// Pick up whatever data-channel events the connection has queued, and report whether the
+/// connection is still one this task should be forwarding for.
+///
+/// Data-channel events are not on either event channel: they never pass through the E2EE
+/// boundary `PcEvent` exists for (see `DataChannelEvent`), so they queue on the connection
+/// itself and have to be collected under its lock.
+///
+/// Returns `false` when the connection has left the engine or a lock is poisoned, telling
+/// the caller to stop forwarding for this `pc_id` entirely.
+fn drain_data_channels(
+    state: &WebRtcState,
+    app: &AppHandle,
+    pc_id: &str,
+    handle: &elementium_webrtc::peer_connection::PeerConnectionHandle,
+) -> bool {
+    {
+        let Ok(engine) = state.0.lock() else {
+            return false;
+        };
+        if engine.get(pc_id).is_none() {
+            return false;
+        }
+    }
+
+    // Taken *after* the engine lock is released, never nested inside it: the I/O loop holds
+    // this connection's lock for the whole of each poll, and holding the engine lock while
+    // waiting for it would stall every other connection and every command that needs the
+    // engine.
+    let Ok(mut pc) = handle.lock() else {
+        return false;
+    };
+    let events = peer_connection::drain_data_channel_events(&mut pc);
+    drop(pc);
+
+    for event in events {
+        emit_to_frontend(app, pc_id, &data_channel_event_to_webrtc(pc_id, event));
+    }
+    true
 }
 
 /// Route one [`PcEvent`] and, if it maps to a frontend event, emit it.
 ///
 /// Split out of `forward_events` because the media and control paths both need exactly
 /// this sequence and would otherwise duplicate it.
-fn route_and_emit(event: PcEvent, routing: &Routing<'_>, dropped_audio_events: &mut u64) {
-    if let Some(tauri_event) = route_pc_event(event, routing, dropped_audio_events) {
+fn route_and_emit(event: PcEvent, routing: &Routing<'_>, stats: &mut ForwardStats) {
+    if let Some(tauri_event) = route_pc_event(event, routing, stats) {
         emit_to_frontend(routing.app, routing.pc_id, &tauri_event);
     }
-}
-
-/// One pass of pulling everything currently queued for `pc_id`: at most one media event
-/// (`event_rx` is bounded and droppable, so only the newest is worth taking per pass),
-/// every pending control event (`control_rx` is unbounded and undroppable), and every
-/// pending data-channel event. Data-channel events are not on `event_rx`: they never pass
-/// through the E2EE boundary `PcEvent` exists for (see `DataChannelEvent`), so they are
-/// queued straight on the connection and drained here instead, under the same lock that
-/// already has to be taken to reach the other two.
-///
-/// Returns `None` when the connection is gone or a lock is poisoned, telling the caller
-/// to stop forwarding for this `pc_id` entirely.
-#[allow(clippy::type_complexity)]
-fn drain_pc_queues(
-    state: &WebRtcState,
-    pc_id: &str,
-) -> Option<(
-    Option<PcEvent>,
-    Vec<PcEvent>,
-    Vec<peer_connection::DataChannelEvent>,
-)> {
-    let engine = state.0.lock().ok()?;
-    let managed = engine.get(pc_id)?;
-
-    let pc_event = managed.event_rx.lock().ok()?.try_recv().ok();
-
-    let control_events = {
-        let mut rx = managed.control_rx.lock().ok()?;
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-        events
-    };
-
-    let mut pc = managed.handle.lock().ok()?;
-    let dc_events = peer_connection::drain_data_channel_events(&mut pc);
-    drop(pc);
-    drop(engine);
-
-    Some((pc_event, control_events, dc_events))
 }
 
 /// Push one event to JS via `eval()` -- calls the global handler registered by the WebRTC

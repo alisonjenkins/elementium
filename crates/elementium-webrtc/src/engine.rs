@@ -83,25 +83,51 @@ pub enum IoCommand {
 /// The protocol handler reads from this to serve frames to the webview.
 pub type VideoFrameBuffer = Arc<Mutex<HashMap<String, VideoFrame>>>;
 
-/// Info about a managed peer connection.
-pub struct ManagedPc {
-    pub handle: PeerConnectionHandle,
-    pub socket: Arc<UdpSocket>,
-    pub io_cmd_tx: mpsc::Sender<IoCommand>,
+/// The receiving ends of a connection's two event channels, handed to whichever task
+/// forwards them.
+///
+/// Owned rather than shared behind a lock. The forwarder is the sole consumer of both, and
+/// owning them is what lets it `await` a message instead of polling one out from under a
+/// mutex -- see [`ManagedPc::take_receivers`].
+pub struct PcReceivers {
     /// High-rate media events (`AudioData`/`VideoData`), bounded so a stalled consumer
     /// sheds load instead of growing without limit. See [`PcEvent::is_media`].
-    pub event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
+    pub event_rx: mpsc::Receiver<PcEvent>,
     /// Control events (connection/ICE state, candidates, stats, keyframe requests).
     /// Unbounded: each is the only notice of a transition that will not repeat, so this
     /// side of the split must never drop under backpressure. Defensible as unbounded
     /// specifically because these are rare and bounded by real state transitions, not by
     /// anything an adversary or a busy network could drive unboundedly -- there is no
     /// event source here that fires faster than the state machine it reports on.
-    pub control_rx: Arc<Mutex<mpsc::UnboundedReceiver<PcEvent>>>,
+    pub control_rx: mpsc::UnboundedReceiver<PcEvent>,
+}
+
+/// Info about a managed peer connection.
+pub struct ManagedPc {
+    pub handle: PeerConnectionHandle,
+    pub socket: Arc<UdpSocket>,
+    pub io_cmd_tx: mpsc::Sender<IoCommand>,
+    /// The event receivers, until something takes them. See [`ManagedPc::take_receivers`].
+    receivers: Mutex<Option<PcReceivers>>,
     /// The `peer_connection` tracing span this connection was created under, carrying
     /// its `correlation_id`. Retained so later operations on this connection (e.g.
     /// closing it) can re-enter the same span.
     pub span: tracing::Span,
+}
+
+impl ManagedPc {
+    /// Take ownership of this connection's event receivers, leaving nothing behind.
+    ///
+    /// Returns `None` on the second call: exactly one task may consume these channels, and
+    /// a second consumer would silently split the event stream between them rather than
+    /// failing. Making that unrepresentable is the point of moving the receivers out
+    /// instead of sharing them behind a mutex -- the previous shape let any number of
+    /// pollers race for each message, and forced the one real consumer to take a lock per
+    /// event on the hot path.
+    #[must_use]
+    pub fn take_receivers(&self) -> Option<PcReceivers> {
+        self.receivers.lock().ok()?.take()
+    }
 }
 
 /// The WebRTC engine manages all active peer connections.
@@ -208,8 +234,10 @@ impl WebRtcEngine {
                 handle,
                 socket,
                 io_cmd_tx,
-                event_rx: Arc::new(Mutex::new(event_rx)),
-                control_rx: Arc::new(Mutex::new(control_rx)),
+                receivers: Mutex::new(Some(PcReceivers {
+                    event_rx,
+                    control_rx,
+                })),
                 span,
             },
         );
