@@ -160,6 +160,14 @@
                 exit 1
               fi
               echo "Running snapshot: $(readlink -f "$latest")" >&2
+              # The snapshot is a bare, unwrapped binary, so it finds none of its dynamic
+              # libraries on its own -- it worked at all only from inside the dev shell,
+              # which is the one environment a frozen snapshot should not need. Without
+              # this it dies loading libayatana-appindicator before the window exists.
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+              # TLS for the WebKit network stack: without it every https request fails.
+              export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules"
               exec "$latest/elementium" "$@"
             '';
           }}/bin/elementium-snapshot";
