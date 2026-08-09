@@ -368,6 +368,12 @@ enum AudioPaceDecision {
 /// measured this. A write processed sooner than this after the last one is only early
 /// because it queued up behind something, not because it is actually due, so only writes
 /// this close to the last one are worth spacing out.
+/// How often to report media dropped because the forwarder is behind.
+///
+/// The first is always reported, so the condition is never invisible, and then one in this
+/// many. Reporting every one cost more than the drop did.
+const DROPPED_EVENT_REPORT_EVERY: u64 = 500;
+
 const AUDIO_PACE_EARLY_BELOW: Duration = Duration::from_millis(5);
 
 /// Nominal Opus frame cadence, and the ceiling a deferred write may be pushed out to. A write
@@ -644,15 +650,27 @@ fn io_loop(
                         if event.is_media() {
                             if event_tx.try_send(event).is_err() {
                                 dropped_events = dropped_events.saturating_add(1);
-                                // Unthrottled: this is a real invisible-loss channel this
-                                // codebase has never had visibility into before, and
-                                // capacity-256 means it shouldn't fire under normal load at
-                                // all -- if it does, every occurrence matters.
-                                tracing::warn!(
-                                    pc_id = %pc.id,
-                                    dropped_events,
-                                    "PcEvent dropped: event_tx to forward_events full"
-                                );
+                                // Throttled, having been written unthrottled on the
+                                // assumption that a capacity of 256 meant it could not fire
+                                // under normal load. It fires hundreds of times a second on
+                                // an ordinary call with inbound video: the forwarder cannot
+                                // drain media as fast as a remote participant produces it.
+                                //
+                                // The volume was not merely noise. Each occurrence formatted
+                                // and wrote a line from inside the I/O loop, slowing the
+                                // loop that was already behind, which dropped more events.
+                                // A log line that makes its own subject worse is the exact
+                                // shape the constitution's "throttle, do not flood" exists
+                                // to prevent, and it went in as part of writing that rule.
+                                if dropped_events == 1
+                                    || dropped_events.is_multiple_of(DROPPED_EVENT_REPORT_EVERY)
+                                {
+                                    tracing::warn!(
+                                        pc_id = %pc.id,
+                                        dropped_events,
+                                        "inbound media dropped: the forwarder is not keeping up"
+                                    );
+                                }
                             }
                         } else if control_tx.send(event).is_err() {
                             // Only fails when `forward_events` has already returned (the
