@@ -121,6 +121,98 @@ describe("describeWidgetMessage", () => {
     expect(line?.text).not.toContain("hello");
   });
 
+  /**
+   * `update_state` delivers a *batch* under `data.state`. Reading `data.type` on it finds
+   * nothing, which is how every mid-call membership change was logged as `type=-` -- the
+   * exact event this module was built to catch, silently missed. Shape taken from a real
+   * message, not invented.
+   */
+  it("finds membership events inside an update_state batch", () => {
+    const line = describeWidgetMessage({
+      api: "toWidget",
+      action: "update_state",
+      data: {
+        state: [
+          {
+            type: "m.room.name",
+            state_key: "",
+            sender: "@alice:example.org",
+            content: { name: "General 1" },
+          },
+          {
+            type: "org.matrix.msc3401.call.member",
+            state_key: "_@bob:example.org_DEVICEONE_m.call",
+            sender: "@bob:example.org",
+            content: { memberships: [{ device_id: "DEVICEONE" }] },
+          },
+        ],
+      },
+    });
+    expect(line?.text).toContain("MatrixRTC membership");
+    expect(line?.text).toContain("JOINED/UPDATED");
+    expect(line?.text).toContain("@bob:example.org");
+    // The room name rode along in the same batch and is content.
+    expect(line?.text).not.toContain("General 1");
+  });
+
+  it("reports every membership in a batch, not just the first", () => {
+    const line = describeWidgetMessage({
+      api: "toWidget",
+      action: "update_state",
+      data: {
+        state: [
+          {
+            type: "m.rtc.member",
+            state_key: "_@bob:example.org_ONE",
+            sender: "@bob:example.org",
+            content: { memberships: [{}] },
+          },
+          {
+            type: "m.rtc.member",
+            state_key: "_@carol:example.org_TWO",
+            sender: "@carol:example.org",
+            content: {},
+          },
+        ],
+      },
+    });
+    expect(line?.text).toContain("@bob:example.org");
+    expect(line?.text).toContain("@carol:example.org");
+    expect(line?.text).toContain("LEFT");
+  });
+
+  it("falls back to the plain action line for an update_state with no membership in it", () => {
+    const line = describeWidgetMessage({
+      api: "toWidget",
+      action: "update_state",
+      data: { state: [{ type: "m.room.topic", content: { topic: "hello" } }] },
+    });
+    expect(line?.text).toContain("update_state");
+    expect(line?.text).not.toContain("MatrixRTC membership");
+    expect(line?.text).not.toContain("hello");
+  });
+
+  /**
+   * Inbound and outbound to-device carry different shapes. Counting recipients on a
+   * delivered event found none and reported `recipients=0` on a key that had arrived
+   * perfectly well -- which reads as a failure and is not one.
+   */
+  it("describes an inbound to-device by its sender, not by a recipient count", () => {
+    const line = describeWidgetMessage({
+      api: "toWidget",
+      action: "send_to_device",
+      data: {
+        type: "io.element.call.encryption_keys",
+        sender: "@bob:example.org",
+        encrypted: true,
+        content: { keys: "SECRET" },
+      },
+    });
+    expect(line?.text).toContain("from=@bob:example.org");
+    expect(line?.text).not.toContain("recipients=0");
+    expect(line?.text).not.toContain("SECRET");
+  });
+
   it("ignores anything that is not widget API traffic", () => {
     expect(describeWidgetMessage({ action: "send_to_device", data: {} })).toBeNull();
     expect(describeWidgetMessage({ api: "somethingElse", action: "send_to_device" })).toBeNull();

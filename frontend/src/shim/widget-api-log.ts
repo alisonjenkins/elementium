@@ -115,6 +115,23 @@ function describeMembership(data: Record<string, unknown> | undefined): string |
 }
 
 /**
+ * Every MatrixRTC membership event in an `update_state` batch, described.
+ *
+ * The batch also carries room name, avatars and topic changes, which are content and are
+ * neither read nor logged.
+ */
+function collectMemberships(state: unknown): string[] {
+  if (!Array.isArray(state)) return [];
+  const out: string[] = [];
+  for (const event of state) {
+    if (typeof event !== "object" || event === null) continue;
+    const described = describeMembership(event as Record<string, unknown>);
+    if (described !== null) out.push(described);
+  }
+  return out;
+}
+
+/**
  * Turn one widget API message into the line worth logging, or `null` if it carries nothing.
  *
  * Pure, and separate from the listener, so the guarantee that matters here -- that no
@@ -127,26 +144,51 @@ export function describeWidgetMessage(message: WidgetMessage): WidgetLogLine | n
   const action = typeof message.action === "string" ? message.action : "?";
 
   if (action === "send_to_device" || action === "org.matrix.msc3819.send_to_device") {
-    // The event type and the recipient count only. The content is key material.
     const type = typeof message.data?.["type"] === "string" ? message.data["type"] : "?";
+    const encrypted = String(message.data?.["encrypted"] ?? "?");
+    // The two directions carry different shapes and want different facts. Outbound is a
+    // `messages` map of recipients -- the number of them is the whole question, since a
+    // rotation that addressed nobody reached nobody. Inbound is one delivered event with a
+    // `sender`, and counting its (absent) recipients reported `recipients=0` on a message
+    // that was working perfectly. Neither branch reads content: it is key material.
+    if (api === "toWidget") {
+      const sender = typeof message.data?.["sender"] === "string" ? message.data["sender"] : "?";
+      return {
+        text:
+          `[Elementium] widget API toWidget send_to_device type=${type} from=${sender} ` +
+          `encrypted=${encrypted} (a key arriving from someone else)`,
+        oncePerAction: false,
+        key: `${api}:${action}`,
+      };
+    }
     return {
       text:
-        `[Elementium] widget API ${api} send_to_device type=${type} ` +
-        `recipients=${recipientCount(message.data)} encrypted=${String(message.data?.["encrypted"] ?? "?")}. ` +
-        `This is how Element Call distributes an encryption key; its absence after a join ` +
-        `means nobody was sent one.`,
+        `[Elementium] widget API fromWidget send_to_device type=${type} ` +
+        `recipients=${recipientCount(message.data)} encrypted=${encrypted}. ` +
+        `This is how Element Call distributes an encryption key; its absence after a ` +
+        `membership change means nobody was sent one.`,
       oncePerAction: false,
       key: `${api}:${action}`,
     };
   }
 
-  const membership = describeMembership(message.data);
-  if (membership !== null) {
+  // `update_state` delivers a batch under `data.state`, not a single event -- reading
+  // `data.type` on it yields nothing, which is how every membership change this was built to
+  // catch was logged as `type=-`. `send_event` does carry the event at the top level, so
+  // both shapes are tried.
+  const memberships = [
+    ...collectMemberships(message.data?.["state"]),
+    ...(describeMembership(message.data) === null
+      ? []
+      : [describeMembership(message.data) as string]),
+  ];
+  if (memberships.length > 0) {
     return {
       text:
-        `[Elementium] widget API ${api} ${action}: MatrixRTC membership ${membership}. ` +
-        `Element Call rotates its key on a leaver, and on a joiner when the current key is ` +
-        `over ten seconds old -- so a send_to_device should follow this line.`,
+        `[Elementium] widget API ${api} ${action}: MatrixRTC membership ` +
+        `${memberships.join("; ")}. Element Call rotates its key on a leaver, and on a ` +
+        `joiner when the current key is over ten seconds old -- so a fromWidget ` +
+        `send_to_device should follow this line.`,
       oncePerAction: false,
       key: `${api}:${action}`,
     };
