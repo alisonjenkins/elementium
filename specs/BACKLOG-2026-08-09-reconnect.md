@@ -24,7 +24,12 @@ The later connections carry almost nothing.
 
 ## Open
 
-- [ ] **R1. Capture does not reattach after a reconnect.** The log says it outright --
+- [ ] **R1. Needs re-measuring; the mechanism written below is wrong.** The attach
+  machinery does run on every new connection -- `capture_attached` is non-zero on the later
+  ones -- and the by-kind gate that would have skipped the camera was already removed. With
+  R3 fixed there should be no reconnects to recover from, and with R6 fixed the camera was
+  no longer invisible for an unrelated reason, so this needs a fresh call before anything is
+  changed. Original note follows. **Capture does not reattach after a reconnect.** The log says it outright --
   `the peer connection this microphone was feeding has closed; audio is detached until a
   connection replaces it` -- and then no connection ever claims it. The camera is the same:
   it came back only when the user toggled it by hand. A reconnect is routine and the
@@ -36,7 +41,7 @@ The later connections carry almost nothing.
   track that has stopped never stops its loop, so every reconnect adds another 29 IPC calls
   a second, permanently. Ours, small.
 
-- [ ] **R3. ROOT CAUSE FOUND, not yet fixed: `No changes to apply` is ours.**
+- [x] **R3. FIXED. `No changes to apply` is ours.**
   `crates/elementium-webrtc/src/peer_connection.rs`, in `create_offer`:
   `api.apply().ok_or("No changes to apply")?`. str0m returns `None` from `apply()` when the
   requested changes leave the session unchanged -- a re-offer whose transceivers already
@@ -48,9 +53,9 @@ The later connections carry almost nothing.
   That was wrong: the search was for the message as thrown, and it is built here from a
   string literal. It was found by reading `create_offer` for an unrelated reason.
 
-  The fix is not simply to ignore `None`: `createOffer` has to return an offer describing
-  the current state, so the last offer needs to be kept and returned when nothing changed.
-  **This is the root; R1 and R2 only make it survivable.**
+  Fixed by keeping the last offer and returning it when nothing changed, which is what
+  `createOffer` in the DOM does. No changes *and* nothing offered before is still an error.
+  **This was the root; R1 and R2 only made it survivable.**
 
 - [ ] **R4. Video quality does not recover after a restart.** 640 kbps to 1.5 Mbps measured
   against a 2764 kbps target at 720p30, with the encoder recreated on every reconnect and
@@ -58,7 +63,7 @@ The later connections carry almost nothing.
   25 PLIs against 1 in a clean run, as "only key frames" at the far end. Partly downstream
   of R3; worth measuring again once reconnects stop.
 
-- [ ] **R5. Frame rate is fixed at 30 with no way to change it.** Nothing in WebRTC, VP8,
+- [x] **R5. FIXED. `ELEMENTIUM_MAX_FPS` sets it, 1..=120, default 30.** Original note: Nothing in WebRTC, VP8,
   H.264 or the SFU requires it -- `MAX_ENCODE_FPS` is ours, and the reasoning (60fps roughly
   doubles bitrate and encode cost for a difference few people see on a webcam) is sound as a
   *default* rather than as a law. The camera delivers 60. Wanted as a setting. Note the
@@ -78,11 +83,16 @@ The later connections carry almost nothing.
   which for video is the camera, so a second video m-line for the share may never get a mid
   of its own and the two keys resolve to one transceiver.
 
-- [ ] **R7. The screen-share picker never appears.** The portal asks for permission and then
-  shares without asking *what* to share. Either the source-selection step is being skipped
-  or a restore token is being reused -- which would also explain sharing the wrong thing
-  without asking. Note that an earlier session established the restore-token behaviour was
-  *not* in use, so this is a change rather than a known quirk.
+- [ ] **R7. The screen-share picker never appears. Not investigable from the log we have.**
+  The session that produced the "screen share shows the camera" screenshot contains **no
+  screen-share activity at all**: no `getDisplayMedia`, no portal call, no share pipeline.
+  So what the far end rendered as a share tile was the camera on the wrong m-line (R6), and
+  whatever prompt appeared did not come from our portal path.
+
+  The portal code itself reads correctly -- `PersistMode::DoNot`, so no restore token, and
+  `SelectSources` with monitors and windows before `Start` -- which is the opposite of what
+  "asks permission then shares without asking what" would suggest. Needs a log of an actual
+  share attempt on a build that has R6 in it before anything is changed here.
 
 ## Fixed on 2026-08-09, after this list was written
 
