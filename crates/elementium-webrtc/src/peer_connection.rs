@@ -184,6 +184,9 @@ pub struct PeerConnectionInner {
     /// construction, and there is nothing to distinguish two of them by.
     pub offered_tracks: Vec<(MediaKind, String)>,
     pub pending_offer: Option<SdpPendingOffer>,
+    /// The last offer this connection produced, returned again when a re-offer would change
+    /// nothing. See `create_offer`.
+    pub last_offer_sdp: Option<String>,
     pub remote_mids: HashMap<Mid, MediaKind>,
     pub audio_frame_count: u64,
     /// Wall-clock instant corresponding to audio RTP timestamp 0 on this connection.
@@ -316,6 +319,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         audio_mid: None,
         video_mid: None,
         send_mids: HashMap::new(),
+        last_offer_sdp: None,
         offered_tracks: Vec::new(),
         pending_offer: None,
         remote_mids: HashMap::new(),
@@ -656,13 +660,41 @@ pub fn create_offer(
         }
     }
 
-    let (offer, pending) = api.apply().ok_or("No changes to apply")?;
+    // Nothing to change is not a failure.
+    //
+    // str0m returns `None` here when the requested changes leave the session as it already
+    // is -- a re-offer whose transceivers and channels all exist. `createOffer` in the DOM
+    // answers that with an offer describing the current state, and it must: the caller is
+    // renegotiating and expects an SDP.
+    //
+    // Returning an error instead cost three reconnections in seventy seconds of one call.
+    // It crossed the IPC as a rejected promise, livekit-client read the negotiation as
+    // failed and tore the session down, and the rebuild lost the encoder's rate control,
+    // the far end's decode state and, until it was fixed separately, the capture pipelines'
+    // attachment. Every symptom of that call traced back to this line.
+    let Some((offer, pending)) = api.apply() else {
+        let Some(previous) = pc.last_offer_sdp.clone() else {
+            // No changes and nothing offered before means there is genuinely nothing to
+            // describe, which is a real fault rather than a quiet re-offer.
+            return Err(crate::error::WebRtcError::from("No changes to apply"));
+        };
+        tracing::info!(
+            pc_id = %pc.id,
+            sdp_len = previous.len(),
+            "re-offer changes nothing; returning the offer already in force"
+        );
+        return Ok(SessionDescription {
+            sdp_type: SdpType::Offer,
+            sdp: previous,
+        });
+    };
     pc.pending_offer = Some(pending);
     // NOTE: apply() does NOT call init_dtls — only accept_offer/accept_answer do.
     // dtls_initialized stays false until we receive the remote answer.
 
     let sdp = offer.to_sdp_string();
     tracing::info!(pc_id = %pc.id, sdp_len = sdp.len(), num_dc = data_channels.len(), num_tc = transceivers.len(), "Created SDP offer");
+    pc.last_offer_sdp = Some(sdp.clone());
 
     Ok(SessionDescription {
         sdp_type: SdpType::Offer,
@@ -2564,6 +2596,42 @@ mod offer_track_id_tests {
         let tc = TransceiverInfo::from_js("video", Some("recvonly"), None, None);
         assert!(tc.track_id.is_none());
         assert_eq!(tc.direction, Direction::RecvOnly);
+    }
+
+    /// A re-offer that changes nothing must still produce an offer.
+    ///
+    /// str0m reports "no changes" by returning `None`, and turning that into an error cost
+    /// three reconnections in seventy seconds: it reached livekit-client as a failed
+    /// negotiation, which tore the session down and rebuilt it.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_re_offer_that_changes_nothing_returns_the_offer_already_in_force() {
+        let mut pc = create_peer_connection("reoffer-test".to_owned());
+        let tcs = [TransceiverInfo::from_js(
+            "audio",
+            Some("sendonly"),
+            None,
+            Some("microphone"),
+        )];
+
+        let first = create_offer(&mut pc, &[], &tcs).expect("the first offer is a change");
+        assert!(!first.sdp.is_empty());
+
+        // A real re-offer carries no new transceivers -- the shim clears its pending list
+        // once an offer has been made -- so str0m has nothing to apply. Passing `tcs` again
+        // would *add a second* audio m-line, which is a change and not this case.
+        let second = create_offer(&mut pc, &[], &[]).expect("a re-offer must not be an error");
+        assert_eq!(
+            second.sdp, first.sdp,
+            "the offer in force describes the current state, which is unchanged"
+        );
+    }
+
+    /// With nothing offered yet and nothing to offer, the error is real and must remain.
+    #[test]
+    fn an_empty_offer_with_no_history_is_still_an_error() {
+        let mut pc = create_peer_connection("empty-offer-test".to_owned());
+        assert!(create_offer(&mut pc, &[], &[]).is_err());
     }
 
     /// The camera and the screen share are different tracks and must not share an m-line.
