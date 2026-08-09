@@ -282,17 +282,21 @@ impl ImageView {
     /// frame. Both mean the image was not the one the caller thought it was, which is worth
     /// refusing rather than writing past a plane.
     fn write_i420(&mut self, frame: &I420Frame) -> Result<(), Status> {
-        let fail = |what: &'static str| Status {
-            operation: what,
-            code: -1,
+        let fail = |what: &'static str| Status::detected(what);
+        // Distinct from `fail`: a `TryFromIntError` here is a real cause (the frame's `u32`
+        // geometry does not fit `usize` on this platform), not merely a fact this crate
+        // detected, and an audit found it discarded into the same unexplained `code: -1` as
+        // everything else in this function.
+        let fail_caused = |what: &'static str, source: std::num::TryFromIntError| {
+            Status::caused_by(what, source)
         };
 
         if self.image.format.fourcc != FOURCC_NV12 {
             return Err(fail("derived image is not NV12"));
         }
         let (width, height) = (
-            usize::try_from(frame.width()).map_err(|_| fail("frame width"))?,
-            usize::try_from(frame.height()).map_err(|_| fail("frame height"))?,
+            usize::try_from(frame.width()).map_err(|e| fail_caused("frame width", e))?,
+            usize::try_from(frame.height()).map_err(|e| fail_caused("frame height", e))?,
         );
         if usize::from(self.image.width) < width || usize::from(self.image.height) < height {
             return Err(fail("surface smaller than the frame"));

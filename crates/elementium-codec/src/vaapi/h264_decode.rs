@@ -26,6 +26,7 @@ use super::h264_params::{Pps, SliceHeader, Sps, nal_type, parse_pps, parse_slice
 use super::image::SurfaceDownload;
 use super::resource::{Buffer, Config, Context, SurfaceId, SurfacePool};
 use super::status::{Status, check};
+use crate::codec_error::{Codec, CodecError, CodecErrorKind};
 use crate::video::{VideoCodec, VideoDecoder};
 
 /// Surfaces in the pool: the picture being decoded, plus the reference window, plus slack.
@@ -101,10 +102,7 @@ impl H264Decoder {
     ///
     /// Returns [`Status`] if no VAAPI display can be opened.
     pub fn new() -> Result<Self, Status> {
-        let display = Arc::new(Display::open_any().ok_or(Status {
-            operation: "no VAAPI render node could be opened",
-            code: -1,
-        })?);
+        let display = Arc::new(Display::open_any().ok_or(Status::detected("no VAAPI render node could be opened"))?);
         Ok(Self {
             display,
             session: None,
@@ -213,10 +211,7 @@ impl H264Decoder {
             match nal_unit_type {
                 nal_type::SPS => {
                     let Some(sps) = parse_sps(&rbsp) else {
-                        return Err(Status {
-                            operation: "SPS uses features this decoder does not support",
-                            code: -1,
-                        });
+                        return Err(Status::detected("SPS uses features this decoder does not support"));
                     };
                     // A resolution change invalidates every surface and the context. Torn
                     // down rather than reused: the old surfaces are the wrong size, and the
@@ -232,10 +227,7 @@ impl H264Decoder {
                 }
                 nal_type::PPS => {
                     let Some(pps) = parse_pps(&rbsp) else {
-                        return Err(Status {
-                            operation: "PPS uses features this decoder does not support",
-                            code: -1,
-                        });
+                        return Err(Status::detected("PPS uses features this decoder does not support"));
                     };
                     self.pps = Some(pps);
                 }
@@ -271,25 +263,16 @@ impl H264Decoder {
             return Ok(None);
         };
         let Some(header) = parse_slice_header(rbsp, nal_unit_type, nal_ref_idc, &sps, &pps) else {
-            return Err(Status {
-                operation: "slice header uses features this decoder does not support",
-                code: -1,
-            });
+            return Err(Status::detected("slice header uses features this decoder does not support"));
         };
         if header.first_mb_in_slice != 0 {
-            return Err(Status {
-                operation: "multi-slice pictures are not supported",
-                code: -1,
-            });
+            return Err(Status::detected("multi-slice pictures are not supported"));
         }
         if self.session.is_none() {
             self.start_session(&sps)?;
         }
         let Some(session) = self.session.as_mut() else {
-            return Err(Status {
-                operation: "no decode session",
-                code: -1,
-            });
+            return Err(Status::detected("no decode session"));
         };
 
         let is_idr = nal_unit_type == nal_type::IDR_SLICE;
@@ -301,10 +284,7 @@ impl H264Decoder {
         let poc = i32::try_from(header.pic_order_cnt_lsb).unwrap_or(0);
         session.prev_poc_lsb = header.pic_order_cnt_lsb;
 
-        let surface = session.free_surface().ok_or(Status {
-            operation: "no free surface for the picture",
-            code: -1,
-        })?;
+        let surface = session.free_surface().ok_or(Status::detected("no free surface for the picture"))?;
 
         let mut picture = picture_parameters(&sps, &pps, &header, session, surface, poc);
         let mut matrix = flat_iq_matrix();
@@ -349,16 +329,10 @@ impl H264Decoder {
         }
 
         let nv12 = session.download.read(surface)?;
-        let layout = session.download.layout().ok_or(Status {
-            operation: "the decoded image does not describe two planes",
-            code: -1,
-        })?;
+        let layout = session.download.layout().ok_or(Status::detected("the decoded image does not describe two planes"))?;
         nv12_to_i420(&nv12, &layout, session.width, session.height)
             .map(Some)
-            .ok_or(Status {
-                operation: "the decoded image is smaller than its own geometry",
-                code: -1,
-            })
+            .ok_or(Status::detected("the decoded image is smaller than its own geometry"))
     }
 }
 
@@ -658,9 +632,9 @@ impl VideoDecoder for H264Decoder {
         VideoCodec::H264
     }
 
-    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError> {
         self.decode_packet(data.as_bytes())
-            .map_err(|e| format!("VAAPI H.264 decode: {e}"))
+            .map_err(|e| CodecError::new(Codec::H264Vaapi, CodecErrorKind::Vaapi(e)))
     }
 }
 

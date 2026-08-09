@@ -15,6 +15,7 @@ use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use openh264::nal_units;
 
+use crate::codec_error::{Codec, CodecError, CodecErrorKind};
 use crate::video::{VideoCodec, VideoDecoder};
 
 /// An H.264 decoder.
@@ -29,9 +30,10 @@ impl H264Decoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if openh264 fails to initialise.
-    pub fn new() -> Result<Self, String> {
-        let inner = Decoder::new().map_err(|e| format!("H264 decoder init failed: {e}"))?;
+    /// Returns [`CodecError`] if openh264 fails to initialise.
+    pub fn new() -> Result<Self, CodecError> {
+        let inner = Decoder::new()
+            .map_err(|e| CodecError::new(Codec::H264Software, CodecErrorKind::Openh264(e)))?;
         Ok(Self {
             inner,
             reported: false,
@@ -44,7 +46,7 @@ impl H264Decoder {
     ///
     /// Returns an error if the packet cannot be split into NAL units at all. A packet that
     /// merely fails to complete a picture is not an error -- see below.
-    pub fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+    pub fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError> {
         let bytes = data.as_bytes();
         if bytes.is_empty() {
             return Ok(Vec::new());
@@ -60,8 +62,24 @@ impl H264Decoder {
                 Ok(Some(yuv)) => {
                     let (width, height) = yuv.dimensions();
                     let (pic_w, pic_h) = (
-                        u32::try_from(width).map_err(|_| "H264 decode: implausible width")?,
-                        u32::try_from(height).map_err(|_| "H264 decode: implausible height")?,
+                        u32::try_from(width).map_err(|source| {
+                            CodecError::new(
+                                Codec::H264Software,
+                                CodecErrorKind::ImplausibleGeometry {
+                                    field: "width",
+                                    source,
+                                },
+                            )
+                        })?,
+                        u32::try_from(height).map_err(|source| {
+                            CodecError::new(
+                                Codec::H264Software,
+                                CodecErrorKind::ImplausibleGeometry {
+                                    field: "height",
+                                    source,
+                                },
+                            )
+                        })?,
                     );
                     if !self.reported {
                         self.reported = true;
@@ -94,7 +112,10 @@ impl H264Decoder {
                         packed(yuv.u(), u_stride, cw, ch),
                         packed(yuv.v(), v_stride, cw, ch),
                     ) else {
-                        return Err("H264 decode: a plane is smaller than its stride implies".to_owned());
+                        return Err(CodecError::new(
+                            Codec::H264Software,
+                            CodecErrorKind::PlaneStrideMismatch,
+                        ));
                     };
                     let frame = I420Frame::from_planes(
                         pic_w,
@@ -109,7 +130,13 @@ impl H264Decoder {
                         0,
                     )
                     .ok_or_else(|| {
-                        format!("H264 decode: {pic_w}x{pic_h} planes too small for the stated geometry")
+                        CodecError::new(
+                            Codec::H264Software,
+                            CodecErrorKind::GeometryMismatch {
+                                width: pic_w,
+                                height: pic_h,
+                            },
+                        )
                     })?;
                     frames.push(frame);
                 }
@@ -138,7 +165,7 @@ impl VideoDecoder for H264Decoder {
         VideoCodec::H264
     }
 
-    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError> {
         Self::decode(self, data)
     }
 }

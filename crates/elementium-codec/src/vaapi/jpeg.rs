@@ -56,10 +56,7 @@ impl JpegDecoder {
     /// Returns [`Status`] if no device offers JPEG decoding, or if the resources cannot be
     /// created. Either means the caller should decode on the CPU instead.
     pub fn new(width: u32, height: u32, subsampling: Subsampling) -> Result<Self, Status> {
-        let display = Arc::new(Display::open_any().ok_or(Status {
-            operation: "no usable render node",
-            code: -1,
-        })?);
+        let display = Arc::new(Display::open_any().ok_or(Status::detected("no usable render node"))?);
         Self::with_display(&display, width, height, subsampling)
     }
 
@@ -136,21 +133,15 @@ impl JpegDecoder {
     /// Returns [`Status`] if the data is not a baseline JPEG this decoder was built for, or
     /// if the driver refuses it.
     pub fn decode(&mut self, jpeg: &[u8]) -> Result<SurfaceId, Status> {
-        let headers = parse(jpeg).map_err(|_| Status {
-            operation: "the data is not a baseline JPEG",
-            code: -1,
-        })?;
+        // The real `ParseError` matters -- "malformed" and "unsupported" call for different
+        // fixes on the caller's side, and both used to be flattened into a fabricated
+        // `code: -1` that named neither.
+        let headers = parse(jpeg).map_err(|e| Status::caused_by("the data is not a baseline JPEG", e))?;
         if u32::from(headers.width) != self.width || u32::from(headers.height) != self.height {
-            return Err(Status {
-                operation: "JPEG is not the negotiated size",
-                code: -1,
-            });
+            return Err(Status::detected("JPEG is not the negotiated size"));
         }
         if headers.subsampling() != Some(self.subsampling) {
-            return Err(Status {
-                operation: "JPEG subsampling changed mid-stream",
-                code: -1,
-            });
+            return Err(Status::detected("JPEG subsampling changed mid-stream"));
         }
 
         let index = self.next;
@@ -160,15 +151,9 @@ impl JpegDecoder {
                 .unwrap_or(0),
         )
         .unwrap_or(0);
-        let surface = self.surfaces.surfaces().get(slot).copied().ok_or(Status {
-            operation: "no surface available",
-            code: -1,
-        })?;
+        let surface = self.surfaces.surfaces().get(slot).copied().ok_or(Status::detected("no surface available"))?;
 
-        let scan = jpeg.get(headers.scan_data.clone()).ok_or(Status {
-            operation: "scan data out of range",
-            code: -1,
-        })?;
+        let scan = jpeg.get(headers.scan_data.clone()).ok_or(Status::detected("scan data out of range"))?;
 
         let mut picture = picture_parameters(&headers);
         let mut quantisers = quantisation_tables(&headers);

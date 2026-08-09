@@ -58,6 +58,7 @@ use super::jpeg_headers::Subsampling;
 use super::resource::{Buffer, Config, Context, SurfaceId, SurfacePool};
 use super::status::{Status, check};
 use super::vpp::Converter;
+use crate::codec_error::{Codec, CodecError, CodecErrorKind};
 use crate::video::{EncodedFrame, PixelLayout, VideoCodec, VideoEncoder};
 
 /// Macroblocks are 16x16, always, in every H.264 profile.
@@ -184,10 +185,7 @@ impl H264Encoder {
     /// generate its own headers, or if any resource cannot be created. Every one of those
     /// means the caller should fall back to software rather than fail the call.
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, Status> {
-        let display = Arc::new(Display::open_any().ok_or(Status {
-            operation: "no usable render node",
-            code: -1,
-        })?);
+        let display = Arc::new(Display::open_any().ok_or(Status::detected("no usable render node"))?);
 
         let mut attributes = [
             va::VAConfigAttrib {
@@ -300,20 +298,21 @@ impl VideoEncoder for H264Encoder {
         PixelLayout::Nv12
     }
 
-    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, String> {
+    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, CodecError> {
         if frame.width() != self.width || frame.height() != self.height {
-            return Err(format!(
-                "frame is {}x{}, encoder is {}x{}",
-                frame.width(),
-                frame.height(),
-                self.width,
-                self.height
+            return Err(CodecError::new(
+                Codec::H264Vaapi,
+                CodecErrorKind::SizeMismatch {
+                    expected: (self.width, self.height),
+                    actual: (frame.width(), frame.height()),
+                },
             ));
         }
-        self.encode_frame(frame).map_err(|e| e.to_string())
+        self.encode_frame(frame)
+            .map_err(|e| CodecError::new(Codec::H264Vaapi, CodecErrorKind::Vaapi(e)))
     }
 
-    fn encode_mjpeg(&mut self, jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, String>> {
+    fn encode_mjpeg(&mut self, jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, CodecError>> {
         if self.mjpeg_unavailable {
             return None;
         }
@@ -333,14 +332,22 @@ impl VideoEncoder for H264Encoder {
                 }
             }
         }
-        Some(self.encode_jpeg(jpeg).map_err(|e| e.to_string()))
+        Some(
+            self.encode_jpeg(jpeg)
+                .map_err(|e| CodecError::new(Codec::H264Vaapi, CodecErrorKind::Vaapi(e))),
+        )
     }
 
     fn request_keyframe(&mut self) {
         self.force_keyframe = true;
     }
 
-    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+    // Not really fallible: the bitrate is applied to the next frame's rate-control buffer
+    // (see `rate_control_parameters`) rather than requiring any driver call now, so there is
+    // nothing here that can fail. `Result` stays in the signature because the trait is
+    // shared with backends that genuinely can reject a bitrate (see `Vp8Encoder`), and
+    // per-implementation signatures were exactly what this shared error type exists to avoid.
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), CodecError> {
         self.bitrate_kbps = kbps;
         Ok(())
     }
@@ -353,20 +360,13 @@ impl H264Encoder {
     /// requirement: surfaces belong to a display, and a decoder that opened its own would
     /// force every frame back through system memory -- the entire cost being avoided.
     fn build_mjpeg_path(&self, jpeg: &[u8]) -> Result<MjpegPath, Status> {
-        let headers = super::jpeg_headers::parse(jpeg).map_err(|_| Status {
-            operation: "not a baseline JPEG",
-            code: -1,
-        })?;
+        // As in `jpeg::JpegDecoder::decode`: keep the real `ParseError` rather than
+        // discarding it into an unexplained `code: -1`.
+        let headers = super::jpeg_headers::parse(jpeg).map_err(|e| Status::caused_by("not a baseline JPEG", e))?;
         if u32::from(headers.width) != self.width || u32::from(headers.height) != self.height {
-            return Err(Status {
-                operation: "JPEG is not the negotiated size",
-                code: -1,
-            });
+            return Err(Status::detected("JPEG is not the negotiated size"));
         }
-        let subsampling = headers.subsampling().ok_or(Status {
-            operation: "unrecognised chroma subsampling",
-            code: -1,
-        })?;
+        let subsampling = headers.subsampling().ok_or(Status::detected("unrecognised chroma subsampling"))?;
 
         let display = self.context.display();
         let decoder = JpegDecoder::with_display(display, self.width, self.height, subsampling)?;
@@ -389,10 +389,7 @@ impl H264Encoder {
 
     /// Decode a JPEG on the GPU and encode the result, without it leaving the GPU.
     fn encode_jpeg(&mut self, jpeg: &[u8]) -> Result<Vec<EncodedFrame>, Status> {
-        let mut path = self.mjpeg.take().ok_or(Status {
-            operation: "no MJPEG path",
-            code: -1,
-        })?;
+        let mut path = self.mjpeg.take().ok_or(Status::detected("no MJPEG path"))?;
         let result = (|| {
             let decoded = path.decoder.decode(jpeg)?;
             // 4:2:0 decodes straight into what the encoder reads; anything else needs
@@ -409,10 +406,7 @@ impl H264Encoder {
 
     /// Upload one frame and encode it.
     fn encode_frame(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, Status> {
-        let source = self.input_for(self.frame_index).ok_or(Status {
-            operation: "no input surface available",
-            code: -1,
-        })?;
+        let source = self.input_for(self.frame_index).ok_or(Status::detected("no input surface available"))?;
 
         // Upload first: the surface must hold the picture before the encode is submitted.
         self.upload.upload(frame, source)?;
@@ -432,10 +426,7 @@ impl H264Encoder {
     fn submit_and_collect(&mut self, source: SurfaceId) -> Result<Vec<EncodedFrame>, Status> {
         let index = self.frame_index;
         let keyframe = self.wants_keyframe();
-        let reconstruction = self.reconstruction_for(index).ok_or(Status {
-            operation: "no reconstruction surface available",
-            code: -1,
-        })?;
+        let reconstruction = self.reconstruction_for(index).ok_or(Status::detected("no reconstruction surface available"))?;
 
         let coded = Buffer::empty(
             &self.context,
@@ -1085,7 +1076,19 @@ mod tests {
             0,
         )
         .expect("planes match the geometry");
-        assert!(VideoEncoder::encode(&mut encoder, &small).is_err());
+        let err = VideoEncoder::encode(&mut encoder, &small).expect_err("wrong size must be refused");
+        assert_eq!(err.codec, crate::codec_error::Codec::H264Vaapi);
+        assert!(
+            matches!(
+                err.kind,
+                crate::codec_error::CodecErrorKind::SizeMismatch {
+                    expected: (W, H),
+                    actual: (320, 240),
+                }
+            ),
+            "expected SizeMismatch{{expected:({W},{H}), actual:(320,240)}}, got {:?}",
+            err.kind
+        );
     }
 
     /// The only test that proves the encoder works: a reference decoder reconstructs the

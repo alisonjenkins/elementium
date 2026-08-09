@@ -34,6 +34,8 @@
 
 use elementium_types::{I420Frame, PlaintextMedia};
 
+use crate::codec_error::{Codec, CodecError, CodecErrorKind};
+
 /// A video codec this application can negotiate.
 ///
 /// The wire name is what appears in SDP, so it is part of the negotiation contract rather
@@ -190,7 +192,7 @@ pub trait VideoEncoder: Send {
     ///
     /// Returns an error if the frame does not match [`VideoEncoder::size`], if its planes
     /// are too small for its geometry, or if the codec fails.
-    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, String>;
+    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, CodecError>;
 
     /// Encode a JPEG directly, without decoding it first, if this encoder can.
     ///
@@ -207,7 +209,7 @@ pub trait VideoEncoder: Send {
     /// # Errors
     ///
     /// Returns the encoder's error if the fast path exists and failed.
-    fn encode_mjpeg(&mut self, _jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, String>> {
+    fn encode_mjpeg(&mut self, _jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, CodecError>> {
         None
     }
 
@@ -227,7 +229,7 @@ pub trait VideoEncoder: Send {
     /// # Errors
     ///
     /// Returns an error if the codec rejects the new rate.
-    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String>;
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), CodecError>;
 }
 
 /// Anything that turns encoded video back into frames.
@@ -242,7 +244,7 @@ pub trait VideoDecoder: Send {
     /// # Errors
     ///
     /// Returns an error if the codec rejects the packet.
-    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String>;
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError>;
 }
 
 /// The encoder for whichever codec was negotiated.
@@ -274,7 +276,7 @@ impl NegotiatedEncoder {
     /// # Errors
     ///
     /// Returns an error if the encoder fails to initialise.
-    pub fn new(codec: VideoCodec, config: EncoderConfig) -> Result<Self, String> {
+    pub fn new(codec: VideoCodec, config: EncoderConfig) -> Result<Self, CodecError> {
         match codec {
             VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Encoder::new(
                 config.width,
@@ -285,21 +287,15 @@ impl NegotiatedEncoder {
             VideoCodec::H264 => {
                 crate::vaapi::H264Encoder::new(config.width, config.height, config.bitrate_kbps)
                     .map(Self::VaapiH264)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| CodecError::new(Codec::H264Vaapi, CodecErrorKind::Vaapi(e)))
             }
             // Negotiable but not encodable here. Reported as an error rather than silently
             // substituting VP8: a caller that asked for H.264 has told the far end it will
             // send H.264, and sending something else produces a peer that receives
             // undecodable video with nothing to explain it.
             #[cfg(not(all(target_os = "linux", feature = "vaapi")))]
-            VideoCodec::H264 => Err(format!(
-                "no encoder available for {} on this build",
-                codec.sdp_name()
-            )),
-            VideoCodec::Av1 => Err(format!(
-                "no encoder available for {} on this build",
-                codec.sdp_name()
-            )),
+            VideoCodec::H264 => Err(CodecError::new(Codec::H264Vaapi, CodecErrorKind::Unsupported)),
+            VideoCodec::Av1 => Err(CodecError::new(Codec::Av1, CodecErrorKind::Unsupported)),
         }
     }
 }
@@ -329,7 +325,7 @@ impl VideoEncoder for NegotiatedEncoder {
         }
     }
 
-    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, String> {
+    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<EncodedFrame>, CodecError> {
         match self {
             Self::Vp8(e) => VideoEncoder::encode(e, frame),
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
@@ -337,7 +333,7 @@ impl VideoEncoder for NegotiatedEncoder {
         }
     }
 
-    fn encode_mjpeg(&mut self, jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, String>> {
+    fn encode_mjpeg(&mut self, jpeg: &[u8]) -> Option<Result<Vec<EncodedFrame>, CodecError>> {
         match self {
             Self::Vp8(e) => e.encode_mjpeg(jpeg),
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
@@ -353,7 +349,7 @@ impl VideoEncoder for NegotiatedEncoder {
         }
     }
 
-    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), CodecError> {
         match self {
             Self::Vp8(e) => VideoEncoder::set_bitrate(e, kbps),
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
@@ -376,7 +372,7 @@ impl NegotiatedDecoder {
     /// # Errors
     ///
     /// Returns an error if the decoder fails to initialise.
-    pub fn new(codec: VideoCodec) -> Result<Self, String> {
+    pub fn new(codec: VideoCodec) -> Result<Self, CodecError> {
         match codec {
             VideoCodec::Vp8 => Ok(Self::Vp8(crate::vpx_codec::Vp8Decoder::new()?)),
             VideoCodec::H264 => {
@@ -392,10 +388,7 @@ impl NegotiatedDecoder {
                 tracing::info!("H.264 will be decoded in software");
                 Ok(Self::H264(crate::h264_codec::H264Decoder::new()?))
             }
-            VideoCodec::Av1 => Err(format!(
-                "no decoder available for {} on this build",
-                codec.sdp_name()
-            )),
+            VideoCodec::Av1 => Err(CodecError::new(Codec::Av1, CodecErrorKind::Unsupported)),
         }
     }
 }
@@ -410,7 +403,7 @@ impl VideoDecoder for NegotiatedDecoder {
         }
     }
 
-    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError> {
         match self {
             Self::Vp8(d) => VideoDecoder::decode(d, data),
             Self::H264(d) => VideoDecoder::decode(d, data),
@@ -540,9 +533,9 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod decoder_selection_tests {
-    use super::{NegotiatedDecoder, VideoCodec, VideoDecoder};
+    use super::{NegotiatedDecoder, NegotiatedEncoder, VideoCodec, VideoDecoder};
 
     /// Whichever backend is chosen, it must decode the codec that was asked for.
     ///
@@ -561,9 +554,33 @@ mod decoder_selection_tests {
         assert_eq!(VideoDecoder::codec(&decoder), VideoCodec::Vp8);
     }
 
-    /// AV1 has no decoder on any path, and must say so rather than pick a wrong one.
+    /// AV1 has no decoder on any path, and must say so rather than pick a wrong one -- with
+    /// a specific `Unsupported` kind naming AV1, not a bare "it failed".
     #[test]
     fn av1_is_refused_rather_than_substituted() {
-        assert!(NegotiatedDecoder::new(VideoCodec::Av1).is_err());
+        // `expect_err` needs `NegotiatedDecoder: Debug`, which it deliberately is not (see
+        // its doc comment on why it stays free of a vtable and any per-call overhead); a
+        // `let else` reaches the error without that bound.
+        let Err(err) = NegotiatedDecoder::new(VideoCodec::Av1) else {
+            panic!("AV1 has no decoder");
+        };
+        assert_eq!(err.codec, super::Codec::Av1);
+        assert!(matches!(err.kind, super::CodecErrorKind::Unsupported));
+    }
+
+    /// AV1 has no encoder either, and the same refusal shape applies on the encode side.
+    #[test]
+    fn av1_encoding_is_refused_rather_than_substituted() {
+        let config = super::EncoderConfig {
+            width: 320,
+            height: 240,
+            bitrate_kbps: 500,
+            max_framerate: 30,
+        };
+        let Err(err) = NegotiatedEncoder::new(VideoCodec::Av1, config) else {
+            panic!("AV1 has no encoder");
+        };
+        assert_eq!(err.codec, super::Codec::Av1);
+        assert!(matches!(err.kind, super::CodecErrorKind::Unsupported));
     }
 }

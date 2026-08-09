@@ -63,18 +63,15 @@ impl Display {
             .read(true)
             .write(true)
             .open(path)
-            .map_err(|_| Status {
-                operation: "open render node",
-                code: -1,
-            })?;
+            // The real cause matters here: "permission denied" and "no such file" call for
+            // different fixes, and both used to be flattened into the same fabricated
+            // `code: -1` with nothing behind it.
+            .map_err(|e| Status::caused_by("open render node", e))?;
 
         // SAFETY: the descriptor is valid and outlives the display, which owns the file.
         let handle = unsafe { va::vaGetDisplayDRM(node.as_raw_fd()) };
         if handle.is_null() {
-            return Err(Status {
-                operation: "vaGetDisplayDRM",
-                code: -1,
-            });
+            return Err(Status::detected("vaGetDisplayDRM"));
         }
 
         let (mut major, mut minor): (c_int, c_int) = (0, 0);

@@ -81,10 +81,7 @@ impl Converter {
                 .unwrap_or(0),
         )
         .unwrap_or(0);
-        let output = self.outputs.surfaces().get(slot).copied().ok_or(Status {
-            operation: "no output surface available",
-            code: -1,
-        })?;
+        let output = self.outputs.surfaces().get(slot).copied().ok_or(Status::detected("no output surface available"))?;
 
         // Both regions cover the whole picture: this converts, it does not scale or crop.
         // Held in locals because the parameter buffer points at them and the driver reads

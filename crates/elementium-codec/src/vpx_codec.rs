@@ -2,6 +2,8 @@
 
 use elementium_types::{I420Frame, PlaintextMedia};
 
+use crate::codec_error::{Codec, CodecError, CodecErrorKind, VpxStatus};
+
 /// How much encoding quality to trade for speed, 0 (best quality) to 16 (fastest).
 ///
 /// libvpx defaults VP8 to 0, and the `vpx-encode` wrapper this code used to go through
@@ -59,10 +61,12 @@ impl Vp8Encoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the dimensions are not even (libvpx requires it for
-    /// 4:2:0 chroma) or if libvpx rejects the configuration.
+    /// Returns [`CodecErrorKind::OddDimensions`] if the dimensions are not even (libvpx
+    /// requires it for 4:2:0 chroma), [`CodecErrorKind::DefaultConfig`] if libvpx will not
+    /// produce a default configuration, or [`CodecErrorKind::EncoderInit`] if it refuses the
+    /// configuration built from it.
     #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
+    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, CodecError> {
         use std::mem::MaybeUninit;
         use vpx_sys::{
             VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION, vp8e_enc_control_id::VP8E_SET_CPUUSED,
@@ -71,8 +75,9 @@ impl Vp8Encoder {
         };
 
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(format!(
-                "VP8 requires even dimensions, got {width}x{height}"
+            return Err(CodecError::new(
+                Codec::Vp8,
+                CodecErrorKind::OddDimensions { width, height },
             ));
         }
 
@@ -83,7 +88,10 @@ impl Vp8Encoder {
             let mut cfg = MaybeUninit::zeroed().assume_init();
             let ret = vpx_codec_enc_config_default(iface, &raw mut cfg, 0);
             if ret != VPX_CODEC_OK {
-                return Err(format!("VP8 encoder config failed: {ret:?}"));
+                return Err(CodecError::new(
+                    Codec::Vp8,
+                    CodecErrorKind::DefaultConfig(VpxStatus(ret)),
+                ));
             }
 
             cfg.g_w = width;
@@ -135,7 +143,10 @@ impl Vp8Encoder {
                     likely_cause,
                     "Failed to initialize VP8 encoder"
                 );
-                return Err(format!("VP8 encoder init: {ret:?}"));
+                return Err(CodecError::new(
+                    Codec::Vp8,
+                    CodecErrorKind::EncoderInit(VpxStatus(ret)),
+                ));
             }
 
             // The speed/quality control the previous wrapper never applied to VP8.
@@ -204,8 +215,8 @@ impl Vp8Encoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if libvpx rejects the new configuration.
-    pub fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<(), String> {
+    /// Returns [`CodecErrorKind::SetBitrate`] if libvpx rejects the new configuration.
+    pub fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<(), CodecError> {
         if kbps == self.bitrate_kbps {
             return Ok(());
         }
@@ -216,7 +227,13 @@ impl Vp8Encoder {
             vpx_sys::vpx_codec_enc_config_set(std::ptr::addr_of_mut!(self.ctx), &raw const self.cfg)
         };
         if ret != vpx_sys::VPX_CODEC_OK {
-            return Err(format!("VP8 set bitrate {kbps}kbps: {ret:?}"));
+            return Err(CodecError::new(
+                Codec::Vp8,
+                CodecErrorKind::SetBitrate {
+                    kbps,
+                    source: VpxStatus(ret),
+                },
+            ));
         }
         tracing::info!(
             from_kbps = self.bitrate_kbps,
@@ -231,15 +248,15 @@ impl Vp8Encoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if `frame`'s dimensions don't match the encoder's
-    /// configured dimensions, if the planes are too small for those dimensions, or if
-    /// libvpx fails to encode.
+    /// Returns [`CodecErrorKind::SizeMismatch`] if `frame`'s dimensions don't match the
+    /// encoder's configured dimensions, [`CodecErrorKind::PlanesTooSmall`] if the planes are
+    /// too small for those dimensions, [`CodecErrorKind::ImageWrapFailed`] if libvpx will not
+    /// wrap the frame, or [`CodecErrorKind::Encode`] if libvpx fails to encode it.
     #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
-    pub fn encode(&mut self, frame: &I420Frame) -> Result<Vec<Vp8Packet>, String> {
+    pub fn encode(&mut self, frame: &I420Frame) -> Result<Vec<Vp8Packet>, CodecError> {
         use vpx_sys::{
-            VPX_CODEC_OK, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF, VPX_FRAME_IS_KEY,
-            vpx_codec_cx_pkt_kind, vpx_codec_encode, vpx_codec_get_cx_data, vpx_codec_iter_t,
-            vpx_img_fmt, vpx_img_wrap,
+            VPX_CODEC_OK, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF, vpx_codec_encode, vpx_img_fmt,
+            vpx_img_wrap,
         };
 
         if frame.width() != self.width || frame.height() != self.height {
@@ -251,12 +268,12 @@ impl Vp8Encoder {
                 error_kind = "frame_size_mismatch",
                 "VP8 encode: frame size does not match encoder configuration"
             );
-            return Err(format!(
-                "Frame size mismatch: encoder={}x{}, frame={}x{}",
-                self.width,
-                self.height,
-                frame.width(),
-                frame.height()
+            return Err(CodecError::new(
+                Codec::Vp8,
+                CodecErrorKind::SizeMismatch {
+                    expected: (self.width, self.height),
+                    actual: (frame.width(), frame.height()),
+                },
             ));
         }
 
@@ -264,15 +281,16 @@ impl Vp8Encoder {
         // overrun, not a bad picture. Checked here rather than trusted, using the frame's
         // own strides -- a padded plane is longer than width*height, and comparing against
         // the tightly-packed size would reject valid frames.
-        let (w, h) = (frame.width() as usize, frame.height() as usize);
+        let h = frame.height() as usize;
         let luma = frame.y_stride().saturating_mul(h);
         let chroma = frame.uv_stride().saturating_mul(h.div_ceil(2));
         if frame.y().len() < luma || frame.u().len() < chroma || frame.v().len() < chroma {
-            return Err(format!(
-                "I420 planes too small for {w}x{h}: y={} u={} v={}",
-                frame.y().len(),
-                frame.u().len(),
-                frame.v().len()
+            return Err(CodecError::new(
+                Codec::Vp8,
+                CodecErrorKind::PlanesTooSmall {
+                    width: frame.width(),
+                    height: frame.height(),
+                },
             ));
         }
 
@@ -305,7 +323,7 @@ impl Vp8Encoder {
                 frame.y().as_ptr().cast_mut(),
             );
             if img.is_null() {
-                return Err("VP8 encode: could not wrap the I420 frame".to_owned());
+                return Err(CodecError::new(Codec::Vp8, CodecErrorKind::ImageWrapFailed));
             }
 
             let img = &mut *img;
@@ -333,12 +351,41 @@ impl Vp8Encoder {
                     vpx_error_code = ?ret,
                     "VP8 encode failed"
                 );
-                return Err(format!("VP8 encode: {ret:?}"));
+                return Err(CodecError::new(Codec::Vp8, CodecErrorKind::Encode(VpxStatus(ret))));
             }
 
-            let mut iter: vpx_codec_iter_t = std::ptr::null();
+            // SAFETY: `self.ctx` was just encoded into above, and stays valid for the
+            // duration of this call.
+            packets.extend(Self::collect_encoded_packets(&mut self.ctx));
+        }
+
+        // One frame's worth of 90kHz ticks is added by the caller's cadence, not assumed
+        // here: `pts` only has to increase, and the RTP timestamps are derived separately
+        // from real elapsed time.
+        self.pts = self.pts.saturating_add(1);
+        Ok(packets)
+    }
+
+    /// Drain every packet libvpx produced for the frame just encoded.
+    ///
+    /// Split out of [`Vp8Encoder::encode`] so that function stays under the workspace's
+    /// line limit; the loop itself is unchanged.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must have just been used in a successful `vpx_codec_encode` call, and must
+    /// still be valid.
+    unsafe fn collect_encoded_packets(ctx: &mut vpx_sys::vpx_codec_ctx_t) -> Vec<Vp8Packet> {
+        use vpx_sys::{
+            VPX_FRAME_IS_KEY, vpx_codec_cx_pkt_kind, vpx_codec_get_cx_data, vpx_codec_iter_t,
+        };
+
+        let mut packets = Vec::new();
+        let mut iter: vpx_codec_iter_t = std::ptr::null();
+        // SAFETY: as documented on this function.
+        unsafe {
             loop {
-                let pkt = vpx_codec_get_cx_data(std::ptr::addr_of_mut!(self.ctx), &raw mut iter);
+                let pkt = vpx_codec_get_cx_data(std::ptr::addr_of_mut!(*ctx), &raw mut iter);
                 if pkt.is_null() {
                     break;
                 }
@@ -355,12 +402,7 @@ impl Vp8Encoder {
                 });
             }
         }
-
-        // One frame's worth of 90kHz ticks is added by the caller's cadence, not assumed
-        // here: `pts` only has to increase, and the RTP timestamps are derived separately
-        // from real elapsed time.
-        self.pts = self.pts.saturating_add(1);
-        Ok(packets)
+        packets
     }
 
     #[must_use]
@@ -401,9 +443,9 @@ impl Vp8Decoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the underlying libvpx decoder fails to
+    /// Returns [`CodecErrorKind::DecoderInit`] if the underlying libvpx decoder fails to
     /// initialize.
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, CodecError> {
         use std::mem::MaybeUninit;
         use vpx_sys::{
             VPX_CODEC_OK, VPX_DECODER_ABI_VERSION, vpx_codec_dec_cfg_t, vpx_codec_dec_init_ver,
@@ -436,7 +478,10 @@ impl Vp8Decoder {
                     vpx_error_code = ?ret,
                     "Failed to initialize VP8 decoder"
                 );
-                return Err(format!("VP8 decoder init failed: error code {ret:?}"));
+                return Err(CodecError::new(
+                    Codec::Vp8,
+                    CodecErrorKind::DecoderInit(VpxStatus(ret)),
+                ));
             }
 
             Ok(Self {
@@ -449,9 +494,11 @@ impl Vp8Decoder {
     ///
     /// # Errors
     ///
-    /// Returns an error string if the underlying libvpx decoder rejects the
-    /// packet.
-    pub fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+    /// Returns [`CodecErrorKind::PacketTooLarge`] if `data` cannot fit libvpx's `u32` length
+    /// field, [`CodecErrorKind::Decode`] if libvpx rejects the packet, or
+    /// [`CodecErrorKind::MalformedVpxImage`] / [`CodecErrorKind::ImplausibleGeometry`] if a
+    /// decoded image's own structure cannot be read -- see the variants' docs.
+    pub fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError> {
         use std::ptr;
         use vpx_sys::{VPX_CODEC_OK, vpx_codec_decode, vpx_codec_get_frame, vpx_codec_iter_t};
 
@@ -466,7 +513,10 @@ impl Vp8Decoder {
                 error_kind = "packet_too_large",
                 "VP8 decode: packet exceeds u32 length"
             );
-            "VP8 decode: packet too large".to_string()
+            CodecError::new(
+                Codec::Vp8,
+                CodecErrorKind::PacketTooLarge { len: data.len() },
+            )
         })?;
 
         // SAFETY: `self.ctx` was initialized by `Vp8Decoder::new`. `data`
@@ -489,7 +539,7 @@ impl Vp8Decoder {
                     vpx_error_code = ?ret,
                     "VP8 decode failed"
                 );
-                return Err(format!("VP8 decode failed: error code {ret:?}"));
+                return Err(CodecError::new(Codec::Vp8, CodecErrorKind::Decode(VpxStatus(ret))));
             }
 
             let mut frames = Vec::new();
@@ -503,70 +553,15 @@ impl Vp8Decoder {
                 let Some(im) = img.as_ref() else {
                     break;
                 };
-                let img_w = im.d_w;
-                let img_h = im.d_h;
-                let w_usize =
-                    usize::try_from(img_w).map_err(|_| "VP8 decode: invalid width".to_string())?;
-                let h_usize =
-                    usize::try_from(img_h).map_err(|_| "VP8 decode: invalid height".to_string())?;
-                let uv_w = w_usize / 2;
-                let uv_h = h_usize / 2;
-
-                let Some(&y_stride) = im.stride.first() else {
-                    return Err("VP8 decode: missing Y stride".to_string());
-                };
-                let Some(&u_stride) = im.stride.get(1) else {
-                    return Err("VP8 decode: missing U stride".to_string());
-                };
-                let Some(&v_stride) = im.stride.get(2) else {
-                    return Err("VP8 decode: missing V stride".to_string());
-                };
-                let y_stride = usize::try_from(y_stride)
-                    .map_err(|_| "VP8 decode: invalid Y stride".to_string())?;
-                let u_stride = usize::try_from(u_stride)
-                    .map_err(|_| "VP8 decode: invalid U stride".to_string())?;
-                let v_stride = usize::try_from(v_stride)
-                    .map_err(|_| "VP8 decode: invalid V stride".to_string())?;
-
-                let Some(&y_plane_ptr) = im.planes.first() else {
-                    return Err("VP8 decode: missing Y plane".to_string());
-                };
-                let Some(&u_plane_ptr) = im.planes.get(1) else {
-                    return Err("VP8 decode: missing U plane".to_string());
-                };
-                let Some(&v_plane_ptr) = im.planes.get(2) else {
-                    return Err("VP8 decode: missing V plane".to_string());
-                };
-
-                let mut y = vec![0u8; w_usize.saturating_mul(h_usize)];
-                let mut u = vec![0u8; uv_w.saturating_mul(uv_h)];
-                let mut v = vec![0u8; uv_w.saturating_mul(uv_h)];
-
-                // Copy row by row (stride may differ from width).
-                // SAFETY: libvpx guarantees each plane has at least
-                // `stride * height` (or `stride * uv_height` for chroma)
-                // valid bytes for a decoded image of dimensions w x h.
-                for (row, y_row) in y.chunks_mut(w_usize).enumerate() {
-                    let offset = row.saturating_mul(y_stride);
-                    let src = std::slice::from_raw_parts(y_plane_ptr.add(offset), w_usize);
-                    y_row.copy_from_slice(src);
-                }
-                for ((row, u_row), v_row) in u.chunks_mut(uv_w).enumerate().zip(v.chunks_mut(uv_w))
-                {
-                    let u_offset = row.saturating_mul(u_stride);
-                    let v_offset = row.saturating_mul(v_stride);
-                    let src_u = std::slice::from_raw_parts(u_plane_ptr.add(u_offset), uv_w);
-                    let src_v = std::slice::from_raw_parts(v_plane_ptr.add(v_offset), uv_w);
-                    u_row.copy_from_slice(src_u);
-                    v_row.copy_from_slice(src_v);
-                }
-
-                if let Some(frame) = I420Frame::from_planes(img_w, img_h, &y, &u, &v, 0) {
+                // SAFETY: `im` is the image `vpx_codec_get_frame` just returned, live for
+                // the duration of this call, as documented on `image_to_frame`; already
+                // inside this function's own `unsafe` block.
+                if let Some(frame) = Self::image_to_frame(im)? {
                     frames.push(frame);
                 } else {
                     tracing::warn!(
-                        width = img_w,
-                        height = img_h,
+                        width = im.d_w,
+                        height = im.d_h,
                         "decoded frame's planes do not match its geometry; dropped"
                     );
                 }
@@ -574,6 +569,80 @@ impl Vp8Decoder {
 
             Ok(frames)
         }
+    }
+
+    /// Convert one decoded libvpx image into an [`I420Frame`], copying row by row to honour
+    /// its own strides.
+    ///
+    /// Split out of [`Vp8Decoder::decode`] so that function stays under the workspace's line
+    /// limit; the logic is unchanged. `None` means the image's planes do not fit its own
+    /// stated geometry -- not an error worth failing the whole packet over, since the caller
+    /// logs and drops it.
+    ///
+    /// # Safety
+    ///
+    /// `im`'s `planes` and `stride` must describe a live decoded image: each plane must have
+    /// at least `stride * height` (or `stride * uv_height` for chroma) valid bytes, as
+    /// libvpx guarantees for the image `vpx_codec_get_frame` returns.
+    unsafe fn image_to_frame(im: &vpx_sys::vpx_image_t) -> Result<Option<I420Frame>, CodecError> {
+        let malformed = |field: &'static str| {
+            CodecError::new(Codec::Vp8, CodecErrorKind::MalformedVpxImage { field })
+        };
+        let implausible = |field: &'static str, source: std::num::TryFromIntError| {
+            CodecError::new(Codec::Vp8, CodecErrorKind::ImplausibleGeometry { field, source })
+        };
+
+        let (img_w, img_h) = (im.d_w, im.d_h);
+        let w_usize = usize::try_from(img_w).map_err(|e| implausible("width", e))?;
+        let h_usize = usize::try_from(img_h).map_err(|e| implausible("height", e))?;
+        let uv_w = w_usize / 2;
+        let uv_h = h_usize / 2;
+
+        let Some(&y_stride) = im.stride.first() else {
+            return Err(malformed("Y stride"));
+        };
+        let Some(&u_stride) = im.stride.get(1) else {
+            return Err(malformed("U stride"));
+        };
+        let Some(&v_stride) = im.stride.get(2) else {
+            return Err(malformed("V stride"));
+        };
+        let y_stride = usize::try_from(y_stride).map_err(|e| implausible("Y stride", e))?;
+        let u_stride = usize::try_from(u_stride).map_err(|e| implausible("U stride", e))?;
+        let v_stride = usize::try_from(v_stride).map_err(|e| implausible("V stride", e))?;
+
+        let Some(&y_plane_ptr) = im.planes.first() else {
+            return Err(malformed("Y plane"));
+        };
+        let Some(&u_plane_ptr) = im.planes.get(1) else {
+            return Err(malformed("U plane"));
+        };
+        let Some(&v_plane_ptr) = im.planes.get(2) else {
+            return Err(malformed("V plane"));
+        };
+
+        let mut y = vec![0u8; w_usize.saturating_mul(h_usize)];
+        let mut u = vec![0u8; uv_w.saturating_mul(uv_h)];
+        let mut v = vec![0u8; uv_w.saturating_mul(uv_h)];
+
+        // SAFETY: as documented on this function.
+        unsafe {
+            for (row, y_row) in y.chunks_mut(w_usize).enumerate() {
+                let offset = row.saturating_mul(y_stride);
+                let src = std::slice::from_raw_parts(y_plane_ptr.add(offset), w_usize);
+                y_row.copy_from_slice(src);
+            }
+            for ((row, u_row), v_row) in u.chunks_mut(uv_w).enumerate().zip(v.chunks_mut(uv_w)) {
+                let u_offset = row.saturating_mul(u_stride);
+                let v_offset = row.saturating_mul(v_stride);
+                let src_u = std::slice::from_raw_parts(u_plane_ptr.add(u_offset), uv_w);
+                let src_v = std::slice::from_raw_parts(v_plane_ptr.add(v_offset), uv_w);
+                u_row.copy_from_slice(src_u);
+                v_row.copy_from_slice(src_v);
+            }
+        }
+
+        Ok(I420Frame::from_planes(img_w, img_h, &y, &u, &v, 0))
     }
 }
 
@@ -596,7 +665,7 @@ impl crate::video::VideoEncoder for Vp8Encoder {
         Self::size(self)
     }
 
-    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<crate::video::EncodedFrame>, String> {
+    fn encode(&mut self, frame: &I420Frame) -> Result<Vec<crate::video::EncodedFrame>, CodecError> {
         Ok(Self::encode(self, frame)?
             .into_iter()
             .map(|p| crate::video::EncodedFrame {
@@ -611,7 +680,7 @@ impl crate::video::VideoEncoder for Vp8Encoder {
         Self::force_keyframe(self);
     }
 
-    fn set_bitrate(&mut self, kbps: u32) -> Result<(), String> {
+    fn set_bitrate(&mut self, kbps: u32) -> Result<(), CodecError> {
         self.set_bitrate_kbps(kbps)
     }
 }
@@ -621,7 +690,7 @@ impl crate::video::VideoDecoder for Vp8Decoder {
         crate::video::VideoCodec::Vp8
     }
 
-    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, String> {
+    fn decode(&mut self, data: &PlaintextMedia) -> Result<Vec<I420Frame>, CodecError> {
         Self::decode(self, data)
     }
 }
@@ -688,6 +757,30 @@ mod tests {
         );
     }
 
+    /// libvpx requires even dimensions for 4:2:0 chroma; an odd one must be refused before
+    /// any libvpx call is made, not handed to the encoder to fail confusingly.
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn odd_dimensions_are_refused_before_touching_libvpx() {
+        // `expect_err` needs `Vp8Encoder: Debug`, which it is not; a `let else` reaches the
+        // error without that bound.
+        let Err(err) = Vp8Encoder::new(321, 240, 500) else {
+            panic!("321 is odd");
+        };
+        assert_eq!(err.codec, crate::codec_error::Codec::Vp8);
+        assert!(
+            matches!(
+                err.kind,
+                crate::codec_error::CodecErrorKind::OddDimensions {
+                    width: 321,
+                    height: 240,
+                }
+            ),
+            "expected OddDimensions{{321,240}}, got {:?}",
+            err.kind
+        );
+    }
+
     #[test]
     #[allow(clippy::expect_used)]
     fn encode_rejects_mismatched_frame_dimensions() {
@@ -701,10 +794,18 @@ mod tests {
             0,
         )
         .expect("planes match the geometry");
-        let result = encoder.encode(&frame);
+        let err = encoder.encode(&frame).expect_err("size mismatch must be refused");
+        assert_eq!(err.codec, crate::codec_error::Codec::Vp8);
         assert!(
-            result.is_err_and(|e| e.contains("size mismatch")),
-            "expected a frame size mismatch error"
+            matches!(
+                err.kind,
+                crate::codec_error::CodecErrorKind::SizeMismatch {
+                    expected: (320, 240),
+                    actual: (640, 480),
+                }
+            ),
+            "expected SizeMismatch{{expected:(320,240), actual:(640,480)}}, got {:?}",
+            err.kind
         );
     }
 
@@ -714,7 +815,13 @@ mod tests {
         let mut decoder = Vp8Decoder::new().expect("decoder creation");
         // Not a valid VP8 bitstream -- libvpx must reject it, not panic or hang.
         let garbage = PlaintextMedia::from_encoder(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert!(decoder.decode(&garbage).is_err());
+        let err = decoder.decode(&garbage).expect_err("garbage must be refused");
+        assert_eq!(err.codec, crate::codec_error::Codec::Vp8);
+        assert!(
+            matches!(err.kind, crate::codec_error::CodecErrorKind::Decode(_)),
+            "expected Decode(_), got {:?}",
+            err.kind
+        );
     }
 
     /// A receiver that joins late can only start decoding at a keyframe, so the encoder
