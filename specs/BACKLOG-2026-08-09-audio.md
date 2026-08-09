@@ -33,7 +33,7 @@ brief stall anywhere becomes a burst.
 
 ## Open
 
-- [ ] **A1. Audio is sent in bursts after any stall.** A pacer at the engine's write
+- [x] **A1. FIXED, UNVERIFIED. Audio is sent in bursts after any stall.** A pacer at the engine's write
   boundary, deliberately minimal: it acts only when there is a backlog, never delays a frame
   that is already late — re-timing a late frame onto the grid only makes it later — and
   gives up and flushes if the backlog grows, because holding one is worse than a burst.
