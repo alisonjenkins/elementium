@@ -129,7 +129,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendSe
                         .try_state::<crate::encoded_streams::EncodedStreams>()
                         .map(|s| (*s).clone());
                     if let Some(streams) = streams {
-                        spawn_stream_responder(request, track_id, streams);
+                        spawn_stream_responder(frame_app.clone(), request, track_id, streams);
                     } else {
                         let response = Response::from_data(NOT_FOUND_BODY).with_status_code(503);
                         if let Err(e) = request.respond(response) {
@@ -292,8 +292,47 @@ impl Drop for FrameStreamReader {
     }
 }
 
+/// Ask the far end for a keyframe on the track a reader has just attached to.
+///
+/// A decoder can start on nothing but a keyframe, so a stream that opens between two of them
+/// shows nothing until the next -- about three seconds here, on top of the twenty-five to
+/// fifty-five seconds a remote participant's key already takes to arrive. One RTCP packet
+/// removes the smaller of those two waits.
+///
+/// Failure is logged at debug and otherwise ignored on purpose: a stream can legitimately
+/// open before the m-line it names is receiving anything, and the sender's own keyframe
+/// timer is the backstop either way.
+fn request_keyframe_for<R: Runtime>(app: &AppHandle<R>, track_id: &str) {
+    let Some(state) = app.try_state::<crate::commands::webrtc::WebRtcState>() else {
+        return;
+    };
+    // The pc id is the part of the key before the mid, and it is also how the engine indexes
+    // its connections -- so the same string that names the stream finds the connection.
+    let Some((pc_id, _)) = track_id.rsplit_once('-') else {
+        return;
+    };
+    let handle = state
+        .0
+        .lock()
+        .ok()
+        .and_then(|engine| engine.get(pc_id).map(|managed| managed.handle.clone()));
+    let Some(handle) = handle else {
+        return;
+    };
+    // Taken after the engine lock is released, never nested inside it: the I/O loop holds
+    // this connection's lock for the whole of each poll.
+    let Ok(mut pc) = handle.lock() else {
+        return;
+    };
+    match elementium_webrtc::peer_connection::request_remote_keyframe(&mut pc, track_id) {
+        Ok(()) => info!(track_id, "asked the far end for a keyframe for a new reader"),
+        Err(e) => debug!(track_id, error = %e, "could not request a keyframe yet"),
+    }
+}
+
 /// Answer a stream request on its own thread, so the accept loop is not held open by it.
-fn spawn_stream_responder(
+fn spawn_stream_responder<R: Runtime>(
+    app: AppHandle<R>,
     request: tiny_http::Request,
     track_id: String,
     streams: crate::encoded_streams::EncodedStreams,
@@ -303,6 +342,7 @@ fn spawn_stream_responder(
         .spawn(move || {
             info!(track_id = %track_id, "encoded stream opened");
             streams.subscribe(&track_id);
+            request_keyframe_for(&app, &track_id);
             let reader = FrameStreamReader {
                 streams,
                 track_id,

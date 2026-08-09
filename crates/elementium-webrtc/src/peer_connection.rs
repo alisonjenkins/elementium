@@ -1253,6 +1253,44 @@ pub fn write_data_channel(
     })
 }
 
+/// Ask the far end for a keyframe on a remote track, by its `<pc id>-<mid>` key.
+///
+/// A decoder can start on nothing but a keyframe, and a stream that opens between two of
+/// them waits for the next. Senders here emit one about every three seconds, so a remote
+/// tile that appears the moment a stream attaches would still show nothing for up to three
+/// seconds -- on top of the twenty-five to fifty-five seconds their key already takes to
+/// arrive. Asking costs one RTCP packet.
+///
+/// # Errors
+///
+/// [`RequestKeyframeError::UnparseableTrackKey`] if the key does not name a mid, and
+/// [`RequestKeyframeError::NotReceiving`] when str0m has no receiving stream for it -- which
+/// is an ordinary race rather than a fault, since a page-side stream can open before the
+/// m-line it names carries anything.
+pub fn request_remote_keyframe(
+    pc: &mut PeerConnectionInner,
+    track_key: &str,
+) -> Result<(), crate::error::RequestKeyframeError> {
+    use crate::error::RequestKeyframeError as Error;
+
+    // `<pc id>-<mid>`, and the pc id contains a dash of its own, so the split is from the
+    // right.
+    let (_, mid_text) = track_key
+        .rsplit_once('-')
+        .filter(|(_, mid)| !mid.is_empty())
+        .ok_or_else(|| Error::UnparseableTrackKey { key: track_key.to_owned() })?;
+
+    let mid = Mid::from(mid_text);
+    pc.rtc
+        .writer(mid)
+        .ok_or_else(|| Error::NotReceiving {
+            mid: mid_text.to_owned(),
+            source: str0m::RtcError::NotReceivingDirection,
+        })?
+        .request_keyframe(None, str0m::media::KeyframeRequestKind::Pli)
+        .map_err(|source| Error::NotReceiving { mid: mid_text.to_owned(), source })
+}
+
 /// Take every data-channel event queued since the last call, for the Tauri command layer
 /// to forward to the page. See [`DataChannelEvent`].
 #[must_use]
@@ -3885,5 +3923,42 @@ a=recvonly\r\n";
         let sdp = "v=0\r\nm=audio 9 x 111\r\na=mid:0\r\na=sendrecv\r\n";
         assert!(parse_remote_stream_ids(sdp).is_empty());
         assert!(parse_remote_stream_ids("").is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::wildcard_enum_match_arm)]
+mod request_keyframe_tests {
+    use super::{create_peer_connection, request_remote_keyframe};
+    use crate::error::RequestKeyframeError;
+
+    /// The key is `<pc id>-<mid>` and the pc id contains a dash of its own, so the split has
+    /// to be from the right. Splitting from the left yields a "mid" of the pc id's own hex
+    /// tail, which names no m-line and would make every request fail for a reason that looks
+    /// like a race rather than a parsing bug.
+    #[test]
+    fn a_mid_is_taken_from_the_right_of_the_track_key() {
+        let mut pc = create_peer_connection("pc-18ca3eca27b97075".to_owned());
+        // No m-lines are negotiated, so this cannot succeed -- but it must fail for the
+        // right reason, which is what distinguishes a parsed key from an unparsed one.
+        let err = request_remote_keyframe(&mut pc, "pc-18ca3eca27b97075-EgD")
+            .expect_err("nothing is receiving on a fresh connection");
+        match err {
+            RequestKeyframeError::NotReceiving { mid, .. } => assert_eq!(mid, "EgD"),
+            other @ RequestKeyframeError::UnparseableTrackKey { .. } => {
+                panic!("expected NotReceiving with the parsed mid, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_with_no_mid_is_reported_as_unparseable() {
+        let mut pc = create_peer_connection("pc-abc".to_owned());
+        for key in ["nomidhere", "trailing-"] {
+            match request_remote_keyframe(&mut pc, key) {
+                Err(RequestKeyframeError::UnparseableTrackKey { .. }) => {}
+                other => panic!("expected UnparseableTrackKey for {key:?}, got {other:?}"),
+            }
+        }
     }
 }

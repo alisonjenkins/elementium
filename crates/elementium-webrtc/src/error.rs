@@ -441,3 +441,24 @@ impl From<WebRtcError> for String {
         e.to_string()
     }
 }
+
+/// Why asking the far end for a keyframe failed.
+///
+/// Its own enum rather than a shared one because the two failures mean different things to
+/// the caller: an unparseable track key is a bug in whoever built it, while a mid that is
+/// not receiving is an ordinary race -- a page-side stream can open before the m-line it
+/// names is carrying anything.
+#[derive(Debug, thiserror::Error)]
+pub enum RequestKeyframeError {
+    /// The track key was not `<pc id>-<mid>`.
+    #[error("track key {key:?} does not name a mid")]
+    UnparseableTrackKey { key: String },
+
+    /// str0m has no receiving stream for that mid, so there is nobody to ask.
+    #[error("mid {mid} is not receiving, so no keyframe can be requested of it")]
+    NotReceiving {
+        mid: String,
+        #[source]
+        source: str0m::RtcError,
+    },
+}
