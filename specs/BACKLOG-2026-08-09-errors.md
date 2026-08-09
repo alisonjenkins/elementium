@@ -23,7 +23,7 @@ any of those 28, and none of them can be walked back to a cause.
 `SignalError` was the tenth and is now done: variants carry `url::ParseError` and the
 tungstenite error, and two variants that were never constructed are gone.
 
-## Open — the migration
+## The migration — complete
 
 Sequenced so the tree builds at every step. The order matters: deleting the escape hatch
 first would break roughly thirty call sites in one unatomic pile.
@@ -40,7 +40,7 @@ first would break roughly thirty call sites in one unatomic pile.
   offer/answer helpers while converting — it is near the 100-line limit and the two arms
   share nothing.
 
-- [ ] **X2. The IPC boundary.** Tauri v2 accepts any `Serialize` error; the
+- [x] **X2. DONE, narrowly and on evidence.** The IPC boundary. Tauri v2 accepts any `Serialize` error; the
   `Result<T, String>` constraint is our plumbing, not the framework's. Keep the string but
   make it a JSON envelope with a stable snake_case `code`, and route every command through
   one helper that walks `source()` into a single `tracing::error!` before flattening — so no
