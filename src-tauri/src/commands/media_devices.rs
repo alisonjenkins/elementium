@@ -2608,6 +2608,19 @@ fn retune_fec_if_needed(
     }
 }
 
+/// Opus only accepts 8/12/16/24/48kHz. A device that already opens at one of those keeps
+/// its rate unchanged (48000 is the common case and must pass through untouched); anything
+/// else -- 44100, 96000, 88200, 32000, 22050, 11025, ... -- is mapped to 48000, which is
+/// only correct paired with an actual resample of the captured samples (see
+/// `audio_capture_loop`, which resamples whenever the result of this function differs from
+/// the device's rate).
+const fn select_opus_rate(sample_rate: u32) -> u32 {
+    match sample_rate {
+        8000 | 12000 | 16000 | 24000 | 48000 => sample_rate,
+        _ => 48000,
+    }
+}
+
 /// Background thread: captures mic audio, Opus-encodes, and sends to a peer
 /// connection when `encode_tx` is connected (deferred connection pattern).
 fn audio_capture_loop(
@@ -2630,11 +2643,7 @@ fn audio_capture_loop(
     let sample_rate = capturer.sample_rate();
     let channels = capturer.channels();
 
-    // Opus supports 8/12/16/24/48kHz; resample 44.1k → 48k
-    let opus_rate = match sample_rate {
-        8000 | 12000 | 16000 | 24000 | 48000 => sample_rate,
-        _ => 48000,
-    };
+    let opus_rate = select_opus_rate(sample_rate);
 
     let encoder_config = OpusEncoderConfig::default();
     let mut encoder = match OpusEncoder::with_config(opus_rate, OUTBOUND_CHANNELS, encoder_config) {
@@ -2645,11 +2654,16 @@ fn audio_capture_loop(
         }
     };
 
+    // Logged once at startup, not just on mismatch: a silent rate mismatch is exactly what
+    // let unresampled 96k/88.2k/32k/22.05k/11.025k devices reach the encoder as if they were
+    // 48k, which sounds like the "robotic"/wrong-speed fault this project has chased before.
+    let resampling_active = sample_rate != opus_rate;
     tracing::info!(
         sample_rate,
         channels,
         opus_rate,
         encoded_channels = OUTBOUND_CHANNELS,
+        resampling_active,
         "Audio capture started"
     );
 
@@ -2715,10 +2729,18 @@ fn audio_capture_loop(
                 &data,
             );
 
-            // Simple sample rate conversion for 44.1kHz → 48kHz
-            if sample_rate == 44100 && opus_rate == 48000 {
+            // Resample whenever the device's actual rate differs from the Opus rate we
+            // picked above -- not just for the common 44.1k -> 48k case. Opus only accepts
+            // 8/12/16/24/48k, so any other device rate (96k, 88.2k, 32k, 22.05k, 11.025k,
+            // ...) was previously handed to the encoder unresampled, which the encoder then
+            // treated as if it were `opus_rate`: same sample count, wrong rate, so the far
+            // end hears it sped up or slowed down. `mono_fold`/`accumulator` below read
+            // `data` *after* this reassignment, so they always see the resampled sample
+            // count, not the captured one -- getting that ordering backwards would frame
+            // Opus packets at the wrong length instead of just the wrong pitch.
+            if resampling_active {
                 data = elementium_media::audio_playback::resample_interleaved(
-                    &data, channels, 44100, 48000,
+                    &data, channels, sample_rate, opus_rate,
                 );
             }
 
@@ -2911,6 +2933,80 @@ mod mute_flag_tests {
             dropped_because_muted(&held_by_pipeline),
             "the capture loop must see a mute set through the handle the command holds"
         );
+    }
+}
+
+#[cfg(test)]
+mod microphone_resample_tests {
+    use super::select_opus_rate;
+    use elementium_media::audio_playback::resample_interleaved;
+
+    /// Opus's five supported rates must pass through unchanged, or a capture at one of
+    /// them would be resampled for no reason. 48000 is the common case and the one most
+    /// likely to regress silently if this ever stopped being a no-op.
+    #[test]
+    fn a_device_already_at_an_opus_rate_needs_no_resample() {
+        assert_eq!(select_opus_rate(48_000), 48_000);
+        assert_eq!(select_opus_rate(16_000), 16_000);
+        assert_eq!(select_opus_rate(8_000), 8_000);
+        assert_eq!(select_opus_rate(12_000), 12_000);
+        assert_eq!(select_opus_rate(24_000), 24_000);
+    }
+
+    /// This was the one pairing the old code actually resampled, so it has to keep working
+    /// exactly as before while the fix widens the condition around it.
+    #[test]
+    fn a_44_1k_device_maps_to_48k_and_needs_resampling() {
+        let opus_rate = select_opus_rate(44_100);
+        assert_eq!(opus_rate, 48_000);
+        assert_ne!(44_100, opus_rate, "44.1k must not reach the encoder unresampled");
+    }
+
+    /// These rates fell through the old match arm with no resample at all: real device
+    /// rate handed to an encoder that believed it was 48kHz. That is the actual bug --
+    /// pinning that each of these is still recognised as needing a resample is the
+    /// regression test for it.
+    #[test]
+    fn unsupported_rates_above_and_below_44_1k_also_need_resampling() {
+        for device_rate in [96_000_u32, 88_200, 32_000, 22_050, 11_025] {
+            let opus_rate = select_opus_rate(device_rate);
+            assert_eq!(opus_rate, 48_000, "every unsupported rate maps to 48k");
+            assert_ne!(
+                device_rate, opus_rate,
+                "{device_rate} must be flagged for resampling, not passed through raw"
+            );
+        }
+    }
+
+    /// A 20ms Opus frame is a fixed sample count at whatever rate Opus ends up encoding at.
+    /// Resampling must land on exactly that count, not just something close to it -- a
+    /// one-sample drift here means every accumulated frame is the wrong length, which is
+    /// worse than the unresampled bug this replaces. The frame-duration algebra actually
+    /// cancels out the rate ratio exactly (`in_frames` samples times `to_rate / from_rate`
+    /// equals `to_rate`'s own 20ms sample count), so every case below lands on the same 960
+    /// samples that 48kHz uses natively.
+    #[test]
+    fn a_20ms_frame_resamples_to_the_opus_rates_own_20ms_frame_size() {
+        const FRAME_MS: u32 = 20;
+        let samples_per_20ms = |rate: u32| -> usize {
+            usize::try_from(rate.saturating_mul(FRAME_MS) / 1000).unwrap_or(0)
+        };
+
+        for device_rate in [48_000_u32, 44_100, 96_000, 16_000, 22_050] {
+            let opus_rate = select_opus_rate(device_rate);
+            let input_samples = samples_per_20ms(device_rate);
+            let expected_output_samples = samples_per_20ms(opus_rate);
+
+            let input = vec![0.0_f32; input_samples];
+            let output = resample_interleaved(&input, 1, device_rate, opus_rate);
+
+            assert_eq!(
+                output.len(),
+                expected_output_samples,
+                "device_rate={device_rate} opus_rate={opus_rate} must produce a full 20ms \
+                 Opus frame, not a partial or oversized one"
+            );
+        }
     }
 }
 
