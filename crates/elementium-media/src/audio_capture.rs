@@ -318,6 +318,97 @@ fn build_stream<T: cpal::Sample + cpal::SizedSample + Into<f32>>(
 /// a stereo capture, and cannot clip: the mean of values in `-1.0..=1.0` stays in range.
 ///
 /// `channels` of 0 or 1 returns the input unchanged.
+/// A channel is carrying signal if its recent peak has been above this.
+///
+/// About -66 dBFS: below any microphone's noise floor in a room with someone in it, and
+/// far above the exact zeros an unconnected input produces.
+const LIVE_CHANNEL_PEAK: f32 = 0.0005;
+
+/// How much of the remembered peak survives each buffer.
+///
+/// At one 20ms buffer per callback this forgets a channel over roughly two seconds, so a
+/// pause between words does not make a channel look dead, and unplugging a microphone is
+/// noticed before the call ends.
+const PEAK_DECAY: f32 = 0.99;
+
+/// Folds a multi-channel microphone down to the one channel everything downstream expects,
+/// averaging only the channels that are actually carrying something.
+///
+/// Averaging every channel is right for a stereo microphone and wrong for an audio
+/// interface. A Scarlett 2i2 with one microphone in input 1 presents two channels, the
+/// second of which is silence, and averaging them attenuates the speaker by exactly 6 dB.
+/// That is the difference between Opus encoding speech and Opus deciding the input is
+/// near-silence and emitting three-byte frames -- which is what "they cannot hear me, I
+/// break up" sounded like from the far end, with nothing dropped and nothing late.
+///
+/// Deliberately not applied to shared desktop audio, which is genuinely stereo: there,
+/// averaging is the correct fold and a channel that falls quiet is music, not a missing
+/// cable.
+pub struct MonoFold {
+    channels: u16,
+    /// Decaying peak per channel, in the order the device interleaves them.
+    peaks: Vec<f32>,
+}
+
+impl MonoFold {
+    #[must_use]
+    pub fn new(channels: u16) -> Self {
+        Self {
+            channels,
+            peaks: vec![0.0; usize::from(channels.max(1))],
+        }
+    }
+
+    /// The remembered peak of each channel, for reporting which input the voice is on.
+    #[must_use]
+    pub fn channel_peaks(&self) -> &[f32] {
+        &self.peaks
+    }
+
+    /// Fold one interleaved buffer to mono.
+    pub fn fold(&mut self, interleaved: &[f32]) -> Vec<f32> {
+        let ch = usize::from(self.channels);
+        if ch <= 1 {
+            return interleaved.to_vec();
+        }
+        for peak in &mut self.peaks {
+            *peak *= PEAK_DECAY;
+        }
+        for frame in interleaved.chunks_exact(ch) {
+            for (index, sample) in frame.iter().enumerate() {
+                if let Some(peak) = self.peaks.get_mut(index) {
+                    *peak = peak.max(sample.abs());
+                }
+            }
+        }
+
+        let live: Vec<bool> = self.peaks.iter().map(|p| *p > LIVE_CHANNEL_PEAK).collect();
+        let live_count = live.iter().filter(|l| **l).count();
+        // Nothing anywhere: the buffer is silence whichever way it is folded, and treating
+        // every channel as live keeps the arithmetic identical to the plain average.
+        let (divisor, use_all) = if live_count == 0 {
+            (ch, true)
+        } else {
+            (live_count, false)
+        };
+        // Channel counts are single digits, so the widening is exact.
+        let divisor = u16::try_from(divisor.max(1)).map_or(1.0_f32, f32::from);
+
+        interleaved
+            .chunks_exact(ch)
+            .map(|frame| {
+                let sum: f32 = frame
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| use_all || live.get(*i).copied().unwrap_or(true))
+                    .map(|(_, s)| *s)
+                    .sum();
+                sum / divisor
+            })
+            .collect()
+    }
+}
+
 #[must_use]
 pub fn downmix_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
     let ch = usize::from(channels);
@@ -332,6 +423,89 @@ pub fn downmix_to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
         .chunks_exact(ch)
         .map(|frame| frame.iter().sum::<f32>() / divisor)
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing)]
+mod mono_fold_tests {
+    use super::{MonoFold, downmix_to_mono};
+
+    /// One 20ms buffer at 48kHz, with `left` on channel 0 and `right` on channel 1.
+    fn stereo(left: f32, right: f32) -> Vec<f32> {
+        (0..960).flat_map(|_| [left, right]).collect()
+    }
+
+    /// The bug this exists for: an audio interface with one microphone in it.
+    ///
+    /// Two channels, one of them an unconnected input, and the plain average hands the
+    /// encoder exactly half the speaker's amplitude -- 6 dB, which is the difference
+    /// between Opus encoding speech and Opus calling it silence.
+    #[test]
+    fn a_silent_second_input_does_not_halve_the_microphone() {
+        let mut fold = MonoFold::new(2);
+        // Long enough for the level history to settle, as it would within a word.
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            out = fold.fold(&stereo(0.5, 0.0));
+        }
+        assert!(
+            (out[0] - 0.5).abs() < 1e-6,
+            "the microphone should arrive at its own level, got {}",
+            out[0]
+        );
+        assert!(
+            (downmix_to_mono(&stereo(0.5, 0.0), 2)[0] - 0.25).abs() < 1e-6,
+            "the plain average is what halved it, and is kept for genuinely stereo sources"
+        );
+    }
+
+    /// A real stereo microphone must still be averaged, or a loud left side alone would
+    /// come through at full scale and clip against a loud right side later.
+    #[test]
+    fn a_genuinely_stereo_source_is_still_averaged() {
+        let mut fold = MonoFold::new(2);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            out = fold.fold(&stereo(0.6, 0.2));
+        }
+        assert!(
+            (out[0] - 0.4).abs() < 1e-6,
+            "both channels carry signal, so both count: got {}",
+            out[0]
+        );
+    }
+
+    /// Silence must fold to silence whichever rule applies, with no divide by zero.
+    #[test]
+    fn silence_stays_silence() {
+        let mut fold = MonoFold::new(2);
+        let out = fold.fold(&stereo(0.0, 0.0));
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    /// A channel that falls quiet mid-call is remembered for a couple of seconds, so a
+    /// pause between words does not change the gain of the next one.
+    #[test]
+    fn a_pause_does_not_immediately_drop_a_channel() {
+        let mut fold = MonoFold::new(2);
+        for _ in 0..10 {
+            let _ = fold.fold(&stereo(0.6, 0.4));
+        }
+        let out = fold.fold(&stereo(0.6, 0.0));
+        assert!(
+            (out[0] - 0.3).abs() < 1e-6,
+            "channel 1 was live a moment ago and still counts: got {}",
+            out[0]
+        );
+    }
+
+    /// Mono input is passed straight through: there is nothing to decide.
+    #[test]
+    fn a_mono_device_is_untouched() {
+        let mut fold = MonoFold::new(1);
+        let out = fold.fold(&[0.1, 0.2, 0.3]);
+        assert_eq!(out, vec![0.1, 0.2, 0.3]);
+    }
 }
 
 #[cfg(test)]

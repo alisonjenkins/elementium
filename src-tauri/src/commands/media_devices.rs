@@ -1901,6 +1901,11 @@ struct OutboundAudioStats {
     /// Total encoded bytes this window, for a real transmitted bitrate.
     bytes_since_report: u64,
     /// Frames this window that encoded down to a silence-sized packet.
+    /// The level the fold last saw on each input channel of the capture device.
+    ///
+    /// Reported because "which input is the microphone actually plugged into" is otherwise
+    /// unanswerable from a log, and getting it wrong sounds exactly like a quiet room.
+    channel_peaks: Vec<f32>,
     silent_packets_since_report: u64,
     /// Frames this window that were audibly loud on input yet still encoded to a
     /// silence-sized packet.
@@ -1970,6 +1975,12 @@ impl OutboundAudioStats {
         self.last_frame_at = Some(now);
     }
 
+    /// Remember the fold's view of each input channel for the next report.
+    fn record_channel_peaks(&mut self, peaks: &[f32]) {
+        self.channel_peaks.clear();
+        self.channel_peaks.extend_from_slice(peaks);
+    }
+
     /// Record one encoded packet against the window's size statistics.
     fn record_packet(&mut self, len: usize, input_peak: f32) {
         self.bytes_since_report = self
@@ -2005,6 +2016,7 @@ impl OutboundAudioStats {
                 last_encoded_len = self.last_encoded_len,
                 applied_packet_loss_perc = self.applied_packet_loss_perc,
                 kbps = self.window_kbps(),
+                channel_peaks = ?self.channel_peaks,
                 silent_packets = self.silent_packets_since_report,
                 loud_but_silent = self.loud_but_silent_since_report,
                 max_gap_ms = self.max_gap_ms,
@@ -2299,6 +2311,9 @@ fn audio_capture_loop(
         / 1000;
     let frame_total_samples = frame_samples.saturating_mul(channels_usize);
     let mut accumulator: Vec<f32> = Vec::with_capacity(frame_total_samples.saturating_mul(2));
+    // Carries the per-channel level history the fold decides on, so it must outlive the
+    // callback rather than being rebuilt per buffer.
+    let mut mono_fold = elementium_media::audio_capture::MonoFold::new(channels);
 
     // Outbound-path counters.
     //
@@ -2353,8 +2368,11 @@ fn audio_capture_loop(
             }
 
             // Fold to mono before framing: the encoder, the RTP timeline and the SDP all
-            // describe a single channel from here on. See `downmix_to_mono`.
-            let mono = elementium_media::audio_capture::downmix_to_mono(&data, channels);
+            // describe a single channel from here on. Only the channels carrying signal
+            // are averaged -- see `MonoFold`, and the 6 dB an audio interface's unused
+            // second input used to cost.
+            let mono = mono_fold.fold(&data);
+            stats.record_channel_peaks(mono_fold.channel_peaks());
             accumulator.extend_from_slice(&mono);
 
             // Process complete Opus frames
