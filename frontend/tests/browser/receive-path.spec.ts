@@ -159,7 +159,7 @@ function startPublisher(
   badFrames = 0,
   video: "h264" | "vp8" | null = null,
   keyIndex = 0,
-  videoSize: "tiny" | null = null,
+  videoSize: "tiny" | "hd" | null = null,
 ): Publisher {
   const args = [
     "--sfu", SFU_HTTP,
@@ -469,7 +469,7 @@ async function measureVideo(
   codec: "h264" | "vp8",
   encrypted = true,
   keyIndex = 0,
-  videoSize: "tiny" | null = null,
+  videoSize: "tiny" | "hd" | null = null,
   // Separately settable so a run can point an *encrypted* publisher at a receiver holding
   // no key. Without a key the page builds a plain `Room` and installs no transform at all,
   // which is the only way to ask whether the packets assemble independently of whether
@@ -1001,6 +1001,31 @@ test.describe("browser receive path", () => {
       "if this is zero, Chrome never assembles our encrypted packets and the decrypt is " +
         "not implicated at all",
     ).toBeGreaterThan(5);
+  });
+
+  /**
+   * The size a real call publishes, rather than the size that is convenient to test.
+   *
+   * Every video test here ran at 320x240, where a keyframe is a handful of RTP packets.
+   * A call publishes 720p, where a keyframe is scores of them and a delta frame is
+   * several -- a different regime for the packetiser, the receiver's packet buffer, and
+   * anything that depends on a frame arriving whole. Reported symptoms from a real call
+   * were audio breaking up and video arriving as occasional stills, with the SFU seeing
+   * zero loss and zero NACKs from us but the receiver asking for a keyframe 65 times, so
+   * the size the tests never covered is worth covering.
+   */
+  test("encrypted VP8 at the size a call actually publishes", async ({ page }) => {
+    const stats = await measureVideo(page, "vp8", true, 0, "hd");
+    console.log(`  720p encrypted VP8: ${JSON.stringify(stats)}`);
+    expect(stats.framesDecoded, "frames must decode at 720p, not only at 320x240")
+      .toBeGreaterThan(50);
+    // The symptom to catch: a receiver that decodes only the keyframes it begs for shows
+    // a slideshow, and `framesDecoded` alone would call that a pass.
+    expect(
+      stats.keyFramesDecoded,
+      "if nearly every decoded frame is a keyframe, the deltas are being dropped and the " +
+        "far end is seeing a slideshow",
+    ).toBeLessThan(stats.framesDecoded / 4);
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.

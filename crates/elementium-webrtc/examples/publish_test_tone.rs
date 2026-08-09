@@ -106,6 +106,10 @@ fn mint_token(identity: &str, room: &str) -> String {
 fn video_size() -> (u32, u32) {
     match arg("--video-size").as_deref() {
         Some("tiny") => (160, 120),
+        // The size a real call actually publishes. A keyframe at 320x240 is a handful of
+        // RTP packets and one at 720p is scores of them, so a receiver that assembles the
+        // small one says nothing about the large one -- which is what a call sends.
+        Some("hd") => (1280, 720),
         _ => (320, 240),
     }
 }
