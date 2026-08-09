@@ -539,11 +539,25 @@ function enabledDescriptor(track: MediaStreamTrack): PropertyDescriptor | undefi
   return undefined;
 }
 
+/**
+ * The property a track carries its backend source on, read by `addTransceiver`.
+ *
+ * A `MediaStreamTrack`'s own `id` is a browser UUID, so nothing downstream can tell the
+ * camera from the screen share -- and the backend was therefore labelling *every* sending
+ * video transceiver as the camera. Two video tracks then competed for one m-line: the
+ * share went out down the camera's slot, so the far end saw the sender's face in the
+ * screen-share tile and a black square where the camera should be.
+ */
+export const TRACK_SOURCE = "__elementiumSource";
+
 function wireMuteToBackend(
   track: MediaStreamTrack,
   kind: "audio" | "video",
   source: string,
 ): void {
+  // Recorded here because this is the one place that already knows which of the user's
+  // tracks this is, for every track type.
+  (track as unknown as Record<string, unknown>)[TRACK_SOURCE] = source;
   const original = enabledDescriptor(track);
   if (!original?.get || !original.set) {
     console.warn("[Elementium] MediaStreamTrack.enabled is not an accessor; mute will not reach the backend");

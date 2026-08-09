@@ -240,6 +240,14 @@ pub struct JsTransceiverInfo {
     /// invents an msid track id the SFU has never seen, and the association falls back to
     /// the server's guess by media kind.
     pub track_id: Option<String>,
+    /// Which of the user's tracks this transceiver sends: `camera`, `screen_share`, and so
+    /// on, as the shim tagged it.
+    ///
+    /// The `MediaStreamTrack` id above is a browser UUID and says nothing about which track
+    /// it is, so without this every sending video transceiver was labelled the camera and
+    /// the screen share had to share its m-line -- which put the camera picture in the
+    /// far end's screen-share tile and left the camera tile black.
+    pub source: Option<String>,
 }
 
 #[command]
@@ -333,6 +341,7 @@ pub async fn create_offer(
                 &tc.kind,
                 tc.direction.as_deref(),
                 tc.track_id,
+                tc.source.as_deref(),
             )
         })
         .collect();

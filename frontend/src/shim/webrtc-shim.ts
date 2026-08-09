@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
 import { frameBytes } from "./frame-payload";
+import { TRACK_SOURCE } from "./media-devices";
 import {
   describeJoinRequest,
   describeRequest,
@@ -284,7 +285,12 @@ class ElementiumRTCPeerConnection extends EventTarget {
    * learns about once str0m's DCEP handshake completes -- see `handleBackendEvent`.
    */
   private _dataChannels = new Map<string, RTCDataChannel>();
-  private _pendingTransceivers: { kind: string; direction: string; trackId?: string }[] = [];
+  private _pendingTransceivers: {
+    kind: string;
+    direction: string;
+    trackId?: string;
+    source?: string;
+  }[] = [];
 
   // Event handler properties (on* style)
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;
@@ -788,7 +794,18 @@ class ElementiumRTCPeerConnection extends EventTarget {
     // same value as the `cid` of its AddTrackRequest, and the SFU pairs a published track
     // with an m-line by matching the two. Without it the SFU falls back to guessing by
     // media kind.
-    this._pendingTransceivers.push({ kind, direction, trackId: track?.id });
+    // `source` distinguishes the camera from the screen share. The track's own id is a
+    // browser UUID that means nothing to the backend, so without this both video
+    // transceivers are labelled the camera and the two tracks contend for one m-line.
+    const source = track
+      ? (track as unknown as Record<string, unknown>)[TRACK_SOURCE]
+      : undefined;
+    this._pendingTransceivers.push({
+      kind,
+      direction,
+      trackId: track?.id,
+      source: typeof source === "string" ? source : undefined,
+    });
 
     const mid = String(this._transceivers.length);
 

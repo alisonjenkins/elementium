@@ -470,7 +470,12 @@ impl TransceiverInfo {
     /// peer connection, where a participant publishes at most one track of each kind. A
     /// screen share arrives through `LiveKit`, which names its tracks explicitly.
     #[must_use]
-    pub fn from_js(kind: &str, direction: Option<&str>, track_id: Option<String>) -> Self {
+    pub fn from_js(
+        kind: &str,
+        direction: Option<&str>,
+        track_id: Option<String>,
+        source: Option<&str>,
+    ) -> Self {
         let kind = match kind {
             "video" => MediaKind::Video,
             _ => MediaKind::Audio,
@@ -481,9 +486,18 @@ impl TransceiverInfo {
             Some("inactive") => Direction::Inactive,
             _ => Direction::SendRecv,
         };
+        // Named by the caller where possible. Assuming the kind is enough was wrong the
+        // moment a second video track existed: both the camera and the screen share
+        // resolved to `video/camera`, the first m-line offered claimed it, and the other
+        // track had no m-line of its own. The far end saw the camera in the screen-share
+        // tile and nothing in the camera tile.
         let key = match direction {
             Direction::RecvOnly | Direction::Inactive => None,
-            _ => Some(default_key_for(kind)),
+            _ => Some(
+                source
+                    .and_then(|s| key_for_source(kind, s))
+                    .unwrap_or_else(|| default_key_for(kind)),
+            ),
         };
         Self {
             kind,
@@ -509,6 +523,21 @@ fn send_mid_for(
         .get(&key)
         .copied()
         .ok_or_else(|| crate::error::WebRtcError::NoMidForTrack(key.to_string()))
+}
+
+/// The track a named source refers to, or `None` when the name is not one we publish.
+///
+/// Unrecognised names fall back to the by-kind default rather than inventing a key: a track
+/// we cannot place is better sent on the default m-line than not at all, and the name comes
+/// from the frontend, which can be older than this list.
+fn key_for_source(kind: MediaKind, source: &str) -> Option<MediaTrackKey> {
+    match (kind, source) {
+        (MediaKind::Video, "camera") => Some(MediaTrackKey::camera()),
+        (MediaKind::Video, "screen_share") => Some(MediaTrackKey::screen_share()),
+        (MediaKind::Audio, "microphone") => Some(MediaTrackKey::microphone()),
+        (MediaKind::Audio, "screen_share_audio") => Some(MediaTrackKey::screen_share_audio()),
+        _ => None,
+    }
 }
 
 /// The track a connection sends on the first m-line of a given kind, absent other
@@ -2518,7 +2547,12 @@ mod offer_track_id_tests {
     /// RTCP reporting zero loss.
     #[test]
     fn a_transceiver_built_from_js_keeps_the_tracks_id() {
-        let tc = TransceiverInfo::from_js("audio", Some("sendrecv"), Some("abc-123".to_owned()));
+        let tc = TransceiverInfo::from_js(
+            "audio",
+            Some("sendrecv"),
+            Some("abc-123".to_owned()),
+            None,
+        );
         assert_eq!(tc.track_id.as_deref(), Some("abc-123"));
         assert_eq!(tc.kind, MediaKind::Audio);
         assert_eq!(tc.direction, Direction::SendRecv);
@@ -2527,9 +2561,41 @@ mod offer_track_id_tests {
     /// A transceiver with no track (a recvonly one, say) is still valid.
     #[test]
     fn a_transceiver_with_no_track_is_still_accepted() {
-        let tc = TransceiverInfo::from_js("video", Some("recvonly"), None);
+        let tc = TransceiverInfo::from_js("video", Some("recvonly"), None, None);
         assert!(tc.track_id.is_none());
         assert_eq!(tc.direction, Direction::RecvOnly);
+    }
+
+    /// The camera and the screen share are different tracks and must not share an m-line.
+    ///
+    /// Both used to resolve to `video/camera`, so the first video transceiver offered
+    /// claimed the key and the other track had none. The far end saw the camera picture in
+    /// the screen-share tile and a black square where the camera belonged.
+    #[test]
+    fn a_named_source_decides_which_track_a_transceiver_sends() {
+        let camera =
+            TransceiverInfo::from_js("video", Some("sendonly"), None, Some("camera"));
+        let share =
+            TransceiverInfo::from_js("video", Some("sendonly"), None, Some("screen_share"));
+        assert_eq!(camera.key, Some(MediaTrackKey::camera()));
+        assert_eq!(share.key, Some(MediaTrackKey::screen_share()));
+        assert_ne!(camera.key, share.key, "two video tracks, two keys");
+    }
+
+    /// A name this build does not know falls back rather than inventing a key: the frontend
+    /// can be older than this list, and a track sent on the default m-line beats one that
+    /// is never sent at all.
+    #[test]
+    fn an_unknown_source_falls_back_to_the_kind() {
+        let tc = TransceiverInfo::from_js("video", Some("sendonly"), None, Some("hologram"));
+        assert_eq!(tc.key, Some(MediaTrackKey::camera()));
+    }
+
+    /// A receiving transceiver is nobody's track of ours and must claim no key at all.
+    #[test]
+    fn a_receiving_transceiver_claims_nothing_even_when_named() {
+        let tc = TransceiverInfo::from_js("video", Some("recvonly"), None, Some("camera"));
+        assert_eq!(tc.key, None);
     }
 
     /// `LiveKit`'s SFU pairs an `AddTrackRequest` with an m-line by matching the request's
