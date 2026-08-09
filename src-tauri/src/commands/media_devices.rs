@@ -853,6 +853,20 @@ pub fn get_video_frame(
 /// disabled, which is the same failure mode as the bugs it exists to find.
 const DUMP_PREVIEW_SENTINEL: &str = "/tmp/elementium-dump-preview";
 
+/// Said once per process, so the warning about writing the camera to disk is not repeated
+/// every frame and is not skipped either.
+static DUMP_ANNOUNCED: std::sync::Once = std::sync::Once::new();
+
+/// How many preview frames have been written this session.
+static DUMPS_WRITTEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The most preview frames one session will write.
+///
+/// Twenty frames spread over twenty seconds is more than enough to see a tear or a colour
+/// swap, and bounds both the disk a forgotten sentinel can fill and how much of the user's
+/// camera ends up on it.
+const DUMP_LIMIT: u32 = 20;
+
 /// Write a preview frame to disk while dumping is enabled.
 ///
 /// Settles a question that cannot be answered from either end alone: whether a corrupt
@@ -874,8 +888,39 @@ fn maybe_dump_preview(frame_count: u64, rgba: &[u8], width: u32, height: u32) {
     {
         return;
     }
+    // Said once, loudly, and said at all.
+    //
+    // The sentinel is a file, which is what makes it usable mid-session and also what makes
+    // it outlive the session that created one: it was found still enabled days later,
+    // quietly writing pictures of the user to a world-readable directory, with only an INFO
+    // line per dump to say so. A diagnostic that records the camera has to announce itself
+    // in terms that make sense to whoever finds the log, and say how to stop it.
+    DUMP_ANNOUNCED.call_once(|| {
+        tracing::warn!(
+            sentinel = DUMP_PREVIEW_SENTINEL,
+            directory = "/tmp",
+            "camera frames are being written to disk as raw images, because preview dumping \
+             is switched on; delete the sentinel file to stop it"
+        );
+    });
+
+    // Bounded, because a sentinel nobody deletes otherwise fills the disk a megabyte at a
+    // time and leaves an hour of the user's camera lying in /tmp. Twenty frames spread over
+    // twenty seconds is more than enough to see a tear or a colour swap.
+    let dumped = DUMPS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if dumped >= DUMP_LIMIT {
+        if dumped == DUMP_LIMIT {
+            tracing::warn!(
+                limit = DUMP_LIMIT,
+                "preview dumping has written its limit and is stopping; restart the app to \
+                 collect more"
+            );
+        }
+        return;
+    }
+
     let path = format!("/tmp/elementium_preview_{frame_count}_{width}x{height}.rgba");
-    match std::fs::write(&path, rgba) {
+    match write_private(&path, rgba) {
         Ok(()) => tracing::info!(
             path,
             width,
@@ -885,6 +930,23 @@ fn maybe_dump_preview(frame_count: u64, rgba: &[u8], width: u32, height: u32) {
         ),
         Err(e) => tracing::warn!(path, reason = %e, "could not dump preview frame"),
     }
+}
+
+/// Write a file only its owner can read.
+///
+/// These are pictures of whoever is in front of the camera, in a directory every account on
+/// the machine can list. The default mode is whatever the umask allows, which on a normal
+/// desktop is world-readable.
+fn write_private(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
 /// How long a newly-subscribed peer may wait before it can decode anything.
