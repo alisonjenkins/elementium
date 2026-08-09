@@ -77,48 +77,23 @@ fn build_secrets_init_script(
     )
 }
 
-// Console interceptor: forwards all JS console output to Rust via Tauri IPC.
-// Uses __TAURI_INTERNALS__ directly (available before npm packages load).
-// Runs in all frames including Element Call iframe.
-const CONSOLE_BRIDGE_SCRIPT: &str = r"(function(){
-    if(window.__elementium_console_bridged) return;
-    window.__elementium_console_bridged = true;
-    var orig = {
-        log: console.log.bind(console),
-        warn: console.warn.bind(console),
-        error: console.error.bind(console),
-        debug: console.debug.bind(console),
-        info: console.info.bind(console)
-    };
-    function send(level, args) {
-        try {
-            var strs = [];
-            for (var i = 0; i < args.length; i++) {
-                try {
-                    strs.push(typeof args[i] === 'string' ? args[i] : JSON.stringify(args[i]));
-                } catch(e) {
-                    strs.push(String(args[i]));
-                }
-            }
-            var t = window.__TAURI_INTERNALS__;
-            if (t && t.invoke) {
-                t.invoke('console_log', { level: level, args: strs }).catch(function(){});
-            }
-        } catch(e) {}
-    }
-    console.log = function() { orig.log.apply(console, arguments); send('info', arguments); };
-    console.info = function() { orig.info.apply(console, arguments); send('info', arguments); };
-    console.warn = function() { orig.warn.apply(console, arguments); send('warn', arguments); };
-    console.error = function() { orig.error.apply(console, arguments); send('error', arguments); };
-    console.debug = function() { orig.debug.apply(console, arguments); send('debug', arguments); };
-    // Also capture unhandled errors and promise rejections
-    window.addEventListener('error', function(e) {
-        send('error', ['[Uncaught] ' + e.message + ' at ' + e.filename + ':' + e.lineno]);
-    });
-    window.addEventListener('unhandledrejection', function(e) {
-        send('error', ['[UnhandledRejection] ' + (e.reason && e.reason.stack ? e.reason.stack : String(e.reason))]);
-    });
-})();";
+// There used to be a second console interceptor here, hand-duplicated in Rust as a Tauri
+// `initialization_script` so it would run before any page script. It predated the frame tag
+// that `console-bridge.ts` now stamps on every line (`[main]`/`[widget]`), and because a
+// Tauri `initialization_script` only runs in the window's top document -- never in a nested
+// iframe -- it patched `console.log` in the main frame alone, milliseconds before the real
+// shim's own `setupConsoleBridge` ran there. `install()` in `install-report.ts` treats an
+// already-patched `console.log` as "this shim is already in place" and does not re-wrap it,
+// so the main frame was permanently stuck on this stale, untagged copy while the widget
+// iframe -- never touched by this script -- ran the current one. That is the entire reason a
+// live log showed 383 `[widget]` lines and zero `[main]` ones, and every widget-API line
+// twice: once tagged, once not.
+//
+// Removed rather than kept in sync, because it served no purpose the JS shim does not: both
+// use `__TAURI_INTERNALS__` directly and both are injected before Element Web's own scripts
+// (the shim script tag is the first one `patch-element-web.sh` writes into `index.html`).
+// One implementation, built by the one build that ships everything else, cannot itself drift
+// out of sync with the frame it runs in -- which two hand-kept copies already had.
 
 /// Load persisted secrets (if any backend is configured) for init-script injection.
 fn load_initial_secrets(
@@ -376,6 +351,11 @@ fn log_element_web_build() {
                     element_call_fingerprint = %field("elementCallFingerprint"),
                     autojoin_injected = %field("autojoinInjected"),
                     patches = %field("patches"),
+                    // What each frame's own console-bridge line (`shim installed,
+                    // build=...`) should say. Printed once here so a mismatch between this
+                    // and a frame's own line -- or between the two frames' lines -- is a
+                    // one-glance diff instead of a mystery.
+                    shim_fingerprint = %field("shimFingerprint"),
                     "Element Web build record"
                 );
             }
@@ -414,7 +394,7 @@ fn main() -> tauri::Result<()> {
         .as_ref()
         .map_or(BackendType::NeedsSetup, SecretBackend::kind);
     let secrets_script = build_secrets_init_script(&initial_secrets, backend_type);
-    let init_script = format!("{CONSOLE_BRIDGE_SCRIPT}\n{secrets_script}");
+    let init_script = secrets_script;
 
     let mut builder = tauri::Builder::default();
     builder = register_state(builder, backend);

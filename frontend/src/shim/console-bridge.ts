@@ -69,6 +69,12 @@ export function setupConsoleBridge(): void {
   w.__elementium_console_bridged = true;
   const frame = frameTag();
 
+  // Set by patch-element-web.sh from a hash of the exact shims file it copied into this
+  // frame -- see the comment on `SHIM_FINGERPRINT` there. Two frames are supposed to run the
+  // same build; when one of them does not, this is the one line that says so, instead of the
+  // fact only turning up as an unexplained difference in behaviour between frames.
+  const fingerprint = w.__ELEMENTIUM_SHIM_FINGERPRINT ?? "unknown";
+
   const orig = {
     log: console.log.bind(console),
     warn: console.warn.bind(console),
@@ -118,4 +124,9 @@ export function setupConsoleBridge(): void {
     // it is often the only thing that says *where*.
     send("error", [`[UnhandledRejection] ${describe(e.reason)}`] as unknown as IArguments);
   });
+
+  // Announced once, through `send` itself, so it carries the same `[frame]` tag as every
+  // other line and lands in the one log stream a bug report is read from -- not a side
+  // channel someone has to know to go looking for.
+  send("info", [`[Elementium] shim installed, build=${fingerprint}`] as unknown as IArguments);
 }
