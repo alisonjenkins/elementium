@@ -239,6 +239,40 @@ describe("negotiationneeded", () => {
     expect(offeredAudio).toBe(true);
   });
 
+  it("does not ask for an offer the caller is already building", async () => {
+    // The opening of every call, in the order it actually happens: livekit-client adds its
+    // receive transceivers *before the connection finishes being created* -- so the request
+    // is held -- and then immediately builds an offer describing exactly those. Releasing
+    // the held request afterwards made it build a second, empty offer; str0m had nothing
+    // new to say so the same SDP came back byte-for-byte, the SFU answered both, and
+    // livekit could not match the extra answer. `No pending offer to match answer`,
+    // negotiation timeout, connection closed -- every fifteen seconds, all call.
+    const pc = new ElementiumRTCPeerConnection();
+    let count = 0;
+    pc.addEventListener("negotiationneeded", () => {
+      count += 1;
+    });
+
+    // Before init resolves: held, because there is no connection to negotiate on yet.
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.addTransceiver("video", { direction: "recvonly" });
+
+    // The caller's own offer, covering exactly those.
+    const offer = await pc.createOffer();
+    await settle();
+    expect(count).toBe(0);
+
+    await pc.setLocalDescription(offer);
+    await pc.setRemoteDescription({ type: "answer", sdp: "v=0\r\n" });
+    await settle();
+    expect(count).toBe(0);
+
+    // A track published afterwards is in no offer, and must still be asked for.
+    pc.addTransceiver("audio", { direction: "sendonly" });
+    await settle();
+    expect(count).toBe(1);
+  });
+
   it("holds a request made before the connection exists, then serves it", async () => {
     // livekit-client adds its receive transceivers immediately after constructing the peer
     // connection, and attaches `onnegotiationneeded` afterwards. Firing in that window

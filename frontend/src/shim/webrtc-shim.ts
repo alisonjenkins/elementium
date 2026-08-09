@@ -846,7 +846,17 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   get sctp(): RTCSctpTransport | null { return null; }
 
   async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
-    return this.chainOperation(() => this.buildOffer(options));
+    // Counted as an operation in flight for the same reason a description is: while the
+    // caller is building an offer, asking it for another one is asking for a duplicate. It
+    // did exactly that at the start of every call, and the duplicate offer drew an extra
+    // answer the caller could not match.
+    this._descriptionsInFlight += 1;
+    try {
+      return await this.chainOperation(() => this.buildOffer(options));
+    } finally {
+      this._descriptionsInFlight -= 1;
+      this.recheckNegotiationSoon();
+    }
   }
 
   private async buildOffer(_options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
@@ -1389,6 +1399,17 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       // request would be consumed rather than served. Held until `init` completes, which
       // re-checks.
       console.log("[Elementium] negotiationneeded held: connection not created yet");
+      return;
+    }
+    if (this._offerDescribesSeq >= this._negotiationRequestSeq) {
+      // An offer already built covers everything asked for, so there is nothing to ask
+      // about. This is the ordinary opening of a call: livekit-client adds its receive
+      // transceivers, which sets the flag, and then builds an offer describing exactly
+      // those. Firing anyway made it build a second, empty offer -- str0m had nothing new
+      // to say so we returned the previous SDP byte-for-byte, the SFU answered both, and
+      // livekit could not match the extra answer: `No pending offer to match answer`,
+      // negotiation timeout, connection closed. Every fifteen seconds, all call.
+      this._negotiationNeeded = false;
       return;
     }
     if (this._descriptionsInFlight > 0) {
