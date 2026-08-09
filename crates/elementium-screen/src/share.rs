@@ -188,6 +188,16 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
 
     tracing::info!("requesting a screencast session from the XDG desktop portal");
 
+    // Each portal step is timed and logged separately because the three of them are
+    // indistinguishable from outside, and the difference matters: exactly one of them is
+    // supposed to put a picker in front of the user. A `SelectSources` that returns in a
+    // millisecond and a `Start` that returns in a millisecond together mean nobody was ever
+    // asked what to share -- which is the report we could not investigate from a log that
+    // said only "requesting" and then "granted". A step that takes seconds is a person
+    // reading a dialog. No source name, window title or pixel is recorded here; the timings
+    // and the step names are the whole of it.
+    let mut step = std::time::Instant::now();
+
     let proxy = Screencast::new()
         .await
         .map_err(|e| ShareError::NoBackend(e.to_string()))?;
@@ -195,6 +205,11 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
         .create_session(CreateSessionOptions::default())
         .await
         .map_err(|e| ShareError::Portal(e.to_string()))?;
+    tracing::info!(
+        elapsed_ms = %step.elapsed().as_millis(),
+        "portal screencast session created"
+    );
+    step = std::time::Instant::now();
 
     proxy
         .select_sources(
@@ -213,6 +228,11 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
         )
         .await
         .map_err(|e| ShareError::Portal(e.to_string()))?;
+    tracing::info!(
+        elapsed_ms = %step.elapsed().as_millis(),
+        "portal accepted the source selection request"
+    );
+    step = std::time::Instant::now();
 
     let response = proxy
         .start(&session, None, StartCastOptions::default())
@@ -220,6 +240,10 @@ pub async fn start_share() -> Result<ShareSession, ShareError> {
         .map_err(|e| ShareError::Portal(e.to_string()))?
         .response()
         .map_err(|_| ShareError::Cancelled)?;
+    tracing::info!(
+        elapsed_ms = %step.elapsed().as_millis(),
+        "portal returned from the picker"
+    );
 
     let stream = response.streams().first().ok_or(ShareError::Cancelled)?;
 
