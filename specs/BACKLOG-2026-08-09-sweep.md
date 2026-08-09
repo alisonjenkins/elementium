@@ -82,22 +82,26 @@ Two audits came back clean, which is worth as much as the findings:
   `CallFeed.clone()` is present in the bundle. This is the preview-loop leak again, reached
   by a different door.
 
-- [ ] **S8. A comment claims a check that does not exist.** MEDIUM.
+- [x] **S8. FIXED. A comment claims a check that does not exist.** MEDIUM.
   `set_local_description` is a documented no-op — reasonable, since str0m applied the SDP
   when it generated it — but its comment says the page's SDP is "checked rather than
   assumed" to match. The body logs and returns `Ok(())`. Either check it or stop saying so;
   a comment asserting a safety property nobody implemented is worse than no comment.
 
-- [ ] **S9. A device-selection landmine that has not gone off.** LOW. matrix-js-sdk builds
+- [x] **S9. FIXED. A device-selection landmine that has not gone off.** LOW. matrix-js-sdk builds
   `deviceId` as `{exact: ...}`; the shim casts it straight through to Rust, which expects a
   string, so IPC deserialization would fail and throw `NotAllowedError` for the whole
   `getUserMedia`. Element Call uses a plain string today, which is the only reason this is
   theoretical.
 
-- [ ] **S10. The by-kind fallback is still armed.** LOW. An unrecognised `source` string
+- [x] **S10. MADE AUDIBLE. The by-kind fallback is still armed.** LOW. An unrecognised `source` string
   from JS falls back to `default_key_for(kind)` — the exact rule that put the camera on the
   screen-share m-line. Deliberate, for forward compatibility with an older frontend, but it
   means a track type this list has not caught up with collides silently rather than failing.
+
+  Kept, because the reasoning for it holds. It is no longer silent: a track taking the
+  fallback names the source that was not recognised, so the fix next time is to add the
+  name rather than to spend a call and a screenshot rediscovering the collision.
 
 - [ ] **S11. Non-PipeWire camera selection is silently ignored.** LOW. On the nokhwa
   fallback path device ids cannot be resolved back to a node, and the capture path takes the
