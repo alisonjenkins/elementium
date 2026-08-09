@@ -67,6 +67,7 @@ pub(crate) fn encrypt_or_drop(
     kind: E2eeMediaKind,
     label: &str,
 ) -> Option<WireMedia> {
+    note_outbound_video_framing(&data, kind);
     let Some(ctx) = e2ee else {
         // Deliberate unencrypted send: named at the call into `WireMedia` so a forgotten
         // key can never silently become "shipped plaintext" -- it has to be written down.
@@ -79,6 +80,42 @@ pub(crate) fn encrypt_or_drop(
         },
         Some,
     )
+}
+
+/// How many outbound video frames pass between framing reports.
+///
+/// At 30fps this is one line every ten seconds -- enough to see the mix of key and delta
+/// framing over a whole call without the log becoming the call.
+const VIDEO_FRAMING_REPORT_EVERY: u64 = 300;
+
+/// Record, throttled, how the outbound path is about to frame a video frame for E2EE.
+///
+/// Exists because a framing disagreement with the receiver is invisible from this side:
+/// every counter stays healthy, encryption succeeds, and only the far end sees the
+/// authentication failures. The frame type and computed clear-header size logged here are
+/// the sender's half of that comparison -- lengths and types only, never contents.
+fn note_outbound_video_framing(data: &PlaintextMedia, kind: E2eeMediaKind) {
+    static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if kind == E2eeMediaKind::Audio {
+        return;
+    }
+    let n = FRAMES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if n != 1 && !n.is_multiple_of(VIDEO_FRAMING_REPORT_EVERY) {
+        return;
+    }
+    let bytes = data.as_bytes();
+    tracing::info!(
+        frame = n,
+        frame_len = bytes.len(),
+        header_size = elementium_e2ee::unencrypted_header_size(bytes, kind),
+        // VP8 frame tag bit 0 (RFC 6386 §9.1): 0 = key frame. Read here the same way the
+        // framing itself reads it, so the two can never disagree in the log.
+        keyframe = bytes.first().is_some_and(|b| b & 0x01 == 0),
+        media_kind = ?kind,
+        "outbound video framing"
+    );
 }
 
 /// Audio frames held while end-to-end encryption is still coming up.
