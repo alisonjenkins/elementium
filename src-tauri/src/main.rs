@@ -276,6 +276,13 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
+    // `RUST_LOG` (standard `tracing-subscriber::EnvFilter` syntax, e.g.
+    // `RUST_LOG=elementium_webrtc=debug`) overrides the default level, per-crate/module, with
+    // no rebuild -- see `docs/observability.md`. Default (no `RUST_LOG` set) is `info` for
+    // everything, which is deliberately below the per-packet `debug!` instrumentation in
+    // `elementium-webrtc`'s I/O loop (`UDP received`, `str0m event`): one 53-second call
+    // produced 6,156 lines of those two alone at `info`, most of a 30MB log file that told a
+    // reader nothing a healthy call did not already tell them. Set `RUST_LOG` to get them back.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let dir = dirs::data_dir().map(|d| d.join("io.github.elementium").join("logs"));
@@ -313,6 +320,15 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     {
         tracing::info!(log_dir = %dir.display(), "logging to file");
     }
+
+    // Said unconditionally, not folded into the line above, because that one only fires when
+    // the log directory could be created -- the override is worth knowing about either way.
+    tracing::info!(
+        default_level = "info",
+        override_env = "RUST_LOG",
+        "RUST_LOG (e.g. RUST_LOG=elementium_webrtc=debug) raises verbosity above the default; \
+         see docs/observability.md"
+    );
 
     guard
 }

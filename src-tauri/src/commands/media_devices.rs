@@ -2149,6 +2149,81 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 /// the peer connection went away and nothing re-attached this pipeline, so every later
 /// frame is wasted. Not connected at all is the ordinary state before a call starts, and
 /// counting it with the others would make a healthy idle pipeline look broken.
+/// How long a pipeline may run producing frames that reach no peer connection before that
+/// is worth a warning, rather than the ordinary gap while a pipeline starts up or a
+/// mid-call renegotiation is in flight.
+///
+/// A pipeline is legitimately unattached for a moment on every start and every device
+/// swap -- see [`connection_for_new_pipeline`] -- and warning about that trains whoever
+/// reads the log to expect and ignore this warning, which defeats the point of having it.
+/// Set with headroom over the longest ordinary handover this file waits out on purpose
+/// ([`AUDIO_HANDOVER_TIMEOUT`], 750ms) so a real outage is what crosses it.
+const NOT_CONNECTED_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the "reaching no peer connection" warning repeats while the outage continues.
+///
+/// The incident this exists for ran 45 seconds with nothing in the log but a counter
+/// nobody was watching, climbing once per captured frame. Once at the start of the outage
+/// and then here after is loud enough to notice on a scroll through the log and nowhere
+/// near the per-frame noise that a warning inside this same hot loop has produced before.
+const NOT_CONNECTED_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Tracks whether a capture pipeline has been producing frames that reach no peer
+/// connection for long enough to be a fault worth a log line, not ordinary startup or
+/// renegotiation churn -- and, once it has warned, keeps quiet until either the pipeline
+/// recovers or the next repeat interval is due.
+///
+/// Shaped after [`KeyframeAnswerWatch`]: the decision of whether to warn *now* is a pure
+/// function of counts and instants, kept apart from the act of warning, so it is testable
+/// at an arbitrary age without a real pipeline, a real clock, or a test that sleeps past a
+/// multi-second threshold.
+#[derive(Default)]
+struct NotConnectedWatch {
+    /// When the current run of unattached frames began. `None` means the most recent frame
+    /// reached a connection, so there is nothing outstanding to time.
+    unattached_since: Option<std::time::Instant>,
+    /// When this run last actually warned. `None` means it has not yet warned this run, so
+    /// the first warning only waits on [`NOT_CONNECTED_WARN_AFTER`], not the repeat gap.
+    last_warned: Option<std::time::Instant>,
+}
+
+impl NotConnectedWatch {
+    /// Whether a run open for `open_for`, having last warned `since_warn` ago (`None` if it
+    /// has never warned this run), is due another warning right now.
+    const fn is_due(open_for: std::time::Duration, since_warn: Option<std::time::Duration>) -> bool {
+        if open_for.as_millis() < NOT_CONNECTED_WARN_AFTER.as_millis() {
+            return false;
+        }
+        match since_warn {
+            None => true,
+            Some(gap) => gap.as_millis() >= NOT_CONNECTED_WARN_EVERY.as_millis(),
+        }
+    }
+
+    /// Record one frame that reached no connection. Returns whether to warn about it now.
+    fn record_skip(&mut self, now: std::time::Instant) -> bool {
+        let opened_at = *self.unattached_since.get_or_insert(now);
+        let open_for = now.saturating_duration_since(opened_at);
+        let since_warn = self.last_warned.map(|warned_at| now.saturating_duration_since(warned_at));
+        if Self::is_due(open_for, since_warn) {
+            self.last_warned = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record that a frame just reached a connection, closing out any open run.
+    ///
+    /// Closing on the first frame sent, not on the connection being merely attached, is
+    /// deliberate: an attached channel that only ever fills up or gets dropped by the peer
+    /// is not the recovery this exists to notice.
+    const fn record_sent(&mut self) {
+        self.unattached_since = None;
+        self.last_warned = None;
+    }
+}
+
 #[derive(Default)]
 struct OutboundVideoStats {
     captured: u64,
@@ -2166,6 +2241,9 @@ struct OutboundVideoStats {
     encode_errors: u64,
     undecodable: u64,
     bytes_since_report: u64,
+    /// Whether a sustained run of frames reaching no peer connection is currently open, and
+    /// whether it has warned about it. See [`NotConnectedWatch`].
+    unattached: NotConnectedWatch,
 }
 
 impl OutboundVideoStats {
@@ -2198,7 +2276,7 @@ impl OutboundVideoStats {
 }
 
 fn encode_and_send<E: VideoEncoder>(
-    key: MediaTrackKey,
+    id: PipelineId<'_>,
     encoder: &mut E,
     frame: &elementium_media::captured_frame::CapturedFrame,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
@@ -2232,15 +2310,24 @@ fn encode_and_send<E: VideoEncoder>(
                 None => {
                     stats.skipped_not_connected =
                         stats.skipped_not_connected.saturating_add(u64::try_from(packets.len()).unwrap_or(0));
+                    if stats.unattached.record_skip(std::time::Instant::now()) {
+                        tracing::warn!(
+                            track_id = id.track_id,
+                            skipped_not_connected = stats.skipped_not_connected,
+                            "captured video is reaching no peer connection; the far end is \
+                             receiving nothing from this track"
+                        );
+                    }
                 }
                 Some(tx) => {
                     for packet in packets {
                         let len = u64::try_from(packet.data.as_bytes().len()).unwrap_or(0);
-                        match tx.try_send(IoCommand::WriteVideo(key, packet.data, codec)) {
+                        match tx.try_send(IoCommand::WriteVideo(id.key, packet.data, codec)) {
                             Ok(()) => {
                                 stats.sent = stats.sent.saturating_add(1);
                                 stats.bytes_since_report =
                                     stats.bytes_since_report.saturating_add(len);
+                                stats.unattached.record_sent();
                             }
                             Err(tokio_mpsc::error::TrySendError::Full(_)) => {
                                 stats.dropped_channel_full =
@@ -2371,7 +2458,7 @@ fn encode_and_send_video_frame(
         &mut out.applied_bitrate_kbps,
         id.track_id,
     );
-    if encode_and_send(id.key, enc, frame, encode_tx, &mut out.stats) {
+    if encode_and_send(id, enc, frame, encode_tx, &mut out.stats) {
         out.keyframe.watch.observed_keyframe();
     }
 }
@@ -2414,6 +2501,9 @@ struct OutboundAudioStats {
     /// The level it is judging that gain from.
     gain_envelope: f32,
     silent_packets_since_report: u64,
+    /// Whether a sustained run of frames reaching no peer connection is currently open, and
+    /// whether it has warned about it. See [`NotConnectedWatch`].
+    unattached: NotConnectedWatch,
     /// Frames this window that were audibly loud on input yet still encoded to a
     /// silence-sized packet.
     ///
@@ -2589,6 +2679,14 @@ fn encode_and_send_frame(
     // Only encode and send if connected to a peer connection
     if !encode_tx.lock().is_ok_and(|g| g.is_some()) {
         stats.skipped_not_connected = stats.skipped_not_connected.saturating_add(1);
+        if stats.unattached.record_skip(std::time::Instant::now()) {
+            tracing::warn!(
+                track = %key,
+                skipped_not_connected = stats.skipped_not_connected,
+                "captured audio is reaching no peer connection; the far end is receiving \
+                 nothing from this track"
+            );
+        }
         return;
     }
 
@@ -2611,7 +2709,10 @@ fn encode_and_send_frame(
                 ctx.frame_samples,
             );
             match deliver(encode_tx, IoCommand::WriteAudio(key, encoded_frame)) {
-                Delivery::Sent => stats.sent = stats.sent.saturating_add(1),
+                Delivery::Sent => {
+                    stats.sent = stats.sent.saturating_add(1);
+                    stats.unattached.record_sent();
+                }
                 Delivery::Full => {
                     stats.dropped_channel_full = stats.dropped_channel_full.saturating_add(1);
                 }
@@ -3361,6 +3462,101 @@ mod keyframe_answer_watch_tests {
         assert!(
             !watch.warned,
             "a request that just arrived has not had time to prove it is unanswered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod not_connected_watch_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{NOT_CONNECTED_WARN_AFTER, NOT_CONNECTED_WARN_EVERY, NotConnectedWatch};
+
+    /// The startup/renegotiation gap this must not warn about: a pipeline is routinely
+    /// unattached for a moment after `getUserMedia` or a device swap, well under
+    /// `NOT_CONNECTED_WARN_AFTER`. A naive "warn on the first skip" implementation fails
+    /// this immediately -- which is exactly the noise this design exists to avoid.
+    #[test]
+    fn a_brief_gap_does_not_warn() {
+        let mut watch = NotConnectedWatch::default();
+        let start = Instant::now();
+        assert!(!watch.record_skip(start), "the very first skip must never warn on its own");
+        assert!(
+            !watch.record_skip(start + Duration::from_millis(500)),
+            "a gap well under the threshold must stay quiet"
+        );
+    }
+
+    /// The incident this exists for: once a run of skips has been open long enough, it must
+    /// actually speak. A naive implementation that only records the skip without ever
+    /// returning `true` (i.e. never warns) passes `a_brief_gap_does_not_warn` above but
+    /// fails this -- so both are needed to pin the behaviour down.
+    #[test]
+    fn a_sustained_outage_warns_once_it_crosses_the_threshold() {
+        let mut watch = NotConnectedWatch::default();
+        let start = Instant::now();
+        watch.record_skip(start);
+        assert!(
+            !watch.record_skip(
+                start + NOT_CONNECTED_WARN_AFTER.saturating_sub(Duration::from_millis(1))
+            ),
+            "must not fire a moment before the threshold"
+        );
+        assert!(
+            watch.record_skip(start + NOT_CONNECTED_WARN_AFTER),
+            "must fire once the run has been open at least NOT_CONNECTED_WARN_AFTER"
+        );
+    }
+
+    /// Once it has warned, it must not warn again on every subsequent skipped frame -- a
+    /// pipeline producing frames at tens of times a second would otherwise turn one warning
+    /// into the exact per-frame flood this file has already been bitten by once. It should,
+    /// however, warn again after the repeat interval, since a 45-second outage deserves more
+    /// than one line.
+    #[test]
+    fn a_continuing_outage_is_throttled_to_the_repeat_interval() {
+        let mut watch = NotConnectedWatch::default();
+        let start = Instant::now();
+        assert!(!watch.record_skip(start), "the run must open before it can be due");
+        assert!(watch.record_skip(start + NOT_CONNECTED_WARN_AFTER));
+
+        // Every frame in between must stay quiet, not just the very next one.
+        for step in 1..20 {
+            let now = start + NOT_CONNECTED_WARN_AFTER + Duration::from_millis(step * 10);
+            assert!(
+                !watch.record_skip(now),
+                "must not warn again before the repeat interval elapses"
+            );
+        }
+
+        let repeat_due = start + NOT_CONNECTED_WARN_AFTER + NOT_CONNECTED_WARN_EVERY;
+        assert!(
+            watch.record_skip(repeat_due),
+            "a still-open outage must warn again once the repeat interval has elapsed"
+        );
+    }
+
+    /// Frames reaching a connection again must clear the state, so a recovered pipeline does
+    /// not keep warning and a later, unrelated outage is judged on its own merits rather
+    /// than inheriting an already-tripped `last_warned`.
+    #[test]
+    fn recovery_resets_the_run_so_a_later_outage_warns_again() {
+        let mut watch = NotConnectedWatch::default();
+        let start = Instant::now();
+        assert!(!watch.record_skip(start), "the run must open before it can be due");
+        assert!(watch.record_skip(start + NOT_CONNECTED_WARN_AFTER));
+
+        watch.record_sent();
+        assert!(watch.unattached_since.is_none(), "recovery must clear the open run");
+        assert!(watch.last_warned.is_none(), "recovery must clear the warned state too");
+
+        // A fresh outage starting right after recovery must go through the same quiet
+        // period again, not warn immediately because a previous run once crossed it.
+        let restart = start + NOT_CONNECTED_WARN_AFTER + Duration::from_secs(1);
+        assert!(!watch.record_skip(restart), "a fresh outage must not warn on its first skip");
+        assert!(
+            watch.record_skip(restart + NOT_CONNECTED_WARN_AFTER),
+            "but must still be able to warn once it, too, is sustained"
         );
     }
 }
