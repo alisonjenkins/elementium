@@ -44,13 +44,38 @@ on a delta**. If our delta framing disagrees with what livekit's decryptor compu
 authentication fails on every delta and succeeds on every keyframe. The picture is therefore
 never black, which is why this has never looked like a crypto fault.
 
-To settle it: log frame type and computed header size on the outbound path, throttled, for
-one call. If deltas are being framed as keyframes or vice versa, that is the bug. If the
-framing is right, the next suspects are the RTP payload descriptor str0m writes, and whether
-the receiver is reassembling our frames at all.
+### Three theories eliminated, overnight, on primary sources
 
-Then: a regression test that encrypts a real delta frame from our own encoder and decrypts it
-with the same rules livekit uses, so this cannot come back silently.
+Recorded so none of them is investigated a fourth time. Every one of them was plausible and
+matched the symptom; none survived contact with the source.
+
+1. **E2EE delta framing.** livekit's `UNENCRYPTED_BYTES = {key: 10, delta: 3, audio: 1}`
+   (`e2ee/constants.ts`), applied by `FrameCryptor.getUnencryptedBytes` to the whole
+   depacketized frame. Our `framing()` computes the same numbers over the same bytes, and
+   what reaches `encrypt_frame` is the bare VP8 frame starting with its frame tag. Existing
+   tests already round-trip a delta under these rules.
+2. **Missing VP8 PictureID.** True that we send none -- str0m's `Vp8Packetizer::default()`
+   has `enable_picture_id: false`, private, no setter. But libwebrtc's
+   `RtpFrameReferenceFinder::Impl::ManageFrame` dispatches to `RtpSeqNumOnlyRefFinder` when
+   `pictureId == kNoPictureId`, a complete fallback rather than an error path, and LiveKit's
+   VP8 munger only reads the I/L/T/K fields when the X bit is set and gates its logic on
+   `pictureIdUsed`. RFC 7741 marks it optional and both implementations mean it. Now pinned
+   by `crates/elementium-webrtc/tests/vp8_payload_descriptor.rs`.
+3. **The send path generally.** Inspected directly: the payload type is chosen to permit
+   fragmentation, RTP timestamps are derived from elapsed time on the 90kHz clock rather
+   than from a frame counter, `writer.write()` is called exactly once per encoded frame, and
+   the encoder runs `lag_in_frames: 0`, CBR, realtime deadline, error-resilient on.
+
+### What that leaves
+
+Everything measurable from our side is correct, and every remaining hypothesis is about what
+the *receiver* does with what we send. That evidence does not exist in our logs and cannot
+be obtained by reading more of our code — which is the strongest argument for the end-to-end
+harness being built alongside this: a Playwright receiver whose `getStats()` and console we
+control turns "they say it looks bad" into `framesDecoded` and `keyFramesDecoded` per second.
+
+The next step is therefore not another theory. It is to run the harness, read the receiver's
+own numbers, and let them say which half of the link is at fault.
 
 ## P1 — Encryption keys: one fault outbound, one inbound
 
