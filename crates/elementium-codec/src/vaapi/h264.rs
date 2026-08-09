@@ -660,7 +660,46 @@ impl H264Encoder {
             w.ue(0); // frame_crop_top_offset
             w.ue(coded_height.saturating_sub(self.height).saturating_div(2));
         }
-        w.bit(false); // vui_parameters_present_flag
+        // VUI with bitstream restriction, written to match what libwebrtc would otherwise
+        // write for us. This is not a quality setting; it is the fix for a bug that took
+        // this project a very long time to find.
+        //
+        // Chrome's receive path runs `SpsVuiRewriter::ParseAndRewriteSps` on every incoming
+        // SPS and *replaces the payload* when the VUI's bitstream restriction is missing.
+        // That happens before the insertable-streams transform, so under E2EE the worker is
+        // handed a keyframe whose SPS is no longer the one we encrypted. Our AAD is the
+        // clear header, which for H.264 spans the SPS -- so AES-GCM authentication fails,
+        // every keyframe is dropped, and the receiver counts packets while assembling no
+        // frames and asking for a keyframe forever.
+        //
+        // Writing the canonical post-rewrite values makes the rewrite a no-op, so the bytes
+        // the worker authenticates are the bytes we sent. The values below are the ones
+        // libwebrtc's own `sps_vui_rewriter.cc` treats as requiring no change:
+        // `max_num_reorder_frames = 0` and `max_dec_frame_buffering = max_num_ref_frames`.
+        //
+        // Only the encrypted path strictly needs this, but it is written unconditionally:
+        // an SPS that differs depending on whether encryption is on would mean two bitstream
+        // shapes to reason about, and the receiver rewrites the other one anyway.
+        w.bit(true); // vui_parameters_present_flag
+        w.bit(false); // aspect_ratio_info_present_flag
+        w.bit(false); // overscan_info_present_flag
+        w.bit(false); // video_signal_type_present_flag
+        w.bit(false); // chroma_loc_info_present_flag
+        w.bit(false); // timing_info_present_flag
+        w.bit(false); // nal_hrd_parameters_present_flag
+        w.bit(false); // vcl_hrd_parameters_present_flag
+        w.bit(false); // pic_struct_present_flag
+        w.bit(true); // bitstream_restriction_flag
+        w.bit(true); // motion_vectors_over_pic_boundaries_flag
+        w.ue(0); // max_bytes_per_pic_denom
+        w.ue(0); // max_bits_per_mb_denom
+        w.ue(16); // log2_max_mv_length_horizontal
+        w.ue(16); // log2_max_mv_length_vertical
+        // Zero reordering, and a DPB matching `max_num_ref_frames` above: together these are
+        // what the rewriter checks for, and they are also true of what this encoder emits --
+        // it produces no B-frames and keeps one reference.
+        w.ue(0); // max_num_reorder_frames
+        w.ue(1); // max_dec_frame_buffering
         w.trailing_bits();
 
         // nal_ref_idc 3: a parameter set is needed to decode everything that follows.

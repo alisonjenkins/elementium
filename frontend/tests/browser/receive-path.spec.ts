@@ -724,13 +724,6 @@ test.describe("browser receive path", () => {
    * exists rather than a Rust round trip through our own code.
    */
   test("H.264 video we encrypt is decrypted by livekit's worker", async ({ page }) => {
-    test.fixme(
-      true,
-      "Encrypted H.264 never assembles a frame at the receiver, with or without the page " +
-        "holding the key. Our encryption is provably correct -- a frame decrypts cleanly " +
-        "through livekit's own worker functions -- and the encrypted frame carries the " +
-        "same Annex B NAL structure as the plain one. See 005 T020.",
-    );
     const roomName = `elementium-h264-${Date.now()}`;
     console.log(`  room: ${roomName}`);
     const server = await startPageServer();
