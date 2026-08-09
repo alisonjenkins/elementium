@@ -94,6 +94,33 @@ if grep -q 'http-equiv="Content-Security-Policy"' "$INDEX"; then
     echo "[patch] Removed Element Web CSP meta tag (Tauri CSP is active)"
 fi
 
+# Set the shim fingerprint in an already-patched index, inserting the line if it is absent.
+#
+# Two cases, and only one of them was handled. A dist patched by a *newer* script has the
+# fingerprint line and needs it refreshed, because the shims bundle is re-copied on every run
+# and a fingerprint written once would drift from the file it names. A dist patched by an
+# *older* script -- which is every dist on disk when this feature lands -- has no such line
+# at all, so a replace-only `sed` matched nothing and the assertion that followed failed the
+# whole build. Being idempotent across script versions is the requirement here, not just
+# across runs.
+set_shim_fingerprint() {
+    local index="$1" anchor="$2"
+    if grep -q "__ELEMENTIUM_SHIM_FINGERPRINT" "$index"; then
+        sed -i "s/window\\.__ELEMENTIUM_SHIM_FINGERPRINT = \"[^\"]*\"/window.__ELEMENTIUM_SHIM_FINGERPRINT = \"$SHIM_FINGERPRINT\"/" "$index"
+    else
+        # Before the shims script, because console-bridge.ts reads the global synchronously
+        # as its first act.
+        awk -v fp="$SHIM_FINGERPRINT" -v anchor="$anchor" '
+            !done && index($0, anchor) {
+                print "    <script>window.__ELEMENTIUM_SHIM_FINGERPRINT = \"" fp "\";</script>"
+                done = 1
+            }
+            { print }
+        ' "$index" > "$index.tmp"
+        mv "$index.tmp" "$index"
+    fi
+}
+
 # 4. Inject shims script tag into index.html (before first <script> tag)
 if grep -qF "$MARKER" "$INDEX"; then
     echo "[patch] Shims already injected, skipping."
@@ -123,7 +150,7 @@ assert_contains "$INDEX" "elementium-shims.js" "shims script tag missing from $I
 # fingerprint that only got written once would drift out of sync with the file it names on
 # the very next `pnpm run build:shims` -- silently reintroducing the fault this fingerprint
 # exists to catch.
-sed -i "s/window\.__ELEMENTIUM_SHIM_FINGERPRINT = \"[^\"]*\"/window.__ELEMENTIUM_SHIM_FINGERPRINT = \"$SHIM_FINGERPRINT\"/" "$INDEX"
+set_shim_fingerprint "$INDEX" "elementium-shims.js"
 assert_contains "$INDEX" "$SHIM_FINGERPRINT" "shim fingerprint missing from $INDEX"
 INJECTIONS=$((INJECTIONS + 1))
 
@@ -278,7 +305,7 @@ assert_contains "$EC_INDEX" "elementium-shims.js" "shims script tag missing from
 assert_contains "$EC_INDEX" "__TAURI_INTERNALS__" "IPC bridge missing from $EC_INDEX"
 # See the matching comment on the main frame's injection, above: refreshed every run so this
 # frame's fingerprint cannot outlive the shims bundle it is meant to identify.
-sed -i "s/window\.__ELEMENTIUM_SHIM_FINGERPRINT = \"[^\"]*\"/window.__ELEMENTIUM_SHIM_FINGERPRINT = \"$SHIM_FINGERPRINT\"/" "$EC_INDEX"
+set_shim_fingerprint "$EC_INDEX" "elementium-shims.js"
 assert_contains "$EC_INDEX" "$SHIM_FINGERPRINT" "shim fingerprint missing from $EC_INDEX"
 INJECTIONS=$((INJECTIONS + 1))
 
