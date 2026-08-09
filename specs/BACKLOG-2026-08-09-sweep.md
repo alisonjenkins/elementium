@@ -21,7 +21,7 @@ Two audits came back clean, which is worth as much as the findings:
 
 ## Open
 
-- [ ] **S1. The page cannot learn that the connection broke.** HIGH. `connectionState` is
+- [x] **S1. FIXED. The page cannot learn that the connection broke.** HIGH. `connectionState` is
   assigned `"connected"` by a hardcoded line in the shim and never changes again:
   `PcEvent::ConnectionStateChange` has zero producers in Rust. Element Call drives its
   reconnect UI from that property. Underneath it, ICE `failed` and `closed` are structurally
@@ -41,33 +41,42 @@ Two audits came back clean, which is worth as much as the findings:
   Every adaptation the client believes it made is discarded. A strong candidate for "the
   video is very pixelated", and it would explain why quality never recovers on its own.
 
-- [ ] **S3. The far end's report on our media is thrown away.** HIGH. 898 `SenderFeedback`
-  events in one two-minute call, dropped into "Unhandled str0m event" — RTCP receiver
-  reports carrying loss, jitter and round-trip for our outbound audio and video. It is the
-  only measurement we have of how our media actually arrives, and we have been debugging
-  "she can't hear me" without it. `StreamPaused` (a freeze signal) and
-  `ChannelBufferedAmountLow` go the same way; the latter has a consumer already written —
-  `write_data_channel`'s doc tells callers to retry when there is room, and nothing ever
-  tells them there is.
+- [x] **S3. FIXED. Two useful events are hidden in 898 lines of noise.** MEDIUM, downgraded from
+  HIGH after checking what the noise actually is. I first read `SenderFeedback` as the far
+  end's receiver reports on our outbound media — loss, jitter, round-trip — which would have
+  made it the measurement we most lacked. It is not: `poll_sender_feedback` iterates
+  `streams_rx`, so these are RTCP *Sender Reports from the remote about media we receive*.
+  Outbound loss and round-trip already reach us through `MediaEgressStats`, which is
+  handled, and whose `loss` is deliberately `None` rather than `0.0` when no report arrived.
 
-- [ ] **S4. Remote tracks have no transceiver and no receiver.** MEDIUM. `getReceivers()`
+  What is left is still worth doing. 898 of these in two minutes flood the "Unhandled str0m
+  event" bucket, and two events that do matter are in there with them: `StreamPaused`, which
+  is a freeze signal, and `ChannelBufferedAmountLow`, which has a consumer already written —
+  `write_data_channel`'s doc tells callers to retry when there is room, and nothing ever
+  tells them there is. A bucket that logs 898 things nobody wants is a bucket nobody reads.
+
+- [x] **S4. FIXED. Remote tracks have no transceiver and no receiver.** MEDIUM. `getReceivers()`
   returns `[]`; no transceiver is created for tracks the SFU pushes at us; `RTCTrackEvent`
   carries `receiver` and `transceiver` as bare `{}`. livekit-client looks tracks up by id
   and by mid through exactly these — 19 call sites — and finds nothing. Separately
   `transceiver.currentDirection` is permanently `null`, and `getLocalTracks()` filters on it
   being `sendonly` or `sendrecv`, so that list is always empty.
 
-- [ ] **S5. livekit cannot confirm a device switch it asked for.** MEDIUM. It checks
+- [x] **S5. FIXED. livekit cannot confirm a device switch it asked for.** MEDIUM. It checks
   `track.getSettings().deviceId === <requested>`. Our tracks are canvas- and
   AudioContext-backed, so `getSettings()` reports the synthetic track's id, never the native
   one — the check reads false even when Rust switched correctly.
 
-- [ ] **S6. `applyConstraints` and `getCapabilities` never reach Rust.** MEDIUM. Neither is
+- [x] **S6. MADE HONEST, not fixed. `applyConstraints` and `getCapabilities` never reach Rust.** MEDIUM. Neither is
   overridden, so both run against the synthetic track: a mid-call resolution change resolves
   successfully and alters nothing, and reported capabilities describe a canvas rather than
   the camera. A caller clamping its request to what we advertise is working from fiction.
 
-- [ ] **S7. A cloned track is an unwired track.** MEDIUM. `stop()` and the `enabled` setter
+  No native command exists to reconfigure a running capture pipeline, and inventing one was
+  out of scope, so both now say loudly what they could not do and name the constraints
+  asked for. The capability is still missing; it is no longer silent.
+
+- [x] **S7. FIXED. A cloned track is an unwired track.** MEDIUM. `stop()` and the `enabled` setter
   are wired per instance, so `.clone()` yields an object whose `stop()` releases no native
   pipeline, leaks the preview loop, and whose mute reaches nothing. matrix-js-sdk's
   `CallFeed.clone()` is present in the bundle. This is the preview-loop leak again, reached
