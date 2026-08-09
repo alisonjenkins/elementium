@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
 import { fetchFrameBytes, frameBytes } from "./frame-payload";
+import { startWebCodecsRender } from "./webcodecs-renderer";
 import { createSilentAudioTrack, TRACK_SOURCE } from "./media-devices";
 import { parseIpcError } from "./ipc-error";
 import {
@@ -685,8 +686,26 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       if (videoTrack) {
         stream.addTrack(videoTrack);
 
-        // Start rendering frames from Rust onto this canvas
-        this.startVideoFrameFetch(canvas, trackId, canvasTrack.present);
+        // Decode in the page where the runtime can, and fall back to Rust's decoder and
+        // its RGBA frames where it cannot. The difference is 20-60kB a frame against 3.7MB,
+        // so this is the whole of the remote frame rate.
+        //
+        // Opt out with ELEMENTIUM_WEBCODECS=0 -- read from the URL because a webview has no
+        // environment, and the fallback has to stay reachable without a rebuild while this
+        // is new.
+        const webCodecsAllowed =
+          !globalThis.location?.search?.includes("elementiumWebCodecs=0");
+        const rendered = webCodecsAllowed
+          ? startWebCodecsRender(canvas, trackId, canvasTrack.present)
+          : null;
+        if (rendered) {
+          console.log(`[Elementium] remote video ${trackId} decoding in the page`);
+        } else {
+          console.log(
+            `[Elementium] remote video ${trackId} decoding natively, frames as RGBA`,
+          );
+          this.startVideoFrameFetch(canvas, trackId, canvasTrack.present);
+        }
       }
     }
 

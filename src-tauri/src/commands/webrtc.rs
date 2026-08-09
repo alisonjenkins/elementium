@@ -687,6 +687,8 @@ struct Routing<'a> {
     pc_id: &'a str,
     audio_tx: &'a tokio_mpsc::Sender<PcEvent>,
     video_tx: &'a tokio_mpsc::Sender<PcEvent>,
+    /// Where an encoded video frame goes when the page is decoding for itself.
+    encoded: &'a crate::encoded_streams::EncodedStreams,
 }
 
 /// Dispatch one peer-connection event.
@@ -748,6 +750,18 @@ fn route_pc_event(
             None
         }
         PcEvent::VideoData { mid, data, codec } => {
+            // When the page has opened a stream for this track it is decoding for itself, and
+            // the encoded frame goes there instead of to our decoder: 20-60kB rather than the
+            // 3.7MB of RGBA that decoding it here would produce, and the webview's own
+            // hardware path instead of our software VP8.
+            //
+            // The frames are still decrypted -- this is downstream of the E2EE boundary and
+            // the type says so -- so nothing about the encryption model changes.
+            let track_key = format!("{}-{}", routing.pc_id, mid);
+            if routing.encoded.has_reader(&track_key) {
+                routing.encoded.push_encoded(&track_key, data);
+                return None;
+            }
             // Was `let _ =`: video dropped between here and the decoder was invisible, so a
             // decoder that could not keep up looked exactly like a peer that sent nothing.
             if routing
@@ -994,11 +1008,15 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // Infallible, for the same reason as the audio pipeline above.
     video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string());
 
+    let encoded = app
+        .try_state::<crate::encoded_streams::EncodedStreams>()
+        .map_or_else(crate::encoded_streams::EncodedStreams::new, |s| (*s).clone());
     let routing = Routing {
         app,
         pc_id,
         audio_tx: &audio_tx,
         video_tx: &video_tx,
+        encoded: &encoded,
     };
     let mut metrics = ForwardStats::default();
     let mut last_report = tokio::time::Instant::now();

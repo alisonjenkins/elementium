@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod encoded_streams;
 mod frontend_server;
 mod protocols;
 mod tray;
@@ -158,6 +159,7 @@ fn register_state(
             session_correlation: Mutex::new(None),
         })
         .manage(protocols::VideoFrameState(video_frames.clone()))
+        .manage(encoded_streams::EncodedStreams::new())
         .manage(LiveKitState {
             rooms: Arc::new(Mutex::new(std::collections::HashMap::new())),
             video_frames,

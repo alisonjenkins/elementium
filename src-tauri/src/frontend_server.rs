@@ -121,6 +121,24 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendSe
             for request in server.incoming_requests() {
                 let path = asset_path(request.url());
 
+                if let Some(track_id) = stream_track_id(&path) {
+                    // Answered on its own thread. This loop serves requests one at a time,
+                    // and a stream response stays open for the life of the track -- holding
+                    // it here would stall every asset and every other track behind it.
+                    let streams = frame_app
+                        .try_state::<crate::encoded_streams::EncodedStreams>()
+                        .map(|s| (*s).clone());
+                    if let Some(streams) = streams {
+                        spawn_stream_responder(request, track_id, streams);
+                    } else {
+                        let response = Response::from_data(NOT_FOUND_BODY).with_status_code(503);
+                        if let Err(e) = request.respond(response) {
+                            debug!(error = %e, "could not refuse a stream request");
+                        }
+                    }
+                    continue;
+                }
+
                 if let Some(track_id) = frame_track_id(&path) {
                     let response = frame_response(&frame_app, &track_id);
                     if let Err(e) = request.respond(response) {
@@ -168,6 +186,106 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendSe
         .map_err(FrontendServerError::ThreadSpawn)?;
 
     Ok(())
+}
+
+/// The prefix a track's encoded-frame stream is served under.
+const STREAM_PREFIX: &str = "/__elementium/stream/";
+
+/// The track id a request is asking to stream, if it is asking to stream one.
+fn stream_track_id(path: &str) -> Option<String> {
+    let raw = path.strip_prefix(STREAM_PREFIX)?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(percent_decode(raw))
+}
+
+/// How long the reader waits for the next frame before checking whether it should still be
+/// here. Short enough that a closed track is noticed promptly, long enough not to spin.
+const STREAM_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How long a stream with no frames at all is kept open.
+///
+/// A track that has produced nothing for this long is over -- the participant left, or the
+/// connection was replaced -- and the response must end so the thread does not outlive it.
+/// Generously longer than the gap between keyframes, so a quiet camera is not mistaken for
+/// a dead one.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A `Read` over a track's encoded frames, for `tiny_http` to write out as it goes.
+///
+/// Blocking rather than returning `Ok(0)` on an empty queue: zero from `read` means end of
+/// stream, and a live track between frames has not ended.
+struct FrameStreamReader {
+    streams: crate::encoded_streams::EncodedStreams,
+    track_id: String,
+    /// The remainder of a frame too large for the last `read` buffer.
+    pending: std::io::Cursor<Vec<u8>>,
+    idle_since: std::time::Instant,
+}
+
+impl std::io::Read for FrameStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let taken = self.pending.read(buf)?;
+            if taken > 0 {
+                return Ok(taken);
+            }
+            if let Some(frame) = self.streams.pop(&self.track_id) {
+                self.idle_since = std::time::Instant::now();
+                self.pending =
+                    std::io::Cursor::new(crate::encoded_streams::encode_wire_frame(&frame));
+                continue;
+            }
+            if self.idle_since.elapsed() > STREAM_IDLE_TIMEOUT {
+                debug!(track_id = %self.track_id, "encoded stream idle; closing");
+                return Ok(0);
+            }
+            std::thread::sleep(STREAM_IDLE_POLL);
+        }
+    }
+}
+
+impl Drop for FrameStreamReader {
+    fn drop(&mut self) {
+        let dropped = self.streams.unsubscribe(&self.track_id);
+        info!(
+            track_id = %self.track_id,
+            frames_dropped = dropped,
+            "encoded stream ended"
+        );
+    }
+}
+
+/// Answer a stream request on its own thread, so the accept loop is not held open by it.
+fn spawn_stream_responder(
+    request: tiny_http::Request,
+    track_id: String,
+    streams: crate::encoded_streams::EncodedStreams,
+) {
+    let thread = std::thread::Builder::new()
+        .name("frame-stream".into())
+        .spawn(move || {
+            info!(track_id = %track_id, "encoded stream opened");
+            streams.subscribe(&track_id);
+            let reader = FrameStreamReader {
+                streams,
+                track_id,
+                pending: std::io::Cursor::new(Vec::new()),
+                idle_since: std::time::Instant::now(),
+            };
+            // No content length, so `tiny_http` sends it chunked -- which is what lets the
+            // page start reading frames before the track has finished producing them.
+            let mut response = Response::new(200.into(), Vec::new(), reader, None, None);
+            add_header(&mut response, "Content-Type", "application/octet-stream");
+            add_header(&mut response, "Cache-Control", "no-store");
+            if let Err(e) = request.respond(response) {
+                debug!(error = %e, "an encoded stream ended with its reader gone");
+            }
+        });
+    if let Err(e) = thread {
+        error!(error = %e, "could not start a thread to serve an encoded stream");
+    }
 }
 
 /// The prefix video frames are served under.
