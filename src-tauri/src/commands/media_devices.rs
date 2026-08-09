@@ -482,7 +482,11 @@ fn connection_for_new_pipeline(
 ///
 /// Replaces whatever was running and takes over its connection, so a mid-call restart
 /// keeps sending -- see [`stop_pipeline_inheriting_connection`].
-fn start_audio_pipeline(media_state: &MediaState, device_index: Option<usize>) -> TrackId {
+fn start_audio_pipeline(
+    media_state: &MediaState,
+    device_index: Option<usize>,
+    auto_gain: bool,
+) -> TrackId {
     let key = MediaTrackKey::microphone();
     let track_id = TrackId(format!("audio-{}", generate_track_id()));
     tracing::info!(track_id = %track_id, "Starting audio capture");
@@ -519,6 +523,7 @@ fn start_audio_pipeline(media_state: &MediaState, device_index: Option<usize>) -
         audio_capture_loop(
             key,
             device_index,
+            auto_gain,
             &encode_tx_clone,
             &muted_clone,
             &stop_rx,
@@ -608,6 +613,19 @@ fn take_over_camera_pipeline(
 }
 
 /// The microphone the caller asked for, resolved the same way the picker numbered it.
+/// Whether the caller asked for automatic gain control.
+///
+/// Defaulted on when unspecified, which is what a browser does and what every caller in
+/// this stack asks for anyway. Honouring it at all is new: the flag was accepted and
+/// ignored, so a quiet microphone was transmitted quiet and Opus encoded near-silence.
+fn wants_auto_gain(constraints: &MediaConstraints) -> bool {
+    constraints
+        .audio
+        .as_ref()
+        .and_then(|a| a.auto_gain_control)
+        .unwrap_or(true)
+}
+
 fn chosen_microphone(constraints: &MediaConstraints) -> Option<usize> {
     constraints
         .audio
@@ -647,7 +665,11 @@ pub async fn get_user_media(
     let mut track_ids = Vec::new();
 
     if constraints.audio.is_some() {
-        track_ids.push(start_audio_pipeline(&media_state, chosen_microphone(&constraints)));
+        track_ids.push(start_audio_pipeline(
+            &media_state,
+            chosen_microphone(&constraints),
+            wants_auto_gain(&constraints),
+        ));
     }
 
     if let Some(ref video_constraints) = constraints.video {
@@ -1906,6 +1928,10 @@ struct OutboundAudioStats {
     /// Reported because "which input is the microphone actually plugged into" is otherwise
     /// unanswerable from a log, and getting it wrong sounds exactly like a quiet room.
     channel_peaks: Vec<f32>,
+    /// The gain automatic gain control is applying, 1.0 when it is off or idle.
+    applied_gain: f32,
+    /// The level it is judging that gain from.
+    gain_envelope: f32,
     silent_packets_since_report: u64,
     /// Frames this window that were audibly loud on input yet still encoded to a
     /// silence-sized packet.
@@ -1975,6 +2001,12 @@ impl OutboundAudioStats {
         self.last_frame_at = Some(now);
     }
 
+    /// Remember the gain the AGC settled on, and the level it judged it from.
+    const fn record_gain(&mut self, gain: f32, envelope: f32) {
+        self.applied_gain = gain;
+        self.gain_envelope = envelope;
+    }
+
     /// Remember the fold's view of each input channel for the next report.
     fn record_channel_peaks(&mut self, peaks: &[f32]) {
         self.channel_peaks.clear();
@@ -2017,6 +2049,8 @@ impl OutboundAudioStats {
                 applied_packet_loss_perc = self.applied_packet_loss_perc,
                 kbps = self.window_kbps(),
                 channel_peaks = ?self.channel_peaks,
+                applied_gain = self.applied_gain,
+                gain_envelope = self.gain_envelope,
                 silent_packets = self.silent_packets_since_report,
                 loud_but_silent = self.loud_but_silent_since_report,
                 max_gap_ms = self.max_gap_ms,
@@ -2262,6 +2296,7 @@ fn retune_fec_if_needed(
 fn audio_capture_loop(
     key: MediaTrackKey,
     device_index: Option<usize>,
+    auto_gain: bool,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
     muted: &Arc<std::sync::atomic::AtomicBool>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
@@ -2314,6 +2349,9 @@ fn audio_capture_loop(
     // Carries the per-channel level history the fold decides on, so it must outlive the
     // callback rather than being rebuilt per buffer.
     let mut mono_fold = elementium_media::audio_capture::MonoFold::new(channels);
+    // `None` when the caller opted out, so the samples are not touched at all rather than
+    // passed through a gain of one.
+    let mut auto_gain = auto_gain.then(elementium_media::auto_gain::AutoGain::new);
 
     // Outbound-path counters.
     //
@@ -2371,8 +2409,12 @@ fn audio_capture_loop(
             // describe a single channel from here on. Only the channels carrying signal
             // are averaged -- see `MonoFold`, and the 6 dB an audio interface's unused
             // second input used to cost.
-            let mono = mono_fold.fold(&data);
+            let mut mono = mono_fold.fold(&data);
             stats.record_channel_peaks(mono_fold.channel_peaks());
+            if let Some(agc) = auto_gain.as_mut() {
+                agc.apply(&mut mono);
+                stats.record_gain(agc.gain(), agc.envelope());
+            }
             accumulator.extend_from_slice(&mono);
 
             // Process complete Opus frames
