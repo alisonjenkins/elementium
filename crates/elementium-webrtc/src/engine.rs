@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use elementium_e2ee::{E2eeContext, MediaKind as E2eeMediaKind};
+use elementium_e2ee::E2eeContext;
 use elementium_media::audio_playback::AudioSink;
 use elementium_types::{MediaTrackKey, PlaintextMedia, VideoFrame};
 
-use crate::e2ee_io::{EncryptionPolicy, encrypt_or_drop, maybe_decrypt_event};
+use crate::e2ee_io::{EncryptionPolicy, StartupHold, encrypt_or_drop, maybe_decrypt_event};
 use crate::peer_connection::{
     self, PcEvent, PeerConnectionHandle, discover_and_add_srflx, lock_pc,
 };
@@ -317,17 +317,26 @@ fn drain_io_commands(
     handle: &PeerConnectionHandle,
     e2ee: Option<&E2eeContext>,
     pacing: &mut WritePacing,
+    hold: &mut StartupHold,
 ) -> bool {
     loop {
         match cmd_rx.try_recv() {
             Ok(IoCommand::WriteAudio(key, opus_data)) => {
-                let Some(data) = encrypt_or_drop(e2ee, opus_data, E2eeMediaKind::Audio, "audio")
-                else {
+                // Usually one frame. More when end-to-end encryption has just become
+                // possible and the audio captured while it came up is released together.
+                let frames = hold.encrypt_audio(e2ee, opus_data);
+                if frames.is_empty() {
                     continue;
-                };
+                }
                 let mut pc = lock_pc(handle);
                 pacing.record(&pc.id.clone());
-                if let Err(e) = peer_connection::write_audio(&mut pc, key, &data) {
+                let mut failure = None;
+                for data in &frames {
+                    if let Err(e) = peer_connection::write_audio(&mut pc, key, data) {
+                        failure = Some(e);
+                    }
+                }
+                if let Some(e) = failure {
                     // Throttled warn, not debug: this is the last hop before the network,
                     // so a persistent failure here means nobody hears us -- and at
                     // `debug` it produced a completely clean log while doing so. The
@@ -397,6 +406,7 @@ fn io_loop(
     // packet-loss-concealment path added for genuine network loss.
     let mut dropped_events: u64 = 0;
     let mut write_pacing = WritePacing::default();
+    let mut startup_hold = StartupHold::default();
 
     loop {
         // Snapshot the E2EE policy for this iteration.
@@ -405,7 +415,13 @@ fn io_loop(
         let e2ee: EncryptionPolicy = e2ee_ctx.lock().map(|g| g.clone()).unwrap_or_default();
 
         // Process any pending commands (non-blocking)
-        if drain_io_commands(&mut cmd_rx, handle, e2ee.as_context(), &mut write_pacing) {
+        if drain_io_commands(
+            &mut cmd_rx,
+            handle,
+            e2ee.as_context(),
+            &mut write_pacing,
+            &mut startup_hold,
+        ) {
             return;
         }
 

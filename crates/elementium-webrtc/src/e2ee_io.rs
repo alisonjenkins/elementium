@@ -81,6 +81,105 @@ pub(crate) fn encrypt_or_drop(
     )
 }
 
+/// Audio frames held while end-to-end encryption is still coming up.
+///
+/// One second at 20ms a frame. Enough to cover the gap measured in a real call -- 420ms
+/// between the first captured frame and a context that could encrypt it -- with room to
+/// spare, and small enough that a call where encryption never becomes possible holds a
+/// second of audio and no more.
+const STARTUP_HOLD_FRAMES: usize = 50;
+
+/// Holds outbound audio across the moment end-to-end encryption becomes possible.
+///
+/// A call starts capturing before the SFU has said who we are and before the first key
+/// arrives, and until both are true no frame can be encrypted. Those frames used to be
+/// dropped: 21 of them in a measured call, 420ms of audio, which is the front of whatever
+/// the user said first.
+///
+/// Holding is bounded to the startup window by construction rather than by a timer: once
+/// one frame has encrypted successfully, encryption is possible, and any later failure is
+/// a real failure that must still drop. So this can never turn a broken call into a
+/// growing backlog.
+///
+/// Safe because the outbound RTP timestamp comes from a frame counter, not from the clock
+/// at write time -- see `write_audio`. Released frames therefore carry the timestamps they
+/// would have had, and arrive as one small burst that a jitter buffer absorbs, rather than
+/// as audio claiming to be from the wrong moment.
+///
+/// Audio only. A held video frame is worse than a dropped one: it is large, it is stale by
+/// the time it is released, and the next keyframe supersedes it anyway.
+#[derive(Debug, Default)]
+pub(crate) struct StartupHold {
+    held: std::collections::VecDeque<PlaintextMedia>,
+    /// Set once a frame has encrypted, after which nothing is held.
+    encrypting: bool,
+    /// Frames given up because the hold was full before encryption became possible.
+    overflowed: u64,
+}
+
+impl StartupHold {
+    /// Encrypt an outbound audio frame, releasing anything held once that becomes possible.
+    ///
+    /// Returns the frames to write, in order: everything held, then this one.
+    pub(crate) fn encrypt_audio(
+        &mut self,
+        e2ee: Option<&E2eeContext>,
+        data: PlaintextMedia,
+    ) -> Vec<WireMedia> {
+        let Some(ctx) = e2ee else {
+            return vec![WireMedia::deliberately_unencrypted(data)];
+        };
+        let Some(encrypted) = ctx.encrypt_frame(&data, E2eeMediaKind::Audio) else {
+            if self.encrypting {
+                // Encryption has worked before, so this is a fault rather than a start-up
+                // race, and holding it would only delay the loss.
+                report_encrypt_failure("audio");
+            } else if self.held.len() >= STARTUP_HOLD_FRAMES {
+                self.held.pop_front();
+                self.overflowed = self.overflowed.saturating_add(1);
+                self.held.push_back(data);
+                report_hold_overflow(self.overflowed);
+            } else {
+                self.held.push_back(data);
+            }
+            return Vec::new();
+        };
+
+        if self.held.is_empty() {
+            self.encrypting = true;
+            return vec![encrypted];
+        }
+
+        let waiting = self.held.len();
+        let mut out = Vec::with_capacity(waiting.saturating_add(1));
+        for frame in std::mem::take(&mut self.held) {
+            if let Some(wire) = ctx.encrypt_frame(&frame, E2eeMediaKind::Audio) {
+                out.push(wire);
+            }
+        }
+        tracing::info!(
+            released = out.len(),
+            held = waiting,
+            overflowed = self.overflowed,
+            "E2EE became possible; releasing the audio held while it came up"
+        );
+        self.encrypting = true;
+        out.push(encrypted);
+        out
+    }
+}
+
+/// Report a full hold, throttled: it fills at fifty frames a second once it starts.
+fn report_hold_overflow(overflowed: u64) {
+    if overflowed == 1 || overflowed.is_multiple_of(ENCRYPT_FAILURE_REPORT_EVERY) {
+        tracing::warn!(
+            overflowed,
+            held_frames = STARTUP_HOLD_FRAMES,
+            "E2EE has not become possible within a second of audio; dropping the oldest held              frames"
+        );
+    }
+}
+
 /// How many dropped frames pass between reports once the first few are past.
 ///
 /// A failure here is per frame: fifty audio frames a second, indefinitely. One real call
@@ -327,6 +426,74 @@ mod tests {
         assert_eq!(event.level, tracing::Level::WARN);
         assert!(event.field("reason").is_some());
         assert_eq!(event.field("label"), Some("audio"));
+    }
+
+    /// The startup race this exists for: audio captured before a key arrives must still be
+    /// sent, not discarded. A measured call lost 420ms of speech to it.
+    #[test]
+    fn audio_captured_before_the_key_arrives_is_released_once_it_lands() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        let mut hold = StartupHold::default();
+
+        for i in 0..5_u8 {
+            let out = hold.encrypt_audio(Some(&ctx), PlaintextMedia::from_encoder(vec![i; 40]));
+            assert!(out.is_empty(), "nothing can be sent before there is a key");
+        }
+
+        ctx.set_key("alice", 0, &[9_u8; 16]);
+        let out = hold.encrypt_audio(Some(&ctx), PlaintextMedia::from_encoder(vec![99; 40]));
+        assert_eq!(
+            out.len(),
+            6,
+            "the five held frames and this one must all be sent, in order"
+        );
+    }
+
+    /// Once encryption has worked, a later failure is a fault and must not be buffered:
+    /// holding it would turn a broken call into a growing backlog of stale audio.
+    #[test]
+    fn a_failure_after_encryption_started_is_dropped_not_held() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, &[9_u8; 16]);
+        let mut hold = StartupHold::default();
+
+        assert_eq!(
+            hold.encrypt_audio(Some(&ctx), PlaintextMedia::from_encoder(vec![1; 40])).len(),
+            1
+        );
+
+        // A context that can no longer encrypt: a fresh one with no key at all.
+        let broken = E2eeContext::new(E2eeOptions::default());
+        let out = hold.encrypt_audio(Some(&broken), PlaintextMedia::from_encoder(vec![2; 40]));
+        assert!(out.is_empty(), "the frame is dropped");
+        // And nothing accumulated: the next success releases only itself.
+        assert_eq!(
+            hold.encrypt_audio(Some(&ctx), PlaintextMedia::from_encoder(vec![3; 40])).len(),
+            1,
+            "a dropped frame must not reappear later"
+        );
+    }
+
+    /// A call where encryption never becomes possible must not grow without bound.
+    #[test]
+    fn the_hold_is_bounded() {
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        let mut hold = StartupHold::default();
+        for i in 0..(STARTUP_HOLD_FRAMES + 25) {
+            let byte = u8::try_from(i % 250).unwrap_or(0);
+            assert!(hold.encrypt_audio(Some(&ctx), PlaintextMedia::from_encoder(vec![byte; 40])).is_empty());
+        }
+
+        ctx.set_key("alice", 0, &[9_u8; 16]);
+        let out = hold.encrypt_audio(Some(&ctx), PlaintextMedia::from_encoder(vec![7; 40]));
+        assert_eq!(
+            out.len(),
+            STARTUP_HOLD_FRAMES + 1,
+            "a second of audio is kept and no more"
+        );
     }
 
     /// Sanity check: when no E2EE context is configured at all, `encrypt_or_drop` passes the
