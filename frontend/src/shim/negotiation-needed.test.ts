@@ -55,10 +55,17 @@ async function connection(): Promise<{
   return { pc, events: () => count };
 }
 
-/** Run queued microtasks, which is where the spec puts the negotiation-needed check. */
+/**
+ * Let the negotiation-needed check run.
+ *
+ * Both a microtask drain and a task turn: the initial check is queued as a microtask, and
+ * the re-check that runs when a description finishes applying is queued as a task, which is
+ * what the DOM does too. A microtask-only drain silently missed the second kind.
+ */
 async function settle(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("negotiationneeded", () => {
@@ -104,6 +111,29 @@ describe("negotiationneeded", () => {
     expect(events()).toBe(1);
 
     await pc.setLocalDescription({ type: "offer", sdp: "v=0\r\n" });
+    await pc.setRemoteDescription({ type: "answer", sdp: "v=0\r\n" });
+    await settle();
+    expect(events()).toBe(1);
+  });
+
+  it("does not ask for a second offer while one is still being applied", async () => {
+    // `setLocalDescription` awaits the IPC before it updates the signalling state, so for
+    // the width of that await the state still reads "stable" while an offer is in fact
+    // being applied. A check landing in that window fired, livekit-client made a second
+    // offer over the first, and the SFU answered with `NegotiationError: No pending offer
+    // to match answer` -- a call that connected to nothing.
+    const { pc, events } = await connection();
+    const applying = pc.setLocalDescription({ type: "offer", sdp: "v=0\r\n" });
+    // Mid-flight: exactly where the real addTransceiver landed.
+    pc.addTransceiver("audio", { direction: "sendonly" });
+    await settle();
+    expect(events()).toBe(0);
+
+    await applying;
+    await settle();
+    // Still held: an offer of ours is outstanding until its answer arrives.
+    expect(events()).toBe(0);
+
     await pc.setRemoteDescription({ type: "answer", sdp: "v=0\r\n" });
     await settle();
     expect(events()).toBe(1);

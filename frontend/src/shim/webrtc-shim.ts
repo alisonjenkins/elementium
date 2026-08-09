@@ -337,6 +337,30 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   private _negotiationNeeded = false;
   /** True between queueing the check and running it, so a burst coalesces into one event. */
   private _negotiationCheckQueued = false;
+  /**
+   * How many description operations are part-way through.
+   *
+   * `setLocalDescription` and `setRemoteDescription` are async: they await the IPC before
+   * updating `_signalingState`, so for the width of that await the state still reads
+   * `stable` while an offer is in fact being applied. A negotiation check landing in that
+   * window saw `stable`, fired, and livekit-client made a second offer over the first --
+   * `NegotiationError: No pending offer to match answer`, and a call that never connected.
+   *
+   * The signalling state alone cannot express "mid-operation", so this does.
+   */
+  private _descriptionsInFlight = 0;
+  /**
+   * How many negotiation requests have been made, ever.
+   *
+   * Applying an offer clears the negotiation flag, because the offer describes what was
+   * outstanding -- but only what was outstanding *when it was created*. A track published
+   * between `createOffer` and `setLocalDescription` is not in it, and clearing
+   * unconditionally threw that request away: the track waited for an offer that had already
+   * been sent without it.
+   */
+  private _negotiationRequestSeq = 0;
+  /** The request count `createOffer` last saw, so a later request is not mistaken for it. */
+  private _offerDescribesSeq = -1;
 
   // Event handler properties (on* style)
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;
@@ -783,6 +807,8 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // Clear pending lists after they've been applied
     this._pendingDataChannels = [];
     this._pendingTransceivers = [];
+    // What this offer describes, so applying it clears only the requests it answers.
+    this._offerDescribesSeq = this._negotiationRequestSeq;
     console.log(`[Elementium] createOffer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
     if (sdpTracingEnabled()) console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
     return sessionDescription(desc, "offer");
@@ -799,6 +825,16 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   }
 
   async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
+    this._descriptionsInFlight += 1;
+    try {
+      await this.applyLocalDescription(description);
+    } finally {
+      this._descriptionsInFlight -= 1;
+      this.recheckNegotiationSoon();
+    }
+  }
+
+  private async applyLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
     if (!description) {
       // The implicit form: the browser generates the offer or answer itself from the
@@ -813,7 +849,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
         this._signalingState === "have-remote-offer"
           ? await this.createAnswer()
           : await this.createOffer();
-      await this.setLocalDescription(implicit);
+      await this.applyLocalDescription(implicit);
       return;
     }
     console.log(`[Elementium] setLocalDescription: pcId=${this.pcId} type=${description.type}`);
@@ -831,7 +867,11 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // clears the flag. An answer does not -- it describes what the *remote* asked about --
     // so anything added meanwhile still needs an offer, and stable is where it can have one.
     if (description.type === "offer") {
-      this._negotiationNeeded = false;
+      // Only if nothing has been requested since this offer was built. Otherwise a track
+      // published between `createOffer` and here waits for an offer already sent without it.
+      if (this._negotiationRequestSeq === this._offerDescribesSeq) {
+        this._negotiationNeeded = false;
+      }
       // We are the offerer: the offer we just applied describes our own transceivers
       // exactly as we asked (this shim never renegotiates a direction the caller didn't
       // request), so their negotiated direction is already known -- no need to wait for
@@ -843,6 +883,16 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   }
 
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+    this._descriptionsInFlight += 1;
+    try {
+      await this.applyRemoteDescription(description);
+    } finally {
+      this._descriptionsInFlight -= 1;
+      this.recheckNegotiationSoon();
+    }
+  }
+
+  private async applyRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
     console.log(`[Elementium] setRemoteDescription: pcId=${this.pcId} type=${description.type} sdpLen=${description.sdp?.length ?? 0}`);
     if (sdpTracingEnabled()) {
@@ -1235,6 +1285,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
    */
   private markNegotiationNeeded(): void {
     this._negotiationNeeded = true;
+    this._negotiationRequestSeq += 1;
     if (this._negotiationCheckQueued) return;
     this._negotiationCheckQueued = true;
     queueMicrotask(() => {
@@ -1260,6 +1311,11 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       // request would be consumed rather than served. Held until `init` completes, which
       // re-checks.
       console.log("[Elementium] negotiationneeded held: connection not created yet");
+      return;
+    }
+    if (this._descriptionsInFlight > 0) {
+      // A description is being applied right now; its completion re-checks.
+      console.log(`[Elementium] negotiationneeded held: pcId=${this.pcId} description in flight`);
       return;
     }
     if (this._signalingState !== "stable") {
