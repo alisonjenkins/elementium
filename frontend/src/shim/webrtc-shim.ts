@@ -370,6 +370,10 @@ export class ElementiumRTCPeerConnection extends EventTarget {
 
       // Register in global PC registry (Rust pushes events via webview.eval())
       __pcRegistry.set(this.pcId, (event: WebRtcEvent) => this.handleBackendEvent(event));
+      // A negotiation asked for before the connection existed -- livekit-client adds its
+      // receive transceivers immediately after construction -- is served now that there is
+      // something to serve it with, and a handler attached to hear it.
+      this.recheckNegotiationSoon();
       // Anything that arrived while this connection was being created, in arrival order.
       const held = __pendingEvents.get(this.pcId);
       if (held) {
@@ -930,7 +934,10 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     const kind = typeof trackOrKind === "string" ? trackOrKind : trackOrKind.kind;
     const track = typeof trackOrKind === "string" ? null : trackOrKind;
     const direction = init?.direction ?? "sendrecv";
-    console.log(`[Elementium] addTransceiver called: kind=${kind} direction=${direction}`);
+    console.log(
+      `[Elementium] addTransceiver called: kind=${kind} direction=${direction} ` +
+        `pcId=${this.pcId} state=${this._signalingState}`,
+    );
     if (kind === "video") {
       this._hasVideo = true;
     }
@@ -1245,11 +1252,40 @@ export class ElementiumRTCPeerConnection extends EventTarget {
    */
   private fireNegotiationNeededIfStable(): void {
     if (!this._negotiationNeeded) return;
-    if (this._signalingState !== "stable") return;
     if (this._connectionState === "closed") return;
+    if (!this.pcId) {
+      // The connection is still being created. livekit-client attaches its
+      // `onnegotiationneeded` handler after constructing the peer connection, so an event
+      // fired in this window reaches nobody -- and because firing clears the flag, the
+      // request would be consumed rather than served. Held until `init` completes, which
+      // re-checks.
+      console.log("[Elementium] negotiationneeded held: connection not created yet");
+      return;
+    }
+    if (this._signalingState !== "stable") {
+      // Deferred, not dropped -- a description transition releases it. Logged because the
+      // silent version of this early return cost a debugging round: a call published
+      // nothing, and the log could not distinguish "the event never fired" from "the event
+      // was held and never released", which need opposite fixes.
+      console.log(
+        `[Elementium] negotiationneeded held: pcId=${this.pcId} state=${this._signalingState}`,
+      );
+      return;
+    }
     this._negotiationNeeded = false;
     console.log(`[Elementium] negotiationneeded: pcId=${this.pcId}`);
     this.fireEvent("negotiationneeded", this.onnegotiationneeded);
+  }
+
+  /**
+   * Re-check the negotiation flag after anything that could have released it.
+   *
+   * Called from a task rather than inline so it runs after the caller has finished
+   * whatever state change prompted it, which is the same reason the DOM queues the check.
+   */
+  private recheckNegotiationSoon(): void {
+    if (!this._negotiationNeeded) return;
+    setTimeout(() => this.fireNegotiationNeededIfStable(), 0);
   }
 
   /**

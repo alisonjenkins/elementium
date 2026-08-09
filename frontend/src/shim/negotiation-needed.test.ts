@@ -109,6 +109,24 @@ describe("negotiationneeded", () => {
     expect(events()).toBe(1);
   });
 
+  it("holds a request made before the connection exists, then serves it", async () => {
+    // livekit-client adds its receive transceivers immediately after constructing the peer
+    // connection, and attaches `onnegotiationneeded` afterwards. Firing in that window
+    // reached nobody -- and because firing clears the flag, the request was consumed rather
+    // than served. A real call published nothing for this reason.
+    const pc = new ElementiumRTCPeerConnection();
+    pc.addTransceiver("audio", { direction: "sendonly" });
+    let count = 0;
+    // Attached after construction, exactly as livekit-client does it.
+    pc.addEventListener("negotiationneeded", () => {
+      count += 1;
+    });
+    await settle();
+    await settle();
+    await settle();
+    expect(count).toBe(1);
+  });
+
   it("fires for addTrack, which publishes just as much as a transceiver does", async () => {
     const { pc, events } = await connection();
     pc.addTrack({ kind: "audio", id: "a1" } as MediaStreamTrack);
