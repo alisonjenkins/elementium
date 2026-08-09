@@ -44,8 +44,12 @@ pub enum RoomEvent {
     #[serde(rename_all = "camelCase")]
     TrackSubscribed {
         room_id: String,
+        /// Empty until resolved from the signalling messages; never a placeholder string.
         participant_sid: String,
+        /// The SFU's track sid, empty until resolved. Distinct from `mid`, which is ours.
         track_sid: String,
+        /// The m-line the track arrived on, which is the identifier we actually have.
+        mid: String,
         kind: String,
     },
     #[serde(rename_all = "camelCase")]
@@ -805,12 +809,14 @@ fn send_room_event(tx: &mpsc::UnboundedSender<RoomEvent>, event: RoomEvent) {
             room_id,
             participant_sid,
             track_sid,
+            mid,
             kind,
         } => {
             tracing::info!(
                 room_id = %room_id,
                 participant_sid = %participant_sid,
                 track_sid = %track_sid,
+                mid = %mid,
                 kind = %kind,
                 "track subscribed"
             );
@@ -1338,12 +1344,29 @@ fn process_transport_events(
                 }
             }
             Some(TransportEvent::SubscriberEvent(PcEvent::RemoteTrackAdded { mid, kind })) => {
+                // Both identifiers here are honest about being unresolved, which they were
+                // not before: `participant_sid` was the literal string "unknown" and
+                // `track_sid` was the m-line id, which is ours and not the SFU's track sid
+                // at all. A consumer keying off either got a plausible-looking value that
+                // had never been measured -- the failure this codebase keeps producing.
+                //
+                // Resolving them properly means correlating the mid against the
+                // `TrackPublished` and participant `Update` messages the signal loop
+                // already receives; until something needs it, saying "not resolved" beats
+                // inventing an answer.
+                tracing::debug!(
+                    %mid,
+                    ?kind,
+                    "remote track subscribed; participant and track sid are not resolved \
+                     from the mid yet"
+                );
                 send_room_event(
                     event_tx,
                     RoomEvent::TrackSubscribed {
                         room_id: room_id.to_string(),
-                        participant_sid: "unknown".to_string(),
-                        track_sid: mid,
+                        participant_sid: String::new(),
+                        track_sid: String::new(),
+                        mid,
                         kind,
                     },
                 );
