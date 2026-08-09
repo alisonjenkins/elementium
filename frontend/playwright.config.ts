@@ -53,6 +53,18 @@ export default defineConfig({
         // Insertable streams back livekit's E2EE worker; without this the encrypted test
         // would fail for a reason unrelated to what it is measuring.
         "--enable-blink-features=RTCInsertableStreams",
+        // Chromium's own account of why it discarded a packet or refused to assemble a
+        // frame. libwebrtc reports those as RTC_LOG lines and nowhere else -- not in
+        // getStats, not to the page -- so a receive-path fault that is invisible from the
+        // sending side is invisible from the receiving side too without this. Opt-in
+        // because it is thousands of lines a second and would bury every other test's
+        // output. Run with ELEMENTIUM_WEBRTC_LOG=1 and DEBUG=pw:browser.
+        ...(process.env.ELEMENTIUM_WEBRTC_LOG
+          ? [
+              "--enable-logging=stderr",
+              "--vmodule=*video_rtp_depacketizer*=2,*h264*=2,*packet_buffer*=2,*rtp_frame_reference*=2,*video_receive*=2",
+            ]
+          : []),
       ],
     },
   },

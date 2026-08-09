@@ -470,6 +470,11 @@ async function measureVideo(
   encrypted = true,
   keyIndex = 0,
   videoSize: "tiny" | null = null,
+  // Separately settable so a run can point an *encrypted* publisher at a receiver holding
+  // no key. Without a key the page builds a plain `Room` and installs no transform at all,
+  // which is the only way to ask whether the packets assemble independently of whether
+  // they decrypt.
+  receiverEncrypted = encrypted,
 ): Promise<VideoStats> {
   const roomName = `elementium-${codec}-${Date.now()}`;
   console.log(`  room: ${roomName}`);
@@ -482,7 +487,7 @@ async function measureVideo(
     url: SFU_WS,
     token: mintToken("browser-subscriber", roomName),
   });
-  if (encrypted) query.set("key", KEY_HEX);
+  if (receiverEncrypted) query.set("key", KEY_HEX);
   // Installs keys at indices 0..keyIndex, so a publisher stamping a non-zero index has one.
   if (keyIndex > 0) query.set("rotations", String(keyIndex));
   await page.goto(`${server.origin}/?${query.toString()}`);
@@ -792,6 +797,14 @@ test.describe("browser receive path", () => {
         () => (window as never as { __errors: string[] }).__errors,
       );
       console.log(`  page errors: ${JSON.stringify(errors)}`);
+      // `__errors` is window-level and a decrypt failure never reaches it: livekit raises
+      // it inside the worker and forwards it to the room as `encryptionError`. Reading
+      // only the window errors is what made this look like a silent failure with nothing
+      // to go on.
+      const cryptoErrors = await page.evaluate(
+        () => (window as never as { __cryptoErrors: string[] }).__cryptoErrors,
+      );
+      console.log(`  crypto errors: ${JSON.stringify(cryptoErrors)}`);
 
       expect(after.mimeType, "the SFU must have negotiated H.264, not VP8").toMatch(/H264/i);
       expect(
@@ -959,6 +972,35 @@ test.describe("browser receive path", () => {
     console.log(`  tiny encrypted H.264: ${JSON.stringify(stats)}`);
     expect(stats.framesReceived, "unfragmented encrypted H.264 must assemble")
       .toBeGreaterThan(5);
+  });
+
+  /**
+   * Do our encrypted H.264 packets assemble into frames at all, decryption aside?
+   *
+   * `framesReceived` has been read throughout this investigation as evidence about
+   * *assembly*, and that reading is only safe if nothing between the depacketiser and the
+   * counter can suppress it. An insertable-streams transform sits exactly there, so under
+   * E2EE a frame that fails to decrypt and a frame that fails to assemble are the same
+   * observation. A run where the receiver merely lacked the key does not separate them
+   * either: livekit still installs the transform, and it still drops what it cannot
+   * decrypt.
+   *
+   * A receiver with no key at all builds a plain `Room` with no transform, so this run is
+   * the one that distinguishes them. It expects garbage on screen -- the payload is
+   * ciphertext -- and asks only whether Chrome's H.264 depacketiser produces frames from
+   * it. If it does, the fault is in the decrypt and the packetisation is sound; if it does
+   * not, the fault is below the transform entirely.
+   */
+  test("diagnostic: does encrypted H.264 assemble with no transform in the way", async ({
+    page,
+  }) => {
+    const stats = await measureVideo(page, "h264", true, 0, null, false);
+    console.log(`  encrypted H.264 into a receiver with no key: ${JSON.stringify(stats)}`);
+    expect(
+      stats.framesReceived,
+      "if this is zero, Chrome never assembles our encrypted packets and the decrypt is " +
+        "not implicated at all",
+    ).toBeGreaterThan(5);
   });
 
   // CONTROL. Two browsers through the same SFU, with no Rust publisher involved.

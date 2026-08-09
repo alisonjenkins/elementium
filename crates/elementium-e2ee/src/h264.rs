@@ -38,10 +38,30 @@ pub fn unencrypted_bytes(frame: &[u8]) -> Option<usize> {
     for index in nalu_indices(frame)? {
         let nalu_type = frame.get(index)? & NALU_TYPE_MASK;
         if nalu_type == SLICE_IDR || nalu_type == SLICE_NON_IDR {
-            return index.checked_add(2).filter(|end| *end <= frame.len());
+            return index
+                .checked_add(2)?
+                .checked_add(extra_clear_bytes())
+                .filter(|end| *end <= frame.len());
         }
     }
     None
+}
+
+/// Extra slice bytes to leave in the clear, for diagnosis only.
+///
+/// Chromium assembles no frames at all from our encrypted H.264 -- not even with its
+/// decryption transform removed, so the packets themselves are what it will not accept.
+/// The one thing those packets have that a working plain stream does not is a slice whose
+/// bytes are opaque after the second. Widening the clear header says whether the receiver
+/// is reading further into the slice header than the two bytes livekit leaves it.
+///
+/// Never set in normal operation: any value but zero puts plaintext on the wire and makes
+/// us disagree with livekit's own framing, so a peer could not decrypt us.
+fn extra_clear_bytes() -> usize {
+    std::env::var("ELEMENTIUM_H264_CLEAR_EXTRA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Offsets of every NAL header byte in an Annex B stream.
