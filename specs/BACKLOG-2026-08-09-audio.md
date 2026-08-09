@@ -40,7 +40,7 @@ brief stall anywhere becomes a burst.
   `ELEMENTIUM_AUDIO_PACING=0` disables it, because this cannot be validated offline and the
   next call should be able to compare.
 
-- [ ] **A2. A device that does not open at 44.1 or 48 kHz is handed to Opus unresampled.**
+- [x] **A2. FIXED. A device that does not open at 44.1 or 48 kHz is handed to Opus unresampled.**
   The rate is mapped to the nearest Opus-supported value, but the resample that would make
   that true fires only for the exact pair 44100 → 48000. A device at 96000, 32000 or 22050
   falls through and its samples reach a 48 kHz encoder unchanged — wrong speed, wrong pitch,
