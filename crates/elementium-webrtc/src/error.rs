@@ -167,6 +167,25 @@ pub enum DataChannelWriteError {
     },
 }
 
+/// Codes for [`DataChannelWriteError`], read by the frontend's `RTCDataChannel.send()` shim
+/// (`webrtc-shim.ts`) to tell "retry once `onopen` fires" from "this channel is dead" from
+/// "the write itself failed" -- three conditions with three different right responses, which
+/// is exactly what the constitution's "act on it or ignore it" test asks for. `NotOpenYet`
+/// and `NoStream` both correspond to the DOM's own `InvalidStateError` for
+/// `RTCDataChannel.send()` on a channel whose `readyState` is not `"open"` (WebRTC 1.0
+/// §6.2); `Sctp` has no DOM analogue evidenced in the shipped bundle (nothing there catches
+/// a `send()` failure by name -- see X2's investigation), so it reaches the page as a
+/// generic rejection rather than a guessed exception name.
+impl elementium_types::IpcErrorCode for DataChannelWriteError {
+    fn ipc_code(&self) -> &'static str {
+        match self {
+            Self::NotOpenYet(_) => "data_channel_not_open",
+            Self::NoStream(_) => "data_channel_no_stream",
+            Self::Sctp { .. } => "data_channel_write_failed",
+        }
+    }
+}
+
 /// Which of the three call sites sharing the [`IoLoopError`] failure surface produced it.
 ///
 /// Not one variant per function: `recv_and_feed` is itself called from two different

@@ -72,6 +72,28 @@ pub enum ShareError {
 /// message. Kept in step with `PICKER_CANCELLED` in `frontend/src/shim/media-devices.ts`.
 pub const PICKER_CANCELLED: &str = "picker_cancelled";
 
+/// Codes for [`ShareError`], read by the frontend's `getDisplayMedia` shim to decide what
+/// to do -- not merely to log. `Cancelled` maps to `picker_cancelled`
+/// ([`PICKER_CANCELLED`], the same sentinel this crate already used for it) because the
+/// page must not report a declined share as a fault; every other variant is a real failure
+/// with no DOM exception the shipped bundle is known to branch on, so it reaches the page
+/// as a generic rejection instead of a fabricated `NotAllowedError` -- which is what it was
+/// tagged before this existed, indistinguishable from an actual decline.
+impl elementium_types::IpcErrorCode for ShareError {
+    fn ipc_code(&self) -> &'static str {
+        match self {
+            Self::Cancelled => PICKER_CANCELLED,
+            #[cfg(target_os = "linux")]
+            Self::NoBackend(_) => "no_capture_backend",
+            #[cfg(not(target_os = "linux"))]
+            Self::NoBackend => "no_capture_backend",
+            #[cfg(target_os = "linux")]
+            Self::Portal(_) => "portal_error",
+            Self::Capture { .. } => "capture_failed",
+        }
+    }
+}
+
 /// Which mechanism a share is using to capture.
 ///
 /// Chosen once when the session starts and then held, because the alternative -- deciding

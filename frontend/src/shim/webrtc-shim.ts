@@ -10,6 +10,7 @@ import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
 import { frameBytes } from "./frame-payload";
 import { createSilentAudioTrack, TRACK_SOURCE } from "./media-devices";
+import { parseIpcError } from "./ipc-error";
 import {
   describeJoinRequest,
   describeRequest,
@@ -1329,12 +1330,24 @@ export class ElementiumRTCPeerConnection extends EventTarget {
           binary,
           data: Array.from(bytes),
         }).catch((e) => {
-          console.error(`[Elementium] send_data_channel_message failed: label=${label}`, e);
+          // The Rust side distinguishes "not open yet, retry after onopen" from "this
+          // channel is dead" from "the write itself failed" (see
+          // `elementium_webrtc::error::DataChannelWriteError`'s `ipc_code`) -- parsed here
+          // and attached to the `error` event as `code` so a caller with a reason to
+          // retry (rather than give up) can tell which case this was, instead of every
+          // failure looking identical. Falls back to the plain message when there is no
+          // envelope to parse (an older backend, or a command not yet converted).
+          const envelope = parseIpcError(e);
+          console.error(
+            `[Elementium] send_data_channel_message failed: label=${label} code=${envelope?.code ?? "(none)"}`,
+            e,
+          );
           // Also raised on the channel, because that is where a caller looks. `send()` is
           // synchronous and cannot reject, so the DOM's only route for a transport failure
           // is an `error` event -- and a console line is not a route at all for code trying
           // to decide whether to retry.
-          const errorEvent = new Event("error");
+          const errorEvent = new Event("error") as Event & { code?: string };
+          if (envelope) errorEvent.code = envelope.code;
           const handler = (channel as unknown as Record<string, unknown>)["onerror"];
           if (typeof handler === "function") {
             (handler as (ev: Event) => void).call(channel, errorEvent);

@@ -15,7 +15,7 @@ use super::media_devices::{
     MediaState, ShareHandle, start_screen_share_audio_pipeline, start_screen_share_pipeline,
 };
 use super::webrtc::WebRtcState;
-use super::{IpcErr, LockExt};
+use super::{IpcErrCoded, IpcErrorEnvelope, LockExt};
 
 /// What starting a share produced.
 ///
@@ -77,9 +77,13 @@ pub async fn get_capture_sources() -> Result<Vec<CaptureSource>, String> {
 ///
 /// # Errors
 ///
-/// Returns the `picker_cancelled` sentinel when the user dismissed the picker, and a
-/// specific description otherwise. The two must stay distinguishable: one is a person
-/// declining, the other is something to investigate.
+/// Returns a coded JSON envelope (see `commands::IpcErrorEnvelope`): `code` is
+/// `"picker_cancelled"` when the user dismissed the picker without choosing anything, and
+/// one of `elementium_screen::ShareError`'s other [`elementium_types::IpcErrorCode`] codes
+/// otherwise. The two must stay distinguishable: one is a person declining, the other is
+/// something to investigate -- the frontend's `getDisplayMedia` shim rejects the former as
+/// a DOM `NotAllowedError` (matching what a real browser does when the user says no) and
+/// the latter as a plain rejection, so it is never mistaken for a decline.
 #[command]
 pub async fn get_display_media(
     webrtc_state: State<'_, WebRtcState>,
@@ -112,23 +116,35 @@ pub async fn get_display_media(
 /// being dismissed (an expected, recoverable outcome: a person declined to share, not a
 /// fault) and at `error` for everything else (a genuine failure to reach or use the portal).
 ///
-/// `start_x11_share`'s errors go through the plain [`IpcErr::ipc_err`] instead: the X11 path
-/// has no picker of its own (see the module doc on `source_id`), so [`elementium_screen::ShareError::Cancelled`]
-/// can never reach it and every variant it can produce is a real fault.
+/// `start_x11_share`'s errors go through the plain [`IpcErrCoded::ipc_err_coded`] instead:
+/// the X11 path has no picker of its own (see the module doc on `source_id`), so
+/// [`elementium_screen::ShareError::Cancelled`] can never reach it and every variant it can
+/// produce is a real fault -- there is no "declined" case here needing a different log
+/// level, only the coded envelope every caller of `get_display_media` now needs regardless
+/// of which backend answered.
 fn log_share_err(error: &elementium_screen::ShareError) -> String {
+    use elementium_types::IpcErrorCode;
+
+    let code = error.ipc_code();
     match error {
         elementium_screen::ShareError::Cancelled => {
             tracing::warn!(
                 command = "get_display_media",
+                code,
                 "screen-share picker dismissed without a selection"
             );
         }
         other => {
             let chain = super::error_chain(other);
-            tracing::error!(command = "get_display_media", chain = %chain, "command failed");
+            tracing::error!(command = "get_display_media", code, chain = %chain, "command failed");
         }
     }
-    error.to_string()
+    let envelope = IpcErrorEnvelope {
+        code: code.to_owned(),
+        message: error.to_string(),
+        id: String::new(),
+    };
+    serde_json::to_string(&envelope).unwrap_or_else(|_| error.to_string())
 }
 
 async fn get_display_media_inner(
@@ -153,11 +169,9 @@ async fn get_display_media_inner(
     // it shows a dialog and takes as long as a person takes to decide. The X11 branch has no
     // dialog and nothing to await.
     let session = if let Some(id) = source_id.as_deref() {
-        elementium_screen::start_x11_share(Some(id)).ipc_err("get_display_media", id)?
+        elementium_screen::start_x11_share(Some(id)).ipc_err_coded("get_display_media", id)?
     } else {
-        elementium_screen::start_share()
-            .await
-            .map_err(|e| log_share_err(&e))?
+        elementium_screen::start_share().await.map_err(|e| log_share_err(&e))?
     };
 
     let video_frames = {

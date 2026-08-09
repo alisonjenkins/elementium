@@ -19,7 +19,7 @@ use elementium_webrtc::peer_connection;
 use elementium_webrtc::{PcEvent, VideoPipeline, start_audio_playback};
 
 use super::media_devices::MediaState;
-use super::{IpcErr, LockExt};
+use super::{IpcErr, IpcErrCoded, LockExt};
 
 /// Shared WebRTC engine state, managed by Tauri.
 #[derive(Clone)]
@@ -501,6 +501,13 @@ pub async fn add_ice_candidate(
 ///
 /// Returns `Ok(false)` (not an error) when str0m's SCTP layer declines to accept the
 /// buffer right now because it would not fit in the send window -- the caller can retry.
+///
+/// # Errors
+///
+/// A coded JSON envelope built from [`elementium_webrtc::error::DataChannelWriteError`]'s
+/// `code`: `"data_channel_not_open"`/`"data_channel_no_stream"` for a channel the shim's
+/// own `send()` should not have called this for yet (see that error type's doc), and
+/// `"data_channel_write_failed"` for a real SCTP failure.
 #[command]
 pub async fn send_data_channel_message(
     state: State<'_, WebRtcState>,
@@ -513,7 +520,7 @@ pub async fn send_data_channel_message(
     let handle = get_pc_handle(&state, "send_data_channel_message", &pc_id)?;
     let mut pc = handle.lock_str("send_data_channel_message")?;
     peer_connection::write_data_channel(&mut pc, &label, binary, &data)
-        .ipc_err("write_data_channel", &pc_id)
+        .ipc_err_coded("write_data_channel", &pc_id)
 }
 
 /// One outbound (sent) track's transport stats, as returned to JS.

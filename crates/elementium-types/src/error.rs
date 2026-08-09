@@ -56,6 +56,29 @@ pub enum ElementiumError {
 
 pub type Result<T> = std::result::Result<T, ElementiumError>;
 
+/// Implemented by an error enum whose variants also cross the Tauri IPC boundary as a
+/// coded JSON envelope.
+///
+/// The envelope is `{"code": ..., "message": ..., "id": ...}`, for a command whose caller
+/// (the WebRTC/media shim) needs to act differently depending on which variant occurred --
+/// not merely log the message and give up.
+///
+/// `ipc_code` is matched on the variant, **never** derived from `self.to_string()` or any
+/// other rendering of the message: the frontend branches on `code`, so a reworded message
+/// must never change it. See `src-tauri/src/commands/mod.rs`'s `IpcErrorEnvelope` for where
+/// this is consumed, and `specs/BACKLOG-2026-08-09-errors.md` item X2 for why it exists --
+/// the 2026-08-09 outage was, in the end, a case of the page being unable to tell an error
+/// it had to act on from one it should ignore.
+///
+/// Every implementor documents its own codes beside its `match`, because that is where
+/// someone adding or renaming a variant will actually see them (a central registry a
+/// contributor never opens is worse than none).
+pub trait IpcErrorCode {
+    /// A stable, `snake_case` identifier naming which variant this is. Never derived from
+    /// `Display`/`to_string()` -- see the trait's own doc.
+    fn ipc_code(&self) -> &'static str;
+}
+
 #[cfg(test)]
 mod tests {
     use super::ElementiumError;

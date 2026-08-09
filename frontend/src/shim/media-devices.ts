@@ -6,6 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvasTrack } from "./canvas-track";
 import { frameBytes } from "./frame-payload";
+import { ipcErrorToRejection, parseIpcError } from "./ipc-error";
 
 /**
  * Notice devices appearing and disappearing, and tell listeners.
@@ -102,15 +103,17 @@ interface NativeDisplayMedia {
 }
 
 /**
- * Prefix the backend puts on the one `get_display_media` failure that is not a fault: the
- * user closed the system picker without choosing anything.
+ * The `code` the backend's coded JSON envelope carries for the one `get_display_media`
+ * failure that is not a fault: the user closed the system picker without choosing anything.
  *
- * An agreed sentinel rather than a pattern matched against the message text. The two sides
- * have to distinguish "the user declined" from "the portal is broken" -- one is routine and
- * one wants investigating -- and a regex over prose would keep working right up until
- * somebody rewords an error, at which point every cancellation starts being logged as a
- * failure with nothing to indicate the reporting changed. Kept in step with
- * `PICKER_CANCELLED` in `src-tauri/src/commands/screen_capture.rs`.
+ * An agreed sentinel matched against the envelope's `code` field, not against message text.
+ * The two sides have to distinguish "the user declined" from "the portal is broken" -- one
+ * is routine and one wants investigating -- and matching prose would keep working right up
+ * until somebody rewords an error, at which point every cancellation starts being logged as
+ * a failure with nothing to indicate the reporting changed; `code` is derived from the
+ * error's variant precisely so a reworded message cannot do that (see
+ * `elementium_types::IpcErrorCode`). Kept in step with `PICKER_CANCELLED` in
+ * `crates/elementium-screen/src/share.rs`.
  */
 const PICKER_CANCELLED = "picker_cancelled";
 
@@ -317,13 +320,19 @@ export function setupMediaDevicesShim(): void {
         // `NotAllowedError`, because that is what a real browser throws in this case. Logged
         // separately from a genuine capture failure so "the user said no" and "the portal is
         // broken" cannot be confused with each other while reading the log later.
-        const message = e instanceof Error ? e.message : String(e);
-        if (message.startsWith(PICKER_CANCELLED)) {
-          debugLog(`getDisplayMedia: picker cancelled: ${message}`);
+        //
+        // Every other code (`get_display_media` failing for a real reason) used to reach
+        // here tagged `NotAllowedError` too, indistinguishable from a decline -- which is
+        // the exact "page cannot tell an error it must act on from one it should ignore"
+        // problem X2 exists to fix. `ipcErrorToRejection` only maps `picker_cancelled` to
+        // that name (see its own doc); everything else is now a plain `Error`.
+        const envelope = parseIpcError(e);
+        if (envelope?.code === PICKER_CANCELLED) {
+          debugLog(`getDisplayMedia: picker cancelled: ${envelope.message}`);
         } else {
           console.error("[Elementium] getDisplayMedia failed:", e);
         }
-        throw new DOMException("Could not start screen capture", "NotAllowedError");
+        throw ipcErrorToRejection(e, "Could not start screen capture");
       }
     },
 

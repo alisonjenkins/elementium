@@ -200,6 +200,153 @@ mod logging_tests {
     }
 }
 
+/// The JSON shape a *coded* IPC error takes once flattened to the `String` the IPC
+/// boundary requires.
+///
+/// `code` is what the page branches on: stable, `snake_case`, and derived from the error's
+/// variant via [`elementium_types::IpcErrorCode`] -- never from `message`, so rewording a
+/// message can never silently change what the page does. `id` is the correlating
+/// identifier the command already logs (`pc_id`, a track key, ...) where it has one, `""`
+/// otherwise, matching [`IpcErr::ipc_err`]'s own convention. `message` is for a human
+/// reading a log or an unhandled-rejection dump, not for the page to match against.
+///
+/// Every code actually produced is documented beside the `IpcErrorCode` impl of the error
+/// type that produces it (see `elementium_screen::ShareError` and
+/// `elementium_webrtc::error::DataChannelWriteError`), not centralised here: that is where
+/// someone adding or renaming a variant will see it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct IpcErrorEnvelope {
+    pub code: String,
+    pub message: String,
+    pub id: String,
+}
+
+/// A `Result<T, String>` counterpart to [`IpcErr`] for a command whose caller must be able
+/// to act differently depending on which error variant occurred, not merely log the
+/// message and give up -- see [`IpcErrorEnvelope`] and
+/// `specs/BACKLOG-2026-08-09-errors.md` item X2.
+///
+/// Deliberately a separate trait from `IpcErr` rather than a flag on it: most of this
+/// crate's ~25 commands have no caller that branches on their failure at all (the page
+/// logs and gives up either way), and giving every one of them a code would be exactly the
+/// blanket conversion X2 warns against -- "codes that exist to let the page ignore an
+/// error" are the wrong fix, and a code nobody reads is worse than a plain message because
+/// it invites exactly that.
+pub trait IpcErrCoded<T> {
+    fn ipc_err_coded(self, command: &str, id: &str) -> Result<T, String>;
+}
+
+impl<T, E> IpcErrCoded<T> for Result<T, E>
+where
+    E: std::error::Error + elementium_types::IpcErrorCode,
+{
+    fn ipc_err_coded(self, command: &str, id: &str) -> Result<T, String> {
+        self.map_err(|e| {
+            let chain = error_chain(&e);
+            let code = e.ipc_code();
+            tracing::error!(command, id, code, chain = %chain, "command failed");
+            let envelope = IpcErrorEnvelope {
+                code: code.to_owned(),
+                message: e.to_string(),
+                id: id.to_owned(),
+            };
+            serde_json::to_string(&envelope).unwrap_or_else(|_| e.to_string())
+        })
+    }
+}
+
+#[cfg(test)]
+mod coded_error_tests {
+    use elementium_observability_test::LogCapture;
+    use elementium_types::IpcErrorCode;
+
+    use super::{IpcErrCoded, IpcErrorEnvelope};
+
+    /// A minimal coded error, standing in for `DataChannelWriteError`/`ShareError` so this
+    /// test does not depend on either crate. Two variants, so the round-trip test and the
+    /// "code survives a reworded message" test can each pick a different one without
+    /// coincidentally exercising the same match arm.
+    #[derive(Debug)]
+    enum Fixture {
+        Alpha(&'static str),
+        Beta,
+    }
+
+    impl std::fmt::Display for Fixture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Alpha(msg) => write!(f, "{msg}"),
+                Self::Beta => write!(f, "beta failed"),
+            }
+        }
+    }
+
+    impl std::error::Error for Fixture {}
+
+    impl IpcErrorCode for Fixture {
+        fn ipc_code(&self) -> &'static str {
+            match self {
+                Self::Alpha(_) => "fixture_alpha",
+                Self::Beta => "fixture_beta",
+            }
+        }
+    }
+
+    /// Every code this module can produce must parse back out of the envelope it built,
+    /// with the id it was given -- the round trip [`IpcErrCoded::ipc_err_coded`] exists to
+    /// guarantee, once per variant `Fixture` has.
+    // `expect_err`/`unwrap_err` throughout this module: every fixture here is deliberately
+    // always `Err`, and asserting that is the point of each test, not a shortcut around it.
+    // `panic!` inside the parse helper below is how a malformed envelope fails the test with
+    // a message that shows the bad JSON, rather than a bare `unwrap` panic with none.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #[test]
+    fn round_trips_every_variant_as_a_json_envelope() {
+        let cases: Vec<(Result<(), Fixture>, &str)> = vec![
+            (Err(Fixture::Alpha("first message")), "fixture_alpha"),
+            (Err(Fixture::Beta), "fixture_beta"),
+        ];
+        for (result, expected_code) in cases {
+            let capture = LogCapture::new();
+            let flattened = capture
+                .run(|| result.ipc_err_coded("test_command", "widget-1"))
+                .expect_err("fixture is always Err");
+            let envelope: IpcErrorEnvelope = serde_json::from_str(&flattened)
+                .unwrap_or_else(|e| panic!("envelope did not parse as JSON: {e}; got {flattened:?}"));
+            assert_eq!(envelope.code, expected_code);
+            assert_eq!(envelope.id, "widget-1");
+        }
+    }
+
+    /// Pins the rule the whole mechanism exists to enforce: `code` comes from the
+    /// *variant*, never from the rendered message. Two `Fixture::Alpha` errors with
+    /// different messages -- as if someone had reworded the `Display` impl -- must produce
+    /// the identical code, because the page's branch depends on it staying put across a
+    /// wording change.
+    // See the `panic!`/`unwrap` note on the previous test -- same reasoning applies here.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #[test]
+    fn code_is_derived_from_the_variant_not_the_message() {
+        let original: Result<(), Fixture> = Err(Fixture::Alpha("no pending offer to match answer"));
+        let reworded: Result<(), Fixture> = Err(Fixture::Alpha("SDP answer arrived unexpectedly"));
+
+        let original_json = original.ipc_err_coded("test_command", "").unwrap_err();
+        let reworded_json = reworded.ipc_err_coded("test_command", "").unwrap_err();
+
+        let parse = |json: &str| -> IpcErrorEnvelope {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("not valid JSON: {e}; got {json:?}"))
+        };
+        let original_env = parse(&original_json);
+        let reworded_env = parse(&reworded_json);
+
+        assert_eq!(original_env.code, reworded_env.code, "reworded message changed the code");
+        assert_ne!(
+            original_env.message, reworded_env.message,
+            "test setup: messages must actually differ for this to prove anything"
+        );
+    }
+}
+
 // A `Result<T, String>` counterpart to `IpcErr` (for sites whose failure is already a bare
 // `String` rather than a typed error) was drafted alongside it and then deleted: every site
 // in this crate that used to build such a `String` ad hoc -- "peer connection not found",
