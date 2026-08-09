@@ -554,11 +554,12 @@ impl TransceiverInfo {
 fn send_mid_for(
     pc: &PeerConnectionInner,
     key: MediaTrackKey,
+    operation: crate::error::MediaWriteOperation,
 ) -> Result<Mid, crate::error::MediaWriteError> {
-    pc.send_mids
-        .get(&key)
-        .copied()
-        .ok_or(crate::error::MediaWriteError::TrackNotPublished(key))
+    pc.send_mids.get(&key).copied().ok_or(crate::error::MediaWriteError {
+        operation,
+        kind: crate::error::MediaWriteErrorKind::TrackNotPublished(key),
+    })
 }
 
 /// The track a named source refers to, or `None` when the name is not one we publish.
@@ -963,20 +964,23 @@ pub fn write_audio(
     key: MediaTrackKey,
     opus_data: &WireMedia,
 ) -> Result<(), crate::error::MediaWriteError> {
-    use crate::error::MediaWriteError as Error;
+    use crate::error::{
+        MediaWriteError as Error, MediaWriteErrorKind as Kind, MediaWriteOperation as Op,
+    };
+    const OPERATION: Op = Op::WriteAudio;
 
     let opus_data = opus_data.as_bytes();
-    let mid = send_mid_for(pc, key)?;
+    let mid = send_mid_for(pc, key, OPERATION)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
-        return Err(Error::NoWriter(MediaKind::Audio));
+        return Err(Error { operation: OPERATION, kind: Kind::NoWriter(MediaKind::Audio) });
     };
 
     let pt = writer
         .payload_params()
         .find(|p| p.spec().codec == Codec::Opus)
         .map(str0m::format::PayloadParams::pt)
-        .ok_or(Error::CodecNotNegotiated { codec: "Opus" })?;
+        .ok_or(Error { operation: OPERATION, kind: Kind::CodecNotNegotiated { codec: "Opus" } })?;
     pc.audio_pt = Some(*pt);
 
     // Opus at 48kHz: each 20ms frame = 960 samples. Saturating, not fallible: a u64 frame
@@ -997,7 +1001,7 @@ pub fn write_audio(
 
     writer
         .write(pt, wallclock, rtp_time, opus_data)
-        .map_err(Error::Rtp)?;
+        .map_err(|e| Error { operation: OPERATION, kind: Kind::Rtp(e) })?;
 
     // Saturating for the same reason as the offset above: a frame counter that has run
     // long enough to overflow u64 has run for longer than any call lasts, so pinning it at
@@ -1061,14 +1065,17 @@ pub fn write_video(
     frame: &WireMedia,
     codec: elementium_codec::VideoCodec,
 ) -> Result<(), crate::error::MediaWriteError> {
-    use crate::error::MediaWriteError as Error;
+    use crate::error::{
+        MediaWriteError as Error, MediaWriteErrorKind as Kind, MediaWriteOperation as Op,
+    };
+    const OPERATION: Op = Op::WriteVideo;
 
     let frame_data = frame.as_bytes();
     dump_frame_head("outbound", codec.sdp_name(), frame_data.len(), frame_data);
-    let mid = send_mid_for(pc, key)?;
+    let mid = send_mid_for(pc, key, OPERATION)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
-        return Err(Error::NoWriter(MediaKind::Video));
+        return Err(Error { operation: OPERATION, kind: Kind::NoWriter(MediaKind::Video) });
     };
 
     // The payload type follows the codec of the bytes in hand rather than an assumption
@@ -1094,8 +1101,9 @@ pub fn write_video(
     let fragmentable = params
         .iter()
         .find(|p| p.spec().format.packetization_mode != Some(0));
-    let chosen = fragmentable.or_else(|| params.first()).ok_or_else(|| Error::CodecNotNegotiated {
-        codec: codec.sdp_name(),
+    let chosen = fragmentable.or_else(|| params.first()).ok_or_else(|| Error {
+        operation: OPERATION,
+        kind: Kind::CodecNotNegotiated { codec: codec.sdp_name() },
     })?;
     if fragmentable.is_none() {
         tracing::warn!(
@@ -1132,7 +1140,7 @@ pub fn write_video(
 
     writer
         .write(pt, now, rtp_time, frame_data)
-        .map_err(Error::Rtp)?;
+        .map_err(|e| Error { operation: OPERATION, kind: Kind::Rtp(e) })?;
 
     // Saturating for the same reason as `write_audio`'s frame counter: overflow needs a
     // call lasting longer than any call does, so an error here was an unreachable path a
@@ -1189,15 +1197,18 @@ pub fn drain_data_channel_events(pc: &mut PeerConnectionInner) -> Vec<DataChanne
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::IoLoopError::Input`] if str0m fails to process a timeout, or
-/// [`crate::error::IoLoopError::Str0mFatal`] if `poll_output` reports a fatal str0m error
+/// Returns [`crate::error::IoLoopErrorKind::Input`] if str0m fails to process a timeout, or
+/// [`crate::error::IoLoopErrorKind::Str0mFatal`] if `poll_output` reports a fatal str0m error
 /// (in which case `pc.alive` is also set to false).
 pub fn poll_once(
     pc: &mut PeerConnectionInner,
     socket: &UdpSocket,
     _recv_buf: &mut [u8],
 ) -> Result<(Vec<WirePcEvent>, Instant), crate::error::IoLoopError> {
-    use crate::error::IoLoopError as Error;
+    use crate::error::{
+        IoLoopError as Error, IoLoopErrorKind as Kind, IoLoopOperation as Op,
+    };
+    const OPERATION: Op = Op::PollOnce;
 
     // str0m's do_poll_output calls dtls.poll_output() which requires dimpl's
     // handle_timeout to have been called. But str0m's do_handle_timeout does NOT
@@ -1225,7 +1236,7 @@ pub fn poll_once(
         // poll_output call, not just once per cycle. Feed a timeout each iteration.
         pc.rtc
             .handle_input(Input::Timeout(Instant::now()))
-            .map_err(Error::Input)?;
+            .map_err(|e| Error { operation: OPERATION, kind: Kind::Input(e) })?;
 
         match pc.rtc.poll_output() {
             Ok(Output::Transmit(transmit)) => {
@@ -1294,7 +1305,7 @@ pub fn poll_once(
             }
             Err(e) => {
                 pc.alive = false;
-                return Err(Error::Str0mFatal(e));
+                return Err(Error { operation: OPERATION, kind: Kind::Str0mFatal(e) });
             }
         }
     }
@@ -1338,11 +1349,29 @@ pub fn recv_and_feed(
     recv_buf: &mut [u8],
     timeout: Duration,
 ) -> Result<bool, crate::error::IoLoopError> {
-    use crate::error::IoLoopError as Error;
+    recv_and_feed_as(pc, socket, recv_buf, timeout, crate::error::IoLoopOperation::Receive)
+}
+
+/// The actual body of `recv_and_feed`, parameterised on the operation to attribute a
+/// failure to.
+///
+/// `drain_backlog` calls this directly with [`crate::error::IoLoopOperation::DrainBacklog`]
+/// instead of calling the public `recv_and_feed` (which always attributes to `Receive`) --
+/// same read, different call site, and the whole reason `IoLoopError` grew an `operation`
+/// field was so a failure mid-burst-drain reads differently in a log from a failure on an
+/// otherwise-idle connection's very first read.
+fn recv_and_feed_as(
+    pc: &mut PeerConnectionInner,
+    socket: &UdpSocket,
+    recv_buf: &mut [u8],
+    timeout: Duration,
+    operation: crate::error::IoLoopOperation,
+) -> Result<bool, crate::error::IoLoopError> {
+    use crate::error::{IoLoopError as Error, IoLoopErrorKind as Kind};
 
     socket
         .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
-        .map_err(Error::Socket)?;
+        .map_err(|e| Error { operation, kind: Kind::Socket(e) })?;
 
     match socket.recv_from(recv_buf) {
         Ok((len, source)) => {
@@ -1374,7 +1403,7 @@ pub fn recv_and_feed(
             // Resolve 0.0.0.0 → actual interface IP so str0m can match
             // the destination to our registered ICE candidate and generate
             // STUN Binding Responses.
-            let mut dest = socket.local_addr().map_err(Error::Socket)?;
+            let mut dest = socket.local_addr().map_err(|e| Error { operation, kind: Kind::Socket(e) })?;
             if dest.ip().is_unspecified()
                 && let Some(real_ip) = get_local_ip()
             {
@@ -1408,7 +1437,7 @@ pub fn recv_and_feed(
                     contents,
                 },
             );
-            pc.rtc.handle_input(input).map_err(Error::Input)?;
+            pc.rtc.handle_input(input).map_err(|e| Error { operation, kind: Kind::Input(e) })?;
             return Ok(true);
         }
         Err(e)
@@ -1417,7 +1446,7 @@ pub fn recv_and_feed(
         {
             pc.rtc
                 .handle_input(Input::Timeout(Instant::now()))
-                .map_err(Error::Input)?;
+                .map_err(|e| Error { operation, kind: Kind::Input(e) })?;
         }
         Err(e) if is_routine_icmp_refusal(e.kind()) => {
             // Routine, but throttled and logged rather than silently swallowed: this is
@@ -1436,7 +1465,7 @@ pub fn recv_and_feed(
             }
         }
         Err(e) => {
-            return Err(Error::Socket(e));
+            return Err(Error { operation, kind: Kind::Socket(e) });
         }
     }
     Ok(false)
@@ -1457,7 +1486,13 @@ pub fn recv_and_feed(
 pub fn drain_backlog(pc: &mut PeerConnectionInner, socket: &UdpSocket, recv_buf: &mut [u8]) {
     let mut drained = 1u32;
     while drained < 64 {
-        match recv_and_feed(pc, socket, recv_buf, Duration::from_millis(1)) {
+        match recv_and_feed_as(
+            pc,
+            socket,
+            recv_buf,
+            Duration::from_millis(1),
+            crate::error::IoLoopOperation::DrainBacklog,
+        ) {
             Ok(true) => drained = drained.saturating_add(1),
             Ok(false) => break,
             Err(e) => {
@@ -3457,7 +3492,8 @@ mod local_candidate_tests {
 mod error_variant_tests {
     use super::*;
     use crate::error::{
-        AddIceCandidateError, CreateAnswerError, MediaWriteError, SetRemoteDescriptionError,
+        AddIceCandidateError, CreateAnswerError, MediaWriteError, MediaWriteErrorKind,
+        MediaWriteOperation, SetRemoteDescriptionError,
     };
     use elementium_types::PlaintextMedia;
 
@@ -3568,10 +3604,38 @@ mod error_variant_tests {
     fn writing_an_unpublished_track_is_track_not_published() {
         let mut pc = create_peer_connection("unpublished-track".to_owned());
         let key = MediaTrackKey::microphone();
-        assert!(matches!(
-            write_audio(&mut pc, key, &silence()),
-            Err(MediaWriteError::TrackNotPublished(k)) if k == key
-        ));
+        let result = write_audio(&mut pc, key, &silence());
+        assert!(
+            matches!(
+                result,
+                Err(MediaWriteError {
+                    operation: MediaWriteOperation::WriteAudio,
+                    kind: MediaWriteErrorKind::TrackNotPublished(k),
+                }) if k == key
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Same fault (`TrackNotPublished`) as the audio test above, but through `write_video` --
+    /// pinning that `operation` tracks which write actually failed, not the fixed key/kind
+    /// shape that is identical between the two. Before `MediaWriteError` grew `operation`,
+    /// this and the audio test above were indistinguishable from each other by variant alone.
+    #[test]
+    fn writing_an_unpublished_video_track_names_video_not_audio() {
+        let mut pc = create_peer_connection("unpublished-video-track".to_owned());
+        let key = MediaTrackKey::camera();
+        let result = write_video(&mut pc, key, &silence(), elementium_codec::VideoCodec::Vp8);
+        assert!(
+            matches!(
+                result,
+                Err(MediaWriteError {
+                    operation: MediaWriteOperation::WriteVideo,
+                    kind: MediaWriteErrorKind::TrackNotPublished(k),
+                }) if k == key
+            ),
+            "{result:?}"
+        );
     }
 
     /// A mid recorded as ours but unknown to str0m (never actually negotiated) must fail
@@ -3582,10 +3646,17 @@ mod error_variant_tests {
         let mut pc = create_peer_connection("unknown-mid".to_owned());
         let key = MediaTrackKey::microphone();
         pc.send_mids.insert(key, Mid::from("zzz"));
-        assert!(matches!(
-            write_audio(&mut pc, key, &silence()),
-            Err(MediaWriteError::NoWriter(MediaKind::Audio))
-        ));
+        let result = write_audio(&mut pc, key, &silence());
+        assert!(
+            matches!(
+                result,
+                Err(MediaWriteError {
+                    operation: MediaWriteOperation::WriteAudio,
+                    kind: MediaWriteErrorKind::NoWriter(MediaKind::Audio),
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     /// A writer exists and negotiation completed on both sides, but the codec asked for
@@ -3618,8 +3689,40 @@ mod error_variant_tests {
             elementium_codec::VideoCodec::Av1,
         );
         assert!(
-            matches!(result, Err(MediaWriteError::CodecNotNegotiated { codec: "AV1" })),
+            matches!(
+                result,
+                Err(MediaWriteError {
+                    operation: MediaWriteOperation::WriteVideo,
+                    kind: MediaWriteErrorKind::CodecNotNegotiated { codec: "AV1" },
+                })
+            ),
             "{result:?}"
         );
+    }
+
+    /// Locks in the wording the constitution's Principle I amendment asked for: `Display`
+    /// on the shared error must read as `{operation}: {kind}`, e.g. `write_video: no mid
+    /// published for track ...`, not just the bare kind message that lost which write
+    /// failed.
+    #[test]
+    fn media_write_error_display_names_the_operation_before_the_kind() {
+        let mut pc = create_peer_connection("display-format".to_owned());
+        let key = MediaTrackKey::camera();
+        let result = write_video(&mut pc, key, &silence(), elementium_codec::VideoCodec::Vp8);
+        assert!(
+            matches!(
+                &result,
+                Err(err) if err.to_string() == "write_video: no mid published for track video/camera"
+            ),
+            "Display must name the operation, not just the underlying kind: {result:?}"
+        );
+    }
+
+    /// Locks in `MediaWriteOperation`'s `Display` wording directly, independent of any
+    /// particular failure -- this is the piece a log line actually reads.
+    #[test]
+    fn media_write_operation_display_names_the_call_site() {
+        assert_eq!(MediaWriteOperation::WriteAudio.to_string(), "write_audio");
+        assert_eq!(MediaWriteOperation::WriteVideo.to_string(), "write_video");
     }
 }

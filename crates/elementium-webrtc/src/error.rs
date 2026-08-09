@@ -72,19 +72,69 @@ pub enum AddIceCandidateError {
     },
 }
 
-/// Failure surface shared by `write_audio`, `write_video` and `send_mid_for`.
+/// Which operation sharing the [`MediaWriteError`] failure surface produced it.
+///
+/// `send_mid_for` (the mid-resolution helper both writers call first) is deliberately *not*
+/// a third `ResolveMid` variant here. It has exactly two callers -- `write_audio` and
+/// `write_video` -- and nothing else ever calls it, so its failure is always really "the
+/// audio write failed to resolve a mid" or "the video write failed to resolve a mid". A log
+/// line reading `write_video: no mid published for track camera` tells a screen-share
+/// dropout apart from a camera one immediately; `resolve_mid: no mid published for track
+/// camera` would still leave the reader guessing which write called it before they even know
+/// whether the picture or the voice was the casualty. So the caller's own operation is
+/// threaded straight through instead of being replaced by a third one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaWriteOperation {
+    /// [`crate::peer_connection::write_audio`], including its `send_mid_for` step.
+    WriteAudio,
+    /// [`crate::peer_connection::write_video`], including its `send_mid_for` step.
+    WriteVideo,
+}
+
+impl std::fmt::Display for MediaWriteOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WriteAudio => "write_audio",
+            Self::WriteVideo => "write_video",
+        })
+    }
+}
+
+/// Failure surface shared by `write_audio` and `write_video` (and the `send_mid_for` helper
+/// both call).
 ///
 /// Sharing is permitted here under constitution principle I only because every caller of
-/// `write_audio`/`write_video` handles every variant identically: drop the frame, log, and
-/// keep the connection running. A caller that needed to react differently per variant would
-/// need its own enum instead.
+/// `write_audio`/`write_video` handles every `kind` identically: drop the frame, log, and
+/// keep the connection running. What sharing must not do is lose which of the two produced
+/// the error -- `RTP write failed` on its own does not say whether a fifth of a second of
+/// speech or an unmissed video frame was dropped -- so `operation` carries that alongside
+/// `kind`, which is otherwise unchanged from before this type gained the field.
 #[derive(Debug, Error)]
-pub enum MediaWriteError {
+#[error("{operation}: {kind}")]
+pub struct MediaWriteError {
+    pub operation: MediaWriteOperation,
+    #[source]
+    pub kind: MediaWriteErrorKind,
+}
+
+/// The distinct ways a media write can fail, independent of which operation hit them.
+///
+/// Kept exactly as before `MediaWriteError` gained its `operation` field: callers that
+/// matched on these variants keep matching on them unchanged.
+#[derive(Debug, Error)]
+pub enum MediaWriteErrorKind {
     /// The write named one of our own tracks that this connection has not published.
     #[error("no mid published for track {0}")]
     TrackNotPublished(elementium_types::MediaTrackKey),
     /// No local writer exists yet for this media kind (e.g. no transceiver of that kind was
     /// ever negotiated).
+    ///
+    /// `operation` on the enclosing [`MediaWriteError`] is still worth carrying here even
+    /// though `str0m::media::MediaKind` already says audio-or-video: the two are not
+    /// interchangeable once other variants (`TrackNotPublished`, `CodecNotNegotiated`,
+    /// `Rtp`) are considered, none of which carry a kind of their own, and a single struct
+    /// shape that always has `operation` is simpler to log and to match on than one field
+    /// that exists on some variants and not others.
     #[error("no {0:?} writer available")]
     NoWriter(str0m::media::MediaKind),
     /// The mid has a writer, but the far end never negotiated a payload type for this
@@ -117,14 +167,59 @@ pub enum DataChannelWriteError {
     },
 }
 
+/// Which of the three call sites sharing the [`IoLoopError`] failure surface produced it.
+///
+/// Not one variant per function: `recv_and_feed` is itself called from two different
+/// places with two different meanings -- once directly, waiting for the next datagram, and
+/// again in a tight loop from `drain_backlog`, pulling datagrams already queued behind a
+/// burst. A failure partway through draining a backlog (kernel buffer already had several
+/// packets queued) is a different situation from a failure on the very first read of an
+/// idle connection, so that distinction is carried here rather than collapsed into a single
+/// `Receive` that could mean either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoLoopOperation {
+    /// [`crate::peer_connection::poll_once`] draining str0m's output queue or handing it a
+    /// timeout tick.
+    PollOnce,
+    /// [`crate::peer_connection::recv_and_feed`] called directly, waiting for the next UDP
+    /// datagram.
+    Receive,
+    /// [`crate::peer_connection::recv_and_feed`] called repeatedly by
+    /// [`crate::peer_connection::drain_backlog`] to pull further datagrams already queued in
+    /// the kernel receive buffer.
+    DrainBacklog,
+}
+
+impl std::fmt::Display for IoLoopOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PollOnce => "poll_once",
+            Self::Receive => "recv_and_feed",
+            Self::DrainBacklog => "drain_backlog",
+        })
+    }
+}
+
 /// Failure surface shared by `poll_once`, `recv_and_feed` and the backlog drain they share.
 ///
 /// Sharing is permitted here under constitution principle I: all three are the same io loop
 /// at different points in one iteration, and a caller who cannot advance the loop for one
 /// reason cannot advance it for any of the others either -- there is nothing to distinguish
-/// by at the call site.
+/// by *in how the caller reacts*. But "socket error" alone does not say whether that was the
+/// very first read on an idle connection or the middle of draining a burst, and those read
+/// very differently in a log, so `operation` carries the call site while `kind` (unchanged
+/// from before this type gained the field) carries the failure itself.
 #[derive(Debug, Error)]
-pub enum IoLoopError {
+#[error("{operation}: {kind}")]
+pub struct IoLoopError {
+    pub operation: IoLoopOperation,
+    #[source]
+    pub kind: IoLoopErrorKind,
+}
+
+/// The distinct ways the io loop can fail, independent of which call site hit them.
+#[derive(Debug, Error)]
+pub enum IoLoopErrorKind {
     /// `Rtc::poll_output` reported a fatal error. The connection is no longer usable;
     /// callers set `pc.alive = false` alongside this.
     #[error("str0m reported a fatal error")]

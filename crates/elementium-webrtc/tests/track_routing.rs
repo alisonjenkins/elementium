@@ -162,9 +162,13 @@ fn writing_an_unpublished_track_is_refused_rather_than_rerouted() {
     assert!(
         matches!(
             err,
-            elementium_webrtc::error::MediaWriteError::TrackNotPublished(_)
+            elementium_webrtc::error::MediaWriteError {
+                operation: elementium_webrtc::error::MediaWriteOperation::WriteVideo,
+                kind: elementium_webrtc::error::MediaWriteErrorKind::TrackNotPublished(_),
+            }
         ),
-        "the failure must name the missing track, not a missing writer; got {err:?}"
+        "the failure must name the missing track and the video write that hit it, not a \
+         missing writer; got {err:?}"
     );
 }
 
