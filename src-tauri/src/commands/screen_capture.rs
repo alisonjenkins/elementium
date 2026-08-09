@@ -15,6 +15,7 @@ use super::media_devices::{
     MediaState, ShareHandle, start_screen_share_audio_pipeline, start_screen_share_pipeline,
 };
 use super::webrtc::WebRtcState;
+use super::{IpcErr, LockExt};
 
 /// What starting a share produced.
 ///
@@ -107,6 +108,29 @@ pub async fn get_display_media(
         .await
 }
 
+/// Flatten a portal share failure for the IPC, logging it once -- at `warn` for the picker
+/// being dismissed (an expected, recoverable outcome: a person declined to share, not a
+/// fault) and at `error` for everything else (a genuine failure to reach or use the portal).
+///
+/// `start_x11_share`'s errors go through the plain [`IpcErr::ipc_err`] instead: the X11 path
+/// has no picker of its own (see the module doc on `source_id`), so [`elementium_screen::ShareError::Cancelled`]
+/// can never reach it and every variant it can produce is a real fault.
+fn log_share_err(error: &elementium_screen::ShareError) -> String {
+    match error {
+        elementium_screen::ShareError::Cancelled => {
+            tracing::warn!(
+                command = "get_display_media",
+                "screen-share picker dismissed without a selection"
+            );
+        }
+        other => {
+            let chain = super::error_chain(other);
+            tracing::error!(command = "get_display_media", chain = %chain, "command failed");
+        }
+    }
+    error.to_string()
+}
+
 async fn get_display_media_inner(
     webrtc_state: State<'_, WebRtcState>,
     media_state: State<'_, MediaState>,
@@ -129,13 +153,15 @@ async fn get_display_media_inner(
     // it shows a dialog and takes as long as a person takes to decide. The X11 branch has no
     // dialog and nothing to await.
     let session = if let Some(id) = source_id.as_deref() {
-        elementium_screen::start_x11_share(Some(id)).map_err(|e| e.to_string())?
+        elementium_screen::start_x11_share(Some(id)).ipc_err("get_display_media", id)?
     } else {
-        elementium_screen::start_share().await.map_err(|e| e.to_string())?
+        elementium_screen::start_share()
+            .await
+            .map_err(|e| log_share_err(&e))?
     };
 
     let video_frames = {
-        let engine = webrtc_state.0.lock().map_err(|_| "engine lock poisoned")?;
+        let engine = webrtc_state.0.lock_str("get_display_media")?;
         engine.video_frames.clone()
     };
 

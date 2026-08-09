@@ -16,9 +16,9 @@ use elementium_types::{CorrelationId, MediaTrackKey};
 use elementium_webrtc::engine::VideoFrameBuffer;
 use elementium_webrtc::livekit::room::{LiveKitRoom, RoomEvent};
 
-use super::LockExt;
 use super::e2ee::E2eeState;
 use super::media_devices::MediaState;
+use super::{IpcErr, LockExt};
 
 /// Shared state holding active `LiveKit` rooms, managed by Tauri.
 #[derive(Clone)]
@@ -52,22 +52,16 @@ pub async fn livekit_connect(
     // register_state doc comment): read the current policy at connect time.
     // EncryptionPolicy clones cheaply (Arc-backed E2eeContext inside), so
     // later e2ee_set_key calls remain visible through this clone.
-    let e2ee = e2ee_state.ctx.lock_str()?.clone();
+    let e2ee = e2ee_state.ctx.lock_str("livekit_connect")?.clone();
 
     async move {
         tracing::info!(sfu_url = %sfu_url, "connect attempt started");
 
         let video_frames = state.video_frames.clone();
-        let connect_result =
+        let (room, mut event_rx) =
             LiveKitRoom::connect(&sfu_url, &token, video_frames, correlation_id.clone(), e2ee)
-                .await;
-        let (room, mut event_rx) = match connect_result {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(reason = %e, "connect attempt failed");
-                return Err(e.into());
-            }
-        };
+                .await
+                .ipc_err("livekit_connect", &sfu_url)?;
 
         let room_id = room.room_id.clone();
         let room_name = room.room_name.clone();
@@ -91,7 +85,7 @@ pub async fn livekit_connect(
             if let Ok(mut slot) = media_state.session_correlation.lock() {
                 *slot = Some(correlation_id.clone());
             }
-            let mut rooms = state.rooms.lock_str()?;
+            let mut rooms = state.rooms.lock_str("livekit_connect")?;
             rooms.insert(room_id.clone(), room);
         }
 
@@ -147,11 +141,12 @@ pub async fn livekit_publish_track(
     kind: String,
     source: String,
 ) -> Result<(), String> {
-    let key = track_key(&kind, &source)?;
-    let room = get_room(&state, &room_id)?;
+    let key = track_key("livekit_publish_track", &kind, &source)?;
+    let room = get_room(&state, "livekit_publish_track", &room_id)?;
     let media_tx = {
         let mut room = room.lock().await;
-        room.publish_track(key)?;
+        room.publish_track(key)
+            .ipc_err("livekit_publish_track", &room_id)?;
         room.media_sender()
     };
     attach_capture_pipeline(&media_state, media_tx, key);
@@ -178,10 +173,11 @@ pub async fn livekit_set_track_muted(
     source: String,
     muted: bool,
 ) -> Result<(), String> {
-    let key = track_key(&kind, &source)?;
-    let room = get_room(&state, &room_id)?;
+    let key = track_key("livekit_set_track_muted", &kind, &source)?;
+    let room = get_room(&state, "livekit_set_track_muted", &room_id)?;
     let room = room.lock().await;
-    room.set_track_muted(key, muted).map_err(|e| e.to_string())
+    room.set_track_muted(key, muted)
+        .ipc_err("livekit_set_track_muted", &room_id)
 }
 
 /// Resolve the kind/source pair the frontend sends into a track identity.
@@ -190,13 +186,20 @@ pub async fn livekit_set_track_muted(
 /// an unrecognised source to `TrackSource::Unknown` and carried on, which produces a track
 /// the SFU accepts and every other client renders as an unlabelled stream -- a failure that
 /// only shows up in somebody else's UI.
-pub(super) fn track_key(kind: &str, source: &str) -> Result<MediaTrackKey, String> {
+///
+/// `command` names the caller for the log line this emits on rejection -- shared by four
+/// call sites across two modules, each of which would otherwise need its own copy of this
+/// match to attach its own name.
+pub(super) fn track_key(command: &str, kind: &str, source: &str) -> Result<MediaTrackKey, String> {
     let key = match (kind, source) {
         ("audio", "microphone") => MediaTrackKey::microphone(),
         ("video", "camera") => MediaTrackKey::camera(),
         ("video", "screen_share") => MediaTrackKey::screen_share(),
         ("audio", "screen_share_audio") => MediaTrackKey::screen_share_audio(),
-        _ => return Err(format!("not a publishable track: {kind}/{source}")),
+        _ => {
+            tracing::error!(command, kind, source, "not a publishable track");
+            return Err(format!("not a publishable track: {kind}/{source}"));
+        }
     };
     debug_assert_eq!(key.kind().as_str(), kind);
     debug_assert_eq!(key.source().as_str(), source);
@@ -301,7 +304,7 @@ pub async fn livekit_disconnect(
     detach_capture_pipelines(&media_state);
 
     let room = {
-        let mut rooms = state.rooms.lock_str()?;
+        let mut rooms = state.rooms.lock_str("livekit_disconnect")?;
         rooms.remove(&room_id)
     };
 
@@ -356,12 +359,13 @@ fn detach_capture_pipelines(media_state: &MediaState) {
 
 fn get_room(
     state: &LiveKitState,
+    command: &str,
     room_id: &str,
 ) -> Result<Arc<tokio::sync::Mutex<LiveKitRoom>>, String> {
-    let rooms = state.rooms.lock_str()?;
-    rooms
-        .get(room_id)
-        .cloned()
-        .ok_or_else(|| format!("Room not found: {room_id}"))
+    let rooms = state.rooms.lock_str(command)?;
+    rooms.get(room_id).cloned().ok_or_else(|| {
+        tracing::warn!(command, room_id, "no LiveKit room is connected with this id");
+        format!("Room not found: {room_id}")
+    })
 }
 

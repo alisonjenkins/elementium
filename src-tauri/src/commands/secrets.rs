@@ -12,7 +12,7 @@ use tauri::{State, command};
 
 use elementium_keyring::{BackendType, SecretBackend, file_backend::FileBackend};
 
-use super::LockExt;
+use super::{IpcErr, LockExt};
 
 /// Managed state for the secret store.
 ///
@@ -32,13 +32,13 @@ pub async fn secret_get(
 ) -> Result<Option<String>, String> {
     let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = backend.lock_str()?;
+        let guard = backend.lock_str("secret_get")?;
         guard
             .as_ref()
-            .map_or(Ok(None), |s| s.get(&key).map_err(|e| e.to_string()))
+            .map_or(Ok(None), |s| s.get(&key).ipc_err("secret_get", &key))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .ipc_err("secret_get", "")?
 }
 
 #[command]
@@ -49,27 +49,27 @@ pub async fn secret_set(
 ) -> Result<(), String> {
     let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = backend.lock_str()?;
+        let guard = backend.lock_str("secret_set")?;
         // no backend, silently ignore
         guard
             .as_ref()
-            .map_or(Ok(()), |s| s.set(&key, &value).map_err(|e| e.to_string()))
+            .map_or(Ok(()), |s| s.set(&key, &value).ipc_err("secret_set", &key))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .ipc_err("secret_set", "")?
 }
 
 #[command]
 pub async fn secret_delete(key: String, state: State<'_, SecretStoreState>) -> Result<(), String> {
     let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = backend.lock_str()?;
+        let guard = backend.lock_str("secret_delete")?;
         guard
             .as_ref()
-            .map_or(Ok(()), |s| s.delete(&key).map_err(|e| e.to_string()))
+            .map_or(Ok(()), |s| s.delete(&key).ipc_err("secret_delete", &key))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .ipc_err("secret_delete", "")?
 }
 
 #[command]
@@ -78,21 +78,21 @@ pub async fn secret_get_all(
 ) -> Result<HashMap<String, String>, String> {
     let backend = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        let guard = backend.lock_str()?;
+        let guard = backend.lock_str("secret_get_all")?;
         guard.as_ref().map_or_else(
             || Ok(HashMap::new()),
-            |s| s.get_all().map_err(|e| e.to_string()),
+            |s| s.get_all().ipc_err("secret_get_all", ""),
         )
     })
     .await
-    .map_err(|e| e.to_string())?
+    .ipc_err("secret_get_all", "")?
 }
 
 #[command]
 pub async fn secret_get_backend_status(
     state: State<'_, SecretStoreState>,
 ) -> Result<BackendType, String> {
-    let guard = state.backend.lock_str()?;
+    let guard = state.backend.lock_str("secret_get_backend_status")?;
     Ok(guard
         .as_ref()
         .map_or(BackendType::NeedsSetup, SecretBackend::kind))
@@ -106,17 +106,18 @@ pub async fn secret_setup_file_backend(
     let backend_arc = state.backend.clone();
 
     tokio::task::spawn_blocking(move || {
-        let file_backend = FileBackend::new(&password).map_err(|e| e.to_string())?;
+        let file_backend =
+            FileBackend::new(&password).ipc_err("secret_setup_file_backend", "")?;
 
         {
-            let mut guard = backend_arc.lock_str()?;
+            let mut guard = backend_arc.lock_str("secret_setup_file_backend")?;
             *guard = Some(SecretBackend::File(file_backend));
         }
 
         Ok(())
     })
     .await
-    .map_err(|e: tokio::task::JoinError| e.to_string())?
+    .ipc_err("secret_setup_file_backend", "")?
 }
 
 #[cfg(test)]

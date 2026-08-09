@@ -4,7 +4,15 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 
-pub fn create_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+/// Build the tray icon and its menu.
+///
+/// # Errors
+///
+/// Returns whatever `tauri::Error` the menu-item, menu, or tray-icon builder produced --
+/// every fallible step here is already typed by `tauri` itself, so there is nothing to erase
+/// behind `Box<dyn Error>` (which this used to do, in violation of Principle I): the concrete
+/// type already names its cause and is propagated unchanged.
+pub fn create_tray(app: &App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show Elementium", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;

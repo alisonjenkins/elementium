@@ -18,8 +18,8 @@ use elementium_webrtc::engine::{IceServerConfig, WebRtcEngine};
 use elementium_webrtc::peer_connection;
 use elementium_webrtc::{PcEvent, VideoPipeline, start_audio_playback};
 
-use super::LockExt;
 use super::media_devices::MediaState;
+use super::{IpcErr, LockExt};
 
 /// Shared WebRTC engine state, managed by Tauri.
 #[derive(Clone)]
@@ -164,8 +164,10 @@ pub async fn create_peer_connection(
     });
 
     {
-        let mut engine = state.0.lock_str()?;
-        engine.create_connection(id.clone(), ice_servers.as_deref())?;
+        let mut engine = state.0.lock_str("create_peer_connection")?;
+        engine
+            .create_connection(id.clone(), ice_servers.as_deref())
+            .ipc_err("create_peer_connection", &id)?;
     }
 
     // Adopt any capture pipeline that is currently attached to nothing.
@@ -280,13 +282,13 @@ pub async fn create_offer(
         "Creating offer"
     );
 
-    let (handle, io_cmd_tx) = state
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&pc_id)
-        .ok_or("Peer connection not found")
-        .map(|managed| (managed.handle.clone(), managed.io_cmd_tx.clone()))?;
+    let (handle, io_cmd_tx) = {
+        let engine = state.0.lock_str("create_offer")?;
+        engine
+            .get(&pc_id)
+            .map(|managed| (managed.handle.clone(), managed.io_cmd_tx.clone()))
+            .ok_or_else(|| pc_not_found("create_offer", &pc_id))?
+    };
 
     // Connect every running capture pipeline to this PC's I/O channel.
     //
@@ -358,45 +360,38 @@ pub async fn create_offer(
         })
         .collect();
 
-    let mut pc = handle.lock_str()?;
-    peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos)
-        .map_err(|e| ipc_error("create_offer", &pc_id, &e))
+    let mut pc = handle.lock_str("create_offer")?;
+    peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos).ipc_err("create_offer", &pc_id)
 }
 
-/// Flatten a native error for the IPC, logging its whole cause chain on the way out.
+/// The "unknown peer connection" failure every lookup by `pc_id` in this module can hit,
+/// logged once here so every call site gets the same message and the same log line rather
+/// than re-deriving both.
 ///
-/// The page can only receive a string — Tauri serializes the error — so the chain that a
-/// typed error carries dies at this boundary unless something records it first. Every
-/// fallible command result goes through here so that no site can forget, which is the
-/// point: today's outage was an `Err` that reached the page and was written nowhere, and
-/// the log showed the operation starting and then nothing at all.
-///
-/// The full chain goes to the log; the page gets the top-level message. A structured
-/// envelope with a stable code, so the shim can distinguish failures it must act on, is
-/// the remaining half of this work (backlog X2).
-fn ipc_error(command: &str, pc_id: &str, error: &dyn std::error::Error) -> String {
-    let mut chain = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        chain.push_str(" <- ");
-        chain.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    tracing::error!(command, pc_id, chain = %chain, "command failed");
-    error.to_string()
+/// `warn`, not `error`: a `pc_id` the frontend still holds after `close_peer_connection` (or
+/// after a race between the two) is an ordinary, recoverable condition -- not evidence this
+/// command itself malfunctioned -- so it must not compete in the log with a genuine failure
+/// the way an `error`-level line would. See Principle II.
+fn pc_not_found(command: &str, pc_id: &str) -> String {
+    tracing::warn!(
+        command,
+        pc_id,
+        "no peer connection is registered with this id; it may already be closed"
+    );
+    "Peer connection not found".to_owned()
 }
 
 /// Look up an active peer connection's handle by ID.
 fn get_pc_handle(
     state: &WebRtcState,
+    command: &str,
     pc_id: &str,
 ) -> Result<peer_connection::PeerConnectionHandle, String> {
-    let engine = state.0.lock_str()?;
-    Ok(engine
+    let engine = state.0.lock_str(command)?;
+    engine
         .get(pc_id)
-        .ok_or("Peer connection not found")?
-        .handle
-        .clone())
+        .map(|managed| managed.handle.clone())
+        .ok_or_else(|| pc_not_found(command, pc_id))
 }
 
 #[command]
@@ -405,9 +400,9 @@ pub async fn create_answer(
     pc_id: String,
 ) -> Result<SessionDescription, String> {
     tracing::info!(pc_id = %pc_id, "Creating answer");
-    let handle = get_pc_handle(&state, &pc_id)?;
-    let mut pc = handle.lock_str()?;
-    peer_connection::create_answer(&mut pc).map_err(|e| ipc_error("create_answer", &pc_id, &e))
+    let handle = get_pc_handle(&state, "create_answer", &pc_id)?;
+    let mut pc = handle.lock_str("create_answer")?;
+    peer_connection::create_answer(&mut pc).ipc_err("create_answer", &pc_id)
 }
 
 #[command]
@@ -437,8 +432,8 @@ pub async fn set_local_description(
     // lengths and a line number, never as SDP: these logs get attached to issues, and an
     // SDP carries the ICE credentials and DTLS fingerprint for the session.
     if description.sdp_type == SdpType::Offer
-        && let Ok(handle) = get_pc_handle(&state, &pc_id)
-        && let Ok(pc) = handle.lock_str()
+        && let Ok(handle) = get_pc_handle(&state, "set_local_description", &pc_id)
+        && let Ok(pc) = handle.lock_str("set_local_description")
         && let Some(generated) = pc.last_offer_sdp.as_deref()
         && generated != description.sdp
     {
@@ -473,10 +468,10 @@ pub async fn set_remote_description(
     description: SessionDescription,
 ) -> Result<Option<SessionDescription>, String> {
     tracing::info!(pc_id = %pc_id, sdp_type = ?description.sdp_type, "Setting remote description");
-    let handle = get_pc_handle(&state, &pc_id)?;
-    let mut pc = handle.lock_str()?;
+    let handle = get_pc_handle(&state, "set_remote_description", &pc_id)?;
+    let mut pc = handle.lock_str("set_remote_description")?;
     peer_connection::set_remote_description(&mut pc, &description)
-        .map_err(|e| ipc_error("set_remote_description", &pc_id, &e))
+        .ipc_err("set_remote_description", &pc_id)
 }
 
 #[command]
@@ -486,10 +481,10 @@ pub async fn add_ice_candidate(
     candidate: IceCandidate,
 ) -> Result<(), String> {
     tracing::info!(pc_id = %pc_id, candidate = %candidate.candidate, "Adding ICE candidate");
-    let handle = get_pc_handle(&state, &pc_id)?;
-    let mut pc = handle.lock_str()?;
+    let handle = get_pc_handle(&state, "add_ice_candidate", &pc_id)?;
+    let mut pc = handle.lock_str("add_ice_candidate")?;
     peer_connection::add_ice_candidate(&mut pc, &candidate.candidate)
-        .map_err(|e| ipc_error("add_ice_candidate", &pc_id, &e))
+        .ipc_err("add_ice_candidate", &pc_id)
 }
 
 /// Write one message to a negotiated data channel.
@@ -515,10 +510,10 @@ pub async fn send_data_channel_message(
     data: Vec<u8>,
 ) -> Result<bool, String> {
     tracing::debug!(pc_id = %pc_id, %label, binary, len = data.len(), "Sending data channel message");
-    let handle = get_pc_handle(&state, &pc_id)?;
-    let mut pc = handle.lock_str()?;
+    let handle = get_pc_handle(&state, "send_data_channel_message", &pc_id)?;
+    let mut pc = handle.lock_str("send_data_channel_message")?;
     peer_connection::write_data_channel(&mut pc, &label, binary, &data)
-        .map_err(|e| ipc_error("write_data_channel", &pc_id, &e))
+        .ipc_err("write_data_channel", &pc_id)
 }
 
 /// One outbound (sent) track's transport stats, as returned to JS.
@@ -586,8 +581,8 @@ pub async fn get_transport_stats(
     state: State<'_, WebRtcState>,
     pc_id: String,
 ) -> Result<TransportStatsResult, String> {
-    let handle = get_pc_handle(&state, &pc_id)?;
-    let pc = handle.lock_str()?;
+    let handle = get_pc_handle(&state, "get_transport_stats", &pc_id)?;
+    let pc = handle.lock_str("get_transport_stats")?;
     let snapshot = peer_connection::transport_stats_snapshot(&pc);
     drop(pc);
 
@@ -643,8 +638,8 @@ pub async fn get_transport_stats(
 /// caller told the restart was accepted will wait for a recovery that cannot come.
 #[command]
 pub async fn restart_ice(state: State<'_, WebRtcState>, pc_id: String) -> Result<(), String> {
-    let handle = get_pc_handle(&state, &pc_id)?;
-    let mut pc = handle.lock_str()?;
+    let handle = get_pc_handle(&state, "restart_ice", &pc_id)?;
+    let mut pc = handle.lock_str("restart_ice")?;
     peer_connection::request_ice_restart(&mut pc);
     tracing::info!(pc_id = %pc_id, "ICE restart requested; the next offer will carry it");
     Ok(())
@@ -656,7 +651,7 @@ pub async fn close_peer_connection(
     pc_id: String,
 ) -> Result<(), String> {
     let span = {
-        let mut engine = state.0.lock_str()?;
+        let mut engine = state.0.lock_str("close_peer_connection")?;
         let span = engine
             .get(&pc_id)
             .map_or_else(tracing::Span::current, |managed| managed.span.clone());
@@ -859,9 +854,11 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     let audio_rx = Arc::new(Mutex::new(audio_rx));
     match shared_player {
         Some(player) => {
-            if let Err(e) = start_audio_playback(audio_rx, pc_id.to_string(), player) {
-                tracing::error!(pc_id = pc_id, "Failed to start audio playback: {e}");
-            }
+            // Infallible: decode failures are handled and logged inside the pipeline rather
+            // than propagated, so there is no error here to handle. It used to return a
+            // `Result` that was always `Ok`, which taught this call site to write a branch
+            // that could never run.
+            start_audio_playback(audio_rx, pc_id.to_string(), player);
         }
         None => {
             tracing::error!(
@@ -874,9 +871,8 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // Start video playback pipeline (receives VP8 → decodes → frame buffer)
     let video_rx = Arc::new(Mutex::new(video_rx));
     let mut video_pipeline = VideoPipeline::new();
-    if let Err(e) = video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string()) {
-        tracing::error!(pc_id = pc_id, "Failed to start video playback: {e}");
-    }
+    // Infallible, for the same reason as the audio pipeline above.
+    video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string());
 
     // Count of `PcEvent::AudioData` dropped because `audio_tx` (this loop -> the audio
     // playback thread, capacity 256) was full -- another gap invisible to str0m's own

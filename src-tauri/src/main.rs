@@ -208,9 +208,48 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
     ])
 }
 
+/// Why [`setup_app`] could not finish bringing up the window.
+///
+/// `tauri::Builder::setup`'s closure is declared by the framework to return
+/// `Result<(), Box<dyn std::error::Error>>` -- not something this crate can change -- so
+/// `main()` still has to hand it exactly that. What this type fixes is what `setup_app`
+/// itself returns: three different fallible steps used to be flattened straight into that
+/// `Box<dyn Error>` with a bare `?`, each one erasing which step failed and (via the `Box`)
+/// its own source too. This names the step and keeps every source, and `main()` logs the
+/// full chain immediately before the one, unavoidable conversion into `Box<dyn Error>` that
+/// the framework's own signature requires.
+#[derive(Debug)]
+enum SetupError {
+    /// Building the tray icon or its menu failed.
+    Tray(tauri::Error),
+    /// The embedded-frontend HTTP server (release builds only) could not start.
+    FrontendServer(frontend_server::FrontendServerError),
+    /// The main webview window could not be created.
+    Window(tauri::Error),
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tray(_) => write!(f, "could not create the tray icon"),
+            Self::FrontendServer(_) => write!(f, "could not start the embedded frontend server"),
+            Self::Window(_) => write!(f, "could not create the main window"),
+        }
+    }
+}
+
+impl std::error::Error for SetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Tray(e) | Self::Window(e) => Some(e),
+            Self::FrontendServer(e) => Some(e),
+        }
+    }
+}
+
 /// Create the tray and main webview window during Tauri's `setup` hook.
-fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::error::Error>> {
-    tray::create_tray(app)?;
+fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), SetupError> {
+    tray::create_tray(app).map_err(SetupError::Tray)?;
 
     // Programmatic window creation with initialization_script for secret injection.
     //
@@ -224,7 +263,7 @@ fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::err
         // Reported rather than ignored: without the server the window has nothing to load,
         // and a blank window with no explanation is the worst way to learn the port is
         // taken.
-        frontend_server::spawn(&app.handle().clone(), port)?;
+        frontend_server::spawn(&app.handle().clone(), port).map_err(SetupError::FrontendServer)?;
         format!("http://localhost:{port}")
     };
     // Both forms are `http://localhost:<u16>`, so the parse cannot fail in practice.
@@ -238,7 +277,8 @@ fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::err
         .resizable(true)
         .fullscreen(false)
         .initialization_script(init_script)
-        .build()?;
+        .build()
+        .map_err(SetupError::Window)?;
 
     let _ = win.eval("console.log('[Elementium] Native WebRTC backend active');");
 
@@ -387,7 +427,14 @@ fn main() -> tauri::Result<()> {
         "elementium",
         protocols::handle_video_frame_protocol,
     );
-    builder = builder.setup(move |app| setup_app(app, &init_script));
+    builder = builder.setup(move |app| {
+        setup_app(app, &init_script).map_err(|e| {
+            let chain = commands::error_chain(&e);
+            tracing::error!(chain = %chain, "app setup failed; the window will not appear");
+            let boxed: Box<dyn std::error::Error> = Box::new(e);
+            boxed
+        })
+    });
 
     // Both `large_stack_frames` and `usage of process::exit` fire on this line because
     // they originate inside the expansion of `tauri::generate_context!()` (framework

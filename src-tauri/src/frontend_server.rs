@@ -36,16 +36,62 @@ const NOT_FOUND_BODY: &[u8] = b"not found";
 /// The path the entry point is served from, and the one path allowed to return its bytes.
 const INDEX_PATH: &str = "/index.html";
 
+/// Why [`spawn`] could not start serving the frontend.
+///
+/// A named type carrying its real source, per Principle I -- this used to be a
+/// `format!(...)`-built `String`, which loses whatever `tiny_http`/`std::io` said as soon as
+/// it is built, and gives the caller nothing to match on. `main.rs` still has to flatten this
+/// to `String` to satisfy `tauri`'s `setup` closure, but that flattening now goes through one
+/// place ([`std::fmt::Display`], via `SetupError` below) that also logs the chain, rather
+/// than losing it at the point this error is created.
+#[derive(Debug)]
+pub enum FrontendServerError {
+    /// The loopback port could not be bound -- most commonly because something else (an
+    /// earlier, still-running instance of this app; a leftover `--port` override colliding
+    /// with the default) already holds it.
+    Bind {
+        port: u16,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The background thread that serves requests could not be spawned.
+    ThreadSpawn(std::io::Error),
+}
+
+impl std::fmt::Display for FrontendServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bind { port, .. } => {
+                write!(f, "could not serve the frontend on 127.0.0.1:{port}")
+            }
+            Self::ThreadSpawn(_) => write!(f, "could not start the frontend HTTP thread"),
+        }
+    }
+}
+
+impl std::error::Error for FrontendServerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Bind { source, .. } => Some(source.as_ref()),
+            Self::ThreadSpawn(source) => Some(source),
+        }
+    }
+}
+
 /// Start serving `app`'s embedded assets on `127.0.0.1:port`.
 ///
 /// Binds before returning so that a port already in use is an error the caller can report,
 /// rather than a blank window. Serving itself continues on a background thread for the
 /// lifetime of the process.
-pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), String> {
+///
+/// # Errors
+///
+/// Returns [`FrontendServerError::Bind`] if the port cannot be bound, or
+/// [`FrontendServerError::ThreadSpawn`] if the OS refuses to start the serving thread.
+pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendServerError> {
     // Loopback only. The frontend carries an access token and holds the IPC grant, and
     // there is no reason for anything off this machine to reach either.
     let server = Server::http((std::net::Ipv4Addr::LOCALHOST, port))
-        .map_err(|e| format!("could not serve the frontend on 127.0.0.1:{port}: {e}"))?;
+        .map_err(|source| FrontendServerError::Bind { port, source })?;
 
     let resolver = app.asset_resolver();
     // Read once, so the per-request comparison is against a value that cannot change.
@@ -98,7 +144,7 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), String> {
             }
             error!("the frontend HTTP server stopped accepting requests");
         })
-        .map_err(|e| format!("could not start the frontend HTTP thread: {e}"))?;
+        .map_err(FrontendServerError::ThreadSpawn)?;
 
     Ok(())
 }

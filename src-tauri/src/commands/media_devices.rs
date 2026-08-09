@@ -22,8 +22,8 @@ use elementium_types::{
 };
 use elementium_webrtc::engine::{IoCommand, VideoFrameBuffer};
 
-use super::LockExt;
 use super::webrtc::WebRtcState;
+use super::{IpcErr, LockExt};
 use crate::protocols::VideoFrameState;
 
 /// The parts of a pipeline handle that only one kind of pipeline has.
@@ -274,8 +274,7 @@ pub fn start_screen_share_pipeline(
 
     media_state
         .pipelines
-        .lock()
-        .map_err(|_| "pipeline map lock poisoned".to_owned())?
+        .lock_str("get_display_media")?
         .insert(
             key,
             PipelineHandle {
@@ -350,8 +349,7 @@ pub fn start_screen_share_audio_pipeline(
 
     media_state
         .pipelines
-        .lock()
-        .map_err(|_| "pipeline map lock poisoned".to_owned())?
+        .lock_str("get_display_media")?
         .insert(
             key,
             PipelineHandle {
@@ -400,18 +398,19 @@ pub fn set_capture_muted(
     source: String,
     muted: bool,
 ) -> Result<(), String> {
-    let key = super::livekit::track_key(&kind, &source)?;
+    let key = super::livekit::track_key("set_capture_muted", &kind, &source)?;
     // The flag is taken out from under the guard rather than used through it, so the lock
     // is not held while anything else happens -- this runs on the IPC thread, and the
     // capture loops take the same map.
     let flag = {
-        let pipelines = media_state
-            .pipelines
-            .lock()
-            .map_err(|_| "pipeline map lock poisoned".to_owned())?;
+        let pipelines = media_state.pipelines.lock_str("set_capture_muted")?;
         pipelines.get(&key).map(|handle| Arc::clone(&handle.muted))
     };
     let Some(flag) = flag else {
+        // Expected under normal use: the page can call this before a pipeline has started
+        // (joining muted) or after it stopped, and both race the mute request harmlessly --
+        // see the "no video pipeline" case below for the same reasoning.
+        tracing::warn!(track = %key, "mute requested for a track with no running capture pipeline");
         return Err(format!("no capture pipeline is running for {key}"));
     };
     flag.store(muted, std::sync::atomic::Ordering::Relaxed);
@@ -448,7 +447,7 @@ pub fn set_video_bitrate(
     source: String,
     max_bitrates_bps: Vec<Option<u32>>,
 ) -> Result<Option<u32>, String> {
-    let key = super::livekit::track_key(&kind, &source)?;
+    let key = super::livekit::track_key("set_video_bitrate", &kind, &source)?;
 
     let Some(requested_kbps) = requested_bitrate_kbps(&max_bitrates_bps) else {
         tracing::info!(
@@ -484,13 +483,14 @@ pub fn set_video_bitrate(
     // from under the guard so the pipeline map is not held while anything else happens, and
     // this runs on the IPC thread while the capture loop takes the same map.
     let flag = {
-        let pipelines = media_state
-            .pipelines
-            .lock()
-            .map_err(|_| "pipeline map lock poisoned".to_owned())?;
+        let pipelines = media_state.pipelines.lock_str("set_video_bitrate")?;
         pipelines.get(&key).and_then(PipelineHandle::bitrate_override).cloned()
     };
     let Some(flag) = flag else {
+        // Expected, not a fault: livekit-client can call setParameters on a sender before
+        // the corresponding capture pipeline has (re)started, e.g. immediately after a
+        // device change.
+        tracing::warn!(track = %key, "setParameters requested for a track with no running video pipeline");
         return Err(format!("no video pipeline is running for {key}"));
     };
     flag.store(kbps, std::sync::atomic::Ordering::Relaxed);
@@ -859,7 +859,7 @@ fn start_camera_pipeline(
 
     // Get the shared video frame buffer from the WebRTC engine
     let video_frames = {
-        let engine = webrtc_state.0.lock_str()?;
+        let engine = webrtc_state.0.lock_str("get_user_media")?;
         engine.video_frames.clone()
     };
 
@@ -1653,7 +1653,15 @@ fn start_x11_video_source(
                 let _ = tx.send(CapturedFrame::Planar(frame));
             }),
         )
-        .map_err(|e| e.to_string())?;
+        .ipc_err("get_display_media", source_id)?;
+
+    // Taken before the capturer moves into the mutex, because this is the only thing that
+    // makes an X11 share's failures visible to anyone. Every frame that fails to capture
+    // used to be discarded with `.ok()?` -- no log, no counter, nothing `source_died()`
+    // could see -- so a share could go dark mid-call and the pipeline would go on believing
+    // it was healthy. The capturer now latches this flag after sustained failure; without
+    // reading it here, that latch would be written and never read.
+    let failed = capturer.failed_handle();
 
     let capturer = Arc::new(Mutex::new(capturer));
     let stopper_capturer = Arc::clone(&capturer);
@@ -1663,9 +1671,11 @@ fn start_x11_video_source(
         }
     });
 
-    Ok(elementium_media::video_source::VideoSource::start_push(
-        rx, stopper, "x11",
-    ))
+    Ok(
+        elementium_media::video_source::VideoSource::start_push_with_health(
+            rx, stopper, "x11", failed,
+        ),
+    )
 }
 
 /// `Option::unwrap_or` is not `const`; this is.

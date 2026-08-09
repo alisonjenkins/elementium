@@ -14,7 +14,7 @@ use elementium_e2ee::E2eeOptions;
 use elementium_webrtc::E2eeContext;
 use elementium_webrtc::EncryptionPolicy;
 
-use super::LockExt;
+use super::{IpcErr, LockExt};
 
 /// Shared E2EE state, managed by Tauri.
 ///
@@ -63,7 +63,7 @@ pub async fn e2ee_init(
     // repeat: livekit sends one per key provider, and the bridge synthesises another
     // whenever a key arrives before the real one. In a real call that sequence ran
     // key, key, key, init -- and the init threw all three away.
-    let mut guard = state.ctx.lock_str()?;
+    let mut guard = state.ctx.lock_str("e2ee_init")?;
     if let EncryptionPolicy::Encrypted(existing) = &*guard {
         existing.set_options(opts);
         tracing::info!(
@@ -94,11 +94,24 @@ pub async fn e2ee_set_key(
 
     state
         .ctx
-        .lock_str()?
+        .lock_str("e2ee_set_key")?
         .as_context()
-        .ok_or("E2EE not initialized — call e2ee_init first")?
+        .ok_or_else(|| e2ee_not_initialized("e2ee_set_key"))?
         .set_key(&participant, key_index, &key_material);
     Ok(())
+}
+
+/// The "call `e2ee_init` first" failure every command below can hit, logged once here.
+///
+/// `warn`, not `error`: this is a caller-ordering condition, not a fault in this process --
+/// the shim mis-sequencing its own init/key/identity calls, or (per the doc on `e2ee_init`)
+/// a key arriving before `e2ee_init` completes -- and it recovers on its own once `e2ee_init`
+/// runs. Bare `ok_or("...")` used to reach the page with nothing recorded at all; this is the
+/// same shape of silent `Err` the project constitution names as the cause of a full-outage
+/// incident, just caught here before it repeats.
+fn e2ee_not_initialized(command: &str) -> String {
+    tracing::warn!(command, "E2EE command received before e2ee_init completed");
+    "E2EE not initialized — call e2ee_init first".to_owned()
 }
 
 /// Record the SFU's server-injected-frame marker.
@@ -123,11 +136,11 @@ pub async fn e2ee_set_sif_trailer(
 
     state
         .ctx
-        .lock_str()?
+        .lock_str("e2ee_set_sif_trailer")?
         .as_context()
-        .ok_or("E2EE not initialized — call e2ee_init first")?
+        .ok_or_else(|| e2ee_not_initialized("e2ee_set_sif_trailer"))?
         .set_sif_trailer(trailer)
-        .map_err(|e| e.to_string())
+        .ipc_err("e2ee_set_sif_trailer", "")
 }
 
 #[command]
@@ -139,9 +152,9 @@ pub async fn e2ee_set_local_identity(
 
     state
         .ctx
-        .lock_str()?
+        .lock_str("e2ee_set_local_identity")?
         .as_context()
-        .ok_or("E2EE not initialized — call e2ee_init first")?
+        .ok_or_else(|| e2ee_not_initialized("e2ee_set_local_identity"))?
         .set_local_identity(&identity);
     Ok(())
 }
