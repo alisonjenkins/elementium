@@ -7,16 +7,6 @@ collected here because they were all found in the same session.
 
 ## Open
 
-- [ ] **M1. The frame rate is not configurable by a person.** Two mechanisms exist and
-  neither is reachable from the UI: `ELEMENTIUM_MAX_FPS` (an environment variable, so it
-  needs a restart and a shell), and the page's own `frameRate` constraint, which reaches the
-  backend only as of today -- before the `camelCase` fix it arrived as `None` for the life of
-  the project, so the encoder has always run at the compiled-in `MAX_ENCODE_FPS = 30`
-  regardless of what anyone asked for. Wanted: a setting, persisted, applied without a
-  restart, and honest about the cap it is clamped to (`MAX_ENCODE_FPS_CEILING = 120`).
-  Requested directly by the user, mid-call, having watched the frame rate be bad and having
-  no way to change it.
-
 - [ ] **M2. The far end sees one keyframe and then a frozen picture.** Confirmed from a
   second client on the same machine: video *into* Elementium renders smoothly, video *out*
   of it does not. The receiver sent 215 PLIs across three and a half minutes -- roughly one
@@ -114,3 +104,33 @@ collected here because they were all found in the same session.
   transmitting on the previous index for `useKeyDelay = 5000`ms -- and dropping them is the
   conformant response, since indices are independent keys and index N-1 is not derivable
   from N. Thousands of them is not expected and is worth a second look once M5 is fixed.
+
+## Closed
+
+- [x] **M1. The frame rate is not configurable by a person.** Implemented, unverified until
+  a real call. `set_max_encode_fps`/`get_max_encode_fps` (Tauri commands in
+  `src-tauri/src/commands/media_devices.rs`) persist the setting through
+  `tauri-plugin-store` (`settings.json`, already a dependency, previously registered but
+  unused from Rust) and push it live into every running video pipeline's own
+  `fps_override` atomic -- the same level-not-event pattern `apply_bitrate_override`
+  already uses for `setParameters`, polled once per frame by the new
+  `apply_fps_override`, so a change takes effect on the pacer without a new encoder, a
+  keyframe, or a dropped call.
+
+  Resolved against the page's own `frameRate` constraint by `resolve_encode_fps`: the
+  setting wins outright when one is set, logged whenever it overrides a different page
+  ask, otherwise the page's constraint behaves exactly as before. Clamped honestly by
+  `clamp_encode_fps_setting`, to the same `MAX_ENCODE_FPS_CEILING` the removed
+  `ELEMENTIUM_MAX_FPS` was held to.
+
+  Reaches the second, capture-side limiter noted in the ask (`pipewire_capture` halving a
+  60fps camera before the encoder ever sees a frame) for every pipeline that *starts*
+  after the setting changes, because `start_camera_pipeline` now resolves `req_fps` --
+  what it asks the camera for -- from the same setting. It does not reach a camera stream
+  already open: that rate is negotiated once at stream start, and reopening a camera
+  mid-call risks the same `EBUSY` window `start_camera_pipeline` already waits out.
+
+  No UI: exposed only as the two Tauri commands above. A UI would need a numeric or
+  slider control (bounded 1..=120) wired to `set_max_encode_fps`, reading its initial
+  value from `get_max_encode_fps` -- not built here because it would mean patching the
+  embedded Element Web bundle rather than this app's own Rust/Tauri surface.

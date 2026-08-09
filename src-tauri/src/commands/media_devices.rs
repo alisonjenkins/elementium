@@ -67,6 +67,15 @@ pub enum PipelineExtras {
         /// that writes this clamps every real request to at least `MIN_BITRATE_KBPS`, so `0`
         /// can never collide with a legitimate one.
         bitrate_override: Arc<std::sync::atomic::AtomicU32>,
+        /// The frame rate this pipeline's encode pacer is currently told to hold, in fps.
+        ///
+        /// A level, the same shape as `bitrate_override` and for the same reason: the
+        /// pacer lives on the capture thread and nothing else may touch it, so a setting
+        /// change is applied by writing the latest desired value here and letting
+        /// `apply_fps_override` pick it up once per frame. Always non-zero -- unlike
+        /// `bitrate_override`, there is no "nothing requested yet" state, because the
+        /// pacer needs a real interval from the moment the pipeline starts.
+        fps_override: Arc<std::sync::atomic::AtomicU32>,
     },
 }
 
@@ -124,6 +133,15 @@ impl PipelineHandle {
     pub const fn bitrate_override(&self) -> Option<&Arc<std::sync::atomic::AtomicU32>> {
         match &self.extras {
             PipelineExtras::Video { bitrate_override, .. } => Some(bitrate_override),
+            PipelineExtras::Audio { .. } => None,
+        }
+    }
+
+    /// The live encode-frame-rate override, if this is a video pipeline.
+    #[must_use]
+    pub const fn fps_override(&self) -> Option<&Arc<std::sync::atomic::AtomicU32>> {
+        match &self.extras {
+            PipelineExtras::Video { fps_override, .. } => Some(fps_override),
             PipelineExtras::Audio { .. } => None,
         }
     }
@@ -209,6 +227,12 @@ pub fn start_screen_share_pipeline(
     let active_codec_clone = active_codec.clone();
     let bitrate_override = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let bitrate_override_clone = Arc::clone(&bitrate_override);
+    // A share has no page `frameRate` constraint to honour -- `getDisplayMedia` never
+    // carried one here -- so only the persisted setting is consulted.
+    let fps_override = Arc::new(std::sync::atomic::AtomicU32::new(
+        encode_fps_setting().unwrap_or_else(max_encode_fps_u32),
+    ));
+    let fps_override_clone = Arc::clone(&fps_override);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let muted_clone = Arc::clone(&muted);
@@ -257,6 +281,7 @@ pub fn start_screen_share_pipeline(
         keyframe_requested: keyframe_requested_clone,
         active_codec: active_codec_clone,
         bitrate_override: bitrate_override_clone,
+        fps_override: fps_override_clone,
     };
     std::thread::spawn(move || {
         let _guard = span.enter();
@@ -287,6 +312,7 @@ pub fn start_screen_share_pipeline(
                     keyframe_requested,
                     active_codec,
                     bitrate_override,
+                    fps_override,
                 },
             },
         );
@@ -496,6 +522,129 @@ pub fn set_video_bitrate(
     flag.store(kbps, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(track = %key, kbps, "video bitrate changed via setParameters");
     Ok(Some(kbps))
+}
+
+/// Where the frame-rate setting is persisted.
+///
+/// `tauri-plugin-store` is already a dependency of this app, registered as a plugin in
+/// `main.rs`, and used nowhere from Rust until now -- it is exactly the "smallest thing
+/// that survives a restart" M1 needs, not a mechanism worth inventing a second time.
+const SETTINGS_STORE: &str = "settings.json";
+const MAX_ENCODE_FPS_KEY: &str = "max_encode_fps";
+
+/// Load the persisted frame-rate setting into the process-wide atomic, once at startup.
+///
+/// Called from `setup_app`, not lazily from the first pipeline: a pipeline can start (a
+/// call auto-joining, or a device preview) before any Tauri command has run, and reading
+/// the store from that background capture thread would mean handing it an `AppHandle` it
+/// has no other reason to hold. Reading here, before anything else touches the atomic,
+/// keeps the capture thread's only interface to the setting a plain atomic load.
+pub fn load_persisted_max_encode_fps(app: &tauri::App) {
+    use tauri_plugin_store::StoreExt as _;
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        // Not a fault worth failing startup over: the setting simply stays unset for this
+        // run, which is the same as it never having been changed.
+        tracing::warn!("could not open the settings store; the frame-rate setting starts unset");
+        return;
+    };
+    let Some(fps) = store
+        .get(MAX_ENCODE_FPS_KEY)
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+    else {
+        return;
+    };
+    let (clamped, was_clamped) = clamp_encode_fps_setting(fps);
+    if was_clamped {
+        tracing::warn!(
+            persisted_fps = fps,
+            applied_fps = clamped,
+            "persisted max_encode_fps is outside the sane range; clamped"
+        );
+    }
+    tracing::info!(fps = clamped, "loaded persisted frame-rate setting");
+    MAX_ENCODE_FPS_SETTING.store(clamped, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame rate this run will encode video at when nothing else overrides it: the
+/// person's persisted setting if they have one, otherwise the compiled default (or
+/// `ELEMENTIUM_MAX_FPS`).
+///
+/// Exposed as a query so a UI can show the effective value even when the person has never
+/// changed it -- "no setting" is a real, reportable state, not an error.
+#[command]
+pub fn get_max_encode_fps() -> u32 {
+    encode_fps_setting().unwrap_or_else(max_encode_fps_u32)
+}
+
+/// Change the person's maximum encode frame rate: persisted so it survives a restart, and
+/// applied to every running video pipeline (camera and screen share alike) without
+/// restarting any of them.
+///
+/// This is item M1 / P5: `ELEMENTIUM_MAX_FPS` needed a shell and a restart, and the page's
+/// own `frameRate` constraint reached this backend as `None` for the life of the project
+/// until today's `camelCase` fix -- so the encoder has run at a hardcoded 30fps regardless
+/// of what anyone asked for.
+///
+/// Reaches a running encoder the same way `set_video_bitrate` reaches one: a shared
+/// atomic, polled once per frame by `apply_fps_override` on the capture thread that owns
+/// the pacer, because nothing else may touch it. Unlike a bitrate change, this never needs
+/// a new encoder -- the pacer's interval is not something the encoder itself knows about,
+/// so raising or lowering it takes effect on the very next frame with no keyframe, no
+/// renegotiation, and no dropped call.
+///
+/// It does **not** reach the capture-side rate limiter inside `pipewire_capture` for a
+/// pipeline already running: the rate a camera is asked for is negotiated once when its
+/// stream opens, and reopening a camera mid-call carries the same `EBUSY` risk
+/// `start_camera_pipeline` already works around with its 500ms release wait. What it does
+/// instead is remove the reason that limiter was ever wrong: every pipeline started after
+/// this call resolves its capture rate from this same setting (see `resolve_encode_fps` in
+/// `start_camera_pipeline`), so the fix is complete for the next join, device change, or
+/// call -- only a currently-open camera stream keeps its rate until it is reopened.
+///
+/// # Errors
+///
+/// Returns an error if the setting could not be persisted, or if the running-pipeline map
+/// cannot be locked.
+#[allow(clippy::needless_pass_by_value)]
+#[command]
+pub fn set_max_encode_fps(
+    app: tauri::AppHandle,
+    media_state: State<'_, MediaState>,
+    fps: u32,
+) -> Result<u32, String> {
+    use tauri_plugin_store::StoreExt as _;
+
+    let (clamped, was_clamped) = clamp_encode_fps_setting(fps);
+    if was_clamped {
+        tracing::warn!(
+            requested_fps = fps,
+            applied_fps = clamped,
+            max_fps = MAX_ENCODE_FPS_CEILING,
+            "set_max_encode_fps requested a rate outside the sane range; clamped"
+        );
+    }
+
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
+    store.set(MAX_ENCODE_FPS_KEY, serde_json::json!(clamped));
+    store.save().map_err(|e| e.to_string())?;
+
+    MAX_ENCODE_FPS_SETTING.store(clamped, std::sync::atomic::Ordering::Relaxed);
+
+    // The lock is dropped explicitly right after the loop, not merely left to the end of
+    // scope: `set_video_bitrate` takes the same map from the IPC thread, and this command
+    // has no reason to hold it across the log line below.
+    let pipelines = media_state.pipelines.lock_str("set_max_encode_fps")?;
+    let mut applied_to = 0_u32;
+    for handle in pipelines.values() {
+        if let Some(fps_override) = handle.fps_override() {
+            fps_override.store(clamped, std::sync::atomic::Ordering::Relaxed);
+            applied_to = applied_to.saturating_add(1);
+        }
+    }
+    drop(pipelines);
+    tracing::info!(fps = clamped, pipelines = applied_to, "max encode frame rate changed");
+    Ok(clamped)
 }
 
 /// The index inside an `audio-input-{n}` device id, which is cpal's own enumeration order.
@@ -870,9 +1019,23 @@ fn start_camera_pipeline(
     let req_height = video_constraints.height;
     // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
     // Asking for what will be consumed means the surplus is never decoded.
-    let req_fps = video_constraints
+    let page_fps = video_constraints
         .frame_rate
         .map_or_else(max_encode_fps_u32, requested_fps);
+    // The person's persisted setting, when they have one, wins outright over the page's
+    // own ask -- see `resolve_encode_fps` for why. This is also what makes the setting
+    // reach the capture-side rate limiter noted in P5/M1: `req_fps` below is what
+    // `VideoCaptureSource::Camera` asks `pipewire_capture` for, so a pipeline that starts
+    // after a setting change opens its camera at the corrected rate, not just its encoder.
+    let (req_fps, fps_overridden) = resolve_encode_fps(page_fps, encode_fps_setting());
+    if fps_overridden {
+        tracing::info!(
+            track_id = %track_id,
+            page_fps,
+            setting_fps = req_fps,
+            "persisted frame-rate setting overrides the page's frameRate constraint"
+        );
+    }
 
     let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
         Arc::new(Mutex::new(inherited_connection));
@@ -883,6 +1046,8 @@ fn start_camera_pipeline(
     let active_codec_clone = active_codec.clone();
     let bitrate_override = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let bitrate_override_clone = Arc::clone(&bitrate_override);
+    let fps_override = Arc::new(std::sync::atomic::AtomicU32::new(req_fps));
+    let fps_override_clone = Arc::clone(&fps_override);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let muted_clone = Arc::clone(&muted);
@@ -906,6 +1071,7 @@ fn start_camera_pipeline(
         keyframe_requested: keyframe_requested_clone,
         active_codec: active_codec_clone,
         bitrate_override: bitrate_override_clone,
+        fps_override: fps_override_clone,
     };
     std::thread::spawn(move || {
         let _guard = camera_span.enter();
@@ -944,6 +1110,7 @@ fn start_camera_pipeline(
                     keyframe_requested,
                     active_codec,
                     bitrate_override,
+                    fps_override,
                 },
             },
         );
@@ -1482,9 +1649,59 @@ fn requested_fps(constraint: f64) -> u32 {
         .unwrap_or_else(max_encode_fps_u32)
 }
 
-/// Minimum gap between encoded frames, from [`max_encode_fps`].
-fn min_encode_interval() -> std::time::Duration {
-    std::time::Duration::from_nanos(1_000_000_000_u64.saturating_div(max_encode_fps().max(1)))
+/// Minimum gap between encoded frames for an arbitrary rate.
+///
+/// Shared by a pipeline's starting pacer interval (`resolve_encode_fps`, applied in
+/// `start_camera_pipeline`/`start_screen_share_pipeline` via each pipeline's own
+/// `fps_override`) and by [`apply_fps_override`] applying a live change to the same pacer
+/// -- one formula, so the two can never compute a different interval for the same fps.
+fn interval_for_fps(fps: u32) -> std::time::Duration {
+    std::time::Duration::from_nanos(1_000_000_000_u64.saturating_div(u64::from(fps.max(1))))
+}
+
+/// The person's persisted encode-frame-rate setting for this run, if they have set one.
+///
+/// `0` means "never set" -- `set_max_encode_fps` clamps every real request to at least
+/// 1fps, so `0` cannot collide with a legitimate value. Backed by a `static` rather than
+/// living on [`MediaState`] because it has to be visible to a pipeline that has not
+/// started yet (so a fresh capture opens at the right rate, see [`start_camera_pipeline`])
+/// as well as to every pipeline already running (see [`set_max_encode_fps`], which pushes
+/// it into each one's [`PipelineExtras::Video::fps_override`]).
+static MAX_ENCODE_FPS_SETTING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn encode_fps_setting() -> Option<u32> {
+    let fps = MAX_ENCODE_FPS_SETTING.load(std::sync::atomic::Ordering::Relaxed);
+    (fps != 0).then_some(fps)
+}
+
+/// Clamp a person's requested encode frame rate to a sane range, reporting whether
+/// clamping changed it -- the same shape as [`clamp_bitrate_kbps`], for the same reason:
+/// a setting reachable from a Tauri command is caller-supplied input, and a typo or a
+/// hostile value must not reach the pacer unfiltered.
+///
+/// The ceiling is [`MAX_ENCODE_FPS_CEILING`], the same ceiling `ELEMENTIUM_MAX_FPS` was
+/// already held to -- a setting reachable at runtime must not be a way to ask for more
+/// than the environment variable was ever allowed to give.
+fn clamp_encode_fps_setting(fps: u32) -> (u32, bool) {
+    let ceiling = u32::try_from(MAX_ENCODE_FPS_CEILING).unwrap_or(120);
+    let clamped = fps.clamp(1, ceiling);
+    (clamped, clamped != fps)
+}
+
+/// Resolve the frame rate a video pipeline should encode at: the page's own `frameRate`
+/// constraint (already reduced to an offered rate by [`requested_fps`]), or a person's
+/// persisted setting when one is set.
+///
+/// The setting wins outright rather than being merged with the page's ask, because it
+/// exists precisely *because* the page's ask could not be trusted to reach the encoder:
+/// Element Call's `frameRate` constraint arrived here as `None` for the life of the
+/// project until today's `camelCase` fix, so the encoder ran at a hardcoded 30 regardless
+/// of what anything requested. Someone who explicitly set this asked for a number and
+/// gets that number rather than one the page negotiates around them. Returns the fps to
+/// apply and whether it overrode a page constraint asking for something different, so the
+/// caller can log the two disagreeing instead of letting one silently win.
+fn resolve_encode_fps(page_fps: u32, setting_fps: Option<u32>) -> (u32, bool) {
+    setting_fps.map_or((page_fps, false), |fps| (fps, fps != page_fps))
 }
 
 /// How early a frame may arrive and still count as this slot's frame, as a fraction of the
@@ -1522,6 +1739,15 @@ impl EncodePacer {
             interval,
             next_due: now,
         }
+    }
+
+    /// Change the pacing interval in place, for a frame-rate setting applied mid-call.
+    ///
+    /// Leaves `next_due` untouched: the next admitted frame lands on whatever schedule was
+    /// already running, rather than resetting the deadline and risking a burst or a stall
+    /// at the exact moment the rate changes.
+    const fn set_interval(&mut self, interval: std::time::Duration) {
+        self.interval = interval;
     }
 
     /// Whether the frame that arrived at `now` should be encoded.
@@ -1853,6 +2079,7 @@ struct VideoPipelineControls {
     keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
     active_codec: Arc<ActiveCodec>,
     bitrate_override: Arc<std::sync::atomic::AtomicU32>,
+    fps_override: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1916,7 +2143,15 @@ fn video_pipeline_loop(
     let mut last_preview = std::time::Instant::now()
         .checked_sub(MIN_PREVIEW_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
-    let mut pacer = EncodePacer::new(min_encode_interval(), std::time::Instant::now());
+    // Seeded from `controls.fps_override` rather than `min_encode_interval()` directly: the
+    // pipeline that started this loop already resolved the page constraint against the
+    // person's setting (see `start_camera_pipeline`) and wrote the answer there, so this is
+    // the one place both a fresh pipeline and a live `set_max_encode_fps` call agree on.
+    let mut applied_fps = controls
+        .fps_override
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    let mut pacer = EncodePacer::new(interval_for_fps(applied_fps), std::time::Instant::now());
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -1979,6 +2214,11 @@ fn video_pipeline_loop(
 
             // VP8 encode and send if encoding is active
             let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
+
+            // Polled unconditionally, not only while encoding, so the pacer stays in sync
+            // with the live setting even across a mute -- resuming should not admit a
+            // frame against a stale interval.
+            apply_fps_override(&mut pacer, &controls.fps_override, &mut applied_fps, track_id);
 
             // The preview above gets every captured frame; the encoder is rate-limited.
             // Counted when it is not, because a frame dropped here used to be invisible --
@@ -2422,6 +2662,39 @@ fn apply_bitrate_override<E: VideoEncoder>(
             );
         }
     }
+}
+
+/// Push a live frame-rate setting into the pacer that gates this pipeline's encoder.
+///
+/// Same level-not-event handling as [`apply_bitrate_override`], polled once per captured
+/// frame for the same reason: the pacer lives on this thread and nothing else may touch
+/// it, an atomic load is cheap at frame rate, and only the latest requested value is ever
+/// worth acting on. Unlike a bitrate change this never needs a new encoder -- the pacer's
+/// interval is data the encoder never sees, so changing it takes effect on the very next
+/// frame without so much as a keyframe.
+fn apply_fps_override(
+    pacer: &mut EncodePacer,
+    fps_override: &Arc<std::sync::atomic::AtomicU32>,
+    applied: &mut u32,
+    track_id: &str,
+) {
+    let requested = fps_override.load(std::sync::atomic::Ordering::Relaxed);
+    if requested == 0 || requested == *applied {
+        return;
+    }
+    let (fps, clamped) = clamp_encode_fps_setting(requested);
+    if clamped {
+        tracing::warn!(
+            track_id,
+            requested_fps = requested,
+            applied_fps = fps,
+            max_fps = MAX_ENCODE_FPS_CEILING,
+            "requested encode frame rate outside the sane range; clamped"
+        );
+    }
+    pacer.set_interval(interval_for_fps(fps));
+    *applied = fps;
+    tracing::info!(track_id, fps, "applied frame-rate setting to running pacer");
 }
 
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
@@ -3563,7 +3836,7 @@ mod not_connected_watch_tests {
 
 #[cfg(test)]
 mod video_bitrate_tests {
-    use super::{MAX_ENCODE_FPS, bitrate_for, max_encode_fps, min_encode_interval};
+    use super::{MAX_ENCODE_FPS, bitrate_for, interval_for_fps, max_encode_fps, max_encode_fps_u32};
 
     /// The default has to hold when nothing asks for anything else, because every other
     /// number here is derived from it -- the frame interval and the bitrate both.
@@ -3578,7 +3851,10 @@ mod video_bitrate_tests {
     #[test]
     fn the_frame_interval_matches_the_rate() {
         let expected = 1_000_000_000_u64 / max_encode_fps();
-        assert_eq!(u64::try_from(min_encode_interval().as_nanos()).unwrap_or(0), expected);
+        assert_eq!(
+            u64::try_from(interval_for_fps(max_encode_fps_u32()).as_nanos()).unwrap_or(0),
+            expected
+        );
     }
 
     /// The regression this guards: a fixed 500kbps was used at every resolution. At 720p
@@ -3617,7 +3893,7 @@ mod video_bitrate_tests {
     fn the_encode_interval_matches_the_frame_rate_cap() {
         let per_second = 1_000_000_000_u64
             .checked_div(
-                min_encode_interval()
+                interval_for_fps(max_encode_fps_u32())
                     .as_nanos()
                     .try_into()
                     .unwrap_or(u64::MAX),
@@ -3690,6 +3966,61 @@ mod set_parameters_policy_tests {
         assert_eq!(clamp_bitrate_kbps(0), (MIN_BITRATE_KBPS, true));
         assert_eq!(clamp_bitrate_kbps(50), (MIN_BITRATE_KBPS, true));
         assert_eq!(clamp_bitrate_kbps(50_000), (MAX_BITRATE_KBPS, true));
+    }
+}
+
+/// M1/P5: a persisted frame-rate setting, clamped honestly and reconciled with the page's
+/// own `frameRate` constraint. Both functions are pure precisely so this suite does not
+/// need a running pipeline, a `MediaState`, or a `tauri::AppHandle` -- the same reasoning
+/// `set_parameters_policy_tests` already applies to bitrate.
+#[cfg(test)]
+mod max_encode_fps_setting_tests {
+    use super::{MAX_ENCODE_FPS_CEILING, clamp_encode_fps_setting, resolve_encode_fps};
+
+    /// A value already inside the range passes through unflagged -- clamping every request
+    /// would make "was this clamped" meaningless, the same reasoning `clamp_bitrate_kbps`
+    /// documents for bitrate.
+    #[test]
+    fn a_sane_value_is_not_clamped() {
+        assert_eq!(clamp_encode_fps_setting(60), (60, false));
+    }
+
+    /// Before this existed there was no floor or ceiling on a runtime-set fps at all --
+    /// `set_max_encode_fps` did not exist, so a caller could not ask for either extreme.
+    /// This is the floor and ceiling policy that closes that gap, both ends.
+    #[test]
+    fn clamping_applies_at_both_ends() {
+        assert_eq!(clamp_encode_fps_setting(0), (1, true));
+        let ceiling = u32::try_from(MAX_ENCODE_FPS_CEILING).unwrap_or(120);
+        assert_eq!(clamp_encode_fps_setting(ceiling), (ceiling, false));
+        assert_eq!(clamp_encode_fps_setting(ceiling + 1), (ceiling, true));
+        assert_eq!(clamp_encode_fps_setting(6000), (ceiling, true));
+    }
+
+    /// With no persisted setting, the page's own constraint is exactly what reaches the
+    /// pacer -- this is the behaviour that predates M1 and must not regress now that a
+    /// setting can override it.
+    #[test]
+    fn with_no_setting_the_page_constraint_wins() {
+        assert_eq!(resolve_encode_fps(30, None), (30, false));
+        assert_eq!(resolve_encode_fps(60, None), (60, false));
+    }
+
+    /// The regression this whole feature exists to fix: before a setting could reach the
+    /// pacer at all, the page's `frameRate` constraint -- even once it started arriving --
+    /// was the only voice the encoder ever heard. A person's explicit setting must win
+    /// outright once one exists, not merely nudge the page's number.
+    #[test]
+    fn a_setting_overrides_a_different_page_constraint() {
+        assert_eq!(resolve_encode_fps(30, Some(60)), (60, true));
+        assert_eq!(resolve_encode_fps(60, Some(15)), (15, true));
+    }
+
+    /// A setting that happens to match the page's own ask is not "overriding" anything --
+    /// the two are not fighting, so nothing should be logged as if they were.
+    #[test]
+    fn a_setting_matching_the_page_is_not_reported_as_an_override() {
+        assert_eq!(resolve_encode_fps(30, Some(30)), (30, false));
     }
 }
 
@@ -3949,6 +4280,37 @@ mod encode_pacer_tests {
         assert!(
             kept <= 3,
             "a 30ms burst after a one-second stall admitted {kept} frames"
+        );
+    }
+
+    /// M1/P5: a live frame-rate change must reach an already-running pacer, and take
+    /// effect immediately rather than after the next scheduled deadline. Before
+    /// `set_interval` existed there was no way to change a pacer's rate without dropping
+    /// it and starting a new one -- this is the mechanism `apply_fps_override` polls once
+    /// per frame, the same shape `apply_bitrate_override` already uses for bitrate.
+    #[test]
+    fn set_interval_changes_the_pacing_rate_immediately() {
+        let slow = Duration::from_micros(33_333); // 30fps
+        let fast = Duration::from_micros(16_666); // 60fps
+        let start = Instant::now();
+        let mut pacer = EncodePacer::new(slow, start);
+        assert!(pacer.admit(start));
+
+        // Raise the rate to 60fps mid-run, then feed frames at exactly 60fps. If the
+        // interval had not actually changed, roughly half of these would still be paced
+        // out. `next_due` is deliberately left where the old, slower schedule put it (see
+        // `set_interval`'s own doc comment), so the single frame nearest the switch may
+        // still measure against the stale deadline -- everything after that must not.
+        pacer.set_interval(fast);
+        let mut kept = 0_u32;
+        for i in 1..=30_u32 {
+            if pacer.admit(start + fast * i) {
+                kept = kept.saturating_add(1);
+            }
+        }
+        assert!(
+            kept >= 29,
+            "raising the rate mid-run must admit (almost) every frame at the new rate, got {kept} of 30"
         );
     }
 }
