@@ -35,6 +35,23 @@ pub enum SignalError {
     /// "cannot-be-a-base" URL (no `//` authority, e.g. `https:opaque-thing` rather than
     /// `https://host/...`), and carries no lower-level cause to preserve. The rejected URL
     /// and the scheme change attempted are the whole diagnosis.
+    ///
+    /// X8 (`specs/BACKLOG-2026-08-09-errors.md`): verified experimentally, not just by
+    /// inspection, that `build_ws_url` cannot actually reach this. `http`/`https`/`ws`/`wss`
+    /// are all "special" schemes under the WHATWG URL spec the `url` crate implements, and a
+    /// special-scheme URL cannot finish `Url::parse` without a host -- a probe of
+    /// `http://`, `http:///path`, `http://example.com`, `https://x`, and others (host
+    /// present, port present, userinfo present) showed every URL that parsed successfully
+    /// also had a host and accepted `set_scheme("wss"/"ws")`, and every host-less input
+    /// failed at `Url::parse` first with "empty host", before `set_scheme` is ever called.
+    /// So this variant cannot be constructed by `build_ws_url` today.
+    ///
+    /// Kept rather than deleted anyway: `set_scheme` is a fallible library call returning
+    /// `Result<(), ()>`, and the workspace denies `unwrap_used`/`expect_used`/`panic`, so
+    /// the honest alternative to matching it is an `#[allow]`-scoped unwrap -- strictly
+    /// worse than a named, documented, unreachable-today error variant that keeps the
+    /// `Result` truthful if a future `url` release (or a future edit to `build_ws_url`
+    /// that parses a wider set of inputs) ever makes it reachable again.
     #[error("SFU URL {url:?} has no authority to rewrite scheme {from:?} to {to:?}")]
     SchemeRewriteRejected {
         url: String,
@@ -86,7 +103,6 @@ impl SignalSender {
 /// `LiveKit` SFU WebSocket signaling client.
 pub struct SignalClient {
     sender: SignalSender,
-    receiver: Option<SignalReceiver>,
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
@@ -95,14 +111,24 @@ impl SignalClient {
     ///
     /// Opens a WebSocket to `wss://<sfu>/rtc?access_token=<token>&auto_subscribe=true&sdk=rust&protocol=9`.
     /// Spawns a background task that reads from the WebSocket and forwards
-    /// `SignalResponse` messages to the returned receiver channel.
+    /// `SignalResponse` messages to the returned receiver.
+    ///
+    /// Hands the receiver back directly, rather than stashing it in an `Option` field a
+    /// caller then has to `take()`. A one-shot value that is only ever consumed once,
+    /// immediately, by the one caller that has the freshly-returned `Self` in hand does
+    /// not need a runtime "already taken" check -- there is no second caller who could
+    /// race for it, so the only way the check can fail is a bug in this function, and the
+    /// type system can say that more plainly than a `None` arm can. See X7 in
+    /// `specs/BACKLOG-2026-08-09-errors.md`: the previous `Option`-and-`take` shape
+    /// modelled an invariant as a runtime `ChannelClosed` error that nothing could ever
+    /// legitimately trigger.
     ///
     /// # Errors
     ///
     /// Returns [`SignalError::InvalidUrl`], [`SignalError::SchemeRewriteRejected`], or
     /// [`SignalError::UnsupportedScheme`] if `sfu_url` is invalid, and
     /// [`SignalError::Handshake`] if the WebSocket handshake fails.
-    pub async fn connect(sfu_url: &str, token: &str) -> Result<Self, SignalError> {
+    pub async fn connect(sfu_url: &str, token: &str) -> Result<(Self, SignalReceiver), SignalError> {
         let ws_url = build_ws_url(sfu_url, token)?;
         tracing::info!(url = %redact_token(&ws_url), "connect attempt started");
 
@@ -137,16 +163,13 @@ impl SignalClient {
 
         let sender = SignalSender { tx: out_tx };
 
-        Ok(Self {
-            sender,
-            receiver: Some(in_rx),
-            shutdown_tx: Some(shutdown_tx),
-        })
-    }
-
-    /// Take the signal receiver (can only be taken once).
-    pub const fn take_receiver(&mut self) -> Option<SignalReceiver> {
-        self.receiver.take()
+        Ok((
+            Self {
+                sender,
+                shutdown_tx: Some(shutdown_tx),
+            },
+            in_rx,
+        ))
     }
 
     /// Get a cloneable sender for sending requests to the SFU.
@@ -158,8 +181,13 @@ impl SignalClient {
     /// Gracefully disconnect from the SFU.
     pub async fn disconnect(&mut self) {
         tracing::info!("Disconnecting from LiveKit SFU");
-        // Send Leave request
-        let _ = self.sender.send(signal_request::Message::Leave(
+        // Send Leave request. This only fails if the writer task's channel is already
+        // closed, which means `Leave` can never reach the SFU over this connection --
+        // the server has no other way to learn we are gone and will keep this
+        // participant's session alive until its own timeout fires, which is visible to
+        // every other participant in the room and can affect a fast reconnect (X9:
+        // previously discarded with `let _ =` and no log, so this never surfaced).
+        if let Err(e) = self.sender.send(signal_request::Message::Leave(
             livekit_protocol::LeaveRequest {
                 can_reconnect: false,
                 // `DisconnectReason` is a fieldless protobuf enum (no `From<_> for i32`
@@ -168,8 +196,18 @@ impl SignalClient {
                 reason: livekit_protocol::DisconnectReason::ClientInitiated as i32,
                 ..Default::default()
             },
-        ));
-        // Signal shutdown to reader
+        )) {
+            tracing::warn!(
+                reason = %e,
+                "could not queue Leave request; the SFU may still believe this call is active"
+            );
+        }
+        // Signal shutdown to reader. A failure here just means the reader task's own
+        // shutdown channel is already gone -- it has already ended by itself (the
+        // server closed the socket, or the read loop errored out and returned), so
+        // there is nothing left to tell it. That is the ordinary shape of a shutdown
+        // race, not a condition with a consequence for the SFU or the next call:
+        // judged uninteresting and left unlogged.
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
@@ -275,7 +313,16 @@ async fn ws_writer_loop(mut rx: mpsc::UnboundedReceiver<SignalRequest>, mut ws_w
         }
     }
     tracing::info!("signal writer loop ended");
-    let _ = ws_write.close().await;
+    // Best-effort: send a clean WebSocket close frame now that nothing more will be
+    // written. If the socket already failed (the `send` error above, which is already
+    // logged) this is expected to fail too and is not worth a second alarm; logged at
+    // debug rather than left silent so a *surprise* failure -- the socket looked fine,
+    // `Leave` above went out, and closing it still errored -- is still visible to
+    // someone deliberately looking, without adding warning-level noise to every
+    // ordinary disconnect.
+    if let Err(e) = ws_write.close().await {
+        tracing::debug!(reason = %e, "closing the SFU websocket after the writer loop ended failed");
+    }
 }
 
 /// Background task: reads from WebSocket, decodes `SignalResponse`, forwards to channel.
@@ -412,6 +459,41 @@ mod tests {
             ))
             .expect_err("no receiver is listening");
         assert!(matches!(err, SignalError::ChannelClosed));
+    }
+
+    /// X9 (`specs/BACKLOG-2026-08-09-errors.md`): a `disconnect()` whose `Leave` request
+    /// cannot even be queued must say so, at `WARN`, not swallow it with `let _ =`.
+    ///
+    /// Before this test existed, that path *did* use `let _ =` with no log call at all:
+    /// the assertion below was written first and run against that code, where it failed
+    /// because `find_event` found nothing -- there was nothing to find. This pins the
+    /// regression: a `Leave` that never reaches the SFU because the writer task is
+    /// already gone, with nothing anywhere saying it happened, is exactly the shape of
+    /// silence Constitution Principle I was ratified over, applied to teardown instead
+    /// of setup.
+    #[tokio::test]
+    async fn a_leave_that_cannot_be_queued_is_logged_not_swallowed() {
+        use elementium_observability_test::LogCapture;
+
+        // Global, not `LogCapture::run`'s thread-local scoping: `disconnect` is async and
+        // this crate's other tests never install a global capture, so there is nothing
+        // for this one to collide with.
+        let capture = LogCapture::new();
+        capture.install_global();
+
+        let (tx, rx) = mpsc::unbounded_channel::<SignalRequest>();
+        drop(rx); // stands in for the writer task having already stopped
+        let mut client = SignalClient {
+            sender: super::SignalSender { tx },
+            shutdown_tx: None,
+        };
+
+        client.disconnect().await;
+
+        let event = capture
+            .find_event("could not queue Leave request")
+            .expect("a discarded Leave send must be logged, not silently dropped");
+        assert_eq!(event.level, tracing::Level::WARN);
     }
 
     /// A WebSocket handshake that fails (here: nothing listening on the far end) must

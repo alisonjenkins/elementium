@@ -194,10 +194,24 @@ impl Transport {
 
     /// Set the SDP offer on the Subscriber PC (from SFU) and return the answer.
     ///
+    /// Currently unreferenced: `room.rs`'s signal loop applies subscriber offers by
+    /// calling `peer_connection::set_remote_description` directly on the subscriber
+    /// handle rather than going through this method. Kept in the same shape as that
+    /// live call site (see the `set_subscriber_offer` case of X6,
+    /// specs/BACKLOG-2026-08-09-errors.md) so the two do not silently drift apart if
+    /// this is ever wired back up.
+    ///
     /// # Errors
     ///
-    /// Returns `Err` if the Subscriber PC lock is poisoned, applying the
-    /// remote description fails, or no answer is produced.
+    /// Returns `Err` if the Subscriber PC lock is poisoned, applying the remote
+    /// description fails, or -- see below -- no answer is produced.
+    ///
+    /// X6: `offer` here always carries `sdp_type: Offer`, and `set_remote_description`'s
+    /// `Offer` arm has exactly one return, `Ok(Some(answer))`; it cannot yield `Ok(None)`
+    /// the way the Answer arm legitimately can. So `answer.ok_or_else` below is not the
+    /// "no pending offer" condition that caused the 2026-08-09 outage -- it would mean an
+    /// SFU offer produced no answer at all, which is a genuine fault (subscription can
+    /// never complete), correctly modelled as `Err` rather than silently swallowed.
     pub fn set_subscriber_offer(
         &self,
         offer: &SessionDescription,
@@ -233,8 +247,25 @@ impl Transport {
     /// Both, not just the publisher: the dispatcher only reaches the publisher, and a
     /// subscriber loop left running holds a `spawn_blocking` thread open for good.
     pub async fn shutdown(&self) {
-        let _ = self.cmd_tx.send(TransportCommand::Shutdown).await;
-        let _ = self.sub_cmd_tx.send(PcCommand::Shutdown).await;
+        // Each send only fails if its I/O loop is already gone -- and if it is, that
+        // loop never got a chance to run its own `PcCommand::Shutdown` teardown (str0m
+        // closing out its ICE/DTLS session cleanly). The SFU is then left holding a
+        // PeerConnection this side considers closed, with the same downstream shape as
+        // a missed `Leave`: the next call's negotiation can trip over state the server
+        // still thinks is live. X9 (specs/BACKLOG-2026-08-09-errors.md): previously
+        // discarded with `let _ =` and no log, so this was never observable.
+        if self.cmd_tx.send(TransportCommand::Shutdown).await.is_err() {
+            tracing::warn!(
+                "publisher I/O loop was already gone before shutdown was requested; \
+                 its PeerConnection was not told to close cleanly"
+            );
+        }
+        if self.sub_cmd_tx.send(PcCommand::Shutdown).await.is_err() {
+            tracing::warn!(
+                "subscriber I/O loop was already gone before shutdown was requested; \
+                 its PeerConnection was not told to close cleanly"
+            );
+        }
     }
 }
 
@@ -563,7 +594,18 @@ async fn transport_dispatch(
                         }
                     }
                     Some(TransportCommand::Shutdown) => {
-                        let _ = pub_cmd_tx.send(PcCommand::Shutdown).await;
+                        // Distinct from `Transport::shutdown`'s own send, which only
+                        // proves the dispatcher (this task) received the request -- not
+                        // that the publisher I/O loop, one hop further, got told. If
+                        // that loop already died (its own `poll_once` failure is logged
+                        // at its source in `pc_io_loop`), this confirms the shutdown
+                        // path never reached it either, rather than leaving both silent.
+                        if pub_cmd_tx.send(PcCommand::Shutdown).await.is_err() {
+                            tracing::warn!(
+                                "publisher I/O loop already gone; shutdown could not be \
+                                 forwarded to it"
+                            );
+                        }
                         break;
                     }
                     None => break,

@@ -284,9 +284,16 @@ impl LiveKitRoom {
     ) -> Result<(Self, mpsc::UnboundedReceiver<RoomEvent>), crate::error::WebRtcError> {
         let room_id = generate_room_id();
 
-        // Connect signaling
-        let mut signal_client = match SignalClient::connect(sfu_url, token).await {
-            Ok(client) => client,
+        // Connect signaling. `connect()` hands back the receiver directly rather than
+        // stashing it behind an `Option` a caller then has to `take()` -- see X7 in
+        // specs/BACKLOG-2026-08-09-errors.md: the previous shape modelled "the receiver
+        // was already taken" as a `ChannelClosed` runtime error, immediately after a
+        // freshly-constructed `SignalClient` that nothing else could have touched. That
+        // was an invariant, not a possible failure, and is now expressed by the type
+        // signature instead of a branch that could never be taken.
+        let (signal_client, mut signal_rx) = match SignalClient::connect(sfu_url, token).await
+        {
+            Ok(v) => v,
             Err(e) => {
                 tracing::error!(reason = %e, "signaling connect failed");
                 return Err(crate::error::WebRtcError::Signaling(format!(
@@ -296,15 +303,6 @@ impl LiveKitRoom {
         };
 
         let signal_sender = signal_client.sender();
-        let Some(mut signal_rx) = signal_client.take_receiver() else {
-            tracing::error!(
-                reason = "signal receiver already taken",
-                "connect attempt failed"
-            );
-            return Err(crate::error::WebRtcError::ChannelClosed(
-                "signal receiver already taken",
-            ));
-        };
 
         // Wait for JoinResponse
         let join_response = match wait_for_join(&mut signal_rx).await {
@@ -985,6 +983,16 @@ async fn signal_processing_loop(
                             poisoned.into_inner()
                         }
                     };
+                    // X6 (specs/BACKLOG-2026-08-09-errors.md): unlike the Answer arm below
+                    // -- where `Ok(None)` means "this answer matches the offer already in
+                    // force, there is nothing to apply" and is not an error -- `desc` here
+                    // always has `sdp_type: Offer`. `set_remote_description`'s `Offer` arm
+                    // (peer_connection.rs) has exactly one return: `accept_offer` either
+                    // errors or produces `Ok(Some(answer))`; there is no path that reaches
+                    // `Ok(None)` for an offer. So this is not the outage-shaped bug: an SFU
+                    // offer that yields no answer would mean the subscriber PC can never
+                    // reply, permanently breaking subscription -- a genuine fault, correctly
+                    // kept as an error rather than turned into a silent `Ok`.
                     match crate::peer_connection::set_remote_description(&mut pc, &desc) {
                         Ok(Some(ans)) => ans,
                         Ok(None) => {
