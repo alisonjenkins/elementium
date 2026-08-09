@@ -38,18 +38,22 @@ impl VideoPipeline {
     /// runs independently of this call and outlives it. A `Result` that could never be
     /// `Err` taught every caller to write dead error-handling around it -- see
     /// `specs/BACKLOG-2026-08-09-errors.md` X4.
+    /// Returns the decode thread's handle, or `None` if playback was already running.
+    /// Production callers drop it (which detaches, as before); it exists so a test can
+    /// join the thread and prove it really does end when its channel closes, rather than
+    /// asserting on the absence of something.
     pub fn start_playback(
         &mut self,
         mut event_rx: mpsc::Receiver<PcEvent>,
         frame_buffer: VideoFrameBuffer,
         pc_id: String,
-    ) {
+    ) -> Option<std::thread::JoinHandle<()>> {
         if self.playback_active {
-            return;
+            return None;
         }
         self.playback_active = true;
 
-        std::thread::spawn(move || {
+        Some(std::thread::spawn(move || {
             // One decoder per remote track (`mid`), not one shared decoder for the whole
             // PC -- a single PeerConnection can carry more than one remote video track
             // (e.g. camera + screen share both active), and VP8 decoding is stateful
@@ -125,7 +129,7 @@ impl VideoPipeline {
             }
 
             tracing::info!(pc_id = %pc_id, "Video playback stopped: the event channel closed");
-        });
+        }))
     }
 
     #[must_use]
@@ -137,5 +141,44 @@ impl VideoPipeline {
 impl Default for VideoPipeline {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VideoFrameBuffer, VideoPipeline};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// The decode thread must end when its sender is dropped.
+    ///
+    /// Fails against the previous implementation, which polled with `try_recv().ok()` --
+    /// a closed channel and an empty one both yielded `None`, so the thread slept 5ms and
+    /// looked again, forever. One leaked per peer connection, and a call that reconnects
+    /// makes several.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_decode_thread_ends_when_its_channel_closes() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let frames: VideoFrameBuffer = Arc::new(Mutex::new(HashMap::new()));
+        let mut pipeline = VideoPipeline::new();
+        let handle = pipeline
+            .start_playback(rx, frames, "pc-test".to_owned())
+            .expect("a fresh pipeline starts playback");
+
+        drop(tx);
+
+        // Joining directly would hang rather than fail if the thread never ends, which
+        // reports a bug as a stuck test suite. Polling gives it a verdict.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the decode thread was still running 5s after its channel closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().expect("the decode thread ended cleanly");
     }
 }
