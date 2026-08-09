@@ -116,7 +116,19 @@ pub fn list_video_sources() -> Result<Vec<PipewireVideoSource>, PipewireError> {
     let timer = mainloop.loop_().add_timer(move |_| {
         timer_loop.quit();
     });
-    let _ = timer.update_timer(Some(ENUMERATION_SETTLE), None);
+    if let Err(e) = timer.update_timer(Some(ENUMERATION_SETTLE), None).into_result() {
+        // Not arming this timer means nothing will ever call `quit()`: the mainloop below
+        // spins forever with no source of the "settle period is over" event it's waiting
+        // for, rather than a bounded enumeration returning an empty or partial list. Logged
+        // rather than propagated: the mainloop still has to run so `register()`'s listener
+        // can be given a chance, and a timer that fails to arm is rare enough that failing
+        // the whole enumeration over it would be a worse outcome than a one-off hang.
+        tracing::error!(
+            error = %e,
+            "failed to arm the enumeration settle timer; this call may hang instead of \
+             returning"
+        );
+    }
     mainloop.run();
 
     // A poisoned lock is reported, not folded into "no sources". The two are opposite
@@ -266,7 +278,19 @@ pub fn list_audio_sources() -> Result<Vec<PipewireAudioSource>, PipewireError> {
     let timer = mainloop.loop_().add_timer(move |_| {
         timer_loop.quit();
     });
-    let _ = timer.update_timer(Some(ENUMERATION_SETTLE), None);
+    if let Err(e) = timer.update_timer(Some(ENUMERATION_SETTLE), None).into_result() {
+        // Not arming this timer means nothing will ever call `quit()`: the mainloop below
+        // spins forever with no source of the "settle period is over" event it's waiting
+        // for, rather than a bounded enumeration returning an empty or partial list. Logged
+        // rather than propagated: the mainloop still has to run so `register()`'s listener
+        // can be given a chance, and a timer that fails to arm is rare enough that failing
+        // the whole enumeration over it would be a worse outcome than a one-off hang.
+        tracing::error!(
+            error = %e,
+            "failed to arm the enumeration settle timer; this call may hang instead of \
+             returning"
+        );
+    }
     mainloop.run();
 
     // Same reasoning as the video path above: "we could not find out" is not "there is

@@ -10,8 +10,9 @@
 //! through `PipeWire`, so the reverse order would work by luck on some machines and fail on
 //! others for reasons no log would explain.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::captured_frame::CapturedFrame;
@@ -54,6 +55,15 @@ pub struct PushCapturer {
     stopper: Box<dyn Fn() + Send + Sync>,
     /// Distinguishes this producer from others sharing the same generic plumbing in logs.
     label: &'static str,
+    /// Set by the producer when it has decided its own source is gone for good -- e.g.
+    /// `X11Capturer`'s consecutive-failure counter crossing its sustained-failure threshold
+    /// (see `elementium-screen/src/x11.rs`). `None` for a producer with no such signal, which
+    /// is what [`VideoSource::failed`] previously reported unconditionally for every push
+    /// producer: `false`, indistinguishable from "healthy" no matter how dead the source
+    /// actually was. Optional rather than mandatory because this crate cannot name the
+    /// concrete producer (see this struct's doc comment) and so cannot require it to supply
+    /// one.
+    failed: Option<Arc<AtomicBool>>,
 }
 
 impl PushCapturer {
@@ -84,6 +94,16 @@ impl PushCapturer {
     /// (once explicitly, once from `Drop`) must not be an error.
     pub fn stop(&self) {
         (self.stopper)();
+    }
+
+    /// Whether the producer has reported its own source as gone for good.
+    ///
+    /// `false` when no health signal was supplied at all -- see [`PushCapturer::failed`]'s
+    /// doc comment -- which keeps this the same "cannot detect, so do not guess" behaviour
+    /// [`VideoSource::failed`] documents for the paths with no signal.
+    #[must_use]
+    fn failed(&self) -> bool {
+        self.failed.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
     }
 }
 
@@ -238,6 +258,33 @@ impl VideoSource {
             height: AtomicU32::new(0),
             stopper,
             label,
+            failed: None,
+        })
+    }
+
+    /// As [`VideoSource::start_push`], but wired to a health signal the producer sets when it
+    /// has decided its own source is gone for good.
+    ///
+    /// Without this, [`VideoSource::failed`] can only ever report `false` for a push source --
+    /// which is exactly the gap that let an X11 screen share go dark with nothing to say why
+    /// (see `elementium-screen/src/x11.rs`'s per-frame failure counter, which this exists to
+    /// expose). `failed` is expected to start `false` and latch permanently to `true`, the
+    /// same contract `PipewireCapturer::failed` documents -- a transient miss must not be
+    /// reported here, only a sustained one.
+    #[must_use]
+    pub fn start_push_with_health(
+        rx: Receiver<CapturedFrame>,
+        stopper: Box<dyn Fn() + Send + Sync>,
+        label: &'static str,
+        failed: Arc<AtomicBool>,
+    ) -> Self {
+        Self::Push(PushCapturer {
+            rx,
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            stopper,
+            label,
+            failed: Some(failed),
         })
     }
 
@@ -283,15 +330,18 @@ impl VideoSource {
     /// like: the stream errors, `try_recv` keeps returning `None`, and the pipeline goes on
     /// delivering nothing with nothing logged.
     ///
-    /// `false` for the pull-from-`V4L2` and push paths rather than a guess: `nokhwa` has no
-    /// equivalent signal, and a dropped push sender is indistinguishable from an idle one
-    /// here. Reporting a failure those paths cannot actually detect would be worse than
-    /// reporting none.
+    /// `false` for the pull-from-`V4L2` path rather than a guess: `nokhwa` has no equivalent
+    /// signal. The push path reports whatever health signal its producer supplied -- `false`
+    /// if none was given (see [`PushCapturer::failed`]), which keeps the same "cannot detect,
+    /// so do not guess" behaviour for a producer with nothing to say, while letting one that
+    /// does have a signal (X11's sustained-failure counter, via
+    /// [`VideoSource::start_push_with_health`]) actually be seen here.
     #[must_use]
     pub fn failed(&self) -> bool {
         match self {
             Self::Pipewire(c) => c.failed(),
-            Self::V4l2(_) | Self::Push(_) => false,
+            Self::V4l2(_) => false,
+            Self::Push(c) => c.failed(),
         }
     }
 
@@ -464,5 +514,35 @@ mod tests {
         drop(source);
         // stop() is idempotent (see `PushCapturer::stop`'s doc), so Drop calling it again is
         // expected and harmless; the assertion above already proved the signal fires.
+    }
+
+    /// S1 regression: before `start_push_with_health` existed, `VideoSource::failed()`
+    /// hardcoded `false` for every push source -- meaning `source_died()` in
+    /// `src-tauri/src/commands/media_devices.rs` could never see an X11 share die, no matter
+    /// how thoroughly `elementium-screen`'s capture thread had given up. This pins that a
+    /// source built with a health handle reports `failed()` honestly in both directions: not
+    /// failed until told so, and failed once its handle is set -- exactly what
+    /// `X11Capturer::failed_handle()` is for.
+    #[test]
+    fn a_push_source_with_a_health_handle_reports_failure_through_it() {
+        let (_tx, rx) = std::sync::mpsc::channel::<CapturedFrame>();
+        let failed = Arc::new(AtomicBool::new(false));
+
+        let source =
+            VideoSource::start_push_with_health(rx, Box::new(|| {}), "test-push", Arc::clone(&failed));
+        assert!(!source.failed(), "must not report failure before the handle is set");
+
+        failed.store(true, Ordering::Relaxed);
+        assert!(source.failed(), "must report failure once the handle is set");
+    }
+
+    /// Companion to the above: a plain `start_push` (no handle supplied -- every producer but
+    /// X11 today) must keep reporting `false` rather than panicking or guessing, matching
+    /// `failed()`'s documented "cannot detect, so do not guess" contract.
+    #[test]
+    fn a_push_source_with_no_health_handle_never_reports_failure() {
+        let (_tx, rx) = std::sync::mpsc::channel::<CapturedFrame>();
+        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push");
+        assert!(!source.failed(), "a producer with no health signal must not report failure");
     }
 }

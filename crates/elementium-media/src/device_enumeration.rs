@@ -8,26 +8,41 @@ pub fn enumerate_audio_devices() -> Vec<MediaDevice> {
     let mut devices = Vec::new();
 
     // Input devices (microphones)
-    if let Ok(inputs) = host.input_devices() {
-        for (i, device) in inputs.enumerate() {
-            let label = device.name().unwrap_or_else(|_| format!("Microphone {i}"));
-            devices.push(MediaDevice {
-                id: format!("audio-input-{i}"),
-                label,
-                kind: MediaDeviceKind::AudioInput,
-            });
+    match host.input_devices() {
+        Ok(inputs) => {
+            for (i, device) in inputs.enumerate() {
+                let label = device.name().unwrap_or_else(|_| format!("Microphone {i}"));
+                devices.push(MediaDevice {
+                    id: format!("audio-input-{i}"),
+                    label,
+                    kind: MediaDeviceKind::AudioInput,
+                });
+            }
+        }
+        Err(e) => {
+            // Distinct from "no microphones are plugged in": a cpal failure here (the host
+            // API itself refusing to enumerate) removed the entire input device class from
+            // the list, and looked in the UI exactly like a machine with no microphones --
+            // there was nothing to tell the two apart. Logged so the difference survives.
+            tracing::error!(error = %e, "failed to enumerate audio input devices");
         }
     }
 
     // Output devices (speakers)
-    if let Ok(outputs) = host.output_devices() {
-        for (i, device) in outputs.enumerate() {
-            let label = device.name().unwrap_or_else(|_| format!("Speaker {i}"));
-            devices.push(MediaDevice {
-                id: format!("audio-output-{i}"),
-                label,
-                kind: MediaDeviceKind::AudioOutput,
-            });
+    match host.output_devices() {
+        Ok(outputs) => {
+            for (i, device) in outputs.enumerate() {
+                let label = device.name().unwrap_or_else(|_| format!("Speaker {i}"));
+                devices.push(MediaDevice {
+                    id: format!("audio-output-{i}"),
+                    label,
+                    kind: MediaDeviceKind::AudioOutput,
+                });
+            }
+        }
+        Err(e) => {
+            // Same reasoning as the input-device case above.
+            tracing::error!(error = %e, "failed to enumerate audio output devices");
         }
     }
 

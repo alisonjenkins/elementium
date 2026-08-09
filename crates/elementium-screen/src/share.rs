@@ -178,8 +178,25 @@ impl Drop for ShareSession {
         // panic. Best effort: hand the close to the runtime if there is one, and say so if
         // there is not, rather than silently leaving a session open on the portal.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let source = self.source.clone();
             handle.spawn(async move {
-                let _ = portal.session.close().await;
+                // Same call as the sibling `close()` above, but reached without an await
+                // point to return through -- Drop, an error path, or a panic unwind. It must
+                // log both outcomes exactly as `close()` does: an unlogged `let _ =` here
+                // left a leaked portal session and a failed session close indistinguishable
+                // from each other and from success, with nothing in the log to tell them
+                // apart after the fact.
+                match portal.session.close().await {
+                    Ok(()) => {
+                        tracing::info!(source = ?source, "screencast portal session closed (via Drop)");
+                    }
+                    Err(e) => tracing::warn!(
+                        source = ?source,
+                        reason = %e,
+                        "screencast portal session could not be closed on Drop; it will be \
+                         dropped instead"
+                    ),
+                }
             });
         } else {
             tracing::warn!(

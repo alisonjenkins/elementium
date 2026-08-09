@@ -1450,10 +1450,25 @@ fn run_until_stopped(
             quit_loop.quit();
         }
     });
-    let _ = timer.update_timer(
-        Some(std::time::Duration::from_millis(100)),
-        Some(std::time::Duration::from_millis(100)),
-    );
+    if let Err(e) = timer
+        .update_timer(
+            Some(std::time::Duration::from_millis(100)),
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .into_result()
+    {
+        // If this timer never fires, `stop_rx` is never polled: a `stop()` call queues its
+        // message and nothing ever reads it, so the capture thread -- and the mainloop it
+        // owns -- runs forever after the caller has already given up on it. Logged, not
+        // propagated: there is no fallback poll mechanism to fall back to here, only the
+        // choice between running with no stop-poll (rare, and still delivers frames) and not
+        // starting capture at all over a timer failure that has never yet been observed.
+        tracing::error!(
+            node_id,
+            error = %e,
+            "failed to arm the stop-poll timer; stop() may never be noticed"
+        );
+    }
 
     tracing::info!(node_id, "PipeWire capture loop running");
     mainloop.run();
@@ -1639,21 +1654,52 @@ struct DmaBufSync {
     flags: u64,
 }
 
+/// Why a DMA-BUF frame could not be mapped for CPU reads.
+///
+/// Distinct variants rather than the `String` this replaced (see the constitution's Principle
+/// I) because [`Self::Mmap`] alone covers several `io::Error` kinds a caller would want to
+/// react to differently -- `PermissionDenied` (the compositor handed over a buffer this
+/// process's credentials cannot read; a sandboxing question) versus `ENOSPC`-style resource
+/// exhaustion (the system, not this process, is out of mapping room) versus a bad or already-
+/// closed fd (a `PipeWire` bug, or a race with the buffer being recycled) all stringified to
+/// the same "mmap ... failed: ..." message before this, with the one field that could tell
+/// them apart -- `io::Error::kind()` -- thrown away in the `format!`.
+#[derive(Debug, thiserror::Error)]
+enum DmaBufMapError {
+    /// The buffer carried no dma-buf descriptor at all.
+    #[error("the buffer carried no dma-buf descriptor")]
+    NoDescriptor,
+    /// The chunk this buffer described was empty.
+    #[error("the chunk reported a size of zero")]
+    EmptyChunk,
+    /// `offset + size` does not fit in a `usize`.
+    #[error("chunk offset {offset} plus size {size} overflows")]
+    OffsetOverflow { offset: usize, size: usize },
+    /// The `mmap(2)` call itself failed; `source.kind()` is what tells a permission problem
+    /// from a resource-exhaustion problem from a bad fd.
+    #[error("mmap of {len} bytes from the dma-buf fd failed: {source}")]
+    Mmap {
+        len: usize,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 impl DmaBufMapping {
     /// Map a DMA-BUF fd for reading, or return `None` if it cannot be read on the CPU.
     ///
     /// `None` rather than an error because the caller's only useful response is to drop the
     /// frame and count it: a buffer this process cannot map is not a fault it can fix
     /// mid-stream, and one that logged per frame would log thirty times a second.
-    fn map(fd: std::os::fd::RawFd, offset: usize, size: usize) -> Result<Self, String> {
+    fn map(fd: std::os::fd::RawFd, offset: usize, size: usize) -> Result<Self, DmaBufMapError> {
         if fd < 0 {
-            return Err("the buffer carried no dma-buf descriptor".to_owned());
+            return Err(DmaBufMapError::NoDescriptor);
         }
         if size == 0 {
-            return Err("the chunk reported a size of zero".to_owned());
+            return Err(DmaBufMapError::EmptyChunk);
         }
         let Some(len) = offset.checked_add(size) else {
-            return Err(format!("chunk offset {offset} plus size {size} overflows"));
+            return Err(DmaBufMapError::OffsetOverflow { offset, size });
         };
 
         // SAFETY: `fd` is a DMA-BUF descriptor owned by the buffer PipeWire just handed us
@@ -1670,8 +1716,7 @@ impl DmaBufMapping {
             )
         };
         if std::ptr::eq(ptr, libc::MAP_FAILED) {
-            let err = std::io::Error::last_os_error();
-            return Err(format!("mmap of {len} bytes from the dma-buf fd failed: {err}"));
+            return Err(DmaBufMapError::Mmap { len, source: std::io::Error::last_os_error() });
         }
 
         let mapping = Self { ptr, len, fd, offset, size };
@@ -1891,7 +1936,47 @@ fn serialize(obj: libspa::pod::Object) -> Vec<u8> {
     clippy::panic
 )]
 mod tests {
-    use super::{PlanarFormat, SourceFormat, planar_to_i420, to_rgba};
+    use super::{DmaBufMapError, DmaBufMapping, PlanarFormat, SourceFormat, planar_to_i420, to_rgba};
+
+    /// Pins the three checks `DmaBufMapping::map` runs before ever calling `mmap(2)`, so a
+    /// negative fd, an empty chunk and an overflowing offset+size each name themselves
+    /// distinctly rather than collapsing into one generic mapping failure -- see
+    /// `DmaBufMapError`'s doc comment for why that distinction is worth keeping.
+    #[test]
+    fn map_rejects_invalid_input_before_touching_the_kernel() {
+        assert!(matches!(
+            DmaBufMapping::map(-1, 0, 64),
+            Err(DmaBufMapError::NoDescriptor)
+        ));
+        assert!(matches!(
+            DmaBufMapping::map(0, 0, 0),
+            Err(DmaBufMapError::EmptyChunk)
+        ));
+        assert!(matches!(
+            DmaBufMapping::map(0, usize::MAX, 1),
+            Err(DmaBufMapError::OffsetOverflow { offset: usize::MAX, size: 1 })
+        ));
+    }
+
+    /// A real `mmap(2)` failure -- exercised here with an unopened, high-numbered fd (a
+    /// guaranteed `EBADF`, not a mock) -- must still carry a real `io::Error` as its source,
+    /// not just a rendered message, so a caller could match `.kind()` to tell a permission
+    /// failure from a bad fd. This is the regression `DmaBufMapError::Mmap`'s `#[source]`
+    /// field exists to prevent: the `String` it replaced had no `.kind()` at all.
+    #[test]
+    fn a_real_mmap_failure_preserves_the_io_error_as_its_source() {
+        let unopened_fd: std::os::fd::RawFd = 999_999;
+        let Err(err) = DmaBufMapping::map(unopened_fd, 0, 64) else {
+            panic!("mapping an unopened fd as a dma-buf must fail");
+        };
+        let DmaBufMapError::Mmap { source, .. } = err else {
+            panic!("must fail with Mmap specifically, got: {err}");
+        };
+        // Only that a real io::Error kind survived, not which one: the exact errno mmap(2)
+        // returns for a non-mappable fd is not part of this test's contract, only that it
+        // was not discarded.
+        let _ = source.kind();
+    }
 
     /// Build a padded planar buffer whose every sample is identifiable, so a plane landing
     /// in the wrong place is visible rather than merely plausible.

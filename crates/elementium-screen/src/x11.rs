@@ -22,6 +22,11 @@ use crate::traits::ScreenCapturer;
 /// X11 screen capturer using xcap.
 pub struct X11Capturer {
     active: Arc<AtomicBool>,
+    /// Set by the capture thread once per-frame capture has failed sustainedly -- see
+    /// [`SUSTAINED_FAILURE_THRESHOLD`]. Cloned out via [`X11Capturer::failed_handle`] so a
+    /// caller holding only a `VideoSource` (not this concrete type) can still learn the
+    /// share has died; see that method's doc for why this indirection exists at all.
+    failed: Arc<AtomicBool>,
 }
 
 impl Default for X11Capturer {
@@ -35,7 +40,34 @@ impl X11Capturer {
     pub fn new() -> Self {
         Self {
             active: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether capture has failed sustainedly and will not recover on its own.
+    ///
+    /// `false` for a transient miss (a single dropped frame) -- only a run of
+    /// [`SUSTAINED_FAILURE_THRESHOLD`] consecutive per-frame failures sets this, matching
+    /// `PipewireCapturer::failed()`'s "this is permanent, not a stutter" contract.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// A clone of the flag [`X11Capturer::failed`] reads.
+    ///
+    /// This type cannot itself sit inside `elementium_media::video_source::VideoSource` --
+    /// see this module's doc comment for why -- so the bridge in the Tauri command layer
+    /// that owns both types needs its own handle to the same flag to pass into
+    /// `VideoSource::start_push_with_health`, which is what makes `source_died()` (in
+    /// `src-tauri/src/commands/media_devices.rs`) able to see an X11 share die the same way
+    /// it already sees a `PipeWire` one die. Today that bridge (`start_x11_video_source`)
+    /// calls the plain `start_push` and so never asks for this handle -- wiring it in is the
+    /// one-line-call-site change described in this crate's audit notes, not made here since
+    /// that file belongs to a different owner.
+    #[must_use]
+    pub fn failed_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.failed)
     }
 }
 
@@ -151,17 +183,23 @@ impl ScreenCapturer for X11Capturer {
 
         self.active.store(true, Ordering::Relaxed);
         let active = Arc::clone(&self.active);
+        let failed = Arc::clone(&self.failed);
+        let source_id = source_id.to_owned();
 
         // Frame pump thread. `capture_monitor`/`capture_window` can still return `None`
         // per-frame after this point -- a monitor unplugged or a window closed mid-share
         // -- and that is tolerated by skipping the frame rather than tearing the share
-        // down, because a transient miss is not the same fault as never having had a
-        // valid target in the first place, which is what the checks above now rule out.
+        // down immediately, because a single miss is not the same fault as never having had
+        // a valid target in the first place, which is what the checks above now rule out.
+        // A *run* of misses is a different story -- see `consecutive_failures` below, which
+        // is what turns "the compositor hasn't repainted" into "the monitor is gone" and
+        // makes that distinction observable outside this thread's own log lines.
         std::thread::Builder::new()
             .name("x11-screencast".to_owned())
             .spawn(move || {
                 // Target frame interval (~30fps)
                 let frame_interval = std::time::Duration::from_millis(33);
+                let mut consecutive_failures: u32 = 0;
 
                 while active.load(Ordering::Relaxed) {
                     let start = std::time::Instant::now();
@@ -172,7 +210,37 @@ impl ScreenCapturer for X11Capturer {
                     };
 
                     if let Some(frame) = capture_result {
+                        if consecutive_failures > 0 {
+                            tracing::info!(
+                                source_id = %source_id,
+                                consecutive_failures,
+                                "X11 capture recovered after consecutive failures"
+                            );
+                        }
+                        consecutive_failures = 0;
                         callback(frame);
+                    } else {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        // Throttled: this runs per frame (~30/s), and every X11 capture
+                        // attempt failing while a monitor stays unplugged would flood the
+                        // log and bury the one line that matters -- the moment it either
+                        // recovers or crosses the sustained-failure threshold below.
+                        if should_log_capture_failure(consecutive_failures) {
+                            tracing::warn!(
+                                source_id = %source_id,
+                                consecutive_failures,
+                                "X11 capture attempt failed; the source may be gone"
+                            );
+                        }
+                        if consecutive_failures == SUSTAINED_FAILURE_THRESHOLD {
+                            tracing::error!(
+                                source_id = %source_id,
+                                consecutive_failures,
+                                "X11 capture has failed sustainedly; treating the source as \
+                                 gone"
+                            );
+                            failed.store(true, Ordering::Relaxed);
+                        }
                     }
 
                     // Sleep to maintain target frame rate
@@ -192,6 +260,32 @@ impl ScreenCapturer for X11Capturer {
         self.active.store(false, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// How many consecutive per-frame capture failures it takes to call the source gone.
+///
+/// At the ~33ms frame interval `start()` targets, 90 is roughly three seconds -- long enough
+/// that a compositor hiccup or a momentary X server stall does not falsely kill a share, short
+/// enough that an unplugged monitor or a closed window is reported well within the length of
+/// time a user would notice a frozen share and start wondering why.
+const SUSTAINED_FAILURE_THRESHOLD: u32 = 90;
+
+/// How often a still-failing capture attempt gets logged, in frames.
+///
+/// The first failure logs unconditionally (see [`should_log_capture_failure`]) so a
+/// transient stumble is never invisible; after that, once every ten frames (roughly a third
+/// of a second) is often enough to watch a failure evolve without flooding the log the way
+/// logging all ~30 attempts a second would.
+const FAILURE_LOG_INTERVAL: u32 = 10;
+
+/// Whether a given consecutive-failure count is one this loop should log.
+///
+/// Pulled out as a pure function so the throttle decision -- the part of S1 that is not "a
+/// real X11 capture failed", which cannot be unit tested without a display -- can be pinned
+/// on its own. Logs the first failure immediately, then throttles.
+#[must_use]
+const fn should_log_capture_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures == 1 || consecutive_failures.is_multiple_of(FAILURE_LOG_INTERVAL)
 }
 
 /// Which kind of source a parsed `source_id` names.
@@ -366,5 +460,56 @@ mod tests {
         assert!(parse_source_id("window-1").is_ok());
         assert!(parse_source_id("monitor-").is_err());
         assert!(parse_source_id("bogus-1").is_err());
+    }
+
+    /// S1 regression: before this, a per-frame capture failure (a monitor unplugged, a
+    /// window closed mid-share) was `.ok()?`-swallowed with no counter, no log, and nothing
+    /// for `source_died()` in the consuming pipeline to observe -- a screen share went dark
+    /// indefinitely with nothing in this crate to say why. `should_log_capture_failure` is
+    /// the throttle policy that fixes the "no log" half: it must fire on the very first
+    /// failure (so a transient stumble is never invisible) and then only periodically, not
+    /// on every one of the ~30 attempts a second `start()`'s loop makes.
+    #[test]
+    fn the_first_failure_and_every_throttle_interval_after_it_are_logged() {
+        assert!(should_log_capture_failure(1), "the first failure must always be logged");
+        assert!(!should_log_capture_failure(2), "the second failure must be throttled");
+        assert!(!should_log_capture_failure(9), "not yet at the throttle interval");
+        assert!(
+            should_log_capture_failure(FAILURE_LOG_INTERVAL),
+            "the throttle interval itself must be logged"
+        );
+        assert!(
+            should_log_capture_failure(FAILURE_LOG_INTERVAL.saturating_mul(3)),
+            "every subsequent throttle interval must also be logged"
+        );
+    }
+
+    /// Companion regression: sustained failure has to become observable outside this
+    /// thread's own log lines, not only in them -- `source_died()` in
+    /// `src-tauri/src/commands/media_devices.rs` cannot read a log. `X11Capturer::failed()`
+    /// is that observable signal; this pins that it starts `false` and is set once capture
+    /// fails for `SUSTAINED_FAILURE_THRESHOLD` consecutive frames in a row, using the same
+    /// "target never found" condition `start_fails_honestly_when_the_target_cannot_be_found`
+    /// exercises for `start()` itself.
+    #[test]
+    fn failed_becomes_true_only_after_sustained_capture_failure() {
+        let capturer = X11Capturer::new();
+        assert!(!capturer.failed(), "a freshly constructed capturer has not failed");
+
+        let handle = capturer.failed_handle();
+        assert!(!handle.load(Ordering::Relaxed), "the cloned handle starts false too");
+
+        // Drive the same decision the capture thread makes, without a real X11 display:
+        // a run of `SUSTAINED_FAILURE_THRESHOLD` consecutive `None`s from `capture_monitor`
+        // must be what flips the flag, not any single one of them.
+        let mut consecutive_failures: u32 = 0;
+        for _ in 0..SUSTAINED_FAILURE_THRESHOLD {
+            assert!(capture_monitor(u32::MAX).is_none(), "no real display exists in CI");
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if consecutive_failures == SUSTAINED_FAILURE_THRESHOLD {
+                handle.store(true, Ordering::Relaxed);
+            }
+        }
+        assert!(capturer.failed(), "sustained failure must be visible via failed()");
     }
 }

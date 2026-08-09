@@ -470,10 +470,23 @@ fn run_until_stopped(
             quit_loop.quit();
         }
     });
-    let _ = timer.update_timer(
-        Some(std::time::Duration::from_millis(100)),
-        Some(std::time::Duration::from_millis(100)),
-    );
+    if let Err(e) = timer
+        .update_timer(
+            Some(std::time::Duration::from_millis(100)),
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .into_result()
+    {
+        // Same failure mode as the video capture loop's identically-shaped timer (see
+        // `pipewire_capture.rs::run_until_stopped`): if this never fires, `stop()` is queued
+        // and never read, so the mainloop -- and this thread -- outlives every caller that
+        // has given up on it, with nothing in the log to say the stop-poll was never armed.
+        tracing::error!(
+            node_id,
+            error = %e,
+            "failed to arm the stop-poll timer; stop() may never be noticed"
+        );
+    }
 
     tracing::info!(node_id, "PipeWire audio capture loop running");
     mainloop.run();

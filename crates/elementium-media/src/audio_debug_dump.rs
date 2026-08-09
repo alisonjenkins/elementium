@@ -23,6 +23,29 @@ struct DumpState {
     writer: BufWriter<File>,
     samples_written: usize,
     capped_logged: bool,
+    /// Samples this stream has failed to write (e.g. the disk filling up mid-dump). Kept
+    /// separate from `samples_written` rather than folded into it -- see [`maybe_dump`] --
+    /// so a failing dump cannot look, from `samples_written` alone, indistinguishable from a
+    /// succeeding one.
+    write_errors: usize,
+}
+
+/// How often a still-failing write to a dump file gets logged, in failed samples.
+///
+/// A disk that has filled up fails every subsequent `write_all` -- potentially thousands a
+/// second at 48kHz stereo -- so logging every one would flood the log exactly when it is
+/// already fullest. Matches [`audio_playback`](crate::audio_playback)'s dropped-frame
+/// throttle interval for the same reasoning.
+const WRITE_FAILURE_LOG_INTERVAL: usize = 50;
+
+/// Whether a given failed-write count is one worth logging.
+///
+/// Pulled out as a pure function, the same way `elementium-screen`'s X11 capture throttle is,
+/// so the "is this the moment to log" decision can be pinned without needing a real
+/// almost-full disk.
+#[must_use]
+const fn should_log_dump_write_failure(write_errors: usize) -> bool {
+    write_errors == 1 || write_errors.is_multiple_of(WRITE_FAILURE_LOG_INTERVAL)
 }
 
 /// Whether audio capture-to-disk is switched on.
@@ -85,6 +108,16 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
     }
 
     let Ok(mut reg) = registry().lock() else {
+        // A poisoned lock means some earlier call panicked while holding it -- after this,
+        // every dump silently stops, forever, with nothing in the log to say why. Logged
+        // once per call rather than propagated: this is a best-effort debug feature (see the
+        // module doc), not something worth teaching every caller in the audio pipeline to
+        // handle a lock-poisoning error from.
+        tracing::error!(
+            stream_key,
+            "ELEMENTIUM_AUDIO_DUMP: dump registry lock is poisoned; no further audio will be \
+             captured to disk"
+        );
         return;
     };
 
@@ -105,6 +138,7 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
                         writer: BufWriter::new(file),
                         samples_written: 0,
                         capped_logged: false,
+                        write_errors: 0,
                     })
                 }
                 Err(e) => {
@@ -135,7 +169,52 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
     let remaining = MAX_SAMPLES_PER_STREAM.saturating_sub(state.samples_written);
     let to_write = samples.len().min(remaining);
     for sample in samples.iter().take(to_write) {
-        let _ = state.writer.write_all(&sample.to_le_bytes());
+        // Only a successful write advances `samples_written` -- previously it advanced by
+        // `to_write` regardless of outcome, so a disk filling up mid-dump kept the counter
+        // climbing exactly as if every sample had landed, with no error and nothing to
+        // distinguish a healthy dump from a truncated one.
+        match state.writer.write_all(&sample.to_le_bytes()) {
+            Ok(()) => state.samples_written = state.samples_written.saturating_add(1),
+            Err(e) => {
+                state.write_errors = state.write_errors.saturating_add(1);
+                if should_log_dump_write_failure(state.write_errors) {
+                    tracing::error!(
+                        stream_key,
+                        error = %e,
+                        write_errors = state.write_errors,
+                        "ELEMENTIUM_AUDIO_DUMP: failed to write a sample to the dump file"
+                    );
+                }
+            }
+        }
     }
-    state.samples_written = state.samples_written.saturating_add(to_write);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S4 regression: before this, a full disk mid-dump was invisible -- `let _ =
+    /// writer.write_all(...)` per sample, with the sample counter climbing regardless of
+    /// whether the byte actually landed. `should_log_dump_write_failure` is the throttle
+    /// half of the fix: it must fire on the first failed write (so a disk filling up is
+    /// never silent) and then only periodically, not on every one of what could be
+    /// thousands of failed writes a second once the disk is full.
+    #[test]
+    fn the_first_write_failure_and_every_throttle_interval_after_it_are_logged() {
+        assert!(should_log_dump_write_failure(1), "the first failure must always be logged");
+        assert!(!should_log_dump_write_failure(2), "the second failure must be throttled");
+        assert!(
+            !should_log_dump_write_failure(WRITE_FAILURE_LOG_INTERVAL - 1),
+            "not yet at the throttle interval"
+        );
+        assert!(
+            should_log_dump_write_failure(WRITE_FAILURE_LOG_INTERVAL),
+            "the throttle interval itself must be logged"
+        );
+        assert!(
+            should_log_dump_write_failure(WRITE_FAILURE_LOG_INTERVAL.saturating_mul(4)),
+            "every subsequent throttle interval must also be logged"
+        );
+    }
 }
