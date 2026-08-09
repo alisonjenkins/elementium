@@ -5,6 +5,7 @@ pub mod auto_gain;
 pub mod camera;
 pub mod captured_frame;
 pub mod device_enumeration;
+pub mod device_holders;
 pub mod pipewire_audio;
 pub mod pipewire_capture;
 pub mod pipewire_nodes;

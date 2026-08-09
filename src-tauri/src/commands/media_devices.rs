@@ -1431,6 +1431,36 @@ fn negotiated_target(
 /// Serves the camera and the screen share both. They differ in how the source is opened and
 /// in nothing else, so a second copy of this loop would only be a second place for every
 /// future encode fix to be applied -- or forgotten.
+/// Report a camera that would not start, naming whoever already has it.
+///
+/// "Device or resource busy" is true and unactionable, and a camera that will not start is
+/// nearly always a camera another application already holds -- which the operating system
+/// knows and we were not asking. A real instance of this took a round trip through the
+/// logs to establish that Signal had the webcam open.
+fn report_capture_failure(reason: &dyn std::fmt::Display, track_id: &str, source: &str) {
+    let held_by = elementium_media::device_holders::holders_of("/dev/video")
+        .iter()
+        .map(elementium_media::device_holders::DeviceHolder::describe)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if held_by.is_empty() {
+        tracing::error!(
+            reason = %reason,
+            track_id,
+            source,
+            "failed to start video capture"
+        );
+    } else {
+        tracing::error!(
+            reason = %reason,
+            track_id,
+            source,
+            camera_held_by = %held_by,
+            "failed to start video capture: another application is using the camera"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn video_pipeline_loop(
     key: MediaTrackKey,
@@ -1464,12 +1494,7 @@ fn video_pipeline_loop(
     let capturer = match source.open(target) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(
-                reason = %e,
-                track_id = %track_id,
-                source = source.label(),
-                "failed to start video capture"
-            );
+            report_capture_failure(&e, track_id, source.label());
             return;
         }
     };
