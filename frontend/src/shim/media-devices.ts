@@ -5,7 +5,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvasTrack } from "./canvas-track";
-import { frameBytes } from "./frame-payload";
+import { fetchFrameBytes, frameBytes } from "./frame-payload";
 import { ipcErrorToRejection, parseIpcError } from "./ipc-error";
 
 /**
@@ -788,7 +788,15 @@ async function firstFrameGeometry(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
+      // Over HTTP, not `invoke` -- see `fetchFrameBytes`. The postMessage IPC fallback
+      // serialises the bytes as a JSON array of numbers, which even a halved preview frame
+      // cannot afford. `invoke` stays as the fallback.
+      let buf: ArrayBuffer | null = null;
+      try {
+        buf = await fetchFrameBytes(trackId);
+      } catch {
+        buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
+      }
       if (buf && buf.byteLength > 8) {
         const view = new DataView(buf);
         const width = view.getUint32(0, true);
@@ -833,7 +841,15 @@ function startLocalVideoFrameFetch(
     const started = Date.now();
 
     try {
-      const buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
+      // Over HTTP, not `invoke` -- see `fetchFrameBytes`. The postMessage IPC fallback
+      // serialises the bytes as a JSON array of numbers, which even a halved preview frame
+      // cannot afford. `invoke` stays as the fallback.
+      let buf: ArrayBuffer | null = null;
+      try {
+        buf = await fetchFrameBytes(trackId);
+      } catch {
+        buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
+      }
       frameCount++;
       if (buf && buf.byteLength > 8) {
         const view = new DataView(buf);

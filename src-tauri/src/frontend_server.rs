@@ -25,7 +25,7 @@
 
 use std::io::Cursor;
 
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tiny_http::{Header, Response, Server};
 use tracing::{debug, error, info};
 
@@ -94,6 +94,18 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendSe
         .map_err(|source| FrontendServerError::Bind { port, source })?;
 
     let resolver = app.asset_resolver();
+    // Frames are served from here rather than over Tauri's IPC, and the reason is measured.
+    // The frontend is loaded over this loopback HTTP server, so the webview's origin is not
+    // a `tauri://` one and Tauri's binary custom-protocol IPC is unavailable -- every log
+    // this project has ever produced opens with "IPC custom protocol failed, Tauri will now
+    // use the postMessage interface instead". Over postMessage a `Vec<u8>` is serialised as
+    // a JSON array of numbers, so one 1280x720 RGBA frame -- 3.7MB -- crosses as roughly
+    // three and a half million comma-separated integers. Four canvases at 30fps is
+    // impossible by two orders of magnitude, and what was measured was 14fps a track.
+    //
+    // Here the bytes are bytes: the page `fetch`es an `ArrayBuffer` from the same origin it
+    // was itself served from, so there is no serialisation at all.
+    let frame_app = app.clone();
     // Read once, so the per-request comparison is against a value that cannot change.
     let index_bytes = resolver.get(INDEX_PATH.to_owned()).map(|a| a.bytes);
     if index_bytes.is_none() {
@@ -108,6 +120,15 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendSe
             info!(port, "serving the embedded frontend over loopback HTTP");
             for request in server.incoming_requests() {
                 let path = asset_path(request.url());
+
+                if let Some(track_id) = frame_track_id(&path) {
+                    let response = frame_response(&frame_app, &track_id);
+                    if let Err(e) = request.respond(response) {
+                        debug!(error = %e, "the frontend closed a frame request before it was answered");
+                    }
+                    continue;
+                }
+
                 let found = resolver.get(path.clone()).filter(|asset| {
                     // Tauri's resolver answers a miss with index.html; see the module
                     // comment. Only the entry point may legitimately be those bytes.
@@ -149,6 +170,80 @@ pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), FrontendSe
     Ok(())
 }
 
+/// The prefix video frames are served under.
+///
+/// Namespaced so it can never collide with an embedded asset path: a route that shadowed a
+/// real file would break the app in a way that looks nothing like a routing mistake.
+const FRAME_PREFIX: &str = "/__elementium/frame/";
+
+/// The track id a request is asking for a frame of, if it is asking for one.
+fn frame_track_id(path: &str) -> Option<String> {
+    let raw = path.strip_prefix(FRAME_PREFIX)?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(percent_decode(raw))
+}
+
+/// Decode the `%XX` escapes a track id may carry, leaving everything else alone.
+///
+/// Track ids are generated here and are hex and dashes today, but they reach this as part of
+/// a URL the page built, and a decoder that is absent is a decoder that is wrong the first
+/// time an id contains anything else.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while let Some(&byte) = bytes.get(i) {
+        let decoded = if byte == b'%' {
+            let hex = raw.get(i.saturating_add(1)..i.saturating_add(3));
+            hex.and_then(|h| u8::from_str_radix(h, 16).ok())
+        } else {
+            None
+        };
+        if let Some(value) = decoded {
+            out.push(value);
+            i = i.saturating_add(3);
+        } else {
+            out.push(byte);
+            i = i.saturating_add(1);
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| raw.to_owned())
+}
+
+/// The latest frame for `track_id`, as an 8-byte header (width, height, both `u32` LE)
+/// followed by RGBA.
+///
+/// An absent frame is the zero header rather than a 404: "this track has produced nothing
+/// yet" is an ordinary state on every connection for the first few hundred milliseconds, and
+/// answering it with an error teaches the caller's error path to fire routinely.
+fn frame_response<R: Runtime>(
+    app: &AppHandle<R>,
+    track_id: &str,
+) -> Response<Cursor<Vec<u8>>> {
+    let frame = app
+        .try_state::<crate::protocols::VideoFrameState>()
+        .and_then(|state| state.0.lock().ok().and_then(|f| f.get(track_id).cloned()));
+
+    let body = frame.map_or_else(
+        || vec![0u8; 8],
+        |f| {
+            let mut body = Vec::with_capacity(f.data.len().saturating_add(8));
+            body.extend_from_slice(&f.width.to_le_bytes());
+            body.extend_from_slice(&f.height.to_le_bytes());
+            body.extend_from_slice(&f.data);
+            body
+        },
+    );
+
+    let mut response = Response::new(200.into(), Vec::new(), Cursor::new(body), None, None);
+    add_header(&mut response, "Content-Type", "application/octet-stream");
+    // Every request must reach the current frame. A cached one is a frozen picture.
+    add_header(&mut response, "Cache-Control", "no-store");
+    response
+}
+
 /// The asset path a request URL refers to, with the query string and fragment removed.
 ///
 /// A bare `/` means the app's entry point; Tauri's resolver keys its assets by a path with
@@ -177,6 +272,40 @@ fn add_header<D: std::io::Read>(response: &mut Response<D>, name: &str, value: &
 #[cfg(test)]
 mod tests {
     use super::asset_path;
+
+    use super::{FRAME_PREFIX, frame_track_id, percent_decode};
+
+    /// The frame route must never be mistaken for an embedded asset, and an asset path must
+    /// never be mistaken for a frame request -- either way round the app breaks in a way
+    /// that looks nothing like a routing mistake.
+    #[test]
+    fn a_frame_request_is_recognised_and_nothing_else_is() {
+        assert_eq!(
+            frame_track_id(&format!("{FRAME_PREFIX}pc-abc123-Ccu")),
+            Some("pc-abc123-Ccu".to_owned())
+        );
+        assert_eq!(frame_track_id("/index.html"), None);
+        assert_eq!(frame_track_id("/bundles/abc/bundle.js"), None);
+        // The prefix with nothing after it names no track.
+        assert_eq!(frame_track_id(FRAME_PREFIX), None);
+    }
+
+    #[test]
+    fn a_percent_escaped_track_id_is_decoded() {
+        assert_eq!(
+            frame_track_id(&format!("{FRAME_PREFIX}pc%2Dabc%20x")),
+            Some("pc-abc x".to_owned())
+        );
+    }
+
+    /// A malformed escape is data, not a crash: the bytes are passed through unchanged.
+    #[test]
+    fn a_malformed_escape_is_left_alone() {
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode(""), "");
+    }
 
     #[test]
     fn the_root_is_the_entry_point() {

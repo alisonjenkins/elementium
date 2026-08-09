@@ -40,3 +40,28 @@ export function frameBytes(value: unknown): ArrayBuffer | null {
   if (Array.isArray(value)) return new Uint8Array(value).buffer;
   return null;
 }
+
+/**
+ * Fetch one frame's bytes for `trackId`, over HTTP rather than over Tauri's IPC.
+ *
+ * The app is served from a loopback HTTP server, so the webview's origin is not a `tauri://`
+ * one and Tauri's binary custom-protocol IPC is unavailable -- every log this project has
+ * produced opens with "IPC custom protocol failed, Tauri will now use the postMessage
+ * interface instead". Over postMessage a `Vec<u8>` is serialised as a JSON array of numbers,
+ * so a 1280x720 RGBA frame -- 3.7MB -- crosses as about three and a half million
+ * comma-separated integers. Measured cost: 14fps a track against a target of 30, with the
+ * decoder and the whole backend idle.
+ *
+ * The frame endpoint is on the same origin the page was served from, so this is a relative
+ * URL and works identically in the main window and the Element Call iframe.
+ *
+ * Returns `null` rather than throwing on a failed fetch: a missed frame is one dropped
+ * frame, and the caller already counts and reports those.
+ */
+export async function fetchFrameBytes(trackId: string): Promise<ArrayBuffer | null> {
+  const response = await fetch(`/__elementium/frame/${encodeURIComponent(trackId)}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) return null;
+  return response.arrayBuffer();
+}

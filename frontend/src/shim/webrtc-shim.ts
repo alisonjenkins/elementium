@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
-import { frameBytes } from "./frame-payload";
+import { fetchFrameBytes, frameBytes } from "./frame-payload";
 import { createSilentAudioTrack, TRACK_SOURCE } from "./media-devices";
 import { parseIpcError } from "./ipc-error";
 import {
@@ -832,7 +832,16 @@ export class ElementiumRTCPeerConnection extends EventTarget {
         // The same coercion the self-view needs: this is the remote participant's
         // renderer, and it is a second copy of the same loop -- which is how the black
         // tile survived the first fix.
-        const buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
+        // Over HTTP, not over `invoke`: the same bytes, without the JSON-array
+        // serialisation the postMessage IPC fallback imposes. See `fetchFrameBytes`.
+        // `invoke` remains the fallback for any environment where the frame route is not
+        // reachable -- a slow picture beats none.
+        let buf: ArrayBuffer | null = null;
+        try {
+          buf = await fetchFrameBytes(trackId);
+        } catch {
+          buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
+        }
         if (buf && buf.byteLength > 8) {
           const view = new DataView(buf);
           const width = view.getUint32(0, true);
