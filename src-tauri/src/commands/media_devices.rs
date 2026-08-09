@@ -691,7 +691,7 @@ pub async fn get_user_media(
         // Asking for what will be consumed means the surplus is never decoded.
         let req_fps = video_constraints
             .frame_rate
-            .map_or(MAX_ENCODE_FPS_U32, requested_fps);
+            .map_or_else(max_encode_fps_u32, requested_fps);
 
         let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
             Arc::new(Mutex::new(inherited_connection));
@@ -1165,6 +1165,44 @@ impl ActiveCodec {
 /// can see. The preview still shows every captured frame; only the encoder skips.
 const MAX_ENCODE_FPS: u64 = 30;
 
+/// The ceiling a run may raise the encode rate to.
+///
+/// A cap on the cap: the value comes from the environment, and a typo that asked for 6000
+/// would spend the whole machine on encoding before anyone noticed the extra zero.
+const MAX_ENCODE_FPS_CEILING: u64 = 120;
+
+/// The fastest this run will encode.
+///
+/// [`MAX_ENCODE_FPS`] is the default and the right one for a talking head. Nothing in
+/// WebRTC, VP8, H.264 or the SFU requires it -- the camera here delivers 60 -- so
+/// `ELEMENTIUM_MAX_FPS` raises or lowers it for a run that wants to trade bandwidth and CPU
+/// for smoothness. Read once, because the encoder's frame interval and its bitrate are both
+/// derived from it and they must not disagree.
+fn max_encode_fps() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let Some(raw) = std::env::var_os("ELEMENTIUM_MAX_FPS") else {
+            return MAX_ENCODE_FPS;
+        };
+        let parsed = raw.to_str().and_then(|v| v.parse::<u64>().ok());
+        match parsed {
+            Some(fps) if (1..=MAX_ENCODE_FPS_CEILING).contains(&fps) => {
+                tracing::info!(fps, "encoding frame rate set from ELEMENTIUM_MAX_FPS");
+                fps
+            }
+            _ => {
+                tracing::warn!(
+                    value = ?raw,
+                    ceiling = MAX_ENCODE_FPS_CEILING,
+                    default_fps = MAX_ENCODE_FPS,
+                    "ELEMENTIUM_MAX_FPS is not a frame rate this will accept; using the default"
+                );
+                MAX_ENCODE_FPS
+            }
+        }
+    })
+}
+
 /// How often the self-view is recomputed, however fast the camera runs.
 ///
 /// The preview is a thumbnail a few centimetres across, fetched by the webview about
@@ -1178,8 +1216,10 @@ const PREVIEW_FPS: u64 = 30;
 const MIN_PREVIEW_INTERVAL: std::time::Duration =
     std::time::Duration::from_nanos(1_000_000_000 / PREVIEW_FPS);
 
-/// [`MAX_ENCODE_FPS`] as the width the capture API takes.
-const MAX_ENCODE_FPS_U32: u32 = 30;
+/// [`max_encode_fps`] as the width the capture API takes.
+fn max_encode_fps_u32() -> u32 {
+    u32::try_from(max_encode_fps()).unwrap_or(30)
+}
 
 /// Turn a `getUserMedia` frame-rate constraint into a rate to ask the camera for.
 ///
@@ -1194,7 +1234,7 @@ fn requested_fps(constraint: f64) -> u32 {
     const RATES: [u32; 8] = [1, 5, 10, 15, 24, 30, 60, 120];
 
     if !constraint.is_finite() {
-        return MAX_ENCODE_FPS_U32;
+        return max_encode_fps_u32();
     }
     let clamped = constraint.round().clamp(1.0, 240.0);
     // Nearest offered rate, and on a tie the lower one -- `RATES` is ascending and
@@ -1210,12 +1250,13 @@ fn requested_fps(constraint: f64) -> u32 {
             );
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         })
-        .unwrap_or(MAX_ENCODE_FPS_U32)
+        .unwrap_or_else(max_encode_fps_u32)
 }
 
-/// Minimum gap between encoded frames, from [`MAX_ENCODE_FPS`].
-const MIN_ENCODE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_nanos(1_000_000_000 / MAX_ENCODE_FPS);
+/// Minimum gap between encoded frames, from [`max_encode_fps`].
+fn min_encode_interval() -> std::time::Duration {
+    std::time::Duration::from_nanos(1_000_000_000_u64.saturating_div(max_encode_fps().max(1)))
+}
 
 /// Pick a VP8 bitrate for a given frame size.
 ///
@@ -1228,7 +1269,7 @@ const MIN_ENCODE_INTERVAL: std::time::Duration =
 /// rule of thumb for VP8 at conversational quality, clamped to a sane range.
 fn bitrate_for(width: u32, height: u32) -> u32 {
     let pixels = u64::from(width).saturating_mul(u64::from(height));
-    let bits_per_second = pixels.saturating_mul(MAX_ENCODE_FPS).saturating_div(10);
+    let bits_per_second = pixels.saturating_mul(max_encode_fps()).saturating_div(10);
     let kbps = bits_per_second.saturating_div(1000);
     u32::try_from(kbps.clamp(300, 4000)).unwrap_or(2000)
 }
@@ -1523,7 +1564,7 @@ fn video_pipeline_loop(
         .checked_sub(MIN_PREVIEW_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
     let mut last_encode = std::time::Instant::now()
-        .checked_sub(MIN_ENCODE_INTERVAL)
+        .checked_sub(min_encode_interval())
         .unwrap_or_else(std::time::Instant::now);
 
     loop {
@@ -1589,7 +1630,7 @@ fn video_pipeline_loop(
             let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
 
             // The preview above gets every captured frame; the encoder is rate-limited.
-            if should_encode && last_encode.elapsed() >= MIN_ENCODE_INTERVAL {
+            if should_encode && last_encode.elapsed() >= min_encode_interval() {
                 last_encode = std::time::Instant::now();
                 encode_and_send_video_frame(
                     PipelineId { key, track_id },
@@ -2757,7 +2798,23 @@ mod keyframe_answer_watch_tests {
 
 #[cfg(test)]
 mod video_bitrate_tests {
-    use super::{MAX_ENCODE_FPS, MIN_ENCODE_INTERVAL, bitrate_for};
+    use super::{MAX_ENCODE_FPS, bitrate_for, max_encode_fps, min_encode_interval};
+
+    /// The default has to hold when nothing asks for anything else, because every other
+    /// number here is derived from it -- the frame interval and the bitrate both.
+    #[test]
+    fn the_default_frame_rate_is_the_one_documented() {
+        // The environment is not set in the test runner, and this is read once per process.
+        assert_eq!(max_encode_fps(), MAX_ENCODE_FPS);
+    }
+
+    /// The interval and the rate must agree, or the encoder is paced for one rate and given
+    /// a bitrate budget for another.
+    #[test]
+    fn the_frame_interval_matches_the_rate() {
+        let expected = 1_000_000_000_u64 / max_encode_fps();
+        assert_eq!(u64::try_from(min_encode_interval().as_nanos()).unwrap_or(0), expected);
+    }
 
     /// The regression this guards: a fixed 500kbps was used at every resolution. At 720p
     /// that is about a tenth of what the picture needs, and the encoder meets the budget
@@ -2795,7 +2852,7 @@ mod video_bitrate_tests {
     fn the_encode_interval_matches_the_frame_rate_cap() {
         let per_second = 1_000_000_000_u64
             .checked_div(
-                MIN_ENCODE_INTERVAL
+                min_encode_interval()
                     .as_nanos()
                     .try_into()
                     .unwrap_or(u64::MAX),
@@ -2807,7 +2864,7 @@ mod video_bitrate_tests {
 
 #[cfg(test)]
 mod requested_fps_tests {
-    use super::{MAX_ENCODE_FPS_U32, requested_fps};
+    use super::{max_encode_fps_u32, requested_fps};
 
     /// A call asks for 30 and streaming asks for 60; both must reach the camera intact.
     /// Capping capture at the call rate would silently halve a stream.
@@ -2834,8 +2891,8 @@ mod requested_fps_tests {
     /// delivers, and an absurd rate would have us decoding frames nothing consumes.
     #[test]
     fn nonsense_falls_back_to_the_default() {
-        assert_eq!(requested_fps(f64::NAN), MAX_ENCODE_FPS_U32);
-        assert_eq!(requested_fps(f64::INFINITY), MAX_ENCODE_FPS_U32);
+        assert_eq!(requested_fps(f64::NAN), max_encode_fps_u32());
+        assert_eq!(requested_fps(f64::INFINITY), max_encode_fps_u32());
         assert_eq!(requested_fps(0.0), 1, "clamped, not zero");
         assert_eq!(requested_fps(-5.0), 1);
         assert_eq!(
