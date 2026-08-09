@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod frontend_server;
 mod protocols;
 mod tray;
 
@@ -19,6 +20,31 @@ use commands::webrtc::WebRtcState;
 use elementium_keyring::{BackendType, SecretBackend, create_backend};
 use elementium_types::CorrelationId;
 use elementium_webrtc::WebRtcEngine;
+
+/// The loopback port a release build serves the embedded frontend from.
+///
+/// A release build cannot load the frontend from Tauri's `tauri://localhost` origin,
+/// because logging in is a redirect chain that has to come back to us: `WebKitGTK` refuses
+/// to follow a redirect whose target is not HTTP(S), so the homeserver's hop back landed
+/// on "Redirection to URL with a scheme that is not HTTP(S)" and the user could never
+/// finish authenticating. The same origin also breaks OIDC before that point, because
+/// dynamic client registration will not accept a `tauri:` redirect URI.
+///
+/// Fixed rather than ephemeral, and deliberately so: the origin keys localStorage,
+/// `IndexedDB` and the crypto store, so a port that moved between launches would discard
+/// the session and the device's own keys on every start.
+const FRONTEND_PORT: u16 = 42871;
+
+/// The port to serve the frontend on, overridable for the case where 42871 is taken.
+///
+/// Changing it logs the user out, for the reason given on [`FRONTEND_PORT`], so it is an
+/// explicit opt-in rather than an automatic fallback to a free port.
+fn frontend_port() -> u16 {
+    std::env::var("ELEMENTIUM_HTTP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(FRONTEND_PORT)
+}
 
 /// Build the JavaScript snippet that pre-populates localStorage with secrets
 /// from the keyring before any page scripts run.
@@ -186,13 +212,23 @@ fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), Box<dyn std::err
     tray::create_tray(app)?;
 
     // Programmatic window creation with initialization_script for secret injection.
-    // The debug-mode URL is a fixed literal, so the parse cannot fail in practice.
-    #[allow(clippy::unwrap_used)]
+    //
+    // Both URLs are loopback HTTP: the dev server in debug, and in release the localhost
+    // plugin serving the embedded assets. Release must not use `WebviewUrl::App`, which
+    // resolves to `tauri://localhost` and makes login impossible -- see `FRONTEND_PORT`.
     let url = if cfg!(debug_assertions) {
-        WebviewUrl::External("http://localhost:5173".parse().unwrap())
+        "http://localhost:5173".to_owned()
     } else {
-        WebviewUrl::App("index.html".into())
+        let port = frontend_port();
+        // Reported rather than ignored: without the server the window has nothing to load,
+        // and a blank window with no explanation is the worst way to learn the port is
+        // taken.
+        frontend_server::spawn(&app.handle().clone(), port)?;
+        format!("http://localhost:{port}")
     };
+    // Both forms are `http://localhost:<u16>`, so the parse cannot fail in practice.
+    #[allow(clippy::unwrap_used)]
+    let url = WebviewUrl::External(url.parse().unwrap());
 
     let win = WebviewWindowBuilder::new(app, "main", url)
         .title("Elementium")
@@ -356,5 +392,34 @@ fn main() -> tauri::Result<()> {
     // they originate inside the expansion of `tauri::generate_context!()` (framework
     // codegen), not in our code.
     #[allow(clippy::large_stack_frames, clippy::exit)]
-    builder.run(tauri::generate_context!())
+    let mut context = tauri::generate_context!();
+
+    // Tell Tauri where the app is actually served from.
+    //
+    // `frontendDist` in `tauri.conf.json` has to stay a directory, because that is what
+    // makes the assets get embedded in the binary. But it is also what Tauri compares a
+    // page's URL against to decide whether that page is the app or something it navigated
+    // to, and a directory means "the `tauri://` origin". Left alone, our own frontend --
+    // the same embedded assets, handed out over loopback -- counts as *remote*, and Tauri
+    // withholds IPC from remote pages unless every command is named in a capability. The
+    // symptom is total and silent: the shims install, `invoke` throws, and nothing is
+    // logged, because the console bridge reports over the IPC that is being refused.
+    //
+    // Pointing `frontend_dist` at the URL we serve on states the truth of the arrangement
+    // and restores the local-origin behaviour, without widening what a genuinely remote
+    // page -- an SSO provider we redirect to -- is allowed to do. The assets are a
+    // separate part of the context and stay embedded.
+    if !cfg!(debug_assertions) {
+        match format!("http://localhost:{}", frontend_port()).parse() {
+            Ok(url) => {
+                context.config_mut().build.frontend_dist =
+                    Some(tauri::utils::config::FrontendDist::Url(url));
+            }
+            // Cannot happen for `http://localhost:<u16>`; if it somehow does, the app runs
+            // without IPC, which is worth a line in the log rather than a panic.
+            Err(e) => warn!("could not parse the frontend URL, so IPC will be refused: {e}"),
+        }
+    }
+
+    builder.run(context)
 }

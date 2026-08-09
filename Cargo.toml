@@ -115,6 +115,10 @@ tauri-plugin-store = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-opener = "2"
+# Serves the embedded frontend over http://localhost instead of Tauri's `tauri://` custom
+# protocol. Required for login: WebKitGTK refuses to follow an HTTP redirect whose target
+# has a non-HTTP(S) scheme, so SSO could never come back to a `tauri://localhost` origin.
+tiny_http = "0.12"
 
 # Media code is unusable at `opt-level = 0`.
 #

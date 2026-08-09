@@ -1,0 +1,156 @@
+//! Serves the embedded frontend over loopback HTTP.
+//!
+//! A release build used to load the frontend from Tauri's `tauri://localhost` origin, and
+//! from there logging in was impossible. Authentication is a redirect chain that has to
+//! come back to us, and `WebKitGTK` refuses to follow a redirect whose target is not
+//! HTTP(S) — the homeserver's hop back died on "Redirection to URL with a scheme that is
+//! not HTTP(S)". OIDC failed earlier still, because dynamic client registration will not
+//! accept a `tauri:` redirect URI.
+//!
+//! `tauri-plugin-localhost` does this job, but it never answers a request for an asset it
+//! does not have: the request is dropped and the socket left open. Element Web probes for
+//! a host-specific `config.<hostname>.json` before falling back to `config.json`, so on
+//! that plugin the app would hang at startup on a file that is *meant* to be absent. A
+//! 404 is not an edge case here, it is part of the normal boot, so this serves the assets
+//! itself.
+//!
+//! Answering that missing asset correctly takes one more step than it looks like it
+//! should. Tauri's own resolver never reports a miss: anything it cannot find falls back
+//! to `index.html`, so `config.localhost.json` came back `200 text/html`. That is the
+//! right behaviour for an app with server-side routes and the wrong one here — Element
+//! Web routes on the fragment, so every path that is not an asset is a genuine miss, and
+//! a page of HTML delivered in place of JSON or wasm is a confusing failure much later.
+//! The fallback is detected by recognising `index.html`'s own bytes coming back under
+//! another name.
+
+use std::io::Cursor;
+
+use tauri::{AppHandle, Runtime};
+use tiny_http::{Header, Response, Server};
+use tracing::{debug, error, info};
+
+/// Everything Element Web needs is same-origin, and the window is the only client, so the
+/// body of a missing asset is only ever read by a developer with the log open.
+const NOT_FOUND_BODY: &[u8] = b"not found";
+
+/// The path the entry point is served from, and the one path allowed to return its bytes.
+const INDEX_PATH: &str = "/index.html";
+
+/// Start serving `app`'s embedded assets on `127.0.0.1:port`.
+///
+/// Binds before returning so that a port already in use is an error the caller can report,
+/// rather than a blank window. Serving itself continues on a background thread for the
+/// lifetime of the process.
+pub fn spawn<R: Runtime>(app: &AppHandle<R>, port: u16) -> Result<(), String> {
+    // Loopback only. The frontend carries an access token and holds the IPC grant, and
+    // there is no reason for anything off this machine to reach either.
+    let server = Server::http((std::net::Ipv4Addr::LOCALHOST, port))
+        .map_err(|e| format!("could not serve the frontend on 127.0.0.1:{port}: {e}"))?;
+
+    let resolver = app.asset_resolver();
+    // Read once, so the per-request comparison is against a value that cannot change.
+    let index_bytes = resolver.get(INDEX_PATH.to_owned()).map(|a| a.bytes);
+    if index_bytes.is_none() {
+        // Not fatal here -- the window will fail visibly on its own -- but the reason is
+        // worth recording, because "the app is blank" is otherwise unattributable.
+        error!("the frontend has no index.html embedded in it");
+    }
+
+    std::thread::Builder::new()
+        .name("frontend-http".into())
+        .spawn(move || {
+            info!(port, "serving the embedded frontend over loopback HTTP");
+            for request in server.incoming_requests() {
+                let path = asset_path(request.url());
+                let found = resolver.get(path.clone()).filter(|asset| {
+                    // Tauri's resolver answers a miss with index.html; see the module
+                    // comment. Only the entry point may legitimately be those bytes.
+                    path == INDEX_PATH || index_bytes.as_ref() != Some(&asset.bytes)
+                });
+                let response = found.map_or_else(
+                    || {
+                        // Expected during a normal boot, not a fault -- see the module
+                        // comment on `config.<hostname>.json`.
+                        debug!(%path, "no such embedded asset");
+                        Response::from_data(NOT_FOUND_BODY).with_status_code(404)
+                    },
+                    |asset| {
+                        let mut response = Response::new(
+                            200.into(),
+                            Vec::new(),
+                            Cursor::new(asset.bytes),
+                            None,
+                            None,
+                        );
+                        add_header(&mut response, "Content-Type", &asset.mime_type);
+                        if let Some(csp) = asset.csp_header {
+                            add_header(&mut response, "Content-Security-Policy", &csp);
+                        }
+                        // The assets are baked into the binary, so the only thing a cache
+                        // could do is serve the previous build after an update.
+                        add_header(&mut response, "Cache-Control", "no-cache");
+                        response
+                    },
+                );
+                if let Err(e) = request.respond(response) {
+                    debug!(error = %e, "the frontend closed a connection before it was answered");
+                }
+            }
+            error!("the frontend HTTP server stopped accepting requests");
+        })
+        .map_err(|e| format!("could not start the frontend HTTP thread: {e}"))?;
+
+    Ok(())
+}
+
+/// The asset path a request URL refers to, with the query string and fragment removed.
+///
+/// A bare `/` means the app's entry point; Tauri's resolver keys its assets by a path with
+/// a leading slash, which is what a request URL already has.
+fn asset_path(url: &str) -> String {
+    let path = url
+        .split_once(['?', '#'])
+        .map_or(url, |(before, _)| before);
+    if path.is_empty() || path == "/" {
+        "/index.html".to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Attach a header, ignoring one that cannot be represented rather than dropping the whole
+/// response — a served asset with a missing header beats a request that never completes.
+fn add_header<D: std::io::Read>(response: &mut Response<D>, name: &str, value: &str) {
+    if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+        response.add_header(header);
+    } else {
+        error!(name, "could not build a response header");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asset_path;
+
+    #[test]
+    fn the_root_is_the_entry_point() {
+        assert_eq!(asset_path("/"), "/index.html");
+        assert_eq!(asset_path(""), "/index.html");
+    }
+
+    #[test]
+    fn a_query_string_is_not_part_of_the_path() {
+        // Element Web appends cache-busting query strings to its own asset URLs, and a
+        // resolver lookup including one finds nothing.
+        assert_eq!(asset_path("/config.json?cachebuster=123"), "/config.json");
+        assert_eq!(asset_path("/index.html#/room/!a:b"), "/index.html");
+    }
+
+    #[test]
+    fn an_ordinary_path_is_left_alone() {
+        assert_eq!(
+            asset_path("/bundles/abc/bundle.js"),
+            "/bundles/abc/bundle.js"
+        );
+    }
+}

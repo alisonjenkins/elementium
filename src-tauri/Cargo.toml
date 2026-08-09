@@ -24,6 +24,7 @@ tauri-plugin-store = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
 tauri-plugin-updater = { workspace = true }
 tauri-plugin-opener = { workspace = true }
+tiny_http = { workspace = true }
 
 tokio = { workspace = true }
 serde = { workspace = true }
