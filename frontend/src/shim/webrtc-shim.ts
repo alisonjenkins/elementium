@@ -6,12 +6,13 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { interceptE2eeWorkerMessage } from "./e2ee-bridge";
+import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
 import {
   describeJoinRequest,
   describeRequest,
   describeResponse,
+  localIdentityFromJoin,
   redactSignalUrl,
   signalBytes,
 } from "./livekit-signal";
@@ -1341,6 +1342,13 @@ export function setupWebRtcShim(): void {
           const idx = recvCount++;
           const bytes = signalBytes(e.data);
           const firstByte = bytes !== null && bytes.length > 0 ? bytes[0] : -1;
+          // The join response is where the SFU says who we are, and end-to-end encryption
+          // cannot encrypt a single frame until it knows. Read here rather than in the
+          // E2EE bridge because this is the only place the message passes through.
+          if (bytes !== null) {
+            const identity = localIdentityFromJoin(bytes);
+            if (identity !== null) noteLocalIdentity(identity);
+          }
           if (trace) {
             if (bytes !== null) {
               console.log(

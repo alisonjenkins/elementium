@@ -226,6 +226,48 @@ function leaveDetail(bytes: Uint8Array, leave: Field): string {
   return parts.length === 0 ? "" : ` ${parts.join(" ")}`;
 }
 
+/** The bytes of the first length-delimited field with this number, if present. */
+function messageField(bytes: Uint8Array, number: number): Uint8Array | null {
+  for (const f of topLevelFields(bytes)) {
+    if (f.number === number && f.wireType === 2) {
+      return bytes.subarray(f.start, f.start + f.length);
+    }
+  }
+  return null;
+}
+
+/**
+ * The identity the SFU has given this participant, from a `JoinResponse`.
+ *
+ * This is the one authoritative answer to "who are we" on this connection, and end-to-end
+ * encryption cannot work without it: the encryptor picks our key by our own identity, and
+ * with none set it refuses every frame. In a real call that was 44,743 consecutive audio
+ * frames discarded before reaching the peer connection, with the microphone, the fold, the
+ * gain and the encoder all working perfectly and the outbound stats reporting them sent.
+ *
+ * Taken from the SFU rather than reconstructed from the Matrix user and device, because the
+ * SFU's identity is the one livekit keys against. A reconstruction that ever disagreed
+ * would fail exactly this silently again.
+ *
+ * `JoinResponse.participant` is field 2, and `ParticipantInfo.identity` is field 2 of that.
+ * Returns null for any other message, which is most of them.
+ */
+export function localIdentityFromJoin(bytes: Uint8Array): string | null {
+  const join = messageField(bytes, 1);
+  if (!join) return null;
+  const participant = messageField(join, 2);
+  if (!participant) return null;
+  const identity = messageField(participant, 2);
+  if (!identity || identity.length === 0) return null;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(identity);
+  } catch {
+    // Not a string, so field 2 was not what this expects and guessing would be worse than
+    // reporting nothing: a wrong identity encrypts under a key no peer will look for.
+    return null;
+  }
+}
+
 /** The name of the oneof case set in a signalling message, e.g. `offer`, `join`. */
 export function describeSignal(bytes: Uint8Array, names: Record<number, string>): string {
   const fields = topLevelFields(bytes);

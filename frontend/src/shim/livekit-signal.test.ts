@@ -9,6 +9,7 @@ import {
   describeJoinRequest,
   describeRequest,
   describeResponse,
+  localIdentityFromJoin,
   redactSignalUrl,
 } from "./livekit-signal";
 
@@ -177,5 +178,50 @@ describe("logging a signalling URL", () => {
     expect(redactSignalUrl("/rtc/v1?access_token=secret&x=1")).toBe(
       "/rtc/v1?access_token=<redacted>&x=1",
     );
+  });
+});
+
+/**
+ * The identity the SFU assigns is what end-to-end encryption keys against, and without it
+ * the encryptor refuses every outbound frame. A real call lost 44,743 consecutive audio
+ * frames to exactly that, so the parse is worth pinning rather than assuming.
+ */
+describe("the local identity in a join response", () => {
+  /** A length-delimited protobuf field. */
+  const msg = (number: number, body: number[]): number[] => [
+    (number << 3) | 2,
+    body.length,
+    ...body,
+  ];
+  const text = (s: string): number[] => Array.from(new TextEncoder().encode(s));
+
+  /** `JoinResponse.participant` is field 2; `ParticipantInfo.identity` is field 2 of that. */
+  const joinResponse = (identity: string): Uint8Array =>
+    new Uint8Array(
+      msg(1, msg(2, [...msg(1, text("PA_sid")), ...msg(2, text(identity))])),
+    );
+
+  it("reads the identity the SFU assigned", () => {
+    expect(localIdentityFromJoin(joinResponse("@ali:example.org:DEVICE"))).toBe(
+      "@ali:example.org:DEVICE",
+    );
+  });
+
+  it("ignores every other kind of message", () => {
+    // An `offer` (field 3) carries no identity, and most traffic is not a join.
+    expect(localIdentityFromJoin(new Uint8Array(msg(3, text("v=0"))))).toBeNull();
+    expect(localIdentityFromJoin(new Uint8Array())).toBeNull();
+  });
+
+  it("reports nothing rather than guessing when the field is absent", () => {
+    // A join whose participant has a sid but no identity yet.
+    const partial = new Uint8Array(msg(1, msg(2, msg(1, text("PA_sid")))));
+    expect(localIdentityFromJoin(partial)).toBeNull();
+  });
+
+  it("refuses bytes that are not text", () => {
+    // A wrong identity is worse than none: it encrypts under a key no peer looks for.
+    const invalid = new Uint8Array(msg(1, msg(2, msg(2, [0xff, 0xfe, 0xfd]))));
+    expect(localIdentityFromJoin(invalid)).toBeNull();
   });
 });

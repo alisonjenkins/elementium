@@ -208,6 +208,26 @@ interface SetKeyMessage {
   keyIndex?: unknown;
 }
 
+/**
+ * Tell the native encryptor which participant we are, once.
+ *
+ * Without it the encryptor cannot choose our key and refuses every outbound frame: a real
+ * call discarded 44,743 consecutive audio frames this way, with capture, fold, gain and
+ * encoding all working and the outbound stats counting them as sent, because the drop
+ * happens further down at the peer-connection boundary.
+ *
+ * Exported because the reliable source is the SFU's join response, which arrives on the
+ * signalling socket rather than through any key message.
+ */
+export function noteLocalIdentity(identity: string): void {
+  if (localIdentitySent || !identity) return;
+  localIdentitySent = true;
+  // The native context has to exist before it can be told anything.
+  if (!initSent) handleInit({});
+  console.log(`[Elementium] E2EE local identity set from the SFU: ${identity}`);
+  invokeTauri("e2ee_set_local_identity", { identity });
+}
+
 /** Whether `e2ee_init` has been sent; the worker is initialized once per room. */
 let initSent = false;
 /** Whether the local participant identity has been reported to Rust. */
@@ -297,9 +317,11 @@ function handleSetKey(data: SetKeyMessage): void {
   // native context exists before the key lands on it.
   if (!initSent) handleInit({});
 
-  if (data.isPublisher === true && !localIdentitySent && participant) {
-    localIdentitySent = true;
-    invokeTauri("e2ee_set_local_identity", { identity: participant });
+  // Kept as a fallback, and no longer the only route: `isPublisher` is not set on the
+  // messages this bridge actually sees, so on its own it never fired. The SFU's join
+  // response is what normally supplies this now -- see `noteLocalIdentity`.
+  if (data.isPublisher === true && participant) {
+    noteLocalIdentity(participant);
   }
 
   keysForwarded += 1;
