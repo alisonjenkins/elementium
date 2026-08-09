@@ -1487,6 +1487,64 @@ fn min_encode_interval() -> std::time::Duration {
     std::time::Duration::from_nanos(1_000_000_000_u64.saturating_div(max_encode_fps().max(1)))
 }
 
+/// How early a frame may arrive and still count as this slot's frame, as a fraction of the
+/// interval. A quarter of a frame at 30fps is 8ms.
+const ENCODE_EARLY_TOLERANCE_DIVISOR: u32 = 4;
+
+/// Decides which captured frames reach the encoder, holding the encode rate at or under the
+/// cap without discarding frames merely for arriving a little early.
+///
+/// The rule this replaces was `last_encode.elapsed() >= interval`, resetting `last_encode`
+/// to the moment of the encode. Both halves of that are wrong against a real camera:
+///
+///   - A camera nominally at the cap does not deliver on an exact period. Frames land a few
+///     milliseconds either side, and every frame landing early was thrown away whole -- so a
+///     30fps camera under a 30fps cap lost frames it had no business losing.
+///   - Resetting to the encode time pushes the next deadline out by a full interval from
+///     wherever the last frame happened to land, so the schedule drifts away from the camera
+///     and the losses become periodic rather than occasional.
+///
+/// Measured on a real call: 4800 frames captured, 2862 sent, steady at 59.6% across every
+/// reporting window. The missing 40% were counted nowhere -- the discard sat above every
+/// counter in `encode_and_send` -- so the log showed a healthy pipeline sending 18fps.
+///
+/// Here the deadline advances by exactly one interval from the previous *deadline*, so the
+/// cadence cannot drift, and is floored one interval behind the present so a stalled camera
+/// cannot bank credit and emit a burst on recovery.
+struct EncodePacer {
+    interval: std::time::Duration,
+    next_due: std::time::Instant,
+}
+
+impl EncodePacer {
+    const fn new(interval: std::time::Duration, now: std::time::Instant) -> Self {
+        Self {
+            interval,
+            next_due: now,
+        }
+    }
+
+    /// Whether the frame that arrived at `now` should be encoded.
+    fn admit(&mut self, now: std::time::Instant) -> bool {
+        let tolerance = self
+            .interval
+            .checked_div(ENCODE_EARLY_TOLERANCE_DIVISOR)
+            .unwrap_or_default();
+        let earliest_accepted = self.next_due.checked_sub(tolerance).unwrap_or(self.next_due);
+        if now < earliest_accepted {
+            return false;
+        }
+        // Advance from the previous deadline so the cadence does not drift -- but pull a
+        // deadline left behind by a stall up to one interval into the past first, or the
+        // schedule would owe us frames and let a burst through on recovery.
+        let base = self
+            .next_due
+            .max(now.checked_sub(self.interval).unwrap_or(now));
+        self.next_due = base.checked_add(self.interval).unwrap_or(now);
+        true
+    }
+}
+
 /// Sane bounds for any bitrate this app hands an encoder, whether picked automatically by
 /// [`bitrate_for`] or requested later through `setParameters`.
 ///
@@ -1858,9 +1916,7 @@ fn video_pipeline_loop(
     let mut last_preview = std::time::Instant::now()
         .checked_sub(MIN_PREVIEW_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
-    let mut last_encode = std::time::Instant::now()
-        .checked_sub(min_encode_interval())
-        .unwrap_or_else(std::time::Instant::now);
+    let mut pacer = EncodePacer::new(min_encode_interval(), std::time::Instant::now());
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -1925,8 +1981,11 @@ fn video_pipeline_loop(
             let should_encode = encode_tx.lock().is_ok_and(|g| g.is_some());
 
             // The preview above gets every captured frame; the encoder is rate-limited.
-            if should_encode && last_encode.elapsed() >= min_encode_interval() {
-                last_encode = std::time::Instant::now();
+            // Counted when it is not, because a frame dropped here used to be invisible --
+            // see `EncodePacer`.
+            if should_encode && !pacer.admit(std::time::Instant::now()) {
+                out.stats.paced_out = out.stats.paced_out.saturating_add(1);
+            } else if should_encode {
                 encode_and_send_video_frame(
                     PipelineId { key, track_id },
                     &frame,
@@ -2094,6 +2153,13 @@ fn maybe_request_keyframe<E: VideoEncoder>(
 struct OutboundVideoStats {
     captured: u64,
     sent: u64,
+    /// Frames the rate limiter held back to keep the encode rate at the cap.
+    ///
+    /// Expected to be non-zero whenever the camera runs faster than the cap -- that is the
+    /// limiter working. It is here because it used to be absent: the discard happened above
+    /// every other counter, so 40% of a real call's frames vanished between `captured` and
+    /// `sent` with every drop counter reading zero. See `EncodePacer`.
+    paced_out: u64,
     skipped_not_connected: u64,
     dropped_channel_closed: u64,
     dropped_channel_full: u64,
@@ -2118,6 +2184,7 @@ impl OutboundVideoStats {
             codec = codec.sdp_name(),
             captured = self.captured,
             sent = self.sent,
+            paced_out = self.paced_out,
             skipped_not_connected = self.skipped_not_connected,
             dropped_channel_closed = self.dropped_channel_closed,
             dropped_channel_full = self.dropped_channel_full,
@@ -3581,5 +3648,111 @@ mod delivery_tests {
     fn an_empty_slot_reports_itself() {
         let slot: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> = Arc::new(Mutex::new(None));
         assert_eq!(deliver(&slot, frame()), Delivery::Unattached);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod encode_pacer_tests {
+    use super::EncodePacer;
+    use std::time::{Duration, Instant};
+
+    /// Feed frames at a fixed cadence and report how many the pacer admitted.
+    fn admitted(interval: Duration, capture_gap: Duration, frames: u32) -> u32 {
+        let start = Instant::now();
+        let mut pacer = EncodePacer::new(interval, start);
+        (0..frames)
+            .filter(|i| pacer.admit(start + capture_gap * *i))
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX)
+    }
+
+    /// A camera at the cap must lose nothing.
+    ///
+    /// The regression this exists for. With the old `elapsed() >= interval` rule and its
+    /// reset-to-now, a 30fps camera under a 30fps cap lost roughly 40% of its frames
+    /// because each one arrived a hair early, and the deadline then drifted further away
+    /// on every encode. Measured on a real call: 4800 captured, 2862 sent.
+    #[test]
+    fn a_camera_running_at_the_cap_loses_nothing() {
+        let interval = Duration::from_micros(33_333);
+        assert_eq!(admitted(interval, interval, 100), 100);
+    }
+
+    /// The real cadence from the log: 29-30fps nominal, 25.8ms between frames.
+    ///
+    /// The pacer may hold some of these back -- the camera is running above the cap -- but
+    /// it must not throw away two fifths of them.
+    #[test]
+    fn a_camera_running_slightly_fast_keeps_most_of_its_frames() {
+        let admitted = admitted(
+            Duration::from_micros(33_333),
+            Duration::from_micros(25_800),
+            100,
+        );
+        assert!(
+            admitted >= 75,
+            "kept only {admitted} of 100 frames from a 38fps camera under a 30fps cap"
+        );
+    }
+
+    /// Jitter around the interval must not cost a frame either side.
+    #[test]
+    fn jitter_around_the_interval_does_not_drop_frames() {
+        let interval = Duration::from_micros(33_333);
+        let start = Instant::now();
+        let mut pacer = EncodePacer::new(interval, start);
+        let mut at = start;
+        let mut kept = 0_u32;
+        // Alternately 3ms early and 3ms late, averaging exactly the cap.
+        for i in 0..100_u32 {
+            let gap = if i % 2 == 0 {
+                Duration::from_micros(30_333)
+            } else {
+                Duration::from_micros(36_333)
+            };
+            at += gap;
+            if pacer.admit(at) {
+                kept = kept.saturating_add(1);
+            }
+        }
+        assert_eq!(kept, 100);
+    }
+
+    /// The cap is still a cap: a camera at twice the rate is halved, not passed through.
+    #[test]
+    fn a_camera_running_at_double_the_cap_is_held_to_it() {
+        let interval = Duration::from_micros(33_333);
+        let admitted = admitted(interval, Duration::from_micros(16_666), 100);
+        assert!(
+            (45..=60).contains(&admitted),
+            "a 60fps camera under a 30fps cap admitted {admitted} of 100"
+        );
+    }
+
+    /// A stall must not bank credit and then let a burst through.
+    ///
+    /// Without the floor, the deadline would sit a second in the past after a pause and
+    /// admit every frame of the next second regardless of the cap.
+    #[test]
+    fn a_stalled_camera_does_not_burst_on_recovery() {
+        let interval = Duration::from_micros(33_333);
+        let start = Instant::now();
+        let mut pacer = EncodePacer::new(interval, start);
+        assert!(pacer.admit(start));
+
+        // Nothing for a second, then frames as fast as the camera can manage.
+        let resumed = start + Duration::from_secs(1);
+        let mut kept = 0_u32;
+        for i in 0..30_u32 {
+            if pacer.admit(resumed + Duration::from_millis(1) * i) {
+                kept = kept.saturating_add(1);
+            }
+        }
+        assert!(
+            kept <= 3,
+            "a 30ms burst after a one-second stall admitted {kept} frames"
+        );
     }
 }
