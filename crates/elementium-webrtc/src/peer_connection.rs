@@ -35,7 +35,19 @@ pub enum PcEvent<P = PlaintextMedia> {
     /// DTLS+ICE connected, media can flow.
     Connected,
     /// A new remote media track was added.
-    RemoteTrackAdded { mid: String, kind: String },
+    /// A remote track became visible on `mid`.
+    ///
+    /// `stream_id` is the `MediaStream` id from the remote SDP's `a=msid`, and it is not
+    /// cosmetic: livekit-client routes an arriving track solely by it, splitting it on `|`
+    /// into a participant sid and a track sid (`Room.onTrackAdded`). Given anything else it
+    /// finds no participant and returns -- and the error it would log is itself gated on the
+    /// sid starting with `PA`, so a wrong id is discarded in total silence. Every remote
+    /// participant was invisible for exactly this reason while their video decoded fine.
+    RemoteTrackAdded {
+        mid: String,
+        kind: String,
+        stream_id: Option<String>,
+    },
     /// A receiver cannot decode our video and is asking for a keyframe (RTCP PLI/FIR).
     ///
     /// Must reach the encoder: until it produces a keyframe the receiver has nothing it
@@ -188,6 +200,9 @@ pub struct PeerConnectionInner {
     /// nothing. See `create_offer`.
     pub last_offer_sdp: Option<String>,
     pub remote_mids: HashMap<Mid, MediaKind>,
+    /// `MediaStream` id per remote mid, read from the remote SDP's `a=msid`. See
+    /// [`PcEvent::RemoteTrackAdded`] for why it has to travel with the track.
+    pub remote_stream_ids: HashMap<String, String>,
     pub audio_frame_count: u64,
     /// Wall-clock instant corresponding to audio RTP timestamp 0 on this connection.
     ///
@@ -339,6 +354,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         offered_tracks: Vec::new(),
         pending_offer: None,
         remote_mids: HashMap::new(),
+        remote_stream_ids: HashMap::new(),
         audio_frame_count: 0,
         audio_epoch: None,
         video_epoch: None,
@@ -758,6 +774,46 @@ pub fn create_answer(
         .ok_or(crate::error::CreateAnswerError::NoRemoteOffer)
 }
 
+/// Read the `MediaStream` id of each m-line out of a remote SDP, keyed by its mid.
+///
+/// Needed because livekit-client identifies an arriving remote track by nothing else: it
+/// splits the stream id on `|` into a participant sid and a track sid, and a track whose
+/// stream id it cannot parse is dropped without a log line (see [`PcEvent::RemoteTrackAdded`]).
+/// str0m does not surface `msid`, so it is taken from the SDP text directly.
+///
+/// Both spellings are accepted. `a=msid:<stream> <track>` is the current form (RFC 8830);
+/// `a=ssrc:N msid:<stream> <track>` is the older per-SSRC form that plenty of servers still
+/// send, and taking only the first would work against one SFU and silently fail against the
+/// next.
+fn parse_remote_stream_ids(sdp: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut mid: Option<String> = None;
+    for line in sdp.lines() {
+        let line = line.trim_end();
+        if line.starts_with("m=") {
+            // A new media section: whatever mid we were collecting for is finished.
+            mid = None;
+        } else if let Some(rest) = line.strip_prefix("a=mid:") {
+            mid = Some(rest.trim().to_owned());
+        } else if let Some(current) = mid.as_ref() {
+            let stream = line.strip_prefix("a=msid:").map(str::trim).or_else(|| {
+                line.strip_prefix("a=ssrc:")
+                    .and_then(|rest| rest.split_once(" msid:"))
+                    .map(|(_, msid)| msid.trim())
+            });
+            if let Some(stream) = stream {
+                // `a=msid:<stream id> <track id>` -- only the stream id is wanted, and a
+                // section can repeat it per SSRC, so the first wins.
+                let id = stream.split_whitespace().next().unwrap_or_default();
+                if !id.is_empty() && id != "-" {
+                    out.entry(current.clone()).or_insert_with(|| id.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Set the remote description (offer or answer).
 ///
 /// # Errors
@@ -777,6 +833,17 @@ pub fn set_remote_description(
     // made the DOM's second `createAnswer()` call fail. `set_remote_offer` below repopulates
     // it with the fresh answer.
     pc.cached_answer = None;
+    // Recorded before the description is applied, because applying it is what makes str0m
+    // start delivering media, and the first media is what announces the track.
+    let stream_ids = parse_remote_stream_ids(&desc.sdp);
+    if !stream_ids.is_empty() {
+        tracing::info!(
+            pc_id = %pc.id,
+            mids = stream_ids.len(),
+            "remote stream ids recorded from the SDP; livekit routes tracks by these"
+        );
+        pc.remote_stream_ids.extend(stream_ids);
+    }
     match desc.sdp_type {
         SdpType::Offer => set_remote_offer(pc, desc).map(Some),
         SdpType::Answer => set_remote_answer(pc, desc),
@@ -1862,12 +1929,15 @@ fn announce_track_on_first_media(
         ?kind,
         "remote track announced from its first media, having never been announced by SDP"
     );
+    let mid_text = data.mid.to_string();
+    let stream_id = pc.remote_stream_ids.get(&mid_text).cloned();
     Some(PcEvent::RemoteTrackAdded {
-        mid: data.mid.to_string(),
+        mid: mid_text,
         kind: match kind {
             MediaKind::Audio => "audio".to_string(),
             MediaKind::Video => "video".to_string(),
         },
+        stream_id,
     })
 }
 
@@ -1983,12 +2053,15 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
             pc.send_mids
                 .entry(default_key_for(media.kind))
                 .or_insert(media.mid);
+            let mid_text = media.mid.to_string();
+            let stream_id = pc.remote_stream_ids.get(&mid_text).cloned();
             Some(PcEvent::RemoteTrackAdded {
-                mid: media.mid.to_string(),
+                mid: mid_text,
                 kind: match media.kind {
                     MediaKind::Audio => "audio".to_string(),
                     MediaKind::Video => "video".to_string(),
                 },
+                stream_id,
             })
         }
         Event::MediaData(data) => media_data_event(pc, data),
@@ -2565,6 +2638,7 @@ mod tests {
             PcEvent::RemoteTrackAdded {
                 mid: "0".to_string(),
                 kind: "audio".to_string(),
+                stream_id: None,
             },
             PcEvent::KeyframeRequested {
                 mid: "0".to_string(),
@@ -3724,5 +3798,82 @@ mod error_variant_tests {
     fn media_write_operation_display_names_the_call_site() {
         assert_eq!(MediaWriteOperation::WriteAudio.to_string(), "write_audio");
         assert_eq!(MediaWriteOperation::WriteVideo.to_string(), "write_video");
+    }
+}
+
+#[cfg(test)]
+mod remote_stream_id_tests {
+    use super::parse_remote_stream_ids;
+
+    /// The shape `LiveKit` actually sends: `<participantSid>|<trackSid>`.
+    ///
+    /// livekit-client splits this on `|` and looks the participant up by the first half.
+    /// Given anything else it matches no participant and returns -- and the error it would
+    /// log is gated on the sid starting with `PA`, so a wrong id is discarded silently.
+    /// Every remote participant was invisible because we handed it `new MediaStream()` and
+    /// its random uuid.
+    #[test]
+    fn a_livekit_msid_is_recovered_for_each_mid() {
+        let sdp = "\
+v=0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=msid:PA_abc123|TR_audio001 TR_audio001\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n\
+a=msid:PA_def456|TR_video001 TR_video001\r\n";
+
+        let ids = parse_remote_stream_ids(sdp);
+        assert_eq!(ids.get("0").map(String::as_str), Some("PA_abc123|TR_audio001"));
+        assert_eq!(ids.get("1").map(String::as_str), Some("PA_def456|TR_video001"));
+    }
+
+    /// The older per-SSRC spelling, which plenty of servers still send. Taking only the
+    /// modern one would work against one SFU and fail silently against the next.
+    #[test]
+    fn the_per_ssrc_spelling_is_read_too() {
+        let sdp = "\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:2\r\n\
+a=ssrc:1234 cname:x\r\n\
+a=ssrc:1234 msid:PA_ghi789|TR_video002 TR_video002\r\n";
+
+        assert_eq!(
+            parse_remote_stream_ids(sdp).get("2").map(String::as_str),
+            Some("PA_ghi789|TR_video002")
+        );
+    }
+
+    /// An `msid` belongs to the section it appears in. Without resetting at each `m=`, a
+    /// section with no msid of its own would inherit the previous section's -- which routes
+    /// one participant's video to another participant's tile.
+    #[test]
+    fn an_msid_does_not_leak_into_the_next_media_section() {
+        let sdp = "\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=msid:PA_abc|TR_a TR_a\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n\
+a=recvonly\r\n";
+
+        let ids = parse_remote_stream_ids(sdp);
+        assert_eq!(ids.get("0").map(String::as_str), Some("PA_abc|TR_a"));
+        assert_eq!(ids.get("1"), None);
+    }
+
+    /// `a=msid:-` is the spelling for "no stream", and recording it would give livekit a
+    /// participant sid of `-`.
+    #[test]
+    fn a_placeholder_msid_is_not_recorded() {
+        let sdp = "m=audio 9 x 111\r\na=mid:0\r\na=msid:- TR_a\r\n";
+        assert!(parse_remote_stream_ids(sdp).is_empty());
+    }
+
+    #[test]
+    fn an_sdp_with_no_msid_at_all_yields_nothing_and_does_not_panic() {
+        let sdp = "v=0\r\nm=audio 9 x 111\r\na=mid:0\r\na=sendrecv\r\n";
+        assert!(parse_remote_stream_ids(sdp).is_empty());
+        assert!(parse_remote_stream_ids("").is_empty());
     }
 }

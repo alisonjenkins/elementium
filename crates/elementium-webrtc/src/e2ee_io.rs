@@ -215,7 +215,15 @@ fn passthrough(event: WirePcEvent) -> Option<PcEvent> {
         PcEvent::IceGatheringComplete => Some(PcEvent::IceGatheringComplete),
         PcEvent::KeyframeRequested { mid } => Some(PcEvent::KeyframeRequested { mid }),
         PcEvent::Connected => Some(PcEvent::Connected),
-        PcEvent::RemoteTrackAdded { mid, kind } => Some(PcEvent::RemoteTrackAdded { mid, kind }),
+        PcEvent::RemoteTrackAdded {
+            mid,
+            kind,
+            stream_id,
+        } => Some(PcEvent::RemoteTrackAdded {
+            mid,
+            kind,
+            stream_id,
+        }),
         PcEvent::EgressStats {
             mid,
             loss,

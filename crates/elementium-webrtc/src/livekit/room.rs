@@ -1365,7 +1365,7 @@ fn process_transport_events(
                     }
                 }
             }
-            Some(TransportEvent::SubscriberEvent(PcEvent::RemoteTrackAdded { mid, kind })) => {
+            Some(TransportEvent::SubscriberEvent(PcEvent::RemoteTrackAdded { mid, kind, .. })) => {
                 // Both identifiers here are honest about being unresolved, which they were
                 // not before: `participant_sid` was the literal string "unknown" and
                 // `track_sid` was the m-line id, which is ours and not the SFU's track sid

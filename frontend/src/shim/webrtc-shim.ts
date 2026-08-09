@@ -66,6 +66,9 @@ interface WebRtcEvent {
   candidate?: string;
   mid?: string;
   kind?: string;
+  /** The `MediaStream` id from the remote SDP, on `remoteTrackAdded`. livekit routes the
+   * track by this alone -- see `emitTrackEvent`. */
+  streamId?: string;
   /** Data channel label, on `dataChannel{Open,Message,Close}` events. */
   label?: string;
   /** Whether a `dataChannelMessage` payload was originally binary (`ArrayBuffer`) rather
@@ -535,8 +538,11 @@ export class ElementiumRTCPeerConnection extends EventTarget {
         break;
 
       case "remoteTrackAdded":
-        console.log(`[Elementium] Remote track: mid=${event.mid} kind=${event.kind}`);
-        this.emitTrackEvent(event.mid!, event.kind!);
+        console.log(
+          `[Elementium] Remote track: mid=${event.mid} kind=${event.kind} ` +
+            `streamId=${event.streamId ?? "<none>"}`,
+        );
+        this.emitTrackEvent(event.mid!, event.kind!, event.streamId);
         break;
 
       case "dataChannelOpen":
@@ -628,9 +634,33 @@ export class ElementiumRTCPeerConnection extends EventTarget {
    * For video tracks, creates a canvas-backed MediaStreamTrack that
    * fetches frames from the Rust backend via the custom protocol.
    */
-  private emitTrackEvent(mid: string, kind: string) {
-    // Create a MediaStream for this track
+  private emitTrackEvent(mid: string, kind: string, streamId?: string) {
+    // The stream's id, not the stream itself, is what routes this track to a participant.
+    //
+    // livekit-client's `Room.onTrackAdded` splits it on `|` into a participant sid and a
+    // track sid and looks the participant up by the first half. A stream whose id it cannot
+    // parse matches no participant, and the error it would log for that is itself gated on
+    // the sid starting with `PA` -- so a random id is discarded in total silence. Every
+    // remote participant was invisible for exactly this reason, while their video decoded
+    // and rendered onto a canvas nothing was ever told to display.
+    //
+    // `MediaStream.id` is read-only, hence the redefinition rather than an assignment.
     const stream = new MediaStream();
+    if (streamId) {
+      try {
+        Object.defineProperty(stream, "id", { value: streamId, configurable: true });
+      } catch {
+        console.warn(
+          `[Elementium] could not set stream id ${streamId} for mid=${mid}; ` +
+            `livekit will not be able to attach this track to a participant`,
+        );
+      }
+    } else {
+      console.warn(
+        `[Elementium] remote track mid=${mid} arrived with no stream id from the SDP; ` +
+          `livekit cannot route it to a participant and will drop it silently`,
+      );
+    }
 
     // For video tracks, create a canvas source that renders frames from Rust
     if (kind === "video" && this.pcId) {

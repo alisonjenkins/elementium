@@ -67,6 +67,9 @@ pub enum WebRtcEvent {
         pc_id: String,
         mid: String,
         kind: String,
+        /// The `MediaStream` id from the remote SDP. livekit-client routes an arriving track
+        /// by this and nothing else -- see `PcEvent::RemoteTrackAdded`.
+        stream_id: Option<String>,
     },
     /// A data channel's DCEP handshake completed; the shim's `RTCDataChannel` for `label`
     /// should flip to `readyState: "open"` and fire `onopen`.
@@ -716,10 +719,15 @@ fn route_pc_event(
         PcEvent::Connected => Some(WebRtcEvent::Connected {
             pc_id: pc_id.to_string(),
         }),
-        PcEvent::RemoteTrackAdded { mid, kind } => Some(WebRtcEvent::RemoteTrackAdded {
+        PcEvent::RemoteTrackAdded {
+            mid,
+            kind,
+            stream_id,
+        } => Some(WebRtcEvent::RemoteTrackAdded {
             pc_id: pc_id.to_string(),
             mid,
             kind,
+            stream_id,
         }),
         PcEvent::AudioData {
             mid,
