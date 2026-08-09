@@ -506,13 +506,33 @@ function wireStopToBackend(track: MediaStreamTrack, nativeTrackId: string): void
  * Failures are logged loudly rather than swallowed. A mute that did not reach the backend
  * is precisely the fault being fixed, and a silent catch here would restore it.
  */
+/**
+ * Find the `enabled` accessor, wherever in the prototype chain it lives.
+ *
+ * It is declared on `MediaStreamTrack.prototype`, but the camera track is the one
+ * `canvas.captureStream()` returns, whose immediate prototype is
+ * `CanvasCaptureMediaStreamTrack.prototype` -- one level below. Looking only at the
+ * immediate prototype found nothing for exactly that track, so video mute was reported as
+ * unwireable and the camera went on capturing and publishing while the user believed it
+ * was off. The microphone, whose track has no such subclass, was wired correctly, which is
+ * why this survived the hot-mic fix.
+ */
+function enabledDescriptor(track: MediaStreamTrack): PropertyDescriptor | undefined {
+  let proto: object | null = Object.getPrototypeOf(track) as object | null;
+  while (proto) {
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "enabled");
+    if (descriptor) return descriptor;
+    proto = Object.getPrototypeOf(proto) as object | null;
+  }
+  return undefined;
+}
+
 function wireMuteToBackend(
   track: MediaStreamTrack,
   kind: "audio" | "video",
   source: string,
 ): void {
-  const proto = Object.getPrototypeOf(track) as object;
-  const original = Object.getOwnPropertyDescriptor(proto, "enabled");
+  const original = enabledDescriptor(track);
   if (!original?.get || !original.set) {
     console.warn("[Elementium] MediaStreamTrack.enabled is not an accessor; mute will not reach the backend");
     return;
@@ -550,6 +570,44 @@ function wireMuteToBackend(
 /// Target preview period: 30fps is plenty for a self-view and halves the IPC volume of 60.
 const TARGET_FRAME_MS = 33;
 
+/** Logged once, so a transport that changed shape says so rather than going quiet. */
+let framePayloadShapeReported = false;
+
+/**
+ * Coerce whatever the IPC handed back into an `ArrayBuffer`.
+ *
+ * `get_video_frame` returns raw bytes, and how those arrive depends on which IPC transport
+ * the webview ended up using. Tauri's custom-protocol IPC delivers an `ArrayBuffer`; its
+ * postMessage fallback -- which WebKitGTK forces whenever the page is served over http,
+ * because it refuses a custom-scheme fetch from an http origin -- delivers the same bytes
+ * as an ordinary array of numbers.
+ *
+ * Assuming the first shape cost a working camera. `buf.byteLength` on an array is
+ * `undefined`, `undefined > 8` is false, and the fetch loop skipped every frame without
+ * incrementing a single counter: 29fps fetched, `drawn=0`, no error, nothing in any log to
+ * say the preview had stopped being a preview. Accepting either shape is a one-line
+ * question and removes the whole class.
+ */
+function frameBytes(value: unknown): ArrayBuffer | null {
+  if (!framePayloadShapeReported) {
+    framePayloadShapeReported = true;
+    const shape = value instanceof ArrayBuffer
+      ? "ArrayBuffer"
+      : ArrayBuffer.isView(value)
+        ? `${value.constructor.name} view`
+        : Array.isArray(value)
+          ? `Array(${value.length})`
+          : typeof value;
+    console.log(`[Elementium] video frame IPC payload arrives as ${shape}`);
+  }
+  if (value instanceof ArrayBuffer) return value;
+  if (ArrayBuffer.isView(value)) {
+    return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
+  }
+  if (Array.isArray(value)) return new Uint8Array(value).buffer;
+  return null;
+}
+
 // Measured on this machine: PipeWire negotiated the camera 3.35s after getUserMedia was
 // called, so a 3s probe missed the first frame by 350ms and fell back to 640x480 for the
 // whole session. The camera cannot be hurried; the probe can wait.
@@ -562,7 +620,7 @@ async function firstFrameGeometry(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
+      const buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
       if (buf && buf.byteLength > 8) {
         const view = new DataView(buf);
         const width = view.getUint32(0, true);
@@ -608,8 +666,7 @@ function startLocalVideoFrameFetch(
     const started = Date.now();
 
     try {
-      // invoke returns ArrayBuffer when Rust returns tauri::ipc::Response
-      const buf = await invoke<ArrayBuffer>("get_video_frame", { trackId });
+      const buf = frameBytes(await invoke<unknown>("get_video_frame", { trackId }));
       frameCount++;
       if (buf && buf.byteLength > 8) {
         const view = new DataView(buf);
