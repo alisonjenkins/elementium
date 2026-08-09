@@ -1015,7 +1015,7 @@ impl E2eeContext {
         // through the whole window on the first undecryptable frame and permanently
         // destroys the real key, so the participant can never be decrypted again even
         // once a good frame arrives.
-        let ratchet_material = if options.ratchet_window_size > 0 {
+        let ratchet_material = if options.auto_ratchet && options.ratchet_window_size > 0 {
             ring.raw_material(key_index)
                 .map(<[u8]>::to_vec)
                 .map(zeroize::Zeroizing::new)
@@ -1671,6 +1671,68 @@ mod tests {
             .expect("should not error")
             .expect("ratchet window should find the key");
         assert_eq!(decrypted.as_bytes(), b"test-data");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    fn auto_ratchet_false_disables_ratcheting_even_with_a_window() {
+        // `auto_ratchet` was deserialized and stored but nothing ever read it -- only
+        // `ratchet_window_size > 0` gated ratcheting. A peer sending `autoRatchet: false`
+        // alongside a nonzero window was asking us not to ratchet, and we would anyway.
+        // Same setup as `key_ratcheting` (sender ratchets, receiver holds the pre-ratchet
+        // key with a window big enough to find it), except the receiver has ratcheting
+        // turned off; decryption must fail rather than silently ratchet to find the key.
+        let sender_opts = E2eeOptions {
+            ratchet_window_size: 5,
+            auto_ratchet: true,
+            ..Default::default()
+        };
+        let sender = E2eeContext::new(sender_opts);
+        sender.set_local_identity("alice");
+        sender.set_key("alice", 0, b"initial-key-material-1234567890");
+
+        let ratcheted = {
+            let Ok(mut inner) = sender.inner.write() else {
+                panic!("test lock is not poisoned");
+            };
+            inner
+                .key_manager
+                .participants
+                .get_mut(&ParticipantId::new("alice"))
+                .map(|ring| {
+                    let salt = HkdfSalt(DEFAULT_RATCHET_SALT);
+                    let current = ring
+                        .raw_material(KeyIndex::new(0))
+                        .expect("key was just set")
+                        .to_vec();
+                    let next = ratchet_key(KeyMaterial(&current), salt);
+                    ring.replace_key(KeyIndex::new(0), KeyMaterial(&next), salt);
+                })
+        };
+        assert_eq!(ratcheted, Some(()));
+
+        let encrypted = sender
+            .encrypt_frame(
+                &PlaintextMedia::from_encoder(b"test-data".to_vec()),
+                MediaKind::Audio,
+            )
+            .expect("encrypt should succeed");
+
+        // Receiver has the original (pre-ratchet) key, a window that would find the
+        // ratcheted key, but auto_ratchet turned off.
+        let receiver_opts = E2eeOptions {
+            ratchet_window_size: 5,
+            auto_ratchet: false,
+            ..Default::default()
+        };
+        let receiver = E2eeContext::new(receiver_opts);
+        receiver.set_key("alice", 0, b"initial-key-material-1234567890");
+
+        let result = receiver.decrypt_frame(&encrypted, "alice", MediaKind::Audio);
+        assert!(
+            result.is_err(),
+            "auto_ratchet: false must stop the ratchet window from being tried"
+        );
     }
 
     #[test]
