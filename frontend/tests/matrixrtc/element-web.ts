@@ -58,7 +58,8 @@ function withoutShims(html: string): string {
   return html
     .replace(/<script[^>]*src="[^"]*elementium-shims\.js"[^>]*>\s*<\/script>/g, "")
     .replace(/<script[^>]*src="[^"]*elementium-autojoin\.js"[^>]*>\s*<\/script>/g, "")
-    .replace(/<script>window\.__ELEMENTIUM_AUTOJOIN[\s\S]*?<\/script>/g, "");
+    .replace(/<script>window\.__ELEMENTIUM_AUTOJOIN[\s\S]*?<\/script>/g, "")
+    .replace(/<script>window\.__ELEMENTIUM_SHIM_FINGERPRINT[\s\S]*?<\/script>/g, "");
 }
 
 /**

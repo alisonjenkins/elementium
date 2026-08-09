@@ -351,6 +351,11 @@ fn log_element_web_build() {
                     element_call_fingerprint = %field("elementCallFingerprint"),
                     autojoin_injected = %field("autojoinInjected"),
                     patches = %field("patches"),
+                    // What each frame's own console-bridge line (`shim installed,
+                    // build=...`) should say. Printed once here so a mismatch between this
+                    // and a frame's own line -- or between the two frames' lines -- is a
+                    // one-glance diff instead of a mystery.
+                    shim_fingerprint = %field("shimFingerprint"),
                     "Element Web build record"
                 );
             }

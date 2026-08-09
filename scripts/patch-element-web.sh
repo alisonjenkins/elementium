@@ -62,6 +62,13 @@ if [[ ! -f "$INDEX" ]]; then
     exit 1
 fi
 
+# Identifies which build of the shims bundle a frame is running, independent of the console
+# bridge that reports it. Content-hashed rather than timestamped: two frames loading the
+# *same* physical file always agree, and a frame that ends up with a stale copy -- the exact
+# fault this whole mechanism exists to catch -- disagrees immediately, in one log line,
+# instead of being inferred after the fact from a missing tag. See console-bridge.ts.
+SHIM_FINGERPRINT=$(sha256sum "$SHIMS_SRC" | cut -c1-16)
+
 # How many injections we asserted, reported at the end so a silent zero is visible.
 INJECTIONS=0
 
@@ -91,10 +98,13 @@ fi
 if grep -qF "$MARKER" "$INDEX"; then
     echo "[patch] Shims already injected, skipping."
 else
-    # Insert marker + shims script before the first <script tag only
-    awk -v marker="$MARKER" '
+    # Insert marker + fingerprint + shims script before the first <script tag only. The
+    # fingerprint has to land before the shims script runs, so it is set inline rather than
+    # fetched -- console-bridge.ts reads it synchronously as its very first act.
+    awk -v marker="$MARKER" -v fp="$SHIM_FINGERPRINT" '
         !done && /<script/ {
             print "    " marker
+            print "    <script>window.__ELEMENTIUM_SHIM_FINGERPRINT = \"" fp "\";</script>"
             print "    <script src=\"elementium-shims.js\"></script>"
             done = 1
         }
@@ -108,6 +118,13 @@ else
     echo "[patch] Injected shims script tag into $INDEX"
 fi
 assert_contains "$INDEX" "elementium-shims.js" "shims script tag missing from $INDEX"
+# Refreshed unconditionally, not only on first injection: the shims *bundle* is re-copied
+# every run (step 1, above) regardless of whether the script tag was already present, so a
+# fingerprint that only got written once would drift out of sync with the file it names on
+# the very next `pnpm run build:shims` -- silently reintroducing the fault this fingerprint
+# exists to catch.
+sed -i "s/window\.__ELEMENTIUM_SHIM_FINGERPRINT = \"[^\"]*\"/window.__ELEMENTIUM_SHIM_FINGERPRINT = \"$SHIM_FINGERPRINT\"/" "$INDEX"
+assert_contains "$INDEX" "$SHIM_FINGERPRINT" "shim fingerprint missing from $INDEX"
 INJECTIONS=$((INJECTIONS + 1))
 
 # 4b. Autojoin driver, for testing only.
@@ -235,7 +252,7 @@ if grep -qF "$EC_MARKER" "$EC_INDEX"; then
     echo "[patch] Element Call shims already injected, skipping."
 else
     # Inject IPC bridge + shims before the first <script> tag
-    awk -v marker="$EC_MARKER" '
+    awk -v marker="$EC_MARKER" -v fp="$SHIM_FINGERPRINT" '
         !done && /<script/ {
             print "    " marker
             print "    <script>"
@@ -245,6 +262,7 @@ else
             print "        console.log(\"[Elementium] Bridged __TAURI_INTERNALS__ from parent into Element Call iframe\");"
             print "      }"
             print "    </script>"
+            print "    <script>window.__ELEMENTIUM_SHIM_FINGERPRINT = \"" fp "\";</script>"
             print "    <script src=\"elementium-shims.js\"></script>"
             done = 1
         }
@@ -258,6 +276,10 @@ inject before. The widget carries the media, so this is a silent call with no er
 fi
 assert_contains "$EC_INDEX" "elementium-shims.js" "shims script tag missing from $EC_INDEX"
 assert_contains "$EC_INDEX" "__TAURI_INTERNALS__" "IPC bridge missing from $EC_INDEX"
+# See the matching comment on the main frame's injection, above: refreshed every run so this
+# frame's fingerprint cannot outlive the shims bundle it is meant to identify.
+sed -i "s/window\.__ELEMENTIUM_SHIM_FINGERPRINT = \"[^\"]*\"/window.__ELEMENTIUM_SHIM_FINGERPRINT = \"$SHIM_FINGERPRINT\"/" "$EC_INDEX"
+assert_contains "$EC_INDEX" "$SHIM_FINGERPRINT" "shim fingerprint missing from $EC_INDEX"
 INJECTIONS=$((INJECTIONS + 1))
 
 # 6. The build record.
@@ -279,10 +301,11 @@ EC_FINGERPRINT=$(find "$EC_DIR/assets" -maxdepth 1 -type f -printf '%f\n' 2>/dev
     LC_ALL=C sort | sha256sum | cut -c1-16)
 
 python3 - "$BUILD_RECORD" "$SOURCE_INFO" "$EC_FINGERPRINT" "${AUTOJOIN_INJECTED:-false}" \
-    "$CONFIG_SRC" "$INJECTIONS" <<'PYEOF'
+    "$CONFIG_SRC" "$INJECTIONS" "$SHIM_FINGERPRINT" <<'PYEOF'
 import json, sys, datetime
 
-record_path, source_info, ec_fingerprint, autojoin, config_src, injections = sys.argv[1:7]
+record_path, source_info, ec_fingerprint, autojoin, config_src, injections, \
+    shim_fingerprint = sys.argv[1:8]
 
 # `.source-info` is written by fetch-element-web.sh as `release:<repo>:<version>` or
 # `git:<repo>:<branch>:<sha>`.
@@ -308,6 +331,11 @@ json.dump({
     "autojoinInjected": autojoin == "true",
     "configSource": config_src,
     "injectionsAsserted": int(injections),
+    # What every frame's own console-bridge line should say (see console-bridge.ts). Two
+    # frames disagreeing with each other, or with this, is a stale copy -- previously
+    # invisible, because both frames read from the same source file name in the same repo and
+    # "looked" identical until you diffed their bytes.
+    "shimFingerprint": shim_fingerprint,
 }, open(record_path, "w"), indent=2)
 PYEOF
 
