@@ -181,6 +181,9 @@ export function startWebCodecsRender(
         const { frames, rest } = takeFrames(pending);
         pending = rest;
         for (const frame of frames) {
+          // A zero-length record is the server's keepalive: it exists so that writing to a
+          // vanished client fails and the stream can end. There is nothing to decode.
+          if (frame.data.byteLength === 0) continue;
           if (!sawKeyframe) {
             if (!frame.keyframe) continue;
             sawKeyframe = true;

@@ -204,13 +204,24 @@ fn stream_track_id(path: &str) -> Option<String> {
 /// here. Short enough that a closed track is noticed promptly, long enough not to spin.
 const STREAM_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// How long a stream with no frames at all is kept open.
+/// How often a quiet stream writes an empty record.
 ///
-/// A track that has produced nothing for this long is over -- the participant left, or the
-/// connection was replaced -- and the response must end so the thread does not outlive it.
-/// Generously longer than the gap between keyframes, so a quiet camera is not mistaken for
-/// a dead one.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The point is not the record, it is the write. With no frames there is nothing to send, so
+/// `tiny_http` never touches the socket and a client that vanished without closing cleanly is
+/// never noticed -- which is why this reader previously gave up after thirty seconds of
+/// silence. A periodic write makes the disconnection observable, so silence no longer has to
+/// be treated as death.
+const STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The backstop for a stream that is neither producing frames nor failing to write.
+///
+/// Ten minutes rather than thirty seconds, and the change is the whole of this fix. A remote
+/// participant's video cannot be decrypted until their key arrives, which in a real call was
+/// measured at twenty-five seconds after joining -- so a thirty-second silence is an ordinary
+/// state at the start of every call, not a dead track. Two of three participants were
+/// permanently invisible because their stream was closed at exactly the moment their first
+/// decodable frame was about to arrive, and nothing reopened it.
+const STREAM_MAX_SILENCE: std::time::Duration = std::time::Duration::from_mins(10);
 
 /// A `Read` over a track's encoded frames, for `tiny_http` to write out as it goes.
 ///
@@ -221,7 +232,10 @@ struct FrameStreamReader {
     track_id: String,
     /// The remainder of a frame too large for the last `read` buffer.
     pending: std::io::Cursor<Vec<u8>>,
+    /// When a real frame was last taken, for the long backstop.
     idle_since: std::time::Instant,
+    /// When anything was last handed to the socket, for the keepalive.
+    last_write: std::time::Instant,
 }
 
 impl std::io::Read for FrameStreamReader {
@@ -233,13 +247,33 @@ impl std::io::Read for FrameStreamReader {
             }
             if let Some(frame) = self.streams.pop(&self.track_id) {
                 self.idle_since = std::time::Instant::now();
+                self.last_write = self.idle_since;
                 self.pending =
                     std::io::Cursor::new(crate::encoded_streams::encode_wire_frame(&frame));
                 continue;
             }
-            if self.idle_since.elapsed() > STREAM_IDLE_TIMEOUT {
-                debug!(track_id = %self.track_id, "encoded stream idle; closing");
+            if self.idle_since.elapsed() > STREAM_MAX_SILENCE {
+                info!(
+                    track_id = %self.track_id,
+                    silent_secs = STREAM_MAX_SILENCE.as_secs(),
+                    "encoded stream produced nothing for a very long time; closing"
+                );
                 return Ok(0);
+            }
+            if self.last_write.elapsed() >= STREAM_KEEPALIVE {
+                self.last_write = std::time::Instant::now();
+                // A zero-length record. The reader skips it; what matters is that writing it
+                // fails when the client has gone.
+                self.pending = std::io::Cursor::new(
+                    crate::encoded_streams::encode_wire_frame(
+                        &crate::encoded_streams::EncodedFrame {
+                            data: elementium_types::PlaintextMedia::from_decrypted(Vec::new()),
+                            keyframe: false,
+                            timestamp_us: 0,
+                        },
+                    ),
+                );
+                continue;
             }
             std::thread::sleep(STREAM_IDLE_POLL);
         }
@@ -274,6 +308,7 @@ fn spawn_stream_responder(
                 track_id,
                 pending: std::io::Cursor::new(Vec::new()),
                 idle_since: std::time::Instant::now(),
+                last_write: std::time::Instant::now(),
             };
             // No content length, so `tiny_http` sends it chunked -- which is what lets the
             // page start reading frames before the track has finished producing them.
