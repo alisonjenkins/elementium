@@ -678,7 +678,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     this._pendingDataChannels = [];
     this._pendingTransceivers = [];
     console.log(`[Elementium] createOffer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
-    console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
+    if (sdpTracingEnabled()) console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
     return sessionDescription(desc, "offer");
   }
 
@@ -711,7 +711,9 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       return;
     }
     console.log(`[Elementium] setLocalDescription: pcId=${this.pcId} type=${description.type}`);
-    console.log("[Elementium] setLocalDescription SDP (post-munge):\n" + (description.sdp ?? "(no sdp)"));
+    if (sdpTracingEnabled()) {
+      console.log("[Elementium] setLocalDescription SDP (post-munge):\n" + (description.sdp ?? "(no sdp)"));
+    }
     await invoke("set_local_description", {
       pcId: this.pcId,
       description: { type: description.type, sdp: description.sdp },
@@ -732,7 +734,9 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     await this.ensureReady();
     console.log(`[Elementium] setRemoteDescription: pcId=${this.pcId} type=${description.type} sdpLen=${description.sdp?.length ?? 0}`);
-    console.log("[Elementium] setRemoteDescription SDP:\n" + (description.sdp ?? "(no sdp)"));
+    if (sdpTracingEnabled()) {
+      console.log("[Elementium] setRemoteDescription SDP:\n" + (description.sdp ?? "(no sdp)"));
+    }
 
     const result = await invoke<NativeSessionDescription | null>(
       "set_remote_description",
@@ -1177,6 +1181,27 @@ function tracePeerConnection<T extends object>(pc: T, pcId: string): T {
       return value;
     },
   });
+}
+
+/**
+ * Whether to write whole SDP bodies to the log.
+ *
+ * Off unless asked for, because an SDP is not a harmless blob: it carries the ICE username
+ * and password and the DTLS certificate fingerprint for the session it describes. Every
+ * offer and answer used to be logged in full, unconditionally, so a single ordinary call
+ * left its ICE credentials sitting in a world-readable file under /tmp -- and these logs
+ * get attached to issues.
+ *
+ * Reuses the existing `tracePc` opt-in rather than adding a second switch: anyone who has
+ * turned that on is already reading a byte-level trace on purpose.
+ */
+function sdpTracingEnabled(): boolean {
+  // `globalThis`, not `window`: this is called from the description path, which runs under
+  // the test runner's node environment as well as in the webview. Reaching for `window`
+  // here threw a ReferenceError that surfaced as two unrelated negotiation tests failing.
+  const w = globalThis as unknown as Record<string, unknown>;
+  const autojoin = w["__ELEMENTIUM_AUTOJOIN"] as Record<string, unknown> | undefined;
+  return Boolean(autojoin?.["tracePc"]);
 }
 
 /** A property value rendered short enough to read in a log, and never a payload. */
