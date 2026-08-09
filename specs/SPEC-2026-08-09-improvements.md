@@ -103,10 +103,25 @@ What differs between the passing test and the failing call, in rough order of su
    observed against the real deployment, so the two configurations do not exercise the same
    code.
 
-The cheapest next experiment is to point the harness at the real SFU rather than the local
-one. If it still reads 30/s, the fault is in the receiver or the participant mix; if it drops
-to keyframes only, it is the network or that SFU, and everything on our side is exonerated.
-Either answer is worth more than another reading of our own code.
+Two experiments follow from that list, and the order matters because one is much cheaper
+than it first appears and the other much dearer.
+
+**Cheapest: add participants to the harness.** It currently runs one remote participant, and
+suspicion 3 says the fault may need three or four -- the point at which an SFU starts making
+forwarding decisions rather than relaying. Everything needed is already there: the harness
+creates sessions on demand, and `peers.spec.ts` already drives two browsers at once. No
+credentials, no external service, and the existing assertions apply unchanged. If the fault
+appears at three participants against a *local* SFU, it is reproducible on demand and the
+investigation is effectively over.
+
+**Dearer than it looks: point the harness at the real SFU.** This was written down first as
+"the cheapest next experiment" and that was wrong. `element-web.ts` hard-codes
+`http://localhost:8008` in six places for registration, login, room creation, joining and
+well-known, so it is not a configuration switch but a parameterisation, plus a way to supply
+real credentials that does not put them in the repo. The SFU itself would follow
+automatically, since a real room's membership names its own `foci_preferred`. Worth doing --
+it is the only experiment that isolates the network and that deployment -- but it is an hour
+of plumbing, not a flag.
 
 ## P1 — Encryption keys: one fault outbound, one inbound
 
