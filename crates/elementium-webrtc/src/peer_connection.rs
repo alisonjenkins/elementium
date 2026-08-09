@@ -807,10 +807,33 @@ pub fn set_remote_description(
             }
             let answer = SdpAnswer::from_sdp_string(&desc.sdp)
                 .map_err(|e| format!("Invalid answer SDP: {e}"))?;
-            let pending = pc
-                .pending_offer
-                .take()
-                .ok_or("No pending offer to match answer")?;
+            // An answer with no pending offer is not a fault, and treating it as one cost
+            // an entire afternoon.
+            //
+            // `create_offer` returns the offer already in force when str0m reports that a
+            // re-offer would change nothing -- which is correct, and is what stopped an
+            // earlier reconnect loop -- but that path registers no new pending offer,
+            // because there is no new negotiation. The caller still sends the SDP, the SFU
+            // still answers it, and the answer arrives here with nothing to match.
+            //
+            // It described a session state we are already in, so there is nothing to apply
+            // and nothing is wrong. Erroring instead rejected the IPC, and the page's
+            // `setRemoteDescription` never reached the line that returns the connection to
+            // `stable`: the signalling state froze mid-offer, every subsequent publish was
+            // held waiting for a state that could not come back, and the call was torn down
+            // and rebuilt every fifteen seconds.
+            //
+            // Silently, too -- this error had no tracing call, so nothing in the log said it
+            // had happened. The message reads like one of livekit-client's own, and was
+            // misread as such for hours.
+            let Some(pending) = pc.pending_offer.take() else {
+                tracing::info!(
+                    pc_id = %pc.id,
+                    "answer arrived with no pending offer; it answers the offer already in \
+                     force, so there is nothing to apply"
+                );
+                return Ok(None);
+            };
             pc.rtc
                 .sdp_api()
                 .accept_answer(pending, answer)
@@ -2292,6 +2315,32 @@ mod tests {
             event,
             Some(PcEvent::ConnectionStateChange(PeerConnectionState::Failed))
         ));
+    }
+
+    /// An answer with no pending offer must be accepted, not refused.
+    ///
+    /// `create_offer` returns the offer already in force when str0m says a re-offer would
+    /// change nothing, and that path registers no pending offer because there is no new
+    /// negotiation. The caller still sends that SDP and the SFU still answers it, so the
+    /// answer arrives with nothing to match. Refusing it rejected the IPC, the page never
+    /// returned to `stable`, every later publish was held against a state that could not
+    /// come back, and the call was rebuilt every fifteen seconds -- with no log line
+    /// anywhere, because the error had no tracing call.
+    #[test]
+    fn an_answer_with_no_pending_offer_is_accepted_as_a_no_op() {
+        let mut pc = create_peer_connection("test".to_owned());
+        assert!(pc.pending_offer.is_none(), "no offer has been made");
+
+        let answer = SessionDescription {
+            sdp_type: SdpType::Answer,
+            sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n".to_owned(),
+        };
+        let result = set_remote_description(&mut pc, &answer);
+
+        assert!(
+            result.is_ok(),
+            "an answer to the offer already in force is not a fault: {result:?}"
+        );
     }
 
     /// Pins the media/control split `engine::io_loop` routes on: exactly `AudioData` and
