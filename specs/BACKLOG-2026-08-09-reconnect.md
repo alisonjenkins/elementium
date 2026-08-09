@@ -5,9 +5,18 @@ in about seventy seconds. Reported symptoms were "audio still not coming through
 "video very pixelated", "she only gets key frames", "my webcam did not resume after the
 reconnect — I had to toggle it", and "I keep getting disconnected".
 
-They are very largely one fault with four faces, and the evidence for that is that **the
-transport never failed**: ICE reported `Checking -> Completed` four times and never once
-`Disconnected` or `Failed`. Nothing dropped on the network. Something above tore the call
+They are very largely one fault with four faces, and the evidence given for that was that
+**the transport never failed**: ICE reported `Checking -> Completed` four times and never
+once `Disconnected` or `Failed`.
+
+**That evidence was worth less than it looked, and the conclusion survived anyway.** A later
+audit found that this side cannot report a failed transport: str0m's `IceConnectionState`
+has no `Failed` or `Closed` variant, ours are dead code with no producer, and
+`connectionState` is pinned to `"connected"` in the shim by a hardcoded assignment. So
+"never reported failed" was structural, not observed. The conclusion still holds — R3 was
+found in the code and fixed, and the reconnects stopped — but it was reached partly on an
+argument that could not have come out any other way. Recorded because the same argument
+will be tempting again, and next time it may be the only one. Something above tore the call
 down and rebuilt it, three times, and the rebuild does not restore what the teardown
 detached.
 
