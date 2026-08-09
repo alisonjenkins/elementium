@@ -1775,9 +1775,51 @@ fn handle_str0m_event(pc: &mut PeerConnectionInner, event: Event) -> Option<Wire
             }
             None
         }
-        _ => {
-            tracing::info!(pc_id = %pc.id, ?event, "Unhandled str0m event");
+        other => {
+            note_diagnostic_event(pc, other);
             None
+        }
+    }
+}
+
+/// Events that change no state here, split by whether anyone would want to read them.
+///
+/// The "unhandled" bucket is only useful if what lands in it is genuinely unconsidered. One
+/// call put 898 `SenderFeedback` events through it in two minutes, which is how a bucket
+/// stops being read at all.
+fn note_diagnostic_event(pc: &PeerConnectionInner, event: Event) {
+    match event {
+        // A remote stream stopped or resumed delivering. str0m raises this after roughly a
+        // second and a half of silence on a receive stream, which is the closest thing we
+        // get to "their picture has frozen" -- worth naming, because it arrives at exactly
+        // the moment someone says the other person has gone still.
+        Event::StreamPaused(paused) => {
+            tracing::info!(
+                pc_id = %pc.id,
+                mid = %paused.mid,
+                paused = paused.paused,
+                "remote stream paused state changed"
+            );
+        }
+        // The SCTP send buffer has drained. `write_data_channel` returns `Ok(false)` when
+        // the buffer is full and its documentation tells callers to retry once there is
+        // room; this is the event that says there is. Nothing acts on it yet, so it is
+        // named rather than left looking like something nobody considered.
+        Event::ChannelBufferedAmountLow(id) => {
+            tracing::debug!(
+                pc_id = %pc.id,
+                channel = ?id,
+                "data channel send buffer drained; a blocked writer could retry now"
+            );
+        }
+        // RTCP Sender Reports for streams we *receive* -- `poll_sender_feedback` walks
+        // `streams_rx`, so despite the name this is the remote describing its own sending,
+        // not feedback about ours. Ours arrives as `MediaEgressStats`, handled above.
+        // Consumed silently; they would matter if this ever did audio/video
+        // synchronisation, which needs the NTP-to-RTP mapping they carry.
+        Event::SenderFeedback(_) => {}
+        other => {
+            tracing::info!(pc_id = %pc.id, event = ?other, "Unhandled str0m event");
         }
     }
 }
