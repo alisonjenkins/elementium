@@ -43,7 +43,17 @@ class FakeMediaStreamTrack {
     this.id = id;
   }
 }
-vi.stubGlobal("MediaStreamTrack", FakeMediaStreamTrack);
+// Constructing `MediaStreamTrack` throws in every browser -- it has no constructor. The
+// stub has to throw too, or a test cannot catch code that calls `new MediaStreamTrack()`,
+// which is exactly what shipped and took down a live call.
+vi.stubGlobal(
+  "MediaStreamTrack",
+  class {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+  },
+);
 
 class FakeMediaStream {
   private tracks: FakeMediaStreamTrack[] = [];
@@ -171,5 +181,18 @@ describe("remote track receivers and transceivers", () => {
 
     transceiver.stop();
     expect(transceiver.currentDirection).toBeNull();
+  });
+
+  it("does not throw when a remote audio track arrives", async () => {
+    // `new MediaStreamTrack()` is an illegal constructor -- it throws in every browser --
+    // and it was the fallback for a stream with no track in it. Only the video path adds
+    // one, so every remote *audio* track hit it and threw, out of the try/catch below it,
+    // aborting the handler part-way through applying an answer. The connection was left in
+    // have-local-offer, the page reported "unable to set answer", and the published
+    // microphone was held waiting for a stable state that never came back.
+    const pc = await connection();
+    expect(() => deliverRemoteTrack(pc, "7", "audio")).not.toThrow();
+    // And it still registers, rather than being skipped to avoid the throw.
+    expect(pc.getReceivers()).toHaveLength(1);
   });
 });

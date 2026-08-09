@@ -9,7 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 import { createCanvasTrack } from "./canvas-track";
 import { frameBytes } from "./frame-payload";
-import { TRACK_SOURCE } from "./media-devices";
+import { createSilentAudioTrack, TRACK_SOURCE } from "./media-devices";
 import {
   describeJoinRequest,
   describeRequest,
@@ -603,7 +603,41 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       }
     }
 
-    const track = stream.getTracks()[0] || new MediaStreamTrack();
+    // `new MediaStreamTrack()` is an illegal constructor -- it throws, always, in every
+    // browser. Only the video branch above puts a track in the stream, so every *remote
+    // audio* track took that path and threw, out of the try/catch below, aborting the
+    // handler mid-way through applying an answer. The connection was left in
+    // `have-local-offer`, the page reported "unable to set answer", and the microphone was
+    // held waiting for a stable state that could not come back. It closed 15 seconds later.
+    //
+    // A real, silent `MediaStreamTrack` instead, from an `AudioContext` -- the remote audio
+    // itself is decoded and played natively, so this exists to be the object the page holds
+    // and mutes, exactly as the microphone's own stand-in does.
+    let track = stream.getTracks()[0];
+    if (!track) {
+      const silent = kind === "audio" ? createSilentAudioTrack() : null;
+      if (silent) {
+        track = silent;
+        stream.addTrack(silent);
+      }
+    }
+    if (!track) {
+      // Last resort, and reachable only where `AudioContext` does not exist -- which in
+      // practice means the test runner, not a webview. A minimal stand-in rather than a
+      // throw: a missing track event costs one remote tile, a throw costs the whole
+      // negotiation, which is what the illegal constructor above actually cost.
+      console.warn(`[Elementium] no real track object for remote ${kind} mid=${mid}`);
+      track = {
+        id: `remote-${mid}`,
+        kind,
+        enabled: true,
+        muted: false,
+        readyState: "live",
+        stop: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      } as unknown as MediaStreamTrack;
+    }
 
     // A receiver whose `.track` is the actual remote track, not a bare `{}` disconnected
     // from it. livekit-client resolves incoming media by walking `getReceivers()` and

@@ -434,7 +434,7 @@ function extractConstraintValue(value: unknown): number | undefined {
  * entirely in Rust -- this track exists only so the page has a MediaStreamTrack object to
  * hold, mute, and hand to the rest of the WebRTC stack; it carries no signal of its own.
  */
-function createSilentAudioTrack(): MediaStreamTrack | null {
+export function createSilentAudioTrack(): MediaStreamTrack | null {
   try {
     const audioCtx = new AudioContext();
     const oscillator = audioCtx.createOscillator();
