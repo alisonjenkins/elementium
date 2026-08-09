@@ -13,7 +13,7 @@ use tauri::{AppHandle, Manager, State, command};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::Instrument;
 
-use elementium_types::{CorrelationId, IceCandidate, SessionDescription};
+use elementium_types::{CorrelationId, IceCandidate, SdpType, SessionDescription};
 use elementium_webrtc::engine::{IceServerConfig, WebRtcEngine};
 use elementium_webrtc::peer_connection;
 use elementium_webrtc::{PcEvent, VideoPipeline, start_audio_playback};
@@ -378,6 +378,7 @@ pub async fn create_answer(
 
 #[command]
 pub async fn set_local_description(
+    state: State<'_, WebRtcState>,
     pc_id: String,
     description: SessionDescription,
 ) -> Result<(), String> {
@@ -390,10 +391,38 @@ pub async fn set_local_description(
     // distinction matters because the previous `let _ = (..)` looked like an oversight, and
     // the obvious "fix" -- plumbing it through to str0m -- would break negotiation.
     //
-    // What is *not* fine is accepting a description that disagrees with what we generated,
-    // so that is checked rather than assumed: an SDP the page munged before handing back
-    // would otherwise be silently ignored, and the far end would receive something the page
-    // did not intend.
+    // What is *not* fine is accepting a description that disagrees with what we generated.
+    // The comment here used to claim that was "checked rather than assumed" while the body
+    // did nothing of the kind -- a comment asserting a safety property nobody implemented,
+    // which is worse than no comment, because the next person reads it and believes it.
+    //
+    // It is checked now, and reported rather than refused. livekit-client munges SDP
+    // deliberately (the shim has a munging block of its own), so a difference is not
+    // automatically a fault; but it does mean the bytes str0m is using are not the bytes
+    // the page thinks it sent, and when that matters it matters a great deal. Reported as
+    // lengths and a line number, never as SDP: these logs get attached to issues, and an
+    // SDP carries the ICE credentials and DTLS fingerprint for the session.
+    if description.sdp_type == SdpType::Offer
+        && let Ok(handle) = get_pc_handle(&state, &pc_id)
+        && let Ok(pc) = handle.lock_str()
+        && let Some(generated) = pc.last_offer_sdp.as_deref()
+        && generated != description.sdp
+    {
+        let diverged_at = generated
+            .lines()
+            .zip(description.sdp.lines())
+            .position(|(ours, theirs)| ours != theirs);
+        tracing::warn!(
+            pc_id = %pc_id,
+            generated_len = generated.len(),
+            returned_len = description.sdp.len(),
+            first_differing_line = diverged_at.map_or_else(|| "(length only)".to_owned(), |n| n.to_string()),
+            reason = "local_description_munged",
+            "the page returned a local description that differs from the one we generated; \
+             str0m is using ours"
+        );
+    }
+
     tracing::info!(
         pc_id = %pc_id,
         sdp_type = ?description.sdp_type,
