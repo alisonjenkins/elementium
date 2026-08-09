@@ -51,6 +51,14 @@ pub enum PipelineExtras {
         keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
         /// The codec the SFU currently wants from us, which can change mid-call.
         active_codec: Arc<ActiveCodec>,
+        /// The bitrate last requested through `RTCRtpSender.setParameters`, in kbps.
+        ///
+        /// A level, like `keyframe_requested` and `active_codec` above: `setParameters` can
+        /// be called any number of times over a call's life, and the encoder thread only
+        /// ever needs the latest value. `0` means "nothing requested yet" -- the command
+        /// that writes this clamps every real request to at least `MIN_BITRATE_KBPS`, so `0`
+        /// can never collide with a legitimate one.
+        bitrate_override: Arc<std::sync::atomic::AtomicU32>,
     },
 }
 
@@ -88,6 +96,7 @@ impl PipelineHandle {
             PipelineExtras::Video {
                 keyframe_requested,
                 active_codec,
+                ..
             } => Some((keyframe_requested, active_codec)),
             PipelineExtras::Audio { .. } => None,
         }
@@ -99,6 +108,15 @@ impl PipelineHandle {
         match &self.extras {
             PipelineExtras::Audio { loss_estimate } => Some(loss_estimate),
             PipelineExtras::Video { .. } => None,
+        }
+    }
+
+    /// The live `setParameters` bitrate override, if this is a video pipeline.
+    #[must_use]
+    pub const fn bitrate_override(&self) -> Option<&Arc<std::sync::atomic::AtomicU32>> {
+        match &self.extras {
+            PipelineExtras::Video { bitrate_override, .. } => Some(bitrate_override),
+            PipelineExtras::Audio { .. } => None,
         }
     }
 }
@@ -181,6 +199,8 @@ pub fn start_screen_share_pipeline(
     let keyframe_requested_clone = keyframe_requested.clone();
     let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
     let active_codec_clone = active_codec.clone();
+    let bitrate_override = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let bitrate_override_clone = Arc::clone(&bitrate_override);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let muted_clone = Arc::clone(&muted);
@@ -225,6 +245,11 @@ pub fn start_screen_share_pipeline(
         track_id = %track_id,
         key = %key
     );
+    let controls = VideoPipelineControls {
+        keyframe_requested: keyframe_requested_clone,
+        active_codec: active_codec_clone,
+        bitrate_override: bitrate_override_clone,
+    };
     std::thread::spawn(move || {
         let _guard = span.enter();
         video_pipeline_loop(
@@ -234,8 +259,7 @@ pub fn start_screen_share_pipeline(
             &capture_source,
             &frames,
             &encode_tx_clone,
-            &keyframe_requested_clone,
-            &active_codec_clone,
+            &controls,
             &stop_rx,
         );
     });
@@ -255,6 +279,7 @@ pub fn start_screen_share_pipeline(
                 extras: PipelineExtras::Video {
                     keyframe_requested,
                     active_codec,
+                    bitrate_override,
                 },
             },
         );
@@ -380,6 +405,85 @@ pub fn set_capture_muted(
     flag.store(muted, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(track = %key, muted, "capture mute state changed");
     Ok(())
+}
+
+/// Apply an `RTCRtpSender.setParameters` bitrate request to a running video pipeline.
+///
+/// Before this existed, `setParameters` resolved successfully and changed nothing: nothing
+/// stored what it was called with, and `getParameters` kept returning the encodings frozen
+/// at `addTransceiver` time. Every bandwidth adaptation `livekit-client` believed it made --
+/// 15 call sites in the shipped bundle -- was silently discarded, which is why video that
+/// degrades under a bad link never recovers: the client keeps asking for less and the
+/// encoder never hears it.
+///
+/// `max_bitrates_bps` is one entry per encoding the caller passed, `None` where an encoding
+/// had no `maxBitrate`. Simulcast is not implemented, so more than one entry collapses to a
+/// single aggregate cap ([`requested_bitrate_kbps`]) rather than driving separate layers;
+/// logged once here so that is visible rather than silently approximated.
+///
+/// Returns the kbps actually applied, or `None` if no encoding carried a `maxBitrate` -- in
+/// which case, per policy, nothing changed and the pipeline keeps its previous bitrate.
+///
+/// # Errors
+///
+/// Returns an error if the kind/source pair is not one we publish, or if there is no video
+/// pipeline running for it.
+#[allow(clippy::needless_pass_by_value)]
+#[command]
+pub fn set_video_bitrate(
+    media_state: State<'_, MediaState>,
+    kind: String,
+    source: String,
+    max_bitrates_bps: Vec<Option<u32>>,
+) -> Result<Option<u32>, String> {
+    let key = super::livekit::track_key(&kind, &source)?;
+
+    let Some(requested_kbps) = requested_bitrate_kbps(&max_bitrates_bps) else {
+        tracing::info!(
+            track = %key,
+            encodings = max_bitrates_bps.len(),
+            "setParameters carried no maxBitrate on any encoding; leaving the encoder as is"
+        );
+        return Ok(None);
+    };
+
+    if max_bitrates_bps.len() > 1 {
+        tracing::info!(
+            track = %key,
+            encodings = max_bitrates_bps.len(),
+            "setParameters supplied multiple encodings; simulcast is not implemented here, \
+             applying only an aggregate bitrate cap"
+        );
+    }
+
+    let (kbps, clamped) = clamp_bitrate_kbps(requested_kbps);
+    if clamped {
+        tracing::warn!(
+            track = %key,
+            requested_kbps,
+            applied_kbps = kbps,
+            min_kbps = MIN_BITRATE_KBPS,
+            max_kbps = MAX_BITRATE_KBPS,
+            "setParameters requested a bitrate outside the sane range; clamped"
+        );
+    }
+
+    // Same lock-then-clone-then-release shape as `set_capture_muted`: the flag is taken out
+    // from under the guard so the pipeline map is not held while anything else happens, and
+    // this runs on the IPC thread while the capture loop takes the same map.
+    let flag = {
+        let pipelines = media_state
+            .pipelines
+            .lock()
+            .map_err(|_| "pipeline map lock poisoned".to_owned())?;
+        pipelines.get(&key).and_then(PipelineHandle::bitrate_override).cloned()
+    };
+    let Some(flag) = flag else {
+        return Err(format!("no video pipeline is running for {key}"));
+    };
+    flag.store(kbps, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(track = %key, kbps, "video bitrate changed via setParameters");
+    Ok(Some(kbps))
 }
 
 /// The index inside an `audio-input-{n}` device id, which is cpal's own enumeration order.
@@ -634,7 +738,122 @@ fn chosen_microphone(constraints: &MediaConstraints) -> Option<usize> {
         .and_then(microphone_index)
 }
 
+/// Start a camera pipeline for one `getUserMedia` video request, returning its track id.
+///
+/// Split out of `get_user_media`, which handles both the audio and video halves of one
+/// request in a single function -- camera startup was most of what made it too long to take
+/// in as one piece, the same reasoning `start_audio_pipeline` already applies to the audio
+/// half.
+///
+/// # Errors
+///
+/// Returns a description if the shared video frame buffer cannot be reached.
+fn start_camera_pipeline(
+    webrtc_state: &WebRtcState,
+    media_state: &MediaState,
+    video_constraints: &elementium_types::VideoConstraints,
+) -> Result<TrackId, String> {
+    let track_id = TrackId(format!("video-{}", generate_track_id()));
+    tracing::info!(track_id = %track_id, "Starting video capture");
 
+    // Get the shared video frame buffer from the WebRTC engine
+    let video_frames = {
+        let engine = webrtc_state.0.lock_str()?;
+        engine.video_frames.clone()
+    };
+
+    let (had_previous, inherited_connection) = take_over_camera_pipeline(media_state, &track_id);
+
+    let req_node_id = camera_node_id(video_constraints.device_id.as_deref());
+    let req_width = video_constraints.width;
+    let req_height = video_constraints.height;
+    // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
+    // Asking for what will be consumed means the surplus is never decoded.
+    let req_fps = video_constraints
+        .frame_rate
+        .map_or_else(max_encode_fps_u32, requested_fps);
+
+    let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
+        Arc::new(Mutex::new(inherited_connection));
+    let encode_tx_clone = encode_tx.clone();
+    let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let keyframe_requested_clone = keyframe_requested.clone();
+    let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
+    let active_codec_clone = active_codec.clone();
+    let bitrate_override = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let bitrate_override_clone = Arc::clone(&bitrate_override);
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let muted_clone = Arc::clone(&muted);
+    let tid = track_id.0.clone();
+
+    // Start the camera pipeline on a background thread, inheriting the
+    // call's correlation span so every event it emits carries the same
+    // correlation_id.
+    // If we just stopped a previous pipeline, delay to let the V4L2
+    // device release (avoids EBUSY on Linux).
+    // Labelled the same way a share's pipeline is, and for the same reason: the camera
+    // path's capture events come from `elementium-media`, which has no idea which
+    // track it is feeding.
+    let camera_span = tracing::info_span!(
+        parent: tracing::Span::current(),
+        "capture",
+        track_id = %track_id,
+        key = %MediaTrackKey::camera()
+    );
+    let controls = VideoPipelineControls {
+        keyframe_requested: keyframe_requested_clone,
+        active_codec: active_codec_clone,
+        bitrate_override: bitrate_override_clone,
+    };
+    std::thread::spawn(move || {
+        let _guard = camera_span.enter();
+        if had_previous {
+            tracing::info!("Waiting for previous camera to release device...");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        video_pipeline_loop(
+            MediaTrackKey::camera(),
+            &muted_clone,
+            &tid,
+            &VideoCaptureSource::Camera {
+                node_id: req_node_id,
+                width: req_width,
+                height: req_height,
+                fps: req_fps,
+            },
+            &video_frames,
+            &encode_tx_clone,
+            &controls,
+            &stop_rx,
+        );
+    });
+
+    // Store the camera pipeline handle
+    if let Ok(mut pipelines) = media_state.pipelines.lock() {
+        pipelines.insert(
+            MediaTrackKey::camera(),
+            PipelineHandle {
+                key: MediaTrackKey::camera(),
+                track_id: track_id.0.clone(),
+                stop_tx,
+                encode_tx,
+                muted,
+                extras: PipelineExtras::Video {
+                    keyframe_requested,
+                    active_codec,
+                    bitrate_override,
+                },
+            },
+        );
+    }
+
+    if let Ok(mut tracks) = media_state.active_tracks.lock() {
+        tracks.push(track_id.clone());
+    }
+
+    Ok(track_id)
+}
 
 #[command]
 pub async fn get_user_media(
@@ -673,98 +892,7 @@ pub async fn get_user_media(
     }
 
     if let Some(ref video_constraints) = constraints.video {
-        let track_id = TrackId(format!("video-{}", generate_track_id()));
-        tracing::info!(track_id = %track_id, "Starting video capture");
-
-        // Get the shared video frame buffer from the WebRTC engine
-        let video_frames = {
-            let engine = webrtc_state.0.lock_str()?;
-            engine.video_frames.clone()
-        };
-
-        let (had_previous, inherited_connection) = take_over_camera_pipeline(&media_state, &track_id);
-
-        let req_node_id = camera_node_id(video_constraints.device_id.as_deref());
-        let req_width = video_constraints.width;
-        let req_height = video_constraints.height;
-        // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
-        // Asking for what will be consumed means the surplus is never decoded.
-        let req_fps = video_constraints
-            .frame_rate
-            .map_or_else(max_encode_fps_u32, requested_fps);
-
-        let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
-            Arc::new(Mutex::new(inherited_connection));
-        let encode_tx_clone = encode_tx.clone();
-        let keyframe_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let keyframe_requested_clone = keyframe_requested.clone();
-        let active_codec = Arc::new(ActiveCodec::new(DEFAULT_VIDEO_CODEC));
-        let active_codec_clone = active_codec.clone();
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let muted_clone = Arc::clone(&muted);
-        let tid = track_id.0.clone();
-
-        // Start the camera pipeline on a background thread, inheriting the
-        // call's correlation span so every event it emits carries the same
-        // correlation_id.
-        // If we just stopped a previous pipeline, delay to let the V4L2
-        // device release (avoids EBUSY on Linux).
-        // Labelled the same way a share's pipeline is, and for the same reason: the camera
-        // path's capture events come from `elementium-media`, which has no idea which
-        // track it is feeding.
-        let camera_span = tracing::info_span!(
-            parent: tracing::Span::current(),
-            "capture",
-            track_id = %track_id,
-            key = %MediaTrackKey::camera()
-        );
-        std::thread::spawn(move || {
-            let _guard = camera_span.enter();
-            if had_previous {
-                tracing::info!("Waiting for previous camera to release device...");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            video_pipeline_loop(
-                MediaTrackKey::camera(),
-                &muted_clone,
-                &tid,
-                &VideoCaptureSource::Camera {
-                    node_id: req_node_id,
-                    width: req_width,
-                    height: req_height,
-                    fps: req_fps,
-                },
-                &video_frames,
-                &encode_tx_clone,
-                &keyframe_requested_clone,
-                &active_codec_clone,
-                &stop_rx,
-            );
-        });
-
-        // Store the camera pipeline handle
-        if let Ok(mut pipelines) = media_state.pipelines.lock() {
-            pipelines.insert(
-                MediaTrackKey::camera(),
-                PipelineHandle {
-                    key: MediaTrackKey::camera(),
-                    track_id: track_id.0.clone(),
-                    stop_tx,
-                    encode_tx,
-                    muted,
-                    extras: PipelineExtras::Video {
-                        keyframe_requested,
-                        active_codec,
-                    },
-                },
-            );
-        }
-
-        if let Ok(mut tracks) = media_state.active_tracks.lock() {
-            tracks.push(track_id.clone());
-        }
-        track_ids.push(track_id);
+        track_ids.push(start_camera_pipeline(&webrtc_state, &media_state, video_constraints)?);
     }
 
     Ok(track_ids)
@@ -1258,6 +1386,17 @@ fn min_encode_interval() -> std::time::Duration {
     std::time::Duration::from_nanos(1_000_000_000_u64.saturating_div(max_encode_fps().max(1)))
 }
 
+/// Sane bounds for any bitrate this app hands an encoder, whether picked automatically by
+/// [`bitrate_for`] or requested later through `setParameters`.
+///
+/// 300 is the floor a tiny frame still needs so the picture is not pure noise. 4000 is the
+/// ceiling because [`bitrate_for`] already lands at roughly 2.7Mbps for 720p -- the highest
+/// resolution this app captures -- under its own ~0.1-bit-per-pixel-per-frame formula, so
+/// 4Mbps leaves headroom for a generous request without accepting a rate this app has never
+/// had reason to send.
+const MIN_BITRATE_KBPS: u32 = 300;
+const MAX_BITRATE_KBPS: u32 = 4000;
+
 /// Pick a VP8 bitrate for a given frame size.
 ///
 /// A fixed 500kbps was used for every resolution. At 1280x720 that is roughly a tenth of
@@ -1271,7 +1410,39 @@ fn bitrate_for(width: u32, height: u32) -> u32 {
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     let bits_per_second = pixels.saturating_mul(max_encode_fps()).saturating_div(10);
     let kbps = bits_per_second.saturating_div(1000);
-    u32::try_from(kbps.clamp(300, 4000)).unwrap_or(2000)
+    u32::try_from(kbps.clamp(u64::from(MIN_BITRATE_KBPS), u64::from(MAX_BITRATE_KBPS)))
+        .unwrap_or(2000)
+}
+
+/// The policy behind `RTCRtpSender.setParameters`: the maximum `maxBitrate` across the
+/// supplied encodings, converted from bits per second to kbps.
+///
+/// A pure function over already-parsed values, not the encodings themselves, so it can be
+/// unit-tested without a `State<MediaState>` or a running pipeline. `None` for any encoding
+/// means it carried no `maxBitrate` and contributes nothing -- per policy, an encoding with
+/// no cap is not a request to remove one. `None` overall (every encoding lacked a cap, or
+/// there were no encodings) means "change nothing", which the caller must not mistake for
+/// "set it to zero".
+///
+/// livekit-client does not do simulcast in this app -- there is no dynamic resize path to
+/// drive extra layers -- so more than one encoding collapses to a single aggregate cap
+/// rather than being rejected; the caller logs that once.
+fn requested_bitrate_kbps(max_bitrates_bps: &[Option<u32>]) -> Option<u32> {
+    max_bitrates_bps
+        .iter()
+        .filter_map(|maybe_bps| *maybe_bps)
+        .max()
+        .map(|bps| bps.saturating_div(1000))
+}
+
+/// Clamp a requested bitrate to [`MIN_BITRATE_KBPS`]..=[`MAX_BITRATE_KBPS`], reporting
+/// whether clamping changed it.
+///
+/// Policy 5: `setParameters` is caller-supplied input, and a caller (or a bug in one) asking
+/// for 0 or a few hundred megabits must not reach the encoder unfiltered.
+fn clamp_bitrate_kbps(kbps: u32) -> (u32, bool) {
+    let clamped = kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+    (clamped, clamped != kbps)
 }
 
 /// What a video pipeline is capturing, and what it needs to open it.
@@ -1502,6 +1673,19 @@ fn report_capture_failure(reason: &dyn std::fmt::Display, track_id: &str, source
     }
 }
 
+/// Live video-pipeline state that changes while capture keeps running -- the SFU's keyframe
+/// requests, its codec choice, and now a caller's `setParameters` bitrate.
+///
+/// Bundled into one struct, the same reasoning as `PipelineExtras::Video` itself: each field
+/// is a level rather than an event (only the latest value ever matters), and grouping them
+/// keeps `video_pipeline_loop` and `encode_and_send_video_frame` inside the workspace's
+/// seven-argument limit as this list grows, rather than reaching for another `#[allow]`.
+struct VideoPipelineControls {
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    active_codec: Arc<ActiveCodec>,
+    bitrate_override: Arc<std::sync::atomic::AtomicU32>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn video_pipeline_loop(
     key: MediaTrackKey,
@@ -1510,20 +1694,19 @@ fn video_pipeline_loop(
     source: &VideoCaptureSource,
     video_frames: &VideoFrameBuffer,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
-    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
-    active_codec: &Arc<ActiveCodec>,
+    controls: &VideoPipelineControls,
     stop_rx: &std::sync::mpsc::Receiver<()>,
 ) {
     // Which format is worth asking the source for depends on where the frames will be
     // encoded, and the answer is not a small difference: MJPEG is the most expensive format
     // on offer when the CPU decodes it and the cheapest when the GPU does.
-    let target = negotiated_target(source, active_codec);
+    let target = negotiated_target(source, &controls.active_codec);
     // Once per pipeline, so "is the GPU doing this" is answerable by reading a log rather
     // than by re-deriving the selection policy from the codec, the geometry and what the
     // driver reported. The three fields are what the policy actually decided on, and
     // `capture_preference` is what it will ask the source for as a result.
     tracing::info!(
-        codec = active_codec.get().sdp_name(),
+        codec = controls.active_codec.get().sdp_name(),
         backend = ?target.backend,
         layout = ?target.layout,
         gpu_jpeg_decode = target.gpu_jpeg_decode,
@@ -1557,6 +1740,7 @@ fn video_pipeline_loop(
     let mut out = VideoOutState {
         keyframe: KeyframeState::new(),
         stats: OutboundVideoStats::default(),
+        applied_bitrate_kbps: 0,
     };
     let mut frame_count: u64 = 0;
     let mut keyframe = KeyframeState::new();
@@ -1584,7 +1768,7 @@ fn video_pipeline_loop(
             if dropped_because_muted(muted) {
                 continue;
             }
-            out.count_captured(track_id, active_codec.get());
+            out.count_captured(track_id, controls.active_codec.get());
             if frame_count <= 3 || frame_count.is_multiple_of(100) {
                 // Named by source, not "Camera": this loop serves the screen share too, and
                 // this is the one line that says frames are flowing. Calling a share's
@@ -1637,8 +1821,7 @@ fn video_pipeline_loop(
                     &frame,
                     &mut encoder,
                     &mut out,
-                    keyframe_requested,
-                    active_codec,
+                    controls,
                     encode_tx,
                 );
             }
@@ -1923,6 +2106,12 @@ struct PipelineId<'a> {
 struct VideoOutState {
     keyframe: KeyframeState,
     stats: OutboundVideoStats,
+    /// The bitrate last pushed into *this* encoder instance, in kbps. `0` means "not applied
+    /// yet". Tracked separately from `PipelineExtras::Video::bitrate_override` -- that is the
+    /// caller's request, this is what the current encoder was actually told -- so a fresh
+    /// encoder (which starts from `bitrate_for`'s default, not the override) picks the
+    /// override back up instead of `apply_bitrate_override` mistaking it for unchanged.
+    applied_bitrate_kbps: u32,
 }
 
 impl VideoOutState {
@@ -1933,6 +2122,42 @@ impl VideoOutState {
     }
 }
 
+/// Push a `setParameters`-requested bitrate into the encoder if it is not already applied.
+///
+/// Polled once per encoded frame rather than acted on the moment `setParameters` runs,
+/// because the encoder lives on this thread and nothing else may touch it -- the same
+/// level-not-event handling as `keyframe_requested` and `active_codec`. An atomic load is
+/// cheap at the encoder's own rate; a channel would need its own draining for what is only
+/// ever "the latest requested value".
+fn apply_bitrate_override<E: VideoEncoder>(
+    enc: &mut E,
+    bitrate_override: &Arc<std::sync::atomic::AtomicU32>,
+    applied: &mut u32,
+    track_id: &str,
+) {
+    let requested = bitrate_override.load(std::sync::atomic::Ordering::Relaxed);
+    if requested == 0 || requested == *applied {
+        return;
+    }
+    match enc.set_bitrate(requested) {
+        Ok(()) => {
+            *applied = requested;
+            tracing::info!(track_id, kbps = requested, "applied setParameters bitrate to encoder");
+        }
+        Err(e) => {
+            // Recorded as applied even though it was not, so a rejecting encoder reports
+            // once for this value instead of once per frame -- thirty errors a second is
+            // how a log stops being read. A later, different request still retries, which
+            // is the case worth retrying.
+            *applied = requested;
+            tracing::error!(
+                track_id,
+                kbps = requested,
+                "encoder rejected the bitrate requested via setParameters: {e}"
+            );
+        }
+    }
+}
 
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
 fn encode_and_send_video_frame(
@@ -1940,13 +2165,19 @@ fn encode_and_send_video_frame(
     frame: &elementium_media::captured_frame::CapturedFrame,
     encoder: &mut Option<NegotiatedEncoder>,
     out: &mut VideoOutState,
-    keyframe_requested: &Arc<std::sync::atomic::AtomicBool>,
-    active_codec: &Arc<ActiveCodec>,
+    controls: &VideoPipelineControls,
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
-    let wanted = active_codec.get();
+    let wanted = controls.active_codec.get();
     let existed = encoder.as_ref().is_some_and(|e| e.codec() == wanted);
     ensure_encoder(encoder, frame.width(), frame.height(), &mut out.keyframe, wanted);
+    if !existed {
+        // A freshly built encoder starts from `bitrate_for`'s default, not the override, so
+        // the tracked "already applied" value has to forget whatever the previous encoder
+        // instance had -- otherwise a same-numbered override looks unchanged and never
+        // reaches the new encoder.
+        out.applied_bitrate_kbps = 0;
+    }
 
     let Some(enc) = encoder.as_mut() else {
         return;
@@ -1954,8 +2185,14 @@ fn encode_and_send_video_frame(
     // A freshly built encoder emits a keyframe on its own, so only ask when it is one we
     // were already using.
     if existed {
-        maybe_request_keyframe(id.track_id, enc, &mut out.keyframe, keyframe_requested);
+        maybe_request_keyframe(id.track_id, enc, &mut out.keyframe, &controls.keyframe_requested);
     }
+    apply_bitrate_override(
+        enc,
+        &controls.bitrate_override,
+        &mut out.applied_bitrate_kbps,
+        id.track_id,
+    );
     if encode_and_send(id.key, enc, frame, encode_tx, &mut out.stats) {
         out.keyframe.watch.observed_keyframe();
     }
@@ -2859,6 +3096,72 @@ mod video_bitrate_tests {
             )
             .unwrap_or(0);
         assert_eq!(per_second, MAX_ENCODE_FPS);
+    }
+}
+
+#[cfg(test)]
+mod set_parameters_policy_tests {
+    use super::{MAX_BITRATE_KBPS, MIN_BITRATE_KBPS, clamp_bitrate_kbps, requested_bitrate_kbps};
+
+    /// The regression this whole feature exists to fix: `setParameters` used to resolve
+    /// successfully and change nothing. Empty input is the shape a caller who set no
+    /// `maxBitrate` at all produces, and it must say "change nothing" rather than "set it to
+    /// zero" -- the two look identical to an encoder that just gets a `u32`.
+    #[test]
+    fn empty_input_changes_nothing() {
+        assert_eq!(requested_bitrate_kbps(&[]), None);
+    }
+
+    /// An encoding with no `maxBitrate` contributes nothing to the aggregate -- it is not a
+    /// request to remove an existing cap.
+    #[test]
+    fn missing_values_are_ignored() {
+        assert_eq!(requested_bitrate_kbps(&[None, None]), None);
+    }
+
+    /// livekit-client's own congestion control lowers `maxBitrate` under a bad link and
+    /// raises it as the link recovers. Only the highest of what was asked for should reach
+    /// the encoder -- the maximum, not the first, the last, or an average.
+    #[test]
+    fn the_maximum_wins() {
+        assert_eq!(
+            requested_bitrate_kbps(&[Some(500_000), Some(2_000_000), Some(1_000_000)]),
+            Some(2000),
+            "2,000,000 bps is 2000 kbps, and it is the largest of the three"
+        );
+    }
+
+    /// This app does not implement simulcast, so several encodings collapse to one aggregate
+    /// cap rather than being rejected -- the maximum still wins even when some entries carry
+    /// no cap at all.
+    #[test]
+    fn missing_values_do_not_prevent_a_real_one_from_winning() {
+        assert_eq!(requested_bitrate_kbps(&[None, Some(1_500_000), None]), Some(1500));
+    }
+
+    /// bps to kbps is a division, not a re-derivation of the value -- a caller asking for
+    /// 999 bps must not round up to a whole kbps that was never requested.
+    #[test]
+    fn bits_per_second_convert_down_to_kbps() {
+        assert_eq!(requested_bitrate_kbps(&[Some(999)]), Some(0));
+        assert_eq!(requested_bitrate_kbps(&[Some(1_000)]), Some(1));
+    }
+
+    /// A value already inside the range must pass through unchanged and unflagged --
+    /// clamping every request, even sane ones, would make the "was this clamped" signal
+    /// meaningless.
+    #[test]
+    fn a_sane_value_is_not_clamped() {
+        assert_eq!(clamp_bitrate_kbps(2000), (2000, false));
+    }
+
+    /// The two ends of the range this feature exists to enforce: policy 5 says a caller's
+    /// request must not reach the encoder unfiltered, in either direction.
+    #[test]
+    fn clamping_applies_at_both_ends() {
+        assert_eq!(clamp_bitrate_kbps(0), (MIN_BITRATE_KBPS, true));
+        assert_eq!(clamp_bitrate_kbps(50), (MIN_BITRATE_KBPS, true));
+        assert_eq!(clamp_bitrate_kbps(50_000), (MAX_BITRATE_KBPS, true));
     }
 }
 

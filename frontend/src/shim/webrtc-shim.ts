@@ -257,6 +257,33 @@ async function getTransportStatsReport(pcId: string | null): Promise<RTCStatsRep
 }
 
 /**
+ * Fields `setParameters` accepts but this app cannot act on, named so a caller relying on
+ * them fails loudly instead of believing they took effect.
+ *
+ * `scaleResolutionDownBy` asks for a smaller encode than the capture resolution and
+ * `degradationPreference` says how to trade resolution against frame rate under load --
+ * both require a dynamic resize path between capture and the encoder, and there is none.
+ * Silently accepting them is exactly the bug this module exists to remove: `setParameters`
+ * resolving successfully while doing nothing.
+ */
+function reportUnsupportedSetParameters(params: RTCRtpSendParameters): void {
+  (params.encodings ?? []).forEach((encoding, index) => {
+    if (encoding.scaleResolutionDownBy !== undefined && encoding.scaleResolutionDownBy !== 1) {
+      console.warn(
+        `[Elementium] setParameters asked for scaleResolutionDownBy=${encoding.scaleResolutionDownBy} ` +
+          `on encoding ${index}; there is no dynamic resize path, so this is not honoured`,
+      );
+    }
+  });
+  if (params.degradationPreference !== undefined) {
+    console.warn(
+      `[Elementium] setParameters asked for degradationPreference=${params.degradationPreference}; ` +
+        "not honoured, there is no dynamic resize path to trade resolution against frame rate",
+    );
+  }
+}
+
+/**
  * Shimmed RTCPeerConnection that delegates to the Rust backend.
  *
  * Extends EventTarget for proper event dispatching. Element Web's
@@ -928,6 +955,16 @@ export class ElementiumRTCPeerConnection extends EventTarget {
 
     const mid = String(this._transceivers.length);
 
+    // What `getParameters` returns until `setParameters` is called at least once. Mutated,
+    // not recomputed, once a caller calls `setParameters` -- see `getParameters` below.
+    let lastSetParameters: RTCRtpSendParameters = {
+      codecs: [],
+      headerExtensions: [],
+      rtcp: { cname: "", reducedSize: false },
+      encodings: init?.sendEncodings ?? [{}],
+      transactionId: "",
+    };
+
     const sender = {
       track,
       dtmf: null,
@@ -952,14 +989,48 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       replaceTrack: async (newTrack: MediaStreamTrack | null) => {
         (sender as unknown as Record<string, unknown>).track = newTrack;
       },
-      getParameters: () => ({
-        codecs: [],
-        headerExtensions: [],
-        rtcp: { cname: "", reducedSize: false },
-        encodings: init?.sendEncodings ?? [{}],
-        transactionId: "",
-      }),
-      setParameters: async (params: RTCRtpSendParameters) => params,
+      // What `getParameters` returns after a `setParameters` call, so a caller reading back
+      // its own change sees it -- rather than the encodings frozen here at creation, which
+      // is what made every bandwidth adaptation `livekit-client` believed it made vanish.
+      getParameters: () => lastSetParameters,
+      /**
+       * Forward the requested video bitrate to the pipeline actually encoding this track.
+       *
+       * `setParameters` used to resolve successfully and store nothing: `getParameters` kept
+       * returning the encodings frozen here at `addTransceiver` time, so congestion control
+       * in `livekit-client` believed every adaptation it made had taken effect while the
+       * encoder never heard about any of them. Video that degraded under a bad link then
+       * never recovered.
+       *
+       * Only `maxBitrate` is applied, as the maximum across encodings converted to kbps --
+       * simulcast is not implemented, so more than one encoding collapses to one aggregate
+       * cap rather than driving separate layers. `scaleResolutionDownBy` and
+       * `degradationPreference` cannot be honoured at all; `reportUnsupportedSetParameters`
+       * names what was asked for rather than dropping it silently.
+       */
+      setParameters: async (params: RTCRtpSendParameters) => {
+        lastSetParameters = params;
+        reportUnsupportedSetParameters(params);
+
+        // The current track, not the one captured when this transceiver was created:
+        // `replaceTrack` can point this sender at a different track (and therefore a
+        // different backend pipeline) since then.
+        const currentTrack = (sender as unknown as Record<string, unknown>).track as
+          | MediaStreamTrack
+          | null;
+        const trackSource = currentTrack
+          ? (currentTrack as unknown as Record<string, unknown>)[TRACK_SOURCE]
+          : undefined;
+        if (kind === "video" && typeof trackSource === "string") {
+          const maxBitratesBps = (params.encodings ?? []).map((encoding) => encoding.maxBitrate ?? null);
+          try {
+            await invoke("set_video_bitrate", { kind, source: trackSource, maxBitratesBps });
+          } catch (e) {
+            console.error(`[Elementium] set_video_bitrate(${kind}/${trackSource}) failed:`, e);
+          }
+        }
+        return params;
+      },
       getStats: async () => new Map() as unknown as RTCStatsReport,
       setStreams: () => {},
     } as unknown as RTCRtpSender;

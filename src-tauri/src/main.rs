@@ -191,6 +191,7 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         commands::livekit::livekit_publish_track,
         commands::livekit::livekit_set_track_muted,
         commands::media_devices::set_capture_muted,
+        commands::media_devices::set_video_bitrate,
         commands::livekit::livekit_disconnect,
         commands::livekit::livekit_set_subscriber_volume,
         commands::secrets::secret_get,
