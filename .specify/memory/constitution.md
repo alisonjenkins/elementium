@@ -9,11 +9,20 @@ one variant per distinct thing that can fail, and each variant carries the under
 as a source.
 
 A failure surface is usually a single function. It may be shared by two or more only when
-*every* caller handles *every* variant identically — `write_audio` and `write_video` fail in
-the same ways and each caller drops the frame and continues, so one enum serves both.
-Anything less than identical handling means separate enums. This wording replaces a stricter
-"one enum per function", which manufactured the near-duplicate code the principle exists to
-prevent.
+both of these hold:
+
+- *every* caller handles *every* variant identically — `write_audio` and `write_video` fail
+  in the same ways and each caller drops the frame and continues; and
+- **the error still names which operation produced it.** A shared enum that does not is a
+  step backwards from a string, because `RTP write failed` in a log no longer says whether
+  the audio or the video path failed, and the two have entirely different consequences.
+  Carry the operation as a field — a small `enum` of the operations that share the surface,
+  rendered in the `Display` — so the type stays shared while the origin stays legible.
+
+Anything less means separate enums. This replaces a stricter "one enum per function", which
+manufactured the near-duplicate code the principle exists to prevent — but the relaxation is
+conditional, and the second condition above was added after the first attempt at sharing
+lost exactly the information a reader would need.
 
 - **No stringly errors.** `ok_or("something went wrong")`, `map_err(|e| format!(...))` and
   `Box<dyn Error>` at a fallible boundary all destroy the cause. A caller cannot match on a
@@ -112,4 +121,4 @@ rewritten or the principle is amended deliberately — not waived in passing.
 Amendments are made when a failure teaches something general. Each principle here was
 written after it was paid for.
 
-**Version**: 1.1.0 | **Ratified**: 2026-08-09 | **Last Amended**: 2026-08-09
+**Version**: 1.2.0 | **Ratified**: 2026-08-09 | **Last Amended**: 2026-08-09
