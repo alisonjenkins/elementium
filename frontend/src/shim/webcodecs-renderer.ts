@@ -145,6 +145,19 @@ export function startWebCodecsRender(
         // decoder within a second or two.
         frame.close();
       }
+      // Progress while it is happening, not only a total when it stops.
+      //
+      // Until now the only line about a remote track's decoding was written in `finally`,
+      // when the stream ended -- so during a call, "we are decoding this person at thirty a
+      // second" and "we have decoded nothing since the first keyframe" looked identical, and
+      // both are faults that happened. Every thirtieth frame is about once a second per
+      // track; the counters are cumulative so a reader (or a test) can measure a rate
+      // between any two lines.
+      if (decoded % 30 === 0) {
+        console.log(
+          `[Elementium] WebCodecs render progress ${trackId}: decoded=${decoded} errors=${errors}`,
+        );
+      }
     },
     error: (e) => {
       errors += 1;

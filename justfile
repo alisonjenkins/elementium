@@ -47,8 +47,15 @@ call-peers:
 #
 # Logs land in /tmp/elementium.log as usual.
 app-join:
-    cd test-env && ./configure-synapse.sh
-    cd test-env && docker compose up -d
+    # Skipped when the caller has already established the stack -- `just test-app-call` has,
+    # through Playwright's global setup, which also decides whether it is allowed to tear the
+    # stack down afterwards. Doing it again from here is not the no-op it looks like: the
+    # containers have fixed names, so a `docker compose up -d` run from a different directory
+    # (a worktree, say) recreates them against *that* directory's empty bind mount and takes
+    # the homeserver down mid-test. What the test then sees is the homeserver answering HTML
+    # 502s to a login, which reads as anything but "something restarted synapse".
+    [ "${ELEMENTIUM_STACK_READY:-0}" = "1" ] || (cd test-env && ./configure-synapse.sh)
+    [ "${ELEMENTIUM_STACK_READY:-0}" = "1" ] || (cd test-env && docker compose up -d)
     # Only if there is no fixture yet. `provision.sh` creates a *new* room every run, so
     # re-provisioning here would put the app in a different room from the participants
     # `just call-peers` already has in a call -- which looks exactly like a call that does
@@ -83,6 +90,29 @@ app-join:
         GDK_BACKEND=x11 WAYLAND_DISPLAY= \
         nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
             cargo tauri dev
+
+# A whole call, with Elementium in it, asserted on by nobody.
+#
+# Every fault so far was found by the maintainer joining a call with real friends and
+# describing what they saw. This is that evening as a command: it brings up the local
+# MatrixRTC stack if it is not already running, puts a real Element Web participant in a
+# call, has Elementium join it by itself on a virtual display, measures what each end
+# actually decodes, and stops what it started. Stacks it did not start are left alone.
+#
+# THIS USES THE CAMERA AND MICROPHONE, for the reason `just app-join` gives: Element Call
+# takes both in its lobby, before any control to decline them exists. The GUI itself is
+# headless -- Xvfb, via `just app-join`.
+#
+# The application is built first, deliberately: inside the test that build would be
+# indistinguishable from a call taking twelve minutes to connect.
+#
+# All four assertions pass as of 2026-08-09, including the late-joiner one that was written
+# expecting to fail -- see the comment on it in app-call.spec.ts for what that measured and
+# what it does *not* cover.
+test-app-call:
+    cargo build -p elementium
+    cd frontend && ELEMENTIUM_APP_CALL=1 pnpm exec playwright test \
+        tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
 
 # Move to an Element Web release, and find out whether we still work on it.
 #

@@ -121,6 +121,28 @@ just dev-test-env    # in another terminal; log in as tester1 and join
 While it holds, each participant reports what it can hear and whose keys it holds, so
 "did Elementium's key ever arrive" is answerable from the other side.
 
+## The same thing, with nobody watching
+
+```sh
+just test-app-call
+```
+
+One command: stack up if it is not already, a real Element Web participant in a call,
+Elementium joining it by itself under Xvfb, and assertions on what each end actually
+decodes — `frontend/tests/matrixrtc/app-call.spec.ts`. A stack it did not start is left
+running, as everywhere else here.
+
+It needs a camera and a microphone on the host. Elementium publishes real capture; there
+is no fake device on the native path the way Chromium has one, so this cannot run on a
+machine with neither, and the webcam light comes on while it runs. Only the GUI is
+headless.
+
+Its last test — whether a participant who joins *after* Elementium can decrypt its media —
+was written expecting to fail and does not. Element Call, not Elementium, distributes and
+rotates the key here, and Elementium adopts each one it is handed. The suspected
+"distributed once at join" fault therefore belongs to the native LiveKit path, which this
+test does not exercise; the comment on the test says so.
+
 ## Things that were not obvious, part two
 
 Everything below stopped a call from happening at all, and none of it pointed at

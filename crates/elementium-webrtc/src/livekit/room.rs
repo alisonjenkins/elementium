@@ -1263,6 +1263,75 @@ fn decode_and_play_subscriber_audio(
     decoded_audio_count
 }
 
+/// Decode one inbound video packet into the frame buffer the webview draws from, counting
+/// what happened to it.
+///
+/// The counting is the new part, and it is the point. Inbound audio has had a throttled
+/// counter for months; inbound video had none, so between "packets are arriving" and "there
+/// is a picture" the log said nothing at all. Twice in one evening a remote participant was
+/// invisible, and both times "we decode nothing" and "we decode fine and draw nowhere" read
+/// identically from the outside.
+///
+/// `tally` is (frames decoded, packets that produced nothing) for this track. Failures are
+/// counted separately rather than ignored because a decoder handed the wrong codec fails on
+/// every packet, and that must not look like a track nobody is publishing on.
+fn decode_and_show_subscriber_video(
+    mid: &str,
+    video_data: &elementium_types::PlaintextMedia,
+    codec: elementium_codec::VideoCodec,
+    video_decoders: &mut HashMap<
+        (String, elementium_codec::VideoCodec),
+        elementium_codec::NegotiatedDecoder,
+    >,
+    video_frames: &VideoFrameBuffer,
+    video_track_key: &str,
+    tally: &mut (u64, u64),
+) {
+    let decoder = match video_decoders.entry((mid.to_string(), codec)) {
+        std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            elementium_codec::NegotiatedDecoder::new(codec)
+                .ok()
+                .map(|d| v.insert(d))
+        }
+    };
+
+    match decoder.map(|d| elementium_codec::VideoDecoder::decode(d, video_data)) {
+        Some(Ok(frames)) => {
+            for i420_frame in frames {
+                tally.0 = tally.0.saturating_add(1);
+                let rgba = elementium_codec::i420_to_rgba(&i420_frame);
+                // Only the first frame's insert needs to own `video_track_key`; every later
+                // frame overwrites the existing entry in place.
+                if let Ok(mut buf) = video_frames.lock() {
+                    if let Some(existing) = buf.get_mut(video_track_key) {
+                        *existing = rgba;
+                    } else {
+                        buf.insert(video_track_key.to_string(), rgba);
+                    }
+                }
+            }
+        }
+        // No decoder for this codec, or a packet this decoder could not use. Both are
+        // "nothing to show", and both are counted so the log can tell them from silence.
+        _ => tally.1 = tally.1.saturating_add(1),
+    }
+
+    // Every 30th frame is about once a second on a 30fps track: often enough to measure a
+    // rate from, rare enough not to bury the rest of the log.
+    let report =
+        (tally.0 > 0 && tally.0.is_multiple_of(30)) || (tally.1 > 0 && tally.1.is_multiple_of(100));
+    if report {
+        tracing::info!(
+            mid,
+            ?codec,
+            frames_decoded = tally.0,
+            decode_failures = tally.1,
+            "Inbound video frame decoded"
+        );
+    }
+}
+
 fn process_transport_events(
     event_rx: &Arc<Mutex<mpsc::Receiver<TransportEvent>>>,
     video_frames: &VideoFrameBuffer,
@@ -1299,6 +1368,14 @@ fn process_transport_events(
         "Subscriber audio playback pipeline initialized"
     );
     let mut decoded_audio_count: u64 = 0;
+    // Inbound video had no counter at all, while inbound audio has had one for months. Twice
+    // in one evening a remote participant was invisible, and both times the log could say
+    // only that a track had been subscribed -- there was no line anywhere between "packets
+    // arriving" and "a picture on screen", so "we decode nothing" and "we decode fine and
+    // draw nowhere" read identically. Counted per track and reported throttled, like the
+    // audio path, and failures counted separately: a decoder handed the wrong codec fails
+    // every frame and would otherwise look exactly like a track that never arrived.
+    let mut decoded_video: HashMap<String, (u64, u64)> = HashMap::new();
 
     loop {
         let event = {
@@ -1339,31 +1416,15 @@ fn process_transport_events(
                 data: video_data,
                 codec,
             })) => {
-                let decoder = match video_decoders.entry((mid.clone(), codec)) {
-                    std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        elementium_codec::NegotiatedDecoder::new(codec)
-                            .ok()
-                            .map(|d| v.insert(d))
-                    }
-                };
-                if let Some(decoder) = decoder
-                    && let Ok(frames) =
-                        elementium_codec::VideoDecoder::decode(decoder, &video_data)
-                {
-                    for i420_frame in frames {
-                        let rgba = elementium_codec::i420_to_rgba(&i420_frame);
-                        // Only the first frame's insert needs to clone `video_track_key`;
-                        // every later frame overwrites the existing entry in place.
-                        if let Ok(mut buf) = video_frames.lock() {
-                            if let Some(existing) = buf.get_mut(&video_track_key) {
-                                *existing = rgba;
-                            } else {
-                                buf.insert(video_track_key.clone(), rgba);
-                            }
-                        }
-                    }
-                }
+                decode_and_show_subscriber_video(
+                    &mid,
+                    &video_data,
+                    codec,
+                    &mut video_decoders,
+                    video_frames,
+                    &video_track_key,
+                    decoded_video.entry(mid.clone()).or_insert((0, 0)),
+                );
             }
             Some(TransportEvent::SubscriberEvent(PcEvent::RemoteTrackAdded { mid, kind, .. })) => {
                 // Both identifiers here are honest about being unresolved, which they were

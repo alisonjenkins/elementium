@@ -64,6 +64,14 @@ impl VideoPipeline {
             // fresh decoder rather than feeding H.264 to a VP8 decoder, which produces
             // nothing and says nothing.
             let mut decoders: HashMap<(String, VideoCodec), NegotiatedDecoder> = HashMap::new();
+            // (frames decoded, packets that produced nothing), per track.
+            //
+            // Inbound audio has been counted for months and inbound video was not, so
+            // between "packets are arriving" and "there is a picture" the log said nothing
+            // at all -- and "we decode nothing" and "we decode fine and draw nowhere" are
+            // two different faults that both happened, on the same evening, looking
+            // identical from outside.
+            let mut tallies: HashMap<String, (u64, u64)> = HashMap::new();
 
             tracing::info!(pc_id = %pc_id, "Video playback pipeline started");
 
@@ -105,9 +113,11 @@ impl VideoPipeline {
                     // two people, and no way to show the second at all. The decoders were
                     // already split per mid; only the display key was not.
                     let track_key = format!("{pc_id}-{mid}");
+                    let tally = tallies.entry(mid.clone()).or_insert((0, 0));
                     match VideoDecoder::decode(decoder, &packet) {
                         Ok(frames) => {
                             for i420_frame in frames {
+                                tally.0 = tally.0.saturating_add(1);
                                 // Convert I420 to RGBA for display
                                 let rgba_frame = elementium_codec::i420_to_rgba(&i420_frame);
 
@@ -122,8 +132,22 @@ impl VideoPipeline {
                             }
                         }
                         Err(e) => {
+                            tally.1 = tally.1.saturating_add(1);
                             tracing::debug!(mid, ?codec, "video decode error: {e}");
                         }
+                    }
+                    // Every 30th frame is about once a second on a 30fps track: often enough
+                    // to measure a rate from, rare enough not to bury the rest of the log.
+                    let report = (tally.0 > 0 && tally.0.is_multiple_of(30))
+                        || (tally.1 > 0 && tally.1.is_multiple_of(100));
+                    if report {
+                        tracing::info!(
+                            mid,
+                            ?codec,
+                            frames_decoded = tally.0,
+                            decode_failures = tally.1,
+                            "Inbound video frame decoded"
+                        );
                     }
                 }
             }
