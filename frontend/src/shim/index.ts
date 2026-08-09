@@ -13,6 +13,7 @@ import { setupConsoleBridge } from "./console-bridge";
 import { setupE2eeBridge } from "./e2ee-bridge";
 import { setupMembershipLog } from "./membership-log";
 import { setupWidgetApiLog } from "./widget-api-log";
+import { setupMatrixRtcMembershipSetLog } from "./matrixrtc-membership-set";
 import { setupWebCodecsProbe } from "./webcodecs-probe";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 import { install, isPatched, record } from "./install-report";
@@ -95,6 +96,20 @@ install(
   () =>
     Boolean(
       (window as unknown as Record<string, unknown>)["__elementium_widget_api_logged"],
+    ),
+);
+
+// membership-log.ts only sees the main frame's Matrix client, so the widget frame -- where
+// Element Call actually reacts to membership -- has reported nothing. This derives the same
+// answer from the widget API traffic widget-api-log.ts already observes, keeping its own
+// running tally of who Element Call has been told is live, and logs only when that changes.
+install(
+  "matrixrtc-membership-set-log",
+  "window message events",
+  setupMatrixRtcMembershipSetLog,
+  () =>
+    Boolean(
+      (window as unknown as Record<string, unknown>)["__elementium_membership_set_logged"],
     ),
 );
 
