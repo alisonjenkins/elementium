@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use elementium_e2ee::E2eeContext;
 use elementium_media::audio_playback::AudioSink;
-use elementium_types::{MediaTrackKey, PlaintextMedia, VideoFrame};
+use elementium_types::{MediaTrackKey, PlaintextMedia, VideoFrame, WireMedia};
 
 use crate::e2ee_io::{EncryptionPolicy, StartupHold, encrypt_or_drop, maybe_decrypt_event};
 use crate::peer_connection::{
@@ -275,6 +275,15 @@ struct WritePacing {
     writes: u64,
     burst_writes: u64,
     max_gap_ms: u64,
+    /// Writes the pacer below held back for at least one iteration.
+    spaced: u64,
+    /// Times the pacer found the backlog too deep to keep pacing and flushed instead.
+    gave_up: u64,
+    /// An audio write already pulled off the command channel and encrypted, held here
+    /// because `decide_audio_pace` said it was early. Only ever one at a time: as long as
+    /// this is `Some`, `drain_io_commands` will not pull another audio write out of order
+    /// behind it, so a second slot is never needed.
+    deferred: Option<(MediaTrackKey, Vec<WireMedia>)>,
 }
 
 impl WritePacing {
@@ -302,12 +311,197 @@ impl WritePacing {
                 writes = self.writes,
                 burst_writes = self.burst_writes,
                 max_gap_ms = self.max_gap_ms,
+                spaced = self.spaced,
+                gave_up = self.gave_up,
                 "Outbound audio wire pacing"
             );
             self.burst_writes = 0;
             self.max_gap_ms = 0;
+            self.spaced = 0;
+            self.gave_up = 0;
         }
     }
+}
+
+/// What `decide_audio_pace` chose to do with one queued audio write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioPaceDecision {
+    /// Write now: no backlog, pacing disabled, an already-late frame, or a healthy gap.
+    /// This is the only outcome a single-frame stream (rule 1) ever sees.
+    Send,
+    /// Hold for one more I/O loop iteration: this write would otherwise land early, and the
+    /// backlog behind it is still shallow enough to be worth catching up on.
+    Defer,
+    /// Backlog is deep enough that continuing to hold writes back would grow the queue
+    /// faster than the burst it is meant to prevent; write now instead.
+    GiveUp,
+}
+
+/// Below this gap, two consecutive sends are "clumped" -- matches
+/// `AudioSendPacing::CLUMPED_BELOW_US` in `peer_connection.rs`, the instrumentation that first
+/// measured this. A write processed sooner than this after the last one is only early
+/// because it queued up behind something, not because it is actually due, so only writes
+/// this close to the last one are worth spacing out.
+const AUDIO_PACE_EARLY_BELOW: Duration = Duration::from_millis(5);
+
+/// Nominal Opus frame cadence, and the ceiling a deferred write may be pushed out to. A write
+/// already at least this far behind the last one has already missed its slot -- holding it
+/// longer only adds mouth-to-ear latency without curing whatever caused the stall (rule 2).
+const AUDIO_PACE_NOMINAL_CADENCE: Duration = Duration::from_millis(20);
+
+/// How many writes may sit queued behind the one being paced before the pacer gives up and
+/// flushes instead of deferring further (rule 3). Four is one nominal cadence period's worth
+/// of catch-up (4 x 20ms = 80ms of backlog); past that, continuing to hold audio back grows
+/// the queue faster than letting the burst through would, which defeats the point of pacing.
+const AUDIO_PACE_MAX_BACKLOG: usize = 4;
+
+/// Pure pacing policy for one audio write.
+///
+/// Given whether pacing is enabled at all, how long it has been since the previous write
+/// actually reached str0m, how many more audio writes are already queued behind this one,
+/// and whether this write is already running at or past the nominal cadence, decide whether
+/// to send it now, hold it for one more I/O loop iteration, or give up pacing and flush.
+///
+/// Pure and free of the clock/channel/socket around it, so the policy itself -- not the
+/// plumbing -- is what the unit tests below pin.
+fn decide_audio_pace(
+    pacing_enabled: bool,
+    since_last_write: Duration,
+    backlog_depth: usize,
+    already_late: bool,
+) -> AudioPaceDecision {
+    if !pacing_enabled {
+        return AudioPaceDecision::Send;
+    }
+    // Rule 1: a lone frame with nothing queued behind it takes the untouched path.
+    if backlog_depth == 0 {
+        return AudioPaceDecision::Send;
+    }
+    // Rule 2: never delay a frame that is already behind, or merely on schedule -- only a
+    // frame that would land early is worth spacing out.
+    if already_late || since_last_write >= AUDIO_PACE_EARLY_BELOW {
+        return AudioPaceDecision::Send;
+    }
+    // Rule 3: catching up is bounded -- a backlog this deep is worse held than flushed.
+    if backlog_depth > AUDIO_PACE_MAX_BACKLOG {
+        return AudioPaceDecision::GiveUp;
+    }
+    AudioPaceDecision::Defer
+}
+
+/// Whether the audio write pacer (`decide_audio_pace`) is active at all.
+///
+/// `ELEMENTIUM_AUDIO_PACING=0` disables it, restoring today's send-immediately behaviour.
+/// This exists because the burst the pacer targets was only ever measured on a real 2-minute
+/// call (see `AudioSendPacing`'s docs in `peer_connection.rs`) -- there is no offline repro to
+/// validate against, so the next real call needs an easy way to A/B this change.
+///
+/// Read once via `OnceLock`, the same pattern as `max_encode_fps()` in
+/// `src-tauri/src/commands/media_devices.rs`.
+fn audio_pacing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let disabled = std::env::var_os("ELEMENTIUM_AUDIO_PACING")
+            .is_some_and(|v| v == std::ffi::OsStr::new("0"));
+        if disabled {
+            tracing::info!("audio write pacing disabled via ELEMENTIUM_AUDIO_PACING=0");
+        }
+        !disabled
+    })
+}
+
+/// Send `frames` now and record pacing stats. Shared by the direct path and by a write
+/// released from the pacer's one-slot hold.
+fn write_audio_now(
+    handle: &PeerConnectionHandle,
+    key: MediaTrackKey,
+    frames: &[WireMedia],
+    pacing: &mut WritePacing,
+) {
+    let mut pc = lock_pc(handle);
+    pacing.record(&pc.id.clone());
+    let mut failure = None;
+    for data in frames {
+        if let Err(e) = peer_connection::write_audio(&mut pc, key, data) {
+            failure = Some(e);
+        }
+    }
+    if let Some(e) = failure {
+        // Throttled warn, not debug: this is the last hop before the network, so a
+        // persistent failure here means nobody hears us -- and at `debug` it produced a
+        // completely clean log while doing so. The usual causes (no audio mid negotiated,
+        // no Opus payload type) are steady-state, not transient, hence the coarse throttle.
+        static WRITE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = WRITE_FAILURES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if n == 1 || n.is_multiple_of(250) {
+            tracing::warn!(
+                pc_id = %pc.id,
+                failures = n,
+                error = %e,
+                "Outbound audio frame not written to the peer connection"
+            );
+        }
+    }
+}
+
+/// Send `frames` now, or hold them in `pacing` for one more I/O loop iteration, per
+/// `decide_audio_pace`.
+///
+/// `backlog_depth` counts everything still queued behind this write, audio and video alike
+/// -- there is no cheap way to filter the channel to audio-only without pulling items out of
+/// it. Video is far lower rate, so this only ever over-counts, which costs an unnecessary
+/// defer, never a missed one.
+fn dispatch_audio_write(
+    handle: &PeerConnectionHandle,
+    cmd_rx: &mpsc::Receiver<IoCommand>,
+    pacing: &mut WritePacing,
+    key: MediaTrackKey,
+    frames: Vec<WireMedia>,
+) {
+    let now = Instant::now();
+    let since_last_write = pacing
+        .last_write
+        .map_or(Duration::MAX, |last| now.saturating_duration_since(last));
+    let already_late = since_last_write >= AUDIO_PACE_NOMINAL_CADENCE;
+    let backlog_depth = cmd_rx.len();
+
+    match decide_audio_pace(
+        audio_pacing_enabled(),
+        since_last_write,
+        backlog_depth,
+        already_late,
+    ) {
+        AudioPaceDecision::Defer => {
+            pacing.spaced = pacing.spaced.saturating_add(1);
+            pacing.deferred = Some((key, frames));
+        }
+        AudioPaceDecision::GiveUp => {
+            pacing.gave_up = pacing.gave_up.saturating_add(1);
+            write_audio_now(handle, key, &frames, pacing);
+        }
+        AudioPaceDecision::Send => write_audio_now(handle, key, &frames, pacing),
+    }
+}
+
+/// Encrypt one queued audio write and hand it to the pacer.
+fn handle_write_audio(
+    handle: &PeerConnectionHandle,
+    cmd_rx: &mpsc::Receiver<IoCommand>,
+    e2ee: Option<&E2eeContext>,
+    hold: &mut StartupHold,
+    pacing: &mut WritePacing,
+    key: MediaTrackKey,
+    opus_data: PlaintextMedia,
+) {
+    // Usually one frame. More when end-to-end encryption has just become possible and the
+    // audio captured while it came up is released together.
+    let frames = hold.encrypt_audio(e2ee, opus_data);
+    if frames.is_empty() {
+        return;
+    }
+    dispatch_audio_write(handle, cmd_rx, pacing, key, frames);
 }
 
 /// Drain any pending I/O commands (non-blocking). Returns `true` if the
@@ -319,42 +513,25 @@ fn drain_io_commands(
     pacing: &mut WritePacing,
     hold: &mut StartupHold,
 ) -> bool {
+    // Flush anything the pacer held back last iteration before pulling anything new off the
+    // channel, so audio can never leave out of order behind it.
+    if let Some((key, frames)) = pacing.deferred.take() {
+        dispatch_audio_write(handle, cmd_rx, pacing, key, frames);
+        if pacing.deferred.is_some() {
+            // Still early (or the backlog grew): wait for the next iteration rather than
+            // drain more audio out of order behind it.
+            return false;
+        }
+    }
+
     loop {
         match cmd_rx.try_recv() {
             Ok(IoCommand::WriteAudio(key, opus_data)) => {
-                // Usually one frame. More when end-to-end encryption has just become
-                // possible and the audio captured while it came up is released together.
-                let frames = hold.encrypt_audio(e2ee, opus_data);
-                if frames.is_empty() {
-                    continue;
-                }
-                let mut pc = lock_pc(handle);
-                pacing.record(&pc.id.clone());
-                let mut failure = None;
-                for data in &frames {
-                    if let Err(e) = peer_connection::write_audio(&mut pc, key, data) {
-                        failure = Some(e);
-                    }
-                }
-                if let Some(e) = failure {
-                    // Throttled warn, not debug: this is the last hop before the network,
-                    // so a persistent failure here means nobody hears us -- and at
-                    // `debug` it produced a completely clean log while doing so. The
-                    // usual causes (no audio mid negotiated, no Opus payload type) are
-                    // steady-state, not transient, hence the coarse throttle.
-                    static WRITE_FAILURES: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let n = WRITE_FAILURES
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        .saturating_add(1);
-                    if n == 1 || n.is_multiple_of(250) {
-                        tracing::warn!(
-                            pc_id = %pc.id,
-                            failures = n,
-                            error = %e,
-                            "Outbound audio frame not written to the peer connection"
-                        );
-                    }
+                handle_write_audio(handle, cmd_rx, e2ee, hold, pacing, key, opus_data);
+                if pacing.deferred.is_some() {
+                    // Just queued this write for the pacer to hold; stop draining so
+                    // nothing behind it can be sent first.
+                    return false;
                 }
             }
             Ok(IoCommand::WriteVideo(key, frame, codec)) => {
@@ -481,5 +658,77 @@ fn io_loop(
         if !recv_phase(handle, socket, &mut recv_buf, wait) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod audio_pace_tests {
+    use super::{
+        AUDIO_PACE_EARLY_BELOW, AUDIO_PACE_MAX_BACKLOG, AudioPaceDecision, decide_audio_pace,
+    };
+    use std::time::Duration;
+
+    /// Rule 1: a healthy stream, one frame at a time, must take exactly the path it takes
+    /// today -- zero backlog is `Send` regardless of how close the gap is, because there is
+    /// nothing to pace against. This is the regression this whole design exists not to
+    /// cause.
+    #[test]
+    fn single_frame_in_healthy_stream_is_never_deferred() {
+        let decision = decide_audio_pace(true, Duration::from_millis(1), 0, false);
+        assert_eq!(decision, AudioPaceDecision::Send);
+    }
+
+    /// A frame that would land 1ms after the previous one, with something queued behind it,
+    /// is exactly the clumping this pacer exists to smooth out -- `Defer`.
+    #[test]
+    fn early_frame_with_backlog_is_deferred() {
+        let decision = decide_audio_pace(true, Duration::from_millis(1), 1, false);
+        assert_eq!(decision, AudioPaceDecision::Defer);
+    }
+
+    /// Sanity check on the boundary: a gap right at `AUDIO_PACE_EARLY_BELOW` is not "early"
+    /// (the report's own `CLUMPED_BELOW_US` cutoff is exclusive), so this must send.
+    #[test]
+    fn gap_at_the_early_threshold_is_not_deferred() {
+        let decision = decide_audio_pace(true, AUDIO_PACE_EARLY_BELOW, 1, false);
+        assert_eq!(decision, AudioPaceDecision::Send);
+    }
+
+    /// Rule 2: a frame already flagged late must never be held, no matter how deep the
+    /// backlog is -- holding it only adds mouth-to-ear latency without curing the stall that
+    /// made it late.
+    #[test]
+    fn already_late_frame_is_never_deferred_regardless_of_backlog() {
+        for backlog_depth in [1, AUDIO_PACE_MAX_BACKLOG, AUDIO_PACE_MAX_BACKLOG + 10] {
+            let decision =
+                decide_audio_pace(true, Duration::from_millis(1), backlog_depth, true);
+            assert_eq!(
+                decision,
+                AudioPaceDecision::Send,
+                "backlog_depth={backlog_depth} must still send a late frame"
+            );
+        }
+    }
+
+    /// Rule 3: catching up is bounded. Once the backlog is deeper than
+    /// `AUDIO_PACE_MAX_BACKLOG`, the pacer must give up and flush rather than defer further,
+    /// because holding a growing backlog is worse than letting the burst through.
+    #[test]
+    fn deep_backlog_gives_up_instead_of_deferring() {
+        let decision = decide_audio_pace(
+            true,
+            Duration::from_millis(1),
+            AUDIO_PACE_MAX_BACKLOG + 1,
+            false,
+        );
+        assert_eq!(decision, AudioPaceDecision::GiveUp);
+    }
+
+    /// Rule 4: `ELEMENTIUM_AUDIO_PACING=0` disables the pacer entirely. Same inputs that
+    /// would otherwise `Defer` must instead `Send`, as if there were no pacer at all.
+    #[test]
+    fn disabled_pacing_always_sends() {
+        let decision = decide_audio_pace(false, Duration::from_millis(1), 1, false);
+        assert_eq!(decision, AudioPaceDecision::Send);
     }
 }
