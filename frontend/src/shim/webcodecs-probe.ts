@@ -21,12 +21,59 @@
  * Nothing here changes behaviour. It observes and reports.
  */
 
-/** The codecs worth asking about: what the SFU negotiates with us today. */
+/**
+ * The codecs worth asking about, spelled the way the WebCodecs registry spells them.
+ *
+ * VP8 is the bare string `"vp8"` -- there is no dotted parameter form for it. The first
+ * version of this probe asked for `vp08.00.10.08`, which is the VP9 shape (`vp09...`) with
+ * the wrong number in it, and got a truthful "no" to a question about a codec that does not
+ * exist. Worth stating because that answer nearly redirected the whole design.
+ */
 const CANDIDATE_CODECS = [
-  { label: "VP8", config: { codec: "vp08.00.10.08", codedWidth: 1280, codedHeight: 720 } },
+  { label: "VP8", config: { codec: "vp8", codedWidth: 1280, codedHeight: 720 } },
+  { label: "VP9", config: { codec: "vp09.00.10.08", codedWidth: 1280, codedHeight: 720 } },
   { label: "H.264", config: { codec: "avc1.42E01F", codedWidth: 1280, codedHeight: 720 } },
   { label: "AV1", config: { codec: "av01.0.04M.08", codedWidth: 1280, codedHeight: 720 } },
 ];
+
+/**
+ * What the media stack can play through the ordinary element APIs.
+ *
+ * Asked alongside WebCodecs to tell two very different failures apart. WebKitGTK decodes
+ * through GStreamer, so a build whose closure is missing the codec plugins reports no
+ * support anywhere -- and the fix for that is packaging, not a different design. If these
+ * say yes while WebCodecs says no, the decoders are present and only the WebCodecs surface
+ * is unavailable, and Media Source Extensions becomes the route worth taking instead.
+ */
+const MSE_TYPES = [
+  { label: "mp4/avc1", type: 'video/mp4; codecs="avc1.42E01F"' },
+  { label: "webm/vp8", type: 'video/webm; codecs="vp8"' },
+  { label: "webm/vp9", type: 'video/webm; codecs="vp9"' },
+];
+
+/** Report what Media Source Extensions and the video element admit to supporting. */
+function reportPlaybackSupport(): void {
+  const mediaSource = (globalThis as Record<string, unknown>)["MediaSource"] as
+    | { isTypeSupported?: (type: string) => boolean }
+    | undefined;
+  const results = MSE_TYPES.map((candidate) => {
+    let mse = "n/a";
+    try {
+      if (typeof mediaSource?.isTypeSupported === "function") {
+        mse = mediaSource.isTypeSupported(candidate.type) ? "yes" : "no";
+      }
+    } catch {
+      mse = "error";
+    }
+    return `${candidate.label}=${mse}`;
+  });
+  console.log(
+    `[Elementium] MediaSource support: ${results.join(" ")}` +
+      (typeof mediaSource?.isTypeSupported === "function"
+        ? ""
+        : " (MediaSource itself is absent)"),
+  );
+}
 
 interface VideoDecoderLike {
   isConfigSupported?: (config: unknown) => Promise<{ supported?: boolean }>;
@@ -48,6 +95,7 @@ export async function probeWebCodecs(): Promise<void> {
       "[Elementium] WebCodecs VideoDecoder is not available in this webview; " +
         "remote video must keep being decoded natively and shipped as RGBA",
     );
+    reportPlaybackSupport();
     return;
   }
 
@@ -78,6 +126,7 @@ export async function probeWebCodecs(): Promise<void> {
       "Where a codec is supported, remote video can be decoded in the page from encoded " +
       "frames -- around 20-60kB each instead of 3.7MB of RGBA.",
   );
+  reportPlaybackSupport();
 }
 
 /** Install the probe. Safe in any frame; runs once per frame and never throws. */
