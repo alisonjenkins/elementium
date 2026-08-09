@@ -72,6 +72,33 @@ async function waitForStack(timeoutMs: number): Promise<void> {
 export default async function globalSetup(): Promise<void> {
   await mkdir(path.dirname(FIXTURE), { recursive: true });
 
+  // Build the publishers these tests drive.
+  //
+  // They are the half of every measurement that is *ours*, and nothing rebuilt them: a
+  // run picked up whatever binary happened to be in `target/debug/examples`, which could
+  // be hours older than the code under test. That does not fail loudly, it just answers
+  // the wrong question -- an encoder fix was read as "did not work" for most of a day
+  // because the browser was being fed a publisher built before it.
+  //
+  // Debug rather than release because that is the path the tests use, and cargo is a
+  // no-op when nothing changed.
+  if (process.env["ELEMENTIUM_SKIP_PUBLISHER_BUILD"] !== "1") {
+    console.log("[test-env] building the publishers the tests drive...");
+    await run(
+      "cargo",
+      [
+        "build",
+        "-p",
+        "elementium-webrtc",
+        "--example",
+        "publish_test_tone",
+        "--example",
+        "publish_screen_share",
+      ],
+      { cwd: REPO },
+    );
+  }
+
   const alreadyUp = await stackIsUp();
   if (alreadyUp) {
     console.log("[test-env] stack already running; leaving it alone afterwards");
