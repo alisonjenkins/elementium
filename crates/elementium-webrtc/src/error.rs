@@ -11,9 +11,161 @@
 
 use thiserror::Error;
 
+/// Failure surface: [`crate::peer_connection::create_offer`].
+///
+/// One variant: the only way `create_offer` can fail is a caller-contract violation, not a
+/// runtime condition, so there is no source to carry.
+#[derive(Debug, Error)]
+pub enum CreateOfferError {
+    /// Nothing was requested (no new data channels, no new transceivers) and no previous
+    /// offer exists to repeat. A genuine fault, not the "re-offer changes nothing" case --
+    /// that one has a previous offer to hand back and is not an error at all.
+    #[error("no changes to offer, and no previous offer to repeat")]
+    NothingToOffer,
+}
+
+/// Failure surface: [`crate::peer_connection::create_answer`].
+#[derive(Debug, Error)]
+pub enum CreateAnswerError {
+    /// `createAnswer()` was called before `set_remote_description` cached an answer for a
+    /// remote offer. Mirrors the DOM's own `InvalidStateError` for the same misuse.
+    #[error("no remote offer has been set; call set_remote_description(offer) first")]
+    NoRemoteOffer,
+}
+
+/// Failure surface: [`crate::peer_connection::set_remote_description`].
+///
+/// Deliberately has **no** "no pending offer" variant: an answer arriving with nothing
+/// pending is not a fault (see `set_remote_description`'s doc comment) and stays `Ok(None)`.
+/// Reintroducing that condition here as an error is the exact regression that froze
+/// signalling and tore every call down every fifteen seconds on 2026-08-09.
+#[derive(Debug, Error)]
+pub enum SetRemoteDescriptionError {
+    /// The remote offer's SDP did not parse.
+    #[error("invalid offer SDP")]
+    OfferParse(#[source] str0m::error::SdpError),
+    /// The remote answer's SDP did not parse.
+    #[error("invalid answer SDP")]
+    AnswerParse(#[source] str0m::error::SdpError),
+    /// str0m parsed the offer but refused to accept it.
+    #[error("str0m rejected the remote offer")]
+    OfferRejected(#[source] str0m::RtcError),
+    /// str0m parsed the answer but refused to accept it against the pending offer.
+    #[error("str0m rejected the remote answer")]
+    AnswerRejected(#[source] str0m::RtcError),
+}
+
+/// Failure surface: [`crate::peer_connection::add_ice_candidate`].
+#[derive(Debug, Error)]
+pub enum AddIceCandidateError {
+    /// The candidate string did not parse as ICE candidate SDP.
+    ///
+    /// Deliberately does not carry the candidate string itself: candidates sit next to ICE
+    /// credential material in the same signalling payloads the constitution (principle IV)
+    /// forbids logging. `len` and the parse error are enough to diagnose a malformed
+    /// candidate without risking that material reaching a log.
+    #[error("malformed ICE candidate ({len} bytes)")]
+    Malformed {
+        len: usize,
+        #[source]
+        source: str0m::error::IceError,
+    },
+}
+
+/// Failure surface shared by `write_audio`, `write_video` and `send_mid_for`.
+///
+/// Sharing is permitted here under constitution principle I only because every caller of
+/// `write_audio`/`write_video` handles every variant identically: drop the frame, log, and
+/// keep the connection running. A caller that needed to react differently per variant would
+/// need its own enum instead.
+#[derive(Debug, Error)]
+pub enum MediaWriteError {
+    /// The write named one of our own tracks that this connection has not published.
+    #[error("no mid published for track {0}")]
+    TrackNotPublished(elementium_types::MediaTrackKey),
+    /// No local writer exists yet for this media kind (e.g. no transceiver of that kind was
+    /// ever negotiated).
+    #[error("no {0:?} writer available")]
+    NoWriter(str0m::media::MediaKind),
+    /// The mid has a writer, but the far end never negotiated a payload type for this
+    /// codec.
+    #[error("no {codec} payload type negotiated")]
+    CodecNotNegotiated { codec: &'static str },
+    /// str0m rejected the RTP write itself.
+    #[error("RTP write failed")]
+    Rtp(#[source] str0m::RtcError),
+}
+
+/// Failure surface: [`crate::peer_connection::write_data_channel`].
+#[derive(Debug, Error)]
+pub enum DataChannelWriteError {
+    /// No channel named `label` has completed its DCEP handshake yet. Transient: the
+    /// caller should retry after `onopen` fires for it.
+    #[error("data channel '{0}' has not completed its handshake yet")]
+    NotOpenYet(String),
+    /// A channel named `label` did complete its handshake once, but str0m has no writable
+    /// SCTP stream for it now (closed, locally or by the remote peer). Not transient: this
+    /// channel is dead and will not become writable again.
+    #[error("data channel '{0}' has no writable SCTP stream (closed or not yet open)")]
+    NoStream(String),
+    /// str0m's SCTP layer rejected the write outright.
+    #[error("SCTP write to data channel '{label}' failed")]
+    Sctp {
+        label: String,
+        #[source]
+        source: str0m::RtcError,
+    },
+}
+
+/// Failure surface shared by `poll_once`, `recv_and_feed` and the backlog drain they share.
+///
+/// Sharing is permitted here under constitution principle I: all three are the same io loop
+/// at different points in one iteration, and a caller who cannot advance the loop for one
+/// reason cannot advance it for any of the others either -- there is nothing to distinguish
+/// by at the call site.
+#[derive(Debug, Error)]
+pub enum IoLoopError {
+    /// `Rtc::poll_output` reported a fatal error. The connection is no longer usable;
+    /// callers set `pc.alive = false` alongside this.
+    #[error("str0m reported a fatal error")]
+    Str0mFatal(#[source] str0m::RtcError),
+    /// Handing input (a timeout tick or a received datagram) to str0m failed.
+    #[error("failed to hand input to str0m")]
+    Input(#[source] str0m::RtcError),
+    /// A socket operation (read-timeout configuration, `recv_from`, `local_addr`) failed.
+    #[error("socket error")]
+    Socket(#[source] std::io::Error),
+}
+
 /// Errors from the native WebRTC / `LiveKit` transport layer.
 #[derive(Debug, Error)]
 pub enum WebRtcError {
+    /// [`create_offer`](crate::peer_connection::create_offer) had nothing to describe.
+    #[error(transparent)]
+    CreateOffer(#[from] CreateOfferError),
+    /// [`create_answer`](crate::peer_connection::create_answer) was called with no remote
+    /// offer in force.
+    #[error(transparent)]
+    CreateAnswer(#[from] CreateAnswerError),
+    /// [`set_remote_description`](crate::peer_connection::set_remote_description) failed to
+    /// parse or apply the remote SDP.
+    #[error(transparent)]
+    SetRemoteDescription(#[from] SetRemoteDescriptionError),
+    /// [`add_ice_candidate`](crate::peer_connection::add_ice_candidate) failed to parse the
+    /// candidate.
+    #[error(transparent)]
+    AddIceCandidate(#[from] AddIceCandidateError),
+    /// [`write_audio`](crate::peer_connection::write_audio)/
+    /// [`write_video`](crate::peer_connection::write_video) failed to write RTP.
+    #[error(transparent)]
+    MediaWrite(#[from] MediaWriteError),
+    /// [`write_data_channel`](crate::peer_connection::write_data_channel) failed to write
+    /// SCTP.
+    #[error(transparent)]
+    DataChannelWrite(#[from] DataChannelWriteError),
+    /// The io loop (`poll_once`/`recv_and_feed`/backlog drain) failed.
+    #[error(transparent)]
+    IoLoop(#[from] IoLoopError),
     /// A peer-connection or transport mutex was poisoned by a panic in another thread.
     #[error("lock is poisoned")]
     LockPoisoned,

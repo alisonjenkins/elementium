@@ -359,9 +359,31 @@ pub async fn create_offer(
         .collect();
 
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::create_offer(
-        &mut pc, &dc_infos, &tc_infos,
-    )?)
+    peer_connection::create_offer(&mut pc, &dc_infos, &tc_infos)
+        .map_err(|e| ipc_error("create_offer", &pc_id, &e))
+}
+
+/// Flatten a native error for the IPC, logging its whole cause chain on the way out.
+///
+/// The page can only receive a string — Tauri serializes the error — so the chain that a
+/// typed error carries dies at this boundary unless something records it first. Every
+/// fallible command result goes through here so that no site can forget, which is the
+/// point: today's outage was an `Err` that reached the page and was written nowhere, and
+/// the log showed the operation starting and then nothing at all.
+///
+/// The full chain goes to the log; the page gets the top-level message. A structured
+/// envelope with a stable code, so the shim can distinguish failures it must act on, is
+/// the remaining half of this work (backlog X2).
+fn ipc_error(command: &str, pc_id: &str, error: &dyn std::error::Error) -> String {
+    let mut chain = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        chain.push_str(" <- ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    tracing::error!(command, pc_id, chain = %chain, "command failed");
+    error.to_string()
 }
 
 /// Look up an active peer connection's handle by ID.
@@ -385,7 +407,7 @@ pub async fn create_answer(
     tracing::info!(pc_id = %pc_id, "Creating answer");
     let handle = get_pc_handle(&state, &pc_id)?;
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::create_answer(&mut pc)?)
+    peer_connection::create_answer(&mut pc).map_err(|e| ipc_error("create_answer", &pc_id, &e))
 }
 
 #[command]
@@ -453,10 +475,8 @@ pub async fn set_remote_description(
     tracing::info!(pc_id = %pc_id, sdp_type = ?description.sdp_type, "Setting remote description");
     let handle = get_pc_handle(&state, &pc_id)?;
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::set_remote_description(
-        &mut pc,
-        &description,
-    )?)
+    peer_connection::set_remote_description(&mut pc, &description)
+        .map_err(|e| ipc_error("set_remote_description", &pc_id, &e))
 }
 
 #[command]
@@ -468,10 +488,8 @@ pub async fn add_ice_candidate(
     tracing::info!(pc_id = %pc_id, candidate = %candidate.candidate, "Adding ICE candidate");
     let handle = get_pc_handle(&state, &pc_id)?;
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::add_ice_candidate(
-        &mut pc,
-        &candidate.candidate,
-    )?)
+    peer_connection::add_ice_candidate(&mut pc, &candidate.candidate)
+        .map_err(|e| ipc_error("add_ice_candidate", &pc_id, &e))
 }
 
 /// Write one message to a negotiated data channel.
@@ -499,9 +517,8 @@ pub async fn send_data_channel_message(
     tracing::debug!(pc_id = %pc_id, %label, binary, len = data.len(), "Sending data channel message");
     let handle = get_pc_handle(&state, &pc_id)?;
     let mut pc = handle.lock_str()?;
-    Ok(peer_connection::write_data_channel(
-        &mut pc, &label, binary, &data,
-    )?)
+    peer_connection::write_data_channel(&mut pc, &label, binary, &data)
+        .map_err(|e| ipc_error("write_data_channel", &pc_id, &e))
 }
 
 /// One outbound (sent) track's transport stats, as returned to JS.

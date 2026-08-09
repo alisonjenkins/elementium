@@ -554,11 +554,11 @@ impl TransceiverInfo {
 fn send_mid_for(
     pc: &PeerConnectionInner,
     key: MediaTrackKey,
-) -> Result<Mid, crate::error::WebRtcError> {
+) -> Result<Mid, crate::error::MediaWriteError> {
     pc.send_mids
         .get(&key)
         .copied()
-        .ok_or_else(|| crate::error::WebRtcError::NoMidForTrack(key.to_string()))
+        .ok_or(crate::error::MediaWriteError::TrackNotPublished(key))
 }
 
 /// The track a named source refers to, or `None` when the name is not one we publish.
@@ -606,12 +606,13 @@ pub const fn request_ice_restart(pc: &mut PeerConnectionInner) {
 ///
 /// # Errors
 ///
-/// Returns an error if str0m has no pending SDP changes to apply.
+/// Returns [`crate::error::CreateOfferError::NothingToOffer`] if str0m has no pending SDP
+/// changes to apply and there is no previous offer to repeat.
 pub fn create_offer(
     pc: &mut PeerConnectionInner,
     data_channels: &[DataChannelInfo],
     transceivers: &[TransceiverInfo],
-) -> Result<SessionDescription, crate::error::WebRtcError> {
+) -> Result<SessionDescription, crate::error::CreateOfferError> {
     let mut api = pc.rtc.sdp_api();
 
     // A requested ICE restart is applied to *this* offer and then forgotten.
@@ -708,7 +709,7 @@ pub fn create_offer(
         let Some(previous) = pc.last_offer_sdp.clone() else {
             // No changes and nothing offered before means there is genuinely nothing to
             // describe, which is a real fault rather than a quiet re-offer.
-            return Err(crate::error::WebRtcError::from("No changes to apply"));
+            return Err(crate::error::CreateOfferError::NothingToOffer);
         };
         tracing::info!(
             pc_id = %pc.id,
@@ -739,11 +740,11 @@ pub fn create_offer(
 ///
 /// # Errors
 ///
-/// Returns an error if no answer has been cached, i.e. `set_remote_description`
-/// was not called with an offer first.
+/// Returns [`crate::error::CreateAnswerError::NoRemoteOffer`] if no answer has been cached,
+/// i.e. `set_remote_description` was not called with an offer first.
 pub fn create_answer(
     pc: &mut PeerConnectionInner,
-) -> Result<SessionDescription, crate::error::WebRtcError> {
+) -> Result<SessionDescription, crate::error::CreateAnswerError> {
     // Clone, not take. The DOM permits `createAnswer()` to be called more than once while
     // still in `have-remote-offer` -- nothing about a second call is a fresh negotiation --
     // but `take()` here emptied the cache on the first read, so the second call found
@@ -753,136 +754,157 @@ pub fn create_answer(
     // supersedes it.
     pc.cached_answer
         .clone()
-        .ok_or_else(|| "No cached answer — call set_remote_description(offer) first".into())
+        .ok_or(crate::error::CreateAnswerError::NoRemoteOffer)
 }
 
 /// Set the remote description (offer or answer).
 ///
 /// # Errors
 ///
-/// Returns an error if the SDP is invalid, or if str0m fails to accept the
-/// offer/answer (e.g. no pending offer to match an answer against).
+/// Returns [`crate::error::SetRemoteDescriptionError`] if the SDP is invalid, or if str0m
+/// refuses to accept the offer/answer. An answer arriving with no pending offer is *not* an
+/// error -- see [`set_remote_answer`] -- and comes back as `Ok(None)`.
 pub fn set_remote_description(
     pc: &mut PeerConnectionInner,
     desc: &SessionDescription,
-) -> Result<Option<SessionDescription>, crate::error::WebRtcError> {
+) -> Result<Option<SessionDescription>, crate::error::SetRemoteDescriptionError> {
     // The cached answer describes the offer that produced it. As soon as another remote
     // description -- offer or answer -- is applied, that offer is no longer the one in
     // force, and a later `createAnswer()` must not hand back a stale answer for a
     // negotiation that has already moved on. This is where the cache gets invalidated now,
     // rather than by `create_answer` consuming it on read: consuming it on read is what
-    // made the DOM's second `createAnswer()` call fail. The `Offer` arm below repopulates
+    // made the DOM's second `createAnswer()` call fail. `set_remote_offer` below repopulates
     // it with the fresh answer.
     pc.cached_answer = None;
     match desc.sdp_type {
-        SdpType::Offer => {
-            // Log the setup direction from the remote offer
-            if let Some(line) = desc.sdp.lines().find(|l| l.starts_with("a=setup:")) {
-                tracing::info!(pc_id = %pc.id, setup = line, "Remote offer DTLS setup direction");
-            }
-            let offer = SdpOffer::from_sdp_string(&desc.sdp)
-                .map_err(|e| format!("Invalid offer SDP: {e}"))?;
-            let answer = pc
-                .rtc
-                .sdp_api()
-                .accept_offer(offer)
-                .map_err(|e| format!("Failed to accept offer: {e}"))?;
-            // accept_offer triggers init_dtls inside str0m
-            pc.dtls_initialized = true;
-            tracing::info!(pc_id = %pc.id, "accept_offer completed, dtls_initialized=true");
+        SdpType::Offer => set_remote_offer(pc, desc).map(Some),
+        SdpType::Answer => set_remote_answer(pc, desc),
+    }
+}
 
-            // Re-add cached remote ICE candidates after accept_offer.
-            // str0m's accept_offer may clear remote candidates during renegotiation,
-            // but livekit-client won't re-send them (deduplication).
-            if !pc.remote_candidates.is_empty() {
-                tracing::info!(
-                    pc_id = %pc.id,
-                    count = pc.remote_candidates.len(),
-                    "Re-adding cached remote ICE candidates after renegotiation"
-                );
-                for cand_sdp in pc.remote_candidates.clone() {
-                    match Candidate::from_sdp_string(&cand_sdp) {
-                        Ok(candidate) => {
-                            pc.rtc.add_remote_candidate(candidate);
-                        }
-                        Err(e) => {
-                            tracing::warn!(pc_id = %pc.id, err = %e, "Failed to re-add cached candidate");
-                        }
-                    }
+/// The `SdpType::Offer` arm of [`set_remote_description`].
+fn set_remote_offer(
+    pc: &mut PeerConnectionInner,
+    desc: &SessionDescription,
+) -> Result<SessionDescription, crate::error::SetRemoteDescriptionError> {
+    use crate::error::SetRemoteDescriptionError as Error;
+
+    // Log the setup direction from the remote offer
+    if let Some(line) = desc.sdp.lines().find(|l| l.starts_with("a=setup:")) {
+        tracing::info!(pc_id = %pc.id, setup = line, "Remote offer DTLS setup direction");
+    }
+    let offer = SdpOffer::from_sdp_string(&desc.sdp).map_err(Error::OfferParse)?;
+    let answer = pc
+        .rtc
+        .sdp_api()
+        .accept_offer(offer)
+        .map_err(Error::OfferRejected)?;
+    // accept_offer triggers init_dtls inside str0m
+    pc.dtls_initialized = true;
+    tracing::info!(pc_id = %pc.id, "accept_offer completed, dtls_initialized=true");
+
+    // Re-add cached remote ICE candidates after accept_offer.
+    // str0m's accept_offer may clear remote candidates during renegotiation,
+    // but livekit-client won't re-send them (deduplication).
+    if !pc.remote_candidates.is_empty() {
+        tracing::info!(
+            pc_id = %pc.id,
+            count = pc.remote_candidates.len(),
+            "Re-adding cached remote ICE candidates after renegotiation"
+        );
+        for cand_sdp in pc.remote_candidates.clone() {
+            match Candidate::from_sdp_string(&cand_sdp) {
+                Ok(candidate) => {
+                    pc.rtc.add_remote_candidate(candidate);
+                }
+                Err(e) => {
+                    tracing::warn!(pc_id = %pc.id, err = %e, "Failed to re-add cached candidate");
                 }
             }
-
-            let answer_sdp = answer.to_sdp_string();
-            let answer_desc = SessionDescription {
-                sdp_type: SdpType::Answer,
-                sdp: answer_sdp,
-            };
-            // Cache for createAnswer() — standard WebRTC API calls createAnswer()
-            // after setRemoteDescription(offer), but str0m generates it during accept_offer.
-            pc.cached_answer = Some(answer_desc.clone());
-            Ok(Some(answer_desc))
-        }
-        SdpType::Answer => {
-            // Log the setup direction from the remote answer — determines DTLS initiator
-            if let Some(line) = desc.sdp.lines().find(|l| l.starts_with("a=setup:")) {
-                tracing::info!(pc_id = %pc.id, setup = line, "Remote answer DTLS setup direction");
-            }
-            let answer = SdpAnswer::from_sdp_string(&desc.sdp)
-                .map_err(|e| format!("Invalid answer SDP: {e}"))?;
-            // An answer with no pending offer is not a fault, and treating it as one cost
-            // an entire afternoon.
-            //
-            // `create_offer` returns the offer already in force when str0m reports that a
-            // re-offer would change nothing -- which is correct, and is what stopped an
-            // earlier reconnect loop -- but that path registers no new pending offer,
-            // because there is no new negotiation. The caller still sends the SDP, the SFU
-            // still answers it, and the answer arrives here with nothing to match.
-            //
-            // It described a session state we are already in, so there is nothing to apply
-            // and nothing is wrong. Erroring instead rejected the IPC, and the page's
-            // `setRemoteDescription` never reached the line that returns the connection to
-            // `stable`: the signalling state froze mid-offer, every subsequent publish was
-            // held waiting for a state that could not come back, and the call was torn down
-            // and rebuilt every fifteen seconds.
-            //
-            // Silently, too -- this error had no tracing call, so nothing in the log said it
-            // had happened. The message reads like one of livekit-client's own, and was
-            // misread as such for hours.
-            let Some(pending) = pc.pending_offer.take() else {
-                tracing::info!(
-                    pc_id = %pc.id,
-                    "answer arrived with no pending offer; it answers the offer already in \
-                     force, so there is nothing to apply"
-                );
-                return Ok(None);
-            };
-            pc.rtc
-                .sdp_api()
-                .accept_answer(pending, answer)
-                .map_err(|e| format!("Failed to accept answer: {e}"))?;
-            // accept_answer triggers init_dtls inside str0m
-            pc.dtls_initialized = true;
-            tracing::info!(pc_id = %pc.id, "accept_answer completed, dtls_initialized=true");
-            Ok(None)
         }
     }
+
+    let answer_sdp = answer.to_sdp_string();
+    let answer_desc = SessionDescription {
+        sdp_type: SdpType::Answer,
+        sdp: answer_sdp,
+    };
+    // Cache for createAnswer() — standard WebRTC API calls createAnswer()
+    // after setRemoteDescription(offer), but str0m generates it during accept_offer.
+    pc.cached_answer = Some(answer_desc.clone());
+    Ok(answer_desc)
+}
+
+/// The `SdpType::Answer` arm of [`set_remote_description`].
+///
+/// An answer with no pending offer is not a fault, and treating it as one cost an entire
+/// afternoon.
+///
+/// `create_offer` returns the offer already in force when str0m reports that a re-offer
+/// would change nothing -- which is correct, and is what stopped an earlier reconnect loop
+/// -- but that path registers no new pending offer, because there is no new negotiation. The
+/// caller still sends the SDP, the SFU still answers it, and the answer arrives here with
+/// nothing to match.
+///
+/// It described a session state we are already in, so there is nothing to apply and nothing
+/// is wrong. Erroring instead rejected the IPC, and the page's `setRemoteDescription` never
+/// reached the line that returns the connection to `stable`: the signalling state froze
+/// mid-offer, every subsequent publish was held waiting for a state that could not come
+/// back, and the call was torn down and rebuilt every fifteen seconds.
+///
+/// Silently, too -- that error had no tracing call, so nothing in the log said it had
+/// happened. The message reads like one of livekit-client's own, and was misread as such for
+/// hours. This is why [`crate::error::SetRemoteDescriptionError`] has no variant for it: the
+/// type itself now makes that regression impossible to reintroduce.
+fn set_remote_answer(
+    pc: &mut PeerConnectionInner,
+    desc: &SessionDescription,
+) -> Result<Option<SessionDescription>, crate::error::SetRemoteDescriptionError> {
+    use crate::error::SetRemoteDescriptionError as Error;
+
+    // Log the setup direction from the remote answer — determines DTLS initiator
+    if let Some(line) = desc.sdp.lines().find(|l| l.starts_with("a=setup:")) {
+        tracing::info!(pc_id = %pc.id, setup = line, "Remote answer DTLS setup direction");
+    }
+    let answer = SdpAnswer::from_sdp_string(&desc.sdp).map_err(Error::AnswerParse)?;
+    let Some(pending) = pc.pending_offer.take() else {
+        tracing::info!(
+            pc_id = %pc.id,
+            "answer arrived with no pending offer; it answers the offer already in \
+             force, so there is nothing to apply"
+        );
+        return Ok(None);
+    };
+    pc.rtc
+        .sdp_api()
+        .accept_answer(pending, answer)
+        .map_err(Error::AnswerRejected)?;
+    // accept_answer triggers init_dtls inside str0m
+    pc.dtls_initialized = true;
+    tracing::info!(pc_id = %pc.id, "accept_answer completed, dtls_initialized=true");
+    Ok(None)
 }
 
 /// Add a remote ICE candidate.
 ///
 /// # Errors
 ///
-/// Returns an error if `candidate_sdp` is not a valid ICE candidate SDP string.
+/// Returns [`crate::error::AddIceCandidateError::Malformed`] if `candidate_sdp` is not a
+/// valid ICE candidate SDP string.
 pub fn add_ice_candidate(
     pc: &mut PeerConnectionInner,
     candidate_sdp: &str,
-) -> Result<(), crate::error::WebRtcError> {
+) -> Result<(), crate::error::AddIceCandidateError> {
     if candidate_sdp.is_empty() {
         return Ok(());
     }
     tracing::info!(pc_id = %pc.id, candidate = %candidate_sdp, "Adding remote ICE candidate");
-    let candidate = Candidate::from_sdp_string(candidate_sdp)
-        .map_err(|e| format!("Invalid ICE candidate: {e}"))?;
+    let candidate = Candidate::from_sdp_string(candidate_sdp).map_err(|source| {
+        crate::error::AddIceCandidateError::Malformed {
+            len: candidate_sdp.len(),
+            source,
+        }
+    })?;
     tracing::info!(pc_id = %pc.id, ?candidate, "Parsed remote ICE candidate");
     pc.rtc.add_remote_candidate(candidate);
     // Cache for re-adding after SDP renegotiation (accept_offer may clear candidates)
@@ -929,8 +951,8 @@ fn audio_wallclock(epoch: Instant, rtp_offset: u64, now: Instant) -> Instant {
 ///
 /// # Errors
 ///
-/// Returns an error if no audio mid/writer is configured, if no Opus payload
-/// type was negotiated, or if str0m fails to write the RTP packet.
+/// Returns [`crate::error::MediaWriteError`] if no audio mid/writer is configured, if no
+/// Opus payload type was negotiated, or if str0m fails to write the RTP packet.
 ///
 /// # Panics
 ///
@@ -940,19 +962,21 @@ pub fn write_audio(
     pc: &mut PeerConnectionInner,
     key: MediaTrackKey,
     opus_data: &WireMedia,
-) -> Result<(), crate::error::WebRtcError> {
+) -> Result<(), crate::error::MediaWriteError> {
+    use crate::error::MediaWriteError as Error;
+
     let opus_data = opus_data.as_bytes();
     let mid = send_mid_for(pc, key)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
-        return Err(crate::error::WebRtcError::NoWriterForKind("audio"));
+        return Err(Error::NoWriter(MediaKind::Audio));
     };
 
     let pt = writer
         .payload_params()
         .find(|p| p.spec().codec == Codec::Opus)
         .map(str0m::format::PayloadParams::pt)
-        .ok_or("No Opus payload type negotiated")?;
+        .ok_or(Error::CodecNotNegotiated { codec: "Opus" })?;
     pc.audio_pt = Some(*pt);
 
     // Opus at 48kHz: each 20ms frame = 960 samples. Saturating, not fallible: a u64 frame
@@ -973,7 +997,7 @@ pub fn write_audio(
 
     writer
         .write(pt, wallclock, rtp_time, opus_data)
-        .map_err(|e| format!("Failed to write audio: {e}"))?;
+        .map_err(Error::Rtp)?;
 
     // Saturating for the same reason as the offset above: a frame counter that has run
     // long enough to overflow u64 has run for longer than any call lasts, so pinning it at
@@ -1024,8 +1048,8 @@ fn dump_frame_head(direction: &str, codec: &str, len: usize, bytes: &[u8]) {
 ///
 /// # Errors
 ///
-/// Returns an error if no video mid/writer is configured, if no VP8 payload
-/// type was negotiated, or if str0m fails to write the RTP packet.
+/// Returns [`crate::error::MediaWriteError`] if no video mid/writer is configured, if no
+/// payload type for `codec` was negotiated, or if str0m fails to write the RTP packet.
 ///
 /// # Panics
 ///
@@ -1036,13 +1060,15 @@ pub fn write_video(
     key: MediaTrackKey,
     frame: &WireMedia,
     codec: elementium_codec::VideoCodec,
-) -> Result<(), crate::error::WebRtcError> {
+) -> Result<(), crate::error::MediaWriteError> {
+    use crate::error::MediaWriteError as Error;
+
     let frame_data = frame.as_bytes();
     dump_frame_head("outbound", codec.sdp_name(), frame_data.len(), frame_data);
     let mid = send_mid_for(pc, key)?;
 
     let Some(writer) = pc.rtc.writer(mid) else {
-        return Err(crate::error::WebRtcError::NoWriterForKind("video"));
+        return Err(Error::NoWriter(MediaKind::Video));
     };
 
     // The payload type follows the codec of the bytes in hand rather than an assumption
@@ -1068,9 +1094,9 @@ pub fn write_video(
     let fragmentable = params
         .iter()
         .find(|p| p.spec().format.packetization_mode != Some(0));
-    let chosen = fragmentable
-        .or_else(|| params.first())
-        .ok_or_else(|| format!("No {} payload type negotiated", codec.sdp_name()))?;
+    let chosen = fragmentable.or_else(|| params.first()).ok_or_else(|| Error::CodecNotNegotiated {
+        codec: codec.sdp_name(),
+    })?;
     if fragmentable.is_none() {
         tracing::warn!(
             pc_id = %pc.id,
@@ -1106,7 +1132,7 @@ pub fn write_video(
 
     writer
         .write(pt, now, rtp_time, frame_data)
-        .map_err(|e| format!("Failed to write video: {e}"))?;
+        .map_err(Error::Rtp)?;
 
     // Saturating for the same reason as `write_audio`'s frame counter: overflow needs a
     // call lasting longer than any call does, so an error here was an unreachable path a
@@ -1125,25 +1151,31 @@ pub fn write_video(
 ///
 /// # Errors
 ///
-/// Returns an error if no channel named `label` has completed its DCEP handshake yet (see
-/// [`PeerConnectionInner::data_channels`]), if it has since closed, or if str0m's SCTP
-/// layer rejects the write outright.
+/// Returns [`crate::error::DataChannelWriteError::NotOpenYet`] if no channel named `label`
+/// has completed its DCEP handshake yet (see [`PeerConnectionInner::data_channels`]),
+/// [`crate::error::DataChannelWriteError::NoStream`] if it has since closed, or
+/// [`crate::error::DataChannelWriteError::Sctp`] if str0m's SCTP layer rejects the write
+/// outright.
 pub fn write_data_channel(
     pc: &mut PeerConnectionInner,
     label: &str,
     binary: bool,
     data: &[u8],
-) -> Result<bool, crate::error::WebRtcError> {
+) -> Result<bool, crate::error::DataChannelWriteError> {
+    use crate::error::DataChannelWriteError as Error;
+
     let id = *pc
         .data_channels
         .get(label)
-        .ok_or_else(|| format!("Data channel '{label}' has not completed its handshake yet"))?;
-    let mut channel = pc.rtc.channel(id).ok_or_else(|| {
-        format!("Data channel '{label}' has no writable SCTP stream (closed or not yet open)")
-    })?;
-    channel
-        .write(binary, data)
-        .map_err(|e| format!("Failed to write to data channel '{label}': {e}").into())
+        .ok_or_else(|| Error::NotOpenYet(label.to_owned()))?;
+    let mut channel = pc
+        .rtc
+        .channel(id)
+        .ok_or_else(|| Error::NoStream(label.to_owned()))?;
+    channel.write(binary, data).map_err(|source| Error::Sctp {
+        label: label.to_owned(),
+        source,
+    })
 }
 
 /// Take every data-channel event queued since the last call, for the Tauri command layer
@@ -1157,13 +1189,16 @@ pub fn drain_data_channel_events(pc: &mut PeerConnectionInner) -> Vec<DataChanne
 ///
 /// # Errors
 ///
-/// Returns an error if str0m fails to process a timeout, or if `poll_output`
-/// reports a fatal str0m error (in which case `pc.alive` is also set to false).
+/// Returns [`crate::error::IoLoopError::Input`] if str0m fails to process a timeout, or
+/// [`crate::error::IoLoopError::Str0mFatal`] if `poll_output` reports a fatal str0m error
+/// (in which case `pc.alive` is also set to false).
 pub fn poll_once(
     pc: &mut PeerConnectionInner,
     socket: &UdpSocket,
     _recv_buf: &mut [u8],
-) -> Result<(Vec<WirePcEvent>, Instant), crate::error::WebRtcError> {
+) -> Result<(Vec<WirePcEvent>, Instant), crate::error::IoLoopError> {
+    use crate::error::IoLoopError as Error;
+
     // str0m's do_poll_output calls dtls.poll_output() which requires dimpl's
     // handle_timeout to have been called. But str0m's do_handle_timeout does NOT
     // propagate to dtls.handle_timeout — only init_dtls does (called during SDP
@@ -1190,7 +1225,7 @@ pub fn poll_once(
         // poll_output call, not just once per cycle. Feed a timeout each iteration.
         pc.rtc
             .handle_input(Input::Timeout(Instant::now()))
-            .map_err(|e| format!("timeout error: {e}"))?;
+            .map_err(Error::Input)?;
 
         match pc.rtc.poll_output() {
             Ok(Output::Transmit(transmit)) => {
@@ -1259,7 +1294,7 @@ pub fn poll_once(
             }
             Err(e) => {
                 pc.alive = false;
-                return Err(format!("str0m error: {e}").into());
+                return Err(Error::Str0mFatal(e));
             }
         }
     }
@@ -1302,10 +1337,12 @@ pub fn recv_and_feed(
     socket: &UdpSocket,
     recv_buf: &mut [u8],
     timeout: Duration,
-) -> Result<bool, crate::error::WebRtcError> {
+) -> Result<bool, crate::error::IoLoopError> {
+    use crate::error::IoLoopError as Error;
+
     socket
         .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
-        .map_err(|e| e.to_string())?;
+        .map_err(Error::Socket)?;
 
     match socket.recv_from(recv_buf) {
         Ok((len, source)) => {
@@ -1337,12 +1374,30 @@ pub fn recv_and_feed(
             // Resolve 0.0.0.0 → actual interface IP so str0m can match
             // the destination to our registered ICE candidate and generate
             // STUN Binding Responses.
-            let mut dest = socket.local_addr().map_err(|e| e.to_string())?;
+            let mut dest = socket.local_addr().map_err(Error::Socket)?;
             if dest.ip().is_unspecified()
                 && let Some(real_ip) = get_local_ip()
             {
                 dest.set_ip(real_ip);
             }
+
+            // A datagram that fails to demultiplex as STUN/DTLS/RTP/RTCP is indistinguish-
+            // able from line noise, not a fault in this loop -- treated the same as the
+            // over-length case above: log it (no payload bytes, which could be SRTP/DTLS
+            // ciphertext) and drop just this one datagram rather than failing the whole
+            // receive loop over a single malformed packet from the wire.
+            let contents = match recv_slice.try_into() {
+                Ok(contents) => contents,
+                Err(e) => {
+                    tracing::warn!(
+                        pc_id = %pc.id,
+                        len,
+                        err = ?e,
+                        "received datagram did not demultiplex as STUN/DTLS/RTP/RTCP; dropping it"
+                    );
+                    return Ok(false);
+                }
+            };
 
             let input = Input::Receive(
                 Instant::now(),
@@ -1350,12 +1405,10 @@ pub fn recv_and_feed(
                     proto: Protocol::Udp,
                     source,
                     destination: dest,
-                    contents: recv_slice.try_into().map_err(|e| format!("{e:?}"))?,
+                    contents,
                 },
             );
-            pc.rtc
-                .handle_input(input)
-                .map_err(|e| format!("handle_input error: {e}"))?;
+            pc.rtc.handle_input(input).map_err(Error::Input)?;
             return Ok(true);
         }
         Err(e)
@@ -1364,7 +1417,7 @@ pub fn recv_and_feed(
         {
             pc.rtc
                 .handle_input(Input::Timeout(Instant::now()))
-                .map_err(|e| format!("timeout error: {e}"))?;
+                .map_err(Error::Input)?;
         }
         Err(e) if is_routine_icmp_refusal(e.kind()) => {
             // Routine, but throttled and logged rather than silently swallowed: this is
@@ -1383,7 +1436,7 @@ pub fn recv_and_feed(
             }
         }
         Err(e) => {
-            return Err(format!("recv error: {e}").into());
+            return Err(Error::Socket(e));
         }
     }
     Ok(false)
@@ -2775,9 +2828,12 @@ mod tests {
         let mut pc = create_peer_connection("dc-test-pc".to_string());
         let result = write_data_channel(&mut pc, "matrix", false, b"hello");
         assert!(
-            result.is_err(),
-            "writing to a label with no completed DCEP handshake must error, not silently \
-             succeed"
+            matches!(
+                result,
+                Err(crate::error::DataChannelWriteError::NotOpenYet(ref label)) if label == "matrix"
+            ),
+            "writing to a label with no completed DCEP handshake must fail with \
+             NotOpenYet, not silently succeed or fail some other way: {result:?}"
         );
     }
 
@@ -3033,11 +3089,18 @@ mod offer_track_id_tests {
         );
     }
 
-    /// With nothing offered yet and nothing to offer, the error is real and must remain.
+    /// With nothing offered yet and nothing to offer, the error is real and must remain --
+    /// as [`crate::error::CreateOfferError::NothingToOffer`] specifically, not just any
+    /// `Err`. Updated from an `is_err()` check to a variant match: that weaker assertion
+    /// would still pass if `NothingToOffer` were ever renamed or replaced by something
+    /// stringly, which is exactly what Principle I forbids.
     #[test]
     fn an_empty_offer_with_no_history_is_still_an_error() {
         let mut pc = create_peer_connection("empty-offer-test".to_owned());
-        assert!(create_offer(&mut pc, &[], &[]).is_err());
+        assert!(matches!(
+            create_offer(&mut pc, &[], &[]),
+            Err(crate::error::CreateOfferError::NothingToOffer)
+        ));
     }
 
     /// The camera and the screen share are different tracks and must not share an m-line.
@@ -3366,6 +3429,197 @@ mod local_candidate_tests {
         assert!(
             !local_host_addresses().is_empty(),
             "a host with any usable interface must advertise at least one candidate"
+        );
+    }
+}
+
+/// One test per error variant from `error.rs`'s per-surface enums (BACKLOG X1).
+///
+/// Asserts the *variant* a failure comes back as, rather than its message -- a caller that
+/// needs to react differently per failure mode can only do that by matching a variant, and a
+/// test that only checks `is_err()` cannot pin which variant a regression silently swapped
+/// in.
+///
+/// `CreateOfferError::NothingToOffer` is covered by
+/// `offer_track_id_tests::an_empty_offer_with_no_history_is_still_an_error`, and
+/// `DataChannelWriteError::NotOpenYet` by
+/// `tests::write_data_channel_rejects_an_unopened_label` -- both pre-existed this change and
+/// were strengthened from `is_err()` to a variant match in place, rather than duplicated
+/// here.
+///
+/// `DataChannelWriteError::{NoStream, Sctp}` have no test here for the same reason
+/// `tests::write_data_channel_rejects_an_unopened_label`'s doc comment gives for not going
+/// further: `str0m::channel::ChannelId` cannot be constructed outside `str0m` itself, so
+/// reaching either variant needs a live, fully negotiated data channel -- exercised by
+/// manual/E2E testing instead. Likewise `MediaWriteError::Rtp`: str0m only returns it deep
+/// inside a real, negotiated RTP write.
+#[cfg(test)]
+mod error_variant_tests {
+    use super::*;
+    use crate::error::{
+        AddIceCandidateError, CreateAnswerError, MediaWriteError, SetRemoteDescriptionError,
+    };
+    use elementium_types::PlaintextMedia;
+
+    fn silence() -> WireMedia {
+        WireMedia::deliberately_unencrypted(PlaintextMedia::from_encoder(vec![0u8; 4]))
+    }
+
+    /// `createAnswer()` before any remote offer has been set is a caller-contract
+    /// violation, not a runtime condition -- there is nothing to wrap as a source.
+    #[test]
+    fn create_answer_with_no_remote_offer_is_no_remote_offer() {
+        let mut pc = create_peer_connection("no-remote-offer".to_owned());
+        assert!(matches!(
+            create_answer(&mut pc),
+            Err(CreateAnswerError::NoRemoteOffer)
+        ));
+    }
+
+    /// SDP that fails to parse at all must surface str0m's own parse error as the source,
+    /// not a formatted string a caller cannot match on.
+    #[test]
+    fn a_malformed_offer_sdp_is_an_offer_parse_error() {
+        let mut pc = create_peer_connection("bad-offer-sdp".to_owned());
+        let desc = SessionDescription {
+            sdp_type: SdpType::Offer,
+            sdp: "this is not SDP at all".to_owned(),
+        };
+        assert!(matches!(
+            set_remote_description(&mut pc, &desc),
+            Err(SetRemoteDescriptionError::OfferParse(_))
+        ));
+    }
+
+    /// Same as the offer case, for the answer arm -- and reached even with no pending
+    /// offer, because parsing precedes the "nothing to match" check that must stay `Ok`.
+    #[test]
+    fn a_malformed_answer_sdp_is_an_answer_parse_error() {
+        let mut pc = create_peer_connection("bad-answer-sdp".to_owned());
+        let desc = SessionDescription {
+            sdp_type: SdpType::Answer,
+            sdp: "this is not SDP at all".to_owned(),
+        };
+        assert!(matches!(
+            set_remote_description(&mut pc, &desc),
+            Err(SetRemoteDescriptionError::AnswerParse(_))
+        ));
+    }
+
+    /// SDP that parses cleanly but describes nothing str0m can accept (no `m=` lines) must
+    /// come back as a rejection with str0m's `RtcError` as its source, distinct from a
+    /// parse failure.
+    #[test]
+    fn an_offer_with_no_media_lines_is_offer_rejected() {
+        let mut pc = create_peer_connection("no-mlines-offer".to_owned());
+        let desc = SessionDescription {
+            sdp_type: SdpType::Offer,
+            sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n".to_owned(),
+        };
+        assert!(matches!(
+            set_remote_description(&mut pc, &desc),
+            Err(SetRemoteDescriptionError::OfferRejected(_))
+        ));
+    }
+
+    /// Same shape as the offer case, on the answer arm, with a real pending offer in force
+    /// so the "no pending offer" `Ok(None)` path is not what is being exercised here.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn an_answer_with_no_media_lines_is_answer_rejected() {
+        let mut pc = create_peer_connection("no-mlines-answer".to_owned());
+        let tcs = [TransceiverInfo::from_js(
+            "audio",
+            Some("sendonly"),
+            None,
+            Some("microphone"),
+        )];
+        create_offer(&mut pc, &[], &tcs).expect("build a pending offer to answer against");
+        assert!(pc.pending_offer.is_some(), "precondition: a pending offer exists");
+
+        let desc = SessionDescription {
+            sdp_type: SdpType::Answer,
+            sdp: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n".to_owned(),
+        };
+        assert!(matches!(
+            set_remote_description(&mut pc, &desc),
+            Err(SetRemoteDescriptionError::AnswerRejected(_))
+        ));
+    }
+
+    /// The candidate string itself must not appear anywhere in the error (constitution
+    /// principle IV -- candidates sit next to ICE/DTLS credential material); only its
+    /// length and str0m's parse error travel.
+    #[test]
+    fn a_malformed_ice_candidate_is_malformed() {
+        let mut pc = create_peer_connection("bad-candidate".to_owned());
+        let garbage = "not a candidate";
+        let result = add_ice_candidate(&mut pc, garbage);
+        assert!(
+            matches!(result, Err(AddIceCandidateError::Malformed { len, .. }) if len == garbage.len()),
+            "{result:?}"
+        );
+    }
+
+    /// Writing one of our own tracks that this connection never published must fail
+    /// closed with the specific track key named, not a generic "no writer" -- that
+    /// conflation is what once sent a screen share down the camera's m-line.
+    #[test]
+    fn writing_an_unpublished_track_is_track_not_published() {
+        let mut pc = create_peer_connection("unpublished-track".to_owned());
+        let key = MediaTrackKey::microphone();
+        assert!(matches!(
+            write_audio(&mut pc, key, &silence()),
+            Err(MediaWriteError::TrackNotPublished(k)) if k == key
+        ));
+    }
+
+    /// A mid recorded as ours but unknown to str0m (never actually negotiated) must fail
+    /// with `NoWriter`, distinct from `TrackNotPublished` -- the track *is* published as
+    /// far as `send_mids` is concerned, but str0m has no media session for the mid.
+    #[test]
+    fn writing_to_a_mid_str0m_does_not_know_is_no_writer() {
+        let mut pc = create_peer_connection("unknown-mid".to_owned());
+        let key = MediaTrackKey::microphone();
+        pc.send_mids.insert(key, Mid::from("zzz"));
+        assert!(matches!(
+            write_audio(&mut pc, key, &silence()),
+            Err(MediaWriteError::NoWriter(MediaKind::Audio))
+        ));
+    }
+
+    /// A writer exists and negotiation completed on both sides, but the codec asked for
+    /// was never one this connection offers at all (`create_peer_connection` enables only
+    /// VP8 and H.264, never AV1) -- so no local payload type for it exists, negotiated or
+    /// not, and the write must fail with `CodecNotNegotiated` rather than panic or
+    /// silently pick a different codec's payload type.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn writing_a_codec_never_configured_is_codec_not_negotiated() {
+        let mut offering = create_peer_connection("codec-offerer".to_owned());
+        let tcs = [TransceiverInfo::from_js(
+            "video",
+            Some("sendonly"),
+            None,
+            Some("camera"),
+        )];
+        let offer = create_offer(&mut offering, &[], &tcs).expect("offer");
+
+        let mut answering = create_peer_connection("codec-answerer".to_owned());
+        set_remote_description(&mut answering, &offer).expect("accept the remote offer");
+        let answer = create_answer(&mut answering).expect("createAnswer");
+
+        set_remote_description(&mut offering, &answer).expect("accept the remote answer");
+
+        let result = write_video(
+            &mut offering,
+            MediaTrackKey::camera(),
+            &silence(),
+            elementium_codec::VideoCodec::Av1,
+        );
+        assert!(
+            matches!(result, Err(MediaWriteError::CodecNotNegotiated { codec: "AV1" })),
+            "{result:?}"
         );
     }
 }

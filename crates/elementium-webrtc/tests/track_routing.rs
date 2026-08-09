@@ -160,7 +160,10 @@ fn writing_an_unpublished_track_is_refused_rather_than_rerouted() {
     .expect_err("a share that was never published must not be writable");
 
     assert!(
-        matches!(err, elementium_webrtc::error::WebRtcError::NoMidForTrack(_)),
+        matches!(
+            err,
+            elementium_webrtc::error::MediaWriteError::TrackNotPublished(_)
+        ),
         "the failure must name the missing track, not a missing writer; got {err:?}"
     );
 }
