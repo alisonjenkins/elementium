@@ -83,9 +83,22 @@
           ffmpeg
 
           # GStreamer (needed by WebKitGTK for media playback)
+          #
+          # `bad` and `libav` are here for H.264, and their absence was measured rather than
+          # assumed. WebKitGTK decodes through GStreamer, so this list decides what the page
+          # can decode: with only `base` and `good`, a probe in the running webview reported
+          # `VP8=yes VP9=yes H.264=no` from both `VideoDecoder.isConfigSupported` and
+          # `MediaSource.isTypeSupported`. VP8 and VP9 come from libvpx in `good`; neither
+          # carries an H.264 decoder, so the application had none.
+          #
+          # Invisible until an SFU negotiates H.264 -- which this codebase supports encoding,
+          # and went to some trouble to get right -- and then the far end's video simply
+          # never appears, with nothing saying why.
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-libav
 
           # Screen capture
           libx11
@@ -115,6 +128,8 @@
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-libav
         ];
 
       in {
@@ -129,7 +144,15 @@
             # Use the nix-provided browsers; playwright must not download its own.
             export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
             export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-            export GST_PLUGIN_PATH="${pkgs.gst_all_1.gst-plugins-base}/lib/gstreamer-1.0:${pkgs.gst_all_1.gst-plugins-good}/lib/gstreamer-1.0''${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+            # Every plugin set the webview may need, not the two it happened to be given.
+            # A missing decoder does not fail loudly here: the codec is simply reported
+            # unsupported, and a participant's video never appears.
+            export GST_PLUGIN_PATH="${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
+              pkgs.gst_all_1.gst-plugins-base
+              pkgs.gst_all_1.gst-plugins-good
+              pkgs.gst_all_1.gst-plugins-bad
+              pkgs.gst_all_1.gst-libav
+            ]}''${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
           '';
         };
 
@@ -168,6 +191,20 @@
               export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
               # TLS for the WebKit network stack: without it every https request fails.
               export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules"
+              # The decoders the webview can offer the page.
+              #
+              # Set here as well as in the dev shell, because this is the environment the
+              # application is actually run in and the two had drifted: the shell listed the
+              # plugins and this did not. Being on `LD_LIBRARY_PATH` is not enough --
+              # GStreamer finds plugins by this path, and a set it cannot find is a codec the
+              # page is told is unsupported, which surfaces only as a participant whose video
+              # never appears.
+              export GST_PLUGIN_PATH="${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" [
+                pkgs.gst_all_1.gst-plugins-base
+                pkgs.gst_all_1.gst-plugins-good
+                pkgs.gst_all_1.gst-plugins-bad
+                pkgs.gst_all_1.gst-libav
+              ]}''${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
               exec "$latest/elementium" "$@"
             '';
           }}/bin/elementium-snapshot";
