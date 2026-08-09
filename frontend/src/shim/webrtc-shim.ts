@@ -377,6 +377,19 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   private _operations: Promise<unknown> = Promise.resolve();
   /** The request count `createOffer` last saw, so a later request is not mistaken for it. */
   private _offerDescribesSeq = -1;
+  /**
+   * Whether anything of ours is sent on this connection.
+   *
+   * LiveKit runs two peer connections: a publisher, which offers, and a subscriber, which
+   * only ever answers what the SFU offers it. Firing `negotiationneeded` at the subscriber
+   * -- which this did, for the six receive-only transceivers livekit adds to it -- made
+   * livekit offer on it anyway. The SFU answered both offers, livekit routes every answer
+   * to the publisher because that is the only transport that offers, and the second answer
+   * matched nothing: `No pending offer to match answer`, and the call closed.
+   *
+   * A connection with nothing of ours on it has nothing to renegotiate about.
+   */
+  private _hasSendTransceiver = false;
 
   // Event handler properties (on* style)
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;
@@ -1052,6 +1065,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     }
     const sender = { track, replaceTrack: async () => {} } as unknown as RTCRtpSender;
     this._senders.push(sender);
+    this._hasSendTransceiver = true;
     this.markNegotiationNeeded();
     return sender;
   }
@@ -1096,6 +1110,9 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       trackId: track?.id,
       source: typeof source === "string" ? source : undefined,
     });
+    if (direction === "sendonly" || direction === "sendrecv") {
+      this._hasSendTransceiver = true;
+    }
     this.markNegotiationNeeded();
 
     const mid = String(this._transceivers.length);
@@ -1399,6 +1416,11 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       // request would be consumed rather than served. Held until `init` completes, which
       // re-checks.
       console.log("[Elementium] negotiationneeded held: connection not created yet");
+      return;
+    }
+    if (!this._hasSendTransceiver) {
+      // Receive-only: see `_hasSendTransceiver`. Held rather than cleared, so publishing
+      // later on this connection still asks.
       return;
     }
     if (this._offerDescribesSeq >= this._negotiationRequestSeq) {

@@ -273,6 +273,25 @@ describe("negotiationneeded", () => {
     expect(count).toBe(1);
   });
 
+  it("never asks a receive-only connection to renegotiate", async () => {
+    // LiveKit runs two peer connections: a publisher, which offers, and a subscriber, which
+    // only ever answers what the SFU offers it. Firing at the subscriber -- which happened,
+    // for the six receive-only transceivers livekit adds to it -- made livekit offer on it
+    // anyway. The SFU answered both offers; livekit routes every answer to the publisher,
+    // because that is the only transport that offers; and the second answer matched
+    // nothing. `No pending offer to match answer`, and the call closed.
+    const { pc, events } = await connection();
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    await settle();
+    expect(events()).toBe(0);
+
+    // Publishing on it later is a different matter, and must still ask.
+    pc.addTransceiver("audio", { direction: "sendonly" });
+    await settle();
+    expect(events()).toBe(1);
+  });
+
   it("holds a request made before the connection exists, then serves it", async () => {
     // livekit-client adds its receive transceivers immediately after constructing the peer
     // connection, and attaches `onnegotiationneeded` afterwards. Firing in that window
