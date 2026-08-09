@@ -509,11 +509,24 @@ impl TransceiverInfo {
         // tile and nothing in the camera tile.
         let key = match direction {
             Direction::RecvOnly | Direction::Inactive => None,
-            _ => Some(
-                source
-                    .and_then(|s| key_for_source(kind, s))
-                    .unwrap_or_else(|| default_key_for(kind)),
-            ),
+            _ => Some(source.and_then(|s| key_for_source(kind, s)).unwrap_or_else(|| {
+                // The fallback is deliberate -- a track we cannot place is better sent on
+                // the default m-line than not at all, and the name comes from a frontend
+                // that may be older than this list -- but it is the exact rule that put the
+                // camera on the screen share's m-line, so a track taking it says so. If
+                // this line ever appears for a source that is not simply absent, the list
+                // below needs the name adding, not the fallback removing.
+                if let Some(name) = source {
+                    tracing::warn!(
+                        kind = ?kind,
+                        source = %name,
+                        reason = "unknown_track_source",
+                        "unrecognised track source; falling back to the default m-line for \
+                         its kind, which two tracks of one kind would then contend for"
+                    );
+                }
+                default_key_for(kind)
+            })),
         };
         Self {
             kind,
