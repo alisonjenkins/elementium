@@ -24,7 +24,54 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
+import { interceptE2eeWorkerMessage, isCallKeyImport, noteLocalIdentity } from "./e2ee-bridge";
+
+/**
+ * `isCallKeyImport` used to accept every HKDF `importKey` call as an Element Call frame key.
+ * matrix-js-sdk derives its own HKDF material (secret storage, key wrapping) on the same
+ * "raw" + "HKDF" shape, so that counted unrelated imports as call keys and made the watchdog
+ * warn about keys that were never missing -- four false alarms in one call where the only
+ * real gap was 320ms at startup.
+ *
+ * The fix narrows on `keyUsages`, confirmed against the shipped bundles rather than guessed:
+ * livekit-client's `BaseKeyProvider.onEncryptionKeyChanged` (what Element Call's
+ * `MatrixKeyProvider` feeds) imports with usages `["deriveBits", "deriveKey"]` because the
+ * imported key is itself used to derive the installable AES key; matrix-js-sdk's HKDF imports
+ * (`deriveKeys.ts` and friends) request only `["deriveBits"]`, since they want raw output
+ * bytes and never install a `CryptoKey`. These tests pin that distinction as a pure function
+ * over the `importKey` arguments, independent of any WebCrypto stubbing.
+ */
+describe("isCallKeyImport", () => {
+  it("accepts HKDF with deriveKey in usages, as a string algorithm (Element Call's own shape)", () => {
+    expect(isCallKeyImport("HKDF", ["deriveBits", "deriveKey"])).toBe(true);
+  });
+
+  it("accepts HKDF with deriveKey in usages, as an algorithm object (livekit's BaseKeyProvider shape)", () => {
+    expect(isCallKeyImport({ name: "HKDF" }, ["deriveBits", "deriveKey"])).toBe(true);
+  });
+
+  it("rejects HKDF that only requests deriveBits (matrix-js-sdk's shape)", () => {
+    expect(isCallKeyImport({ name: "HKDF" }, ["deriveBits"])).toBe(false);
+    expect(isCallKeyImport("HKDF", ["deriveBits"])).toBe(false);
+  });
+
+  it("rejects a non-HKDF algorithm even if it asks for deriveKey", () => {
+    expect(isCallKeyImport({ name: "PBKDF2" }, ["deriveBits", "deriveKey"])).toBe(false);
+    expect(isCallKeyImport("AES-CTR", ["deriveKey"])).toBe(false);
+  });
+
+  it("rejects when keyUsages is missing, empty, or not an array", () => {
+    expect(isCallKeyImport("HKDF", undefined)).toBe(false);
+    expect(isCallKeyImport("HKDF", [])).toBe(false);
+    expect(isCallKeyImport("HKDF", "deriveKey")).toBe(false);
+  });
+
+  it("rejects an algorithm that is neither a matching string nor an object with the right name", () => {
+    expect(isCallKeyImport(null, ["deriveBits", "deriveKey"])).toBe(false);
+    expect(isCallKeyImport(undefined, ["deriveBits", "deriveKey"])).toBe(false);
+    expect(isCallKeyImport({}, ["deriveBits", "deriveKey"])).toBe(false);
+  });
+});
 
 describe("interceptE2eeWorkerMessage dispatch", () => {
   let invoke: ReturnType<typeof vi.fn>;

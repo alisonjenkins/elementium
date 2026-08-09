@@ -111,7 +111,7 @@ function hookImportKey(): void {
       if (bytes) {
         // Copy: the caller's buffer may be reused or detached after this returns.
         const copy = new Uint8Array(bytes);
-        const call = isCallKeyImport(algorithm) ? noteKeyImported() : null;
+        const call = isCallKeyImport(algorithm, keyUsages) ? noteKeyImported() : null;
         result
           .then((key) => {
             rawKeyMaterial.set(key, copy);
@@ -130,20 +130,40 @@ function hookImportKey(): void {
 }
 
 /**
- * Whether an `importKey` call is Element Call deriving a frame-encryption key.
+ * Whether an `importKey` call is a frame-encryption key on its way to livekit's E2EE worker,
+ * as opposed to matrix-js-sdk deriving key material for something else entirely.
  *
- * Element Call imports its call keys as HKDF material
- * (`importKey("raw", key, "HKDF", false, ["deriveBits", "deriveKey"])`). Element Web imports
- * plenty of other raw keys for Matrix's own crypto, and counting those would make the
- * arithmetic below meaningless.
+ * Both use HKDF, so algorithm name alone does not distinguish them -- that was the bug: the
+ * old version of this check counted every HKDF import as a call key, so matrix-js-sdk's own
+ * derivations (secret storage, PBKDF2-adjacent key wrapping) were misclassified as call keys
+ * that went missing, and the watchdog below cried wolf on a normal call.
+ *
+ * `keyUsages` is what actually separates them, per the shipped bundles (grepped, not
+ * guessed -- see `element-web-dist/widgets/element-call/assets/index-ZYqhOGev.js` and
+ * `element-web-dist/bundles/*\/9392.js`):
+ *
+ * - livekit-client's `BaseKeyProvider.onEncryptionKeyChanged` (which is what Element Call's
+ *   `MatrixKeyProvider` feeds) imports with
+ *   `importKey("raw", key, "HKDF", false, ["deriveBits", "deriveKey"])` -- it asks for
+ *   `deriveKey` because the imported key is itself used to derive further `CryptoKey`s
+ *   (the AES key actually installed via `setKey`).
+ * - matrix-js-sdk's HKDF derivations (`deriveKeys.ts`, secret-storage key wrapping) import
+ *   with `importKey("raw", key, {name: "HKDF"}, false, ["deriveBits"])` -- `deriveBits`
+ *   only, because they want raw output bytes, not an installable key.
+ *
+ * So the distinguisher is "HKDF import that also requests `deriveKey`". Not a proof --
+ * nothing observed at this layer can be -- but it is the actual difference between the two
+ * call sites in the bundle, not a guess.
  */
-function isCallKeyImport(algorithm: unknown): boolean {
-  if (algorithm === "HKDF") return true;
-  return (
-    typeof algorithm === "object" &&
-    algorithm !== null &&
-    (algorithm as { name?: unknown }).name === "HKDF"
-  );
+export function isCallKeyImport(algorithm: unknown, keyUsages: unknown): boolean {
+  const name =
+    algorithm === "HKDF"
+      ? "HKDF"
+      : typeof algorithm === "object" && algorithm !== null
+        ? (algorithm as { name?: unknown }).name
+        : undefined;
+  if (name !== "HKDF") return false;
+  return Array.isArray(keyUsages) && keyUsages.includes("deriveKey");
 }
 
 /**
@@ -154,8 +174,11 @@ function isCallKeyImport(algorithm: unknown): boolean {
  * key ever failed to be recovered. Either livekit never told the worker about those keys, or
  * it did so by a route this ignores -- and the two have different owners.
  *
- * Counting derivations against forwards separates them. A key that Element Call derives and
- * never sends is upstream of us; a key that is sent and not forwarded is ours.
+ * Counting derivations against forwards separates the two only partway: a key that this
+ * bridge tried to send and the IPC refused (`ipc_failures`) is definitely ours. A key that
+ * simply never arrived at `setKey` is *consistent* with livekit never asking the worker to
+ * install it, but that is an absence, not an observation -- see the hedge in the watchdog
+ * message below.
  *
  * Holds no `CryptoKey` and no material -- only a serial and a timestamp -- so nothing here
  * keeps key material alive or puts it anywhere it could be logged.
@@ -186,11 +209,13 @@ function noteKeyImported(): number {
     pendingImports.delete(serial);
     console.warn(
       `[Elementium] E2EE call key #${serial} was derived ${Date.now() - entry.at}ms ago and ` +
-        `never reached the worker, so the native backend does not have it. ` +
+        `has not reached the worker via setKey, so the native backend does not have it yet. ` +
         `derived=${keysImported} forwarded=${keysForwarded} ` +
         `still_waiting=${pendingImports.size} ipc_failures=${keyIpcFailures}. ` +
-        `A non-zero ipc_failures means the bridge tried and the IPC refused, which is ours; ` +
-        `zero means livekit was never asked to install it, which is upstream of the bridge.`,
+        `A non-zero ipc_failures means this bridge tried to hand a key to the native backend ` +
+        `and the IPC call failed -- that part is ours. A zero here only means the bridge did ` +
+        `not fail; it does not prove livekit ever tried to install this key, only that this ` +
+        `bridge never saw it try.`,
     );
   }, UNFORWARDED_KEY_MS);
   return serial;
