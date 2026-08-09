@@ -77,6 +77,37 @@ control turns "they say it looks bad" into `framesDecoded` and `keyFramesDecoded
 The next step is therefore not another theory. It is to run the harness, read the receiver's
 own numbers, and let them say which half of the link is at fault.
 
+### The harness now exists, and the fault does not reproduce in it
+
+`just test-app-call` puts Elementium in a real call against the local stack and measures the
+far end. Result:
+
+    framesDecoded 30.1/s, keyFramesDecoded 1% of them
+
+That is healthy video, from the same send path that gives a remote participant twenty frames
+a minute. So the fault is **not in the send path alone** -- which agrees with all three
+theories above having been disproved -- and is a property of the configuration, not the code
+in isolation.
+
+What differs between the passing test and the failing call, in rough order of suspicion:
+
+1. **The SFU and the network between us and it.** The test uses a LiveKit container on
+   loopback; the failing calls go to a remote LiveKit 1.12.0 over the internet. Loss, MTU and
+   the SFU's own forwarding decisions all exist in one and not the other.
+2. **Who the receiver is.** The test's far end is Element Web driven by Playwright. The
+   failing reports come from other people's clients and from a browser on the same machine.
+3. **Participant count.** One remote participant in the test; three or four in the failing
+   calls, which is when an SFU starts making forwarding choices rather than relaying.
+4. **The key path.** In the test Element Call distributes and rotates over to-device and
+   Elementium adopts each key -- sixteen in one call. The single-distribution fault (P1a) was
+   observed against the real deployment, so the two configurations do not exercise the same
+   code.
+
+The cheapest next experiment is to point the harness at the real SFU rather than the local
+one. If it still reads 30/s, the fault is in the receiver or the participant mix; if it drops
+to keyframes only, it is the network or that SFU, and everything on our side is exonerated.
+Either answer is worth more than another reading of our own code.
+
 ## P1 — Encryption keys: one fault outbound, one inbound
 
 Same subsystem, same root, two visible failures. Both trace to this client's MatrixRTC
