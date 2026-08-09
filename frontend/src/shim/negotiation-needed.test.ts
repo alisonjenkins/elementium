@@ -172,18 +172,16 @@ describe("negotiationneeded", () => {
     expect(events()).toBe(1);
   });
 
-  it("keeps a request the offer being built could not have included", async () => {
-    // The sequence a real call produced, and the reason a microphone stayed unpublished
-    // while every other part of this machinery worked:
+  it("gets a published track into an offer even when it lands mid-negotiation", async () => {
+    // The sequence a real call produced, three times, and the reason a microphone stayed
+    // unpublished while every other part of this machinery worked: a description is being
+    // applied, the backend is building an offer, and the track is published into that
+    // window -- belonging to neither.
     //
-    //   a description is being applied     -> a new request is held rather than served
-    //   the backend is building an offer   -> what it will describe is already fixed
-    //   the track is published             -> in neither
-    //   the offer comes back and is applied
-    //
-    // Recording what the offer covers *after* its await counted that late request as
-    // covered, so applying the offer cleared it and nothing ever asked again. The count has
-    // to be taken when the backend is asked, not when it answers.
+    // What matters is not which mechanism rescues it. Either the offer being built ends up
+    // carrying it, or a fresh negotiation is asked for afterwards. What must never happen,
+    // and did, is that the request is quietly cleared by an offer that does not contain it,
+    // leaving the track waiting for an offer already sent without it.
     const { pc, events } = await connection();
     const firstOffer = await pc.createOffer();
 
@@ -193,21 +191,52 @@ describe("negotiationneeded", () => {
     const building = pc.createOffer();
     await settle();
 
-    // Published into that window: held, because a description is in flight.
     pc.addTransceiver("audio", { direction: "sendonly" });
     await settle();
-    expect(events()).toBe(0);
 
     releaseLocal();
     await applying;
     releaseOffer();
     const secondOffer = await building;
-
     await pc.setLocalDescription(secondOffer);
     await pc.setRemoteDescription({ type: "answer", sdp: "v=0\r\n" });
     await settle();
-    // Neither offer describes the audio track, so its request must have survived both.
-    expect(events()).toBe(1);
+
+    const offered = invoked
+      .filter((c) => c.cmd === "create_offer")
+      .flatMap((c) => ((c.args as { transceivers?: unknown[] }).transceivers ?? []));
+    const audioOffered = offered.some(
+      (t) => (t as { kind?: string; direction?: string }).kind === "audio"
+        && (t as { direction?: string }).direction === "sendonly",
+    );
+    // Either it made it into an offer, or one is still being asked for. Never neither.
+    expect(audioOffered || events() > 0).toBe(true);
+  });
+
+  it("does not lose a transceiver added while the backend is building an offer", async () => {
+    // The root of three failed builds. `createOffer` handed the backend the pending
+    // transceivers and then cleared the list *after* the await -- deleting anything added
+    // while the backend was working. livekit-client publishes exactly there: on a real call
+    // the backend took 1.1 seconds to answer and the microphone was added 20ms in. It went
+    // into no offer, and the record of it was gone, so no later offer could carry it
+    // either. The participant showed as muted for the rest of the call.
+    const { pc } = await connection();
+    const release = hold("offer");
+
+    const building = pc.createOffer();
+    await settle();
+    // Published while the backend builds.
+    pc.addTransceiver("audio", { direction: "sendonly" });
+    release();
+    await building;
+
+    // The next offer must still know about it.
+    await pc.createOffer();
+    const offeredAudio = invoked
+      .filter((c) => c.cmd === "create_offer")
+      .flatMap((c) => ((c.args as { transceivers?: unknown[] }).transceivers ?? []))
+      .some((t) => (t as { kind?: string }).kind === "audio");
+    expect(offeredAudio).toBe(true);
   });
 
   it("holds a request made before the connection exists, then serves it", async () => {

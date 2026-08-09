@@ -359,6 +359,22 @@ export class ElementiumRTCPeerConnection extends EventTarget {
    * been sent without it.
    */
   private _negotiationRequestSeq = 0;
+  /**
+   * The DOM's operations chain, which this shim did not have.
+   *
+   * `RTCPeerConnection` serialises `createOffer`, `createAnswer`,
+   * `setLocalDescription` and `setRemoteDescription`: each waits for the one before it, so
+   * the signalling state a caller observes is always the state the previous operation left.
+   * Here each of those awaits its own IPC and writes `_signalingState` when that returns --
+   * so two overlapping operations complete in whatever order the backend answers, and a
+   * slow one lands after a later one and overwrites it.
+   *
+   * A real call did exactly that: an answer returned the connection to `stable`, an
+   * earlier `setLocalDescription` finished afterwards and set `have-local-offer` again, and
+   * the published microphone was held waiting for a stable state that never came back. The
+   * connection closed fifteen seconds later.
+   */
+  private _operations: Promise<unknown> = Promise.resolve();
   /** The request count `createOffer` last saw, so a later request is not mistaken for it. */
   private _offerDescribesSeq = -1;
 
@@ -795,7 +811,11 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   get canTrickleIceCandidates(): boolean | null { return true; }
   get sctp(): RTCSctpTransport | null { return null; }
 
-  async createOffer(_options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
+  async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
+    return this.chainOperation(() => this.buildOffer(options));
+  }
+
+  private async buildOffer(_options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
     console.log(`[Elementium] createOffer: pcId=${this.pcId} hasVideo=${this._hasVideo} dc=${this._pendingDataChannels.length} tc=${this._pendingTransceivers.length}`);
     // Captured here, not after the await. What the offer describes is the transceivers
@@ -805,22 +825,38 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // for an offer that had already gone without it. That is how the microphone stayed
     // unpublished on a call where every other part of this machinery worked.
     const describesSeq = this._negotiationRequestSeq;
+    // Taken and cleared *before* the await, not after.
+    //
+    // Clearing afterwards deleted anything added while the backend was building the SDP --
+    // and livekit-client publishes exactly there. The transceiver was never sent with this
+    // offer, because the snapshot predated it, and never sent with any later one either,
+    // because the record of it was gone. On a real call the backend took 1.1 seconds to
+    // answer and the microphone was published 20ms in: it was dropped, silently, and the
+    // participant showed as muted for the rest of the call.
+    //
+    // A fresh array for late arrivals means they survive to the next offer, which the
+    // preserved negotiation request will ask for.
+    const dataChannels = this._pendingDataChannels;
+    const transceivers = this._pendingTransceivers;
+    this._pendingDataChannels = [];
+    this._pendingTransceivers = [];
     const desc = await invoke<NativeSessionDescription>("create_offer", {
       pcId: this.pcId,
       includeVideo: this._hasVideo,
-      dataChannels: this._pendingDataChannels.length > 0 ? this._pendingDataChannels : null,
-      transceivers: this._pendingTransceivers.length > 0 ? this._pendingTransceivers : null,
+      dataChannels: dataChannels.length > 0 ? dataChannels : null,
+      transceivers: transceivers.length > 0 ? transceivers : null,
     });
-    // Clear pending lists after they've been applied
-    this._pendingDataChannels = [];
-    this._pendingTransceivers = [];
     this._offerDescribesSeq = describesSeq;
     console.log(`[Elementium] createOffer result: pcId=${this.pcId} sdpLen=${desc.sdp.length}`);
     if (sdpTracingEnabled()) console.log("[Elementium] createOffer raw SDP:\n" + desc.sdp);
     return sessionDescription(desc, "offer");
   }
 
-  async createAnswer(_options?: RTCAnswerOptions): Promise<RTCSessionDescriptionInit> {
+  async createAnswer(options?: RTCAnswerOptions): Promise<RTCSessionDescriptionInit> {
+    return this.chainOperation(() => this.buildAnswer(options));
+  }
+
+  private async buildAnswer(_options?: RTCAnswerOptions): Promise<RTCSessionDescriptionInit> {
     await this.ensureReady();
     console.log(`[Elementium] createAnswer: pcId=${this.pcId}`);
     const desc = await invoke<NativeSessionDescription>("create_answer", {
@@ -833,7 +869,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
     this._descriptionsInFlight += 1;
     try {
-      await this.applyLocalDescription(description);
+      await this.chainOperation(() => this.applyLocalDescription(description));
     } finally {
       this._descriptionsInFlight -= 1;
       this.recheckNegotiationSoon();
@@ -851,10 +887,12 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       //
       // Which one to generate is decided by the same rule the spec gives: an offer unless
       // a remote offer is outstanding, in which case the reply is an answer.
+      // The unchained builders: this already runs inside a chained operation, and calling
+      // the public methods here would queue behind the operation that is running them.
       const implicit =
         this._signalingState === "have-remote-offer"
-          ? await this.createAnswer()
-          : await this.createOffer();
+          ? await this.buildAnswer()
+          : await this.buildOffer();
       await this.applyLocalDescription(implicit);
       return;
     }
@@ -891,7 +929,7 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     this._descriptionsInFlight += 1;
     try {
-      await this.applyRemoteDescription(description);
+      await this.chainOperation(() => this.applyRemoteDescription(description));
     } finally {
       this._descriptionsInFlight -= 1;
       this.recheckNegotiationSoon();
@@ -1345,6 +1383,22 @@ export class ElementiumRTCPeerConnection extends EventTarget {
    * Called from a task rather than inline so it runs after the caller has finished
    * whatever state change prompted it, which is the same reason the DOM queues the check.
    */
+  /**
+   * Run `op` after every operation queued before it, whatever their outcome.
+   *
+   * A failed operation must not stall the chain -- the DOM's rejects the pending ones, but
+   * here a stuck chain would silently freeze all future negotiation, which is a worse
+   * failure than letting the next operation try.
+   */
+  private chainOperation<T>(op: () => Promise<T>): Promise<T> {
+    const run = this._operations.then(op, op);
+    this._operations = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   private recheckNegotiationSoon(): void {
     if (!this._negotiationNeeded) return;
     setTimeout(() => this.fireNegotiationNeededIfStable(), 0);
