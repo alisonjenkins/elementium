@@ -262,7 +262,7 @@ async function getTransportStatsReport(pcId: string | null): Promise<RTCStatsRep
  * Extends EventTarget for proper event dispatching. Element Web's
  * matrix-js-sdk relies on onicecandidate, ontrack, etc. callbacks.
  */
-class ElementiumRTCPeerConnection extends EventTarget {
+export class ElementiumRTCPeerConnection extends EventTarget {
   private pcId: string | null = null;
   private _connectionState: RTCPeerConnectionState = "new";
   private _iceConnectionState: RTCIceConnectionState = "new";
@@ -291,6 +291,17 @@ class ElementiumRTCPeerConnection extends EventTarget {
     trackId?: string;
     source?: string;
   }[] = [];
+  /**
+   * The spec's "negotiation-needed flag": set when something has changed that an offer
+   * would have to describe, cleared once an offer describing it has been applied.
+   *
+   * Held as state rather than firing the event inline because the event may only be
+   * delivered from a stable signaling state. A track published while an offer is already
+   * outstanding sets the flag and waits; returning to stable is what releases it.
+   */
+  private _negotiationNeeded = false;
+  /** True between queueing the check and running it, so a burst coalesces into one event. */
+  private _negotiationCheckQueued = false;
 
   // Event handler properties (on* style)
   onconnectionstatechange: ((this: RTCPeerConnection, ev: Event) => void) | null = null;
@@ -708,6 +719,14 @@ class ElementiumRTCPeerConnection extends EventTarget {
     this._localDescription = new RTCSessionDescription(description);
     this._signalingState = description.type === "offer" ? "have-local-offer" : "stable";
     this.fireEvent("signalingstatechange", this.onsignalingstatechange);
+    // An offer of ours describes everything outstanding at the moment it was created, so it
+    // clears the flag. An answer does not -- it describes what the *remote* asked about --
+    // so anything added meanwhile still needs an offer, and stable is where it can have one.
+    if (description.type === "offer") {
+      this._negotiationNeeded = false;
+    } else {
+      this.fireNegotiationNeededIfStable();
+    }
   }
 
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
@@ -736,6 +755,9 @@ class ElementiumRTCPeerConnection extends EventTarget {
       this._signalingState = "stable";
     }
     this.fireEvent("signalingstatechange", this.onsignalingstatechange);
+    // An answer completing our exchange returns us to stable, which is where anything that
+    // was added mid-negotiation finally gets its offer.
+    this.fireNegotiationNeededIfStable();
   }
 
   async addIceCandidate(candidate?: RTCIceCandidateInit | null): Promise<void> {
@@ -770,12 +792,17 @@ class ElementiumRTCPeerConnection extends EventTarget {
     }
     const sender = { track, replaceTrack: async () => {} } as unknown as RTCRtpSender;
     this._senders.push(sender);
+    this.markNegotiationNeeded();
     return sender;
   }
 
   removeTrack(sender: RTCRtpSender): void {
     console.log("[Elementium] removeTrack called");
+    const before = this._senders.length;
     this._senders = this._senders.filter(s => s !== sender);
+    // Only when a sender was actually removed. livekit-client calls this for senders it has
+    // already dropped, and an offer per no-op call is renegotiation for nothing.
+    if (this._senders.length !== before) this.markNegotiationNeeded();
   }
 
   addTransceiver(
@@ -806,6 +833,7 @@ class ElementiumRTCPeerConnection extends EventTarget {
       trackId: track?.id,
       source: typeof source === "string" ? source : undefined,
     });
+    this.markNegotiationNeeded();
 
     const mid = String(this._transceivers.length);
 
@@ -1016,6 +1044,48 @@ class ElementiumRTCPeerConnection extends EventTarget {
 
   async getStats(_selector?: MediaStreamTrack | null): Promise<RTCStatsReport> {
     return getTransportStatsReport(this.pcId);
+  }
+
+  /**
+   * Record that renegotiation is required, and arrange for `negotiationneeded` to fire.
+   *
+   * Adding a track or a transceiver makes an offer necessary, and in the DOM the browser
+   * says so by firing this event. Nothing here did: `addTransceiver` recorded the
+   * transceiver for the next offer and returned, and `addTrack` did not even do that. Any
+   * caller that publishes by adding a transceiver and then waits to be asked for an offer --
+   * which is livekit-client, and so every call this application makes -- waited forever. Its
+   * publisher timed out after fifteen seconds, reported `negotiation disconnected`, and
+   * rebuilt the whole room; a call spent its life doing that on a loop, with the microphone
+   * never published and the participant shown, correctly, as muted.
+   *
+   * The check is queued rather than run inline because the spec requires it: the event fires
+   * from a task, after the code that caused it has finished, so several additions in one
+   * turn produce one offer rather than one each.
+   */
+  private markNegotiationNeeded(): void {
+    this._negotiationNeeded = true;
+    if (this._negotiationCheckQueued) return;
+    this._negotiationCheckQueued = true;
+    queueMicrotask(() => {
+      this._negotiationCheckQueued = false;
+      this.fireNegotiationNeededIfStable();
+    });
+  }
+
+  /**
+   * Fire `negotiationneeded` if one is outstanding and the connection can act on it.
+   *
+   * Only from `stable`: an offer made while another is in flight is a glare, and the caller
+   * will make one anyway when the current exchange completes -- which is why the signaling
+   * state transitions call this too.
+   */
+  private fireNegotiationNeededIfStable(): void {
+    if (!this._negotiationNeeded) return;
+    if (this._signalingState !== "stable") return;
+    if (this._connectionState === "closed") return;
+    this._negotiationNeeded = false;
+    console.log(`[Elementium] negotiationneeded: pcId=${this.pcId}`);
+    this.fireEvent("negotiationneeded", this.onnegotiationneeded);
   }
 
   restartIce(): void {
