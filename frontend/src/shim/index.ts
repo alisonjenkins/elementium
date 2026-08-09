@@ -12,6 +12,7 @@ import { setupMediaDevicesShim } from "./media-devices";
 import { setupConsoleBridge } from "./console-bridge";
 import { setupE2eeBridge } from "./e2ee-bridge";
 import { setupMembershipLog } from "./membership-log";
+import { setupWidgetApiLog } from "./widget-api-log";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 import { install, isPatched, record } from "./install-report";
 
@@ -69,6 +70,18 @@ install(
   () =>
     Boolean(
       (window as unknown as Record<string, unknown>)["__elementium_membership_logged"],
+    ),
+);
+
+// Element Call's whole view of the room, and its only route for distributing a key, is the
+// widget API. Logged in both frames -- each sees the direction addressed to it.
+install(
+  "widget-api-log",
+  "window message events",
+  setupWidgetApiLog,
+  () =>
+    Boolean(
+      (window as unknown as Record<string, unknown>)["__elementium_widget_api_logged"],
     ),
 );
 
