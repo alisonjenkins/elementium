@@ -273,6 +273,14 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   private _initPromise: Promise<void>;
   private _senders: RTCRtpSender[] = [];
   private _transceivers: RTCRtpTransceiver[] = [];
+  /** Receivers for tracks the SFU pushed at us -- what `getReceivers()` returns. */
+  private _receivers: RTCRtpReceiver[] = [];
+  /**
+   * Transceivers created for a remote track arriving, kept apart from `_transceivers`
+   * (which holds only ones this side created via `addTransceiver`/implicit publish) so each
+   * can be built and looked up by its own rules, then merged for `getTransceivers()`.
+   */
+  private _remoteTransceivers: RTCRtpTransceiver[] = [];
   private _dataChannelIdCounter = 0;
   private _hasVideo = false;
   // Tracked for passing to create_offer so the SDP includes the right m-lines
@@ -524,13 +532,80 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       }
     }
 
-    // Dispatch the track event
+    const track = stream.getTracks()[0] || new MediaStreamTrack();
+
+    // A receiver whose `.track` is the actual remote track, not a bare `{}` disconnected
+    // from it. livekit-client resolves incoming media by walking `getReceivers()` and
+    // `getTransceivers()` and reading `receiver.track` off what it finds there -- a
+    // receiver that doesn't carry the track that just arrived makes that walk find nothing,
+    // even though the `RTCTrackEvent` it also inspects carries the same track object.
+    const receiver = {
+      track,
+      transport: null,
+      transform: null as unknown,
+      getParameters: () => ({
+        codecs: [],
+        headerExtensions: [],
+        rtcp: { cname: "", reducedSize: false },
+      }),
+      // No per-receiver stats path exists from str0m to here -- only the aggregate
+      // transport-stats snapshot `getTransportStatsReport()` builds for `pc.getStats()`.
+      // Left as an empty map rather than inventing numbers nothing measured, per the same
+      // rule `getTransportStatsReport()`'s own doc comment states.
+      getStats: async () => new Map() as unknown as RTCStatsReport,
+      getContributingSources: () => [],
+      getSynchronizationSources: () => [],
+    } as unknown as RTCRtpReceiver;
+
+    // A receive transceiver keyed by the real mid, not a `{}` nothing can look up by mid or
+    // track id. livekit-client's `getTransceiverByTrackId` and `getRemoteTrackIdByMid` both
+    // walk `getTransceivers()` for exactly this pairing (mid <-> receiver.track.id).
+    const transceiver = {
+      mid,
+      sender: {
+        track: null,
+        dtmf: null,
+        transport: null,
+        transform: null as unknown,
+        replaceTrack: async () => {},
+        getParameters: () => ({
+          codecs: [],
+          headerExtensions: [],
+          rtcp: { cname: "", reducedSize: false },
+          encodings: [],
+          transactionId: "",
+        }),
+        setParameters: async (params: RTCRtpSendParameters) => params,
+        getStats: async () => new Map() as unknown as RTCStatsReport,
+        setStreams: () => {},
+      } as unknown as RTCRtpSender,
+      receiver,
+      direction: "recvonly" as RTCRtpTransceiverDirection,
+      // Already negotiated by the time a track can physically arrive at all -- unlike a
+      // transceiver we create ourselves, there is no "added but not yet offered" state for
+      // one the SFU is already pushing media through.
+      currentDirection: "recvonly" as RTCRtpTransceiverDirection | null,
+      stopped: false,
+      setDirection: () => {},
+      stop: () => {
+        (transceiver as unknown as Record<string, unknown>).stopped = true;
+        (transceiver as unknown as Record<string, unknown>).currentDirection = null;
+      },
+      setCodecPreferences: () => {},
+    } as unknown as RTCRtpTransceiver;
+
+    this._receivers.push(receiver);
+    this._remoteTransceivers.push(transceiver);
+
+    // Dispatch the track event, carrying the same receiver/transceiver objects just
+    // registered above -- not fresh `{}` ones the caller can never find again through
+    // `getReceivers()`/`getTransceivers()`.
     try {
       const trackEvent = new RTCTrackEvent("track", {
-        track: stream.getTracks()[0] || new MediaStreamTrack(),
+        track,
         streams: [stream],
-        receiver: {} as RTCRtpReceiver,
-        transceiver: {} as RTCRtpTransceiver,
+        receiver,
+        transceiver,
       });
       this.dispatchEvent(trackEvent);
       this.ontrack?.call(this as unknown as RTCPeerConnection, trackEvent);
@@ -726,6 +801,11 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // so anything added meanwhile still needs an offer, and stable is where it can have one.
     if (description.type === "offer") {
       this._negotiationNeeded = false;
+      // We are the offerer: the offer we just applied describes our own transceivers
+      // exactly as we asked (this shim never renegotiates a direction the caller didn't
+      // request), so their negotiated direction is already known -- no need to wait for
+      // the answer to say what it already knows.
+      this.applyNegotiatedDirection();
     } else {
       this.fireNegotiationNeededIfStable();
     }
@@ -759,6 +839,13 @@ export class ElementiumRTCPeerConnection extends EventTarget {
       this._signalingState = "stable";
     }
     this.fireEvent("signalingstatechange", this.onsignalingstatechange);
+    if (description.type === "answer") {
+      // The remote side's answer to our offer is what completes the exchange -- this is
+      // the point the DOM itself updates `currentDirection` at. Idempotent with the
+      // `setLocalDescription(offer)` call: both apply the same already-known value, since
+      // this shim never renegotiates a direction down from what the caller asked for.
+      this.applyNegotiatedDirection();
+    }
     // An answer completing our exchange returns us to stable, which is where anything that
     // was added mid-negotiation finally gets its offer.
     this.fireNegotiationNeededIfStable();
@@ -1043,8 +1130,10 @@ export class ElementiumRTCPeerConnection extends EventTarget {
   setConfiguration(_configuration?: RTCConfiguration): void {}
 
   getSenders(): RTCRtpSender[] { return this._senders; }
-  getReceivers(): RTCRtpReceiver[] { return []; }
-  getTransceivers(): RTCRtpTransceiver[] { return [...this._transceivers]; }
+  getReceivers(): RTCRtpReceiver[] { return [...this._receivers]; }
+  getTransceivers(): RTCRtpTransceiver[] {
+    return [...this._transceivers, ...this._remoteTransceivers];
+  }
 
   async getStats(_selector?: MediaStreamTrack | null): Promise<RTCStatsReport> {
     return getTransportStatsReport(this.pcId);
@@ -1090,6 +1179,24 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     this._negotiationNeeded = false;
     console.log(`[Elementium] negotiationneeded: pcId=${this.pcId}`);
     this.fireEvent("negotiationneeded", this.onnegotiationneeded);
+  }
+
+  /**
+   * Move `currentDirection` from `null` to the direction we asked for, on our own send
+   * transceivers, once a description application makes that real.
+   *
+   * `direction` (desired) and `currentDirection` (negotiated) stayed conflated at `null`
+   * forever: nothing ever set the latter. livekit-client's `getLocalTracks()` filters on
+   * `currentDirection` being `"sendonly"` or `"sendrecv"`, so that list was permanently
+   * empty no matter what actually got negotiated. Only `_transceivers` (this side's own,
+   * from `addTransceiver`) is touched here -- remote transceivers set their own
+   * `currentDirection` at creation, and a stopped transceiver's direction is meaningless.
+   */
+  private applyNegotiatedDirection(): void {
+    for (const t of this._transceivers) {
+      if ((t as unknown as { stopped: boolean }).stopped) continue;
+      (t as unknown as Record<string, unknown>).currentDirection = t.direction;
+    }
   }
 
   restartIce(): void {
