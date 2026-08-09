@@ -7,6 +7,7 @@
 #![allow(clippy::unreachable)]
 use serde::Serialize;
 use tauri::{State, command};
+use tracing::Instrument;
 
 use elementium_types::CaptureSource;
 
@@ -80,6 +81,33 @@ pub async fn get_capture_sources() -> Result<Vec<CaptureSource>, String> {
 /// declining, the other is something to investigate.
 #[command]
 pub async fn get_display_media(
+    webrtc_state: State<'_, WebRtcState>,
+    media_state: State<'_, MediaState>,
+    source_id: Option<String>,
+    audio: bool,
+) -> Result<DisplayMediaResult, String> {
+    // The call this share belongs to, so the portal exchange can be read alongside the rest
+    // of the call rather than as an unattached island. The pipeline this eventually starts
+    // already labels itself this way; without it here, the steps *before* a pipeline exists
+    // -- which is where a share that never gets a picker fails -- belonged to no call at all.
+    //
+    // Carried as a span applied to the future with `Instrument`, never as an entered guard:
+    // a guard held across an `.await` is attached to whichever thread resumes it, and this
+    // function awaits a dialog for as long as a person takes to read one.
+    let call_id = media_state
+        .session_correlation
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default();
+    let span = tracing::info_span!("share", correlation_id = %call_id);
+
+    get_display_media_inner(webrtc_state, media_state, source_id, audio)
+        .instrument(span)
+        .await
+}
+
+async fn get_display_media_inner(
     webrtc_state: State<'_, WebRtcState>,
     media_state: State<'_, MediaState>,
     source_id: Option<String>,
