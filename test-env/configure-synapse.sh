@@ -43,6 +43,13 @@ if [[ ! -f "$DATA/localhost.tls.crt" ]]; then
     in_synapse openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
         -keyout /data/localhost.tls.key -out /data/localhost.tls.crt \
         -subj "/CN=localhost" >/dev/null 2>&1
+    # openssl runs as root in that container and writes the key 0600 root:root, while synapse
+    # runs as the invoking user (UID/GID in the compose file, so the config stays editable
+    # from outside). The homeserver then cannot read its own federation key and exits at
+    # startup with `Error accessing file '/data/localhost.tls.key'` -- on a *clean checkout
+    # only*, which is why it survived: every existing environment already had a key from
+    # before the container ran as anyone but root.
+    in_synapse chown "$(id -u):$(id -g)" /data/localhost.tls.key /data/localhost.tls.crt
 fi
 
 echo "[configure] applying test-environment settings"
