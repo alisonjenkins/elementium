@@ -220,18 +220,28 @@ interface SetKeyMessage {
  * signalling socket rather than through any key message.
  */
 export function noteLocalIdentity(identity: string): void {
-  if (localIdentitySent || !identity) return;
-  localIdentitySent = true;
+  if (!identity || identity === localIdentity) return;
+  // Latched on the *value*, not on "have we ever done this". The latch used to be a
+  // boolean, which is correct exactly once: a reconnect opens a new socket and brings a
+  // fresh JoinResponse, and if the SFU has assigned a different participant then the new
+  // identity was discarded and Rust went on encrypting under the stale one -- choosing a
+  // key ring by an identity nobody holds keys for, silently, for the rest of the call.
+  const previous = localIdentity;
+  localIdentity = identity;
   // The native context has to exist before it can be told anything.
   if (!initSent) handleInit({});
-  console.log(`[Elementium] E2EE local identity set from the SFU: ${identity}`);
+  console.log(
+    previous
+      ? `[Elementium] E2EE local identity changed from the SFU: ${previous} -> ${identity}`
+      : `[Elementium] E2EE local identity set from the SFU: ${identity}`,
+  );
   invokeTauri("e2ee_set_local_identity", { identity });
 }
 
 /** Whether `e2ee_init` has been sent; the worker is initialized once per room. */
 let initSent = false;
-/** Whether the local participant identity has been reported to Rust. */
-let localIdentitySent = false;
+/** The local participant identity last reported to Rust, or null before the first join. */
+let localIdentity: string | null = null;
 
 /** How many `setKey` messages this bridge has forwarded, for the watchdog below. */
 let keysForwarded = 0;

@@ -24,7 +24,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { interceptE2eeWorkerMessage } from "./e2ee-bridge";
+import { interceptE2eeWorkerMessage, noteLocalIdentity } from "./e2ee-bridge";
 
 describe("interceptE2eeWorkerMessage dispatch", () => {
   let invoke: ReturnType<typeof vi.fn>;
@@ -139,5 +139,58 @@ describe("interceptE2eeWorkerMessage dispatch", () => {
     });
 
     expect(allLoggedText()).not.toContain("not-a-cryptokey-do-not-log-me");
+  });
+});
+
+/**
+ * The identity the encryptor uses to choose our key ring used to be latched by a boolean:
+ * set once, and every later report ignored. That is right exactly until a reconnect, which
+ * opens a fresh socket and brings a fresh JoinResponse -- and if the SFU has assigned a
+ * different participant, the new identity was discarded and Rust went on encrypting under
+ * an identity nobody holds keys for, silently, for the rest of the call.
+ */
+describe("noteLocalIdentity", () => {
+  let invoke: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    invoke = vi.fn().mockResolvedValue(undefined);
+    (globalThis as unknown as Record<string, unknown>)["window"] = {
+      __TAURI_INTERNALS__: { invoke },
+    };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function identitiesSet(): string[] {
+    return invoke.mock.calls
+      .filter(([cmd]) => cmd === "e2ee_set_local_identity")
+      .map(([, args]) => (args as { identity: string }).identity);
+  }
+
+  // The identity last reported lives in module state, which no `beforeEach` can reach --
+  // so each test uses identities of its own rather than sharing one and depending on the
+  // order they happen to run in. Writing them all as "AAAA" made the third test fail
+  // against correct code, which is the wrong way round.
+  it("reports a changed identity after a reconnect", () => {
+    noteLocalIdentity("@ali:example.org:AAAA");
+    noteLocalIdentity("@ali:example.org:BBBB");
+    expect(identitiesSet()).toEqual(["@ali:example.org:AAAA", "@ali:example.org:BBBB"]);
+  });
+
+  it("does not re-report the identity it already holds", () => {
+    // The same JoinResponse is parsed on every inbound signalling message, so this is the
+    // common case by a wide margin -- one IPC call per message would be absurd.
+    noteLocalIdentity("@ali:example.org:CCCC");
+    noteLocalIdentity("@ali:example.org:CCCC");
+    expect(identitiesSet()).toEqual(["@ali:example.org:CCCC"]);
+  });
+
+  it("ignores an empty identity rather than clearing the one it has", () => {
+    noteLocalIdentity("@ali:example.org:DDDD");
+    noteLocalIdentity("");
+    expect(identitiesSet()).toEqual(["@ali:example.org:DDDD"]);
   });
 });
