@@ -57,6 +57,28 @@ The later connections carry almost nothing.
   interaction: at 720p60 on software VP8 this is a real CPU load, where the VAAPI H.264
   encoder -- unblocked earlier today -- would absorb it comfortably.
 
+- [ ] **R6. The screen share carries the camera picture.** The far end sees the shared-screen
+  tile showing the sender's webcam, not their screen, while the sender's own camera tile is
+  black. Two video tracks, and the frames are going to the wrong one. First place to look is
+  `send_mids` in `peer_connection.rs`: `MediaAdded` inserts under `default_key_for(kind)`,
+  which for video is the camera, so a second video m-line for the share may never get a mid
+  of its own and the two keys resolve to one transceiver.
+
+- [ ] **R7. The screen-share picker never appears.** The portal asks for permission and then
+  shares without asking *what* to share. Either the source-selection step is being skipped
+  or a restore token is being reused -- which would also explain sharing the wrong thing
+  without asking. Note that an earlier session established the restore-token behaviour was
+  *not* in use, so this is a change rather than a known quirk.
+
+## Fixed on 2026-08-09, after this list was written
+
+- **The remote participant's video was a black tile.** Rust decoded every frame and answered
+  `has_frame: true`; the renderer never drew one. The self-view's copy of the loop had been
+  fixed the day before, and the remote renderer is a second copy of it in another file that
+  still assumed an `ArrayBuffer` where the postMessage IPC delivers an array of numbers. The
+  coercion now lives in one module both import.
+- **R2.** Preview loops now stop with their tracks.
+
 ## Checked and not a fault
 
 - **Audio silence in the outbound stats.** `silent_packets` reached 250 of 250 in some
