@@ -210,16 +210,16 @@ export function setupMediaDevicesShim(): void {
               // Both directions reach Rust: stopping releases the device, and muting stops
               // the media rather than only the icon. Neither happened before — a camera
               // stayed lit after the UI said it was off, and a muted microphone kept being
-              // published.
-              wireStopToBackend(audioTrack, id);
-              wireMuteToBackend(audioTrack, "audio", "microphone");
+              // published. The requested deviceId is the one Rust actually opened (see
+              // chosen_microphone in media_devices.rs), so it is also what getSettings()
+              // reports back -- see wireNativeDeviceId.
+              wireNativeTrack(audioTrack, id, "audio", "microphone", nativeConstraints.audio?.deviceId);
               stream.addTrack(audioTrack);
             }
           } else if (id.startsWith("video-")) {
             const videoTrack = await createNativeVideoTrack(id);
             if (videoTrack) {
-              wireStopToBackend(videoTrack, id);
-              wireMuteToBackend(videoTrack, "video", "camera");
+              wireNativeTrack(videoTrack, id, "video", "camera", nativeConstraints.video?.deviceId);
               stream.addTrack(videoTrack);
             }
           }
@@ -291,17 +291,17 @@ export function setupMediaDevicesShim(): void {
         if (videoTrack) {
           // Stopping a share from the Element Web UI has to reach the backend, or the
           // native capture, its threads and its portal session all keep running after the
-          // page thinks the share ended.
-          wireStopToBackend(videoTrack, result.videoTrackId);
-          wireMuteToBackend(videoTrack, "video", "screen_share");
+          // page thinks the share ended. There is no per-device id for a screen/window
+          // share the way there is for a camera or mic, so the capture source id -- the
+          // thing that was actually opened -- stands in for it.
+          wireNativeTrack(videoTrack, result.videoTrackId, "video", "screen_share", sourceId);
           stream.addTrack(videoTrack);
         }
 
         if (wantsAudio && result.audioTrackId) {
           const audioTrack = createSilentAudioTrack();
           if (audioTrack) {
-            wireStopToBackend(audioTrack, result.audioTrackId);
-            wireMuteToBackend(audioTrack, "audio", "screen_share_audio");
+            wireNativeTrack(audioTrack, result.audioTrackId, "audio", "screen_share_audio");
             stream.addTrack(audioTrack);
           }
         }
@@ -490,16 +490,148 @@ async function createNativeVideoTrack(trackId: string): Promise<MediaStreamTrack
  */
 const previewStoppers = new Map<string, () => void>();
 
-function wireStopToBackend(track: MediaStreamTrack, nativeTrackId: string): void {
+/**
+ * FIX 1: how many live JS handles point at each native pipeline.
+ *
+ * A cloned track (matrix-js-sdk's `CallFeed.clone()` makes one, and it ships in the bundle)
+ * is a second `MediaStreamTrack` object backed by the *same* Rust capture. If `stop()` on
+ * either handle unconditionally told the backend to tear the pipeline down, whichever handle
+ * stopped first would silently kill the other's media. Counted by native track id rather
+ * than by JS object, so "last handle out turns off the lights": the pipeline, the preview
+ * fetch loop, and the `stop_track` invoke only fire once every handle sharing that id has
+ * stopped.
+ */
+const nativeTrackRefCounts = new Map<NativeTrackId, number>();
+
+function wireStopToBackend(track: MediaStreamTrack, nativeTrackId: NativeTrackId): void {
+  nativeTrackRefCounts.set(nativeTrackId, (nativeTrackRefCounts.get(nativeTrackId) ?? 0) + 1);
   const originalStop = track.stop.bind(track);
   track.stop = () => {
+    // The local object always stops -- that part is per-handle, not shared.
     originalStop();
+    const remaining = (nativeTrackRefCounts.get(nativeTrackId) ?? 1) - 1;
+    if (remaining > 0) {
+      // Another clone of this same native track is still live; the pipeline stays up.
+      nativeTrackRefCounts.set(nativeTrackId, remaining);
+      return;
+    }
+    nativeTrackRefCounts.delete(nativeTrackId);
     previewStoppers.get(nativeTrackId)?.();
     previewStoppers.delete(nativeTrackId);
     invoke("stop_track", { trackId: nativeTrackId }).catch((e) => {
       console.error(`[Elementium] stop_track(${nativeTrackId}) failed:`, e);
     });
   };
+}
+
+/**
+ * FIX 1 (continued): make `clone()` return a fully-wired track instead of an inert copy.
+ *
+ * The browser's own `clone()` (which this calls first, via the bound reference taken before
+ * overriding) knows nothing about Rust: the copy it returns has no `TRACK_SOURCE` tag, its
+ * `stop()` releases nothing native, and its `enabled` setter mutes nothing but itself. Every
+ * fix in this file is re-applied to the clone with the *same* nativeTrackId, kind, source and
+ * deviceId as the track it was cloned from, so the two JS objects behave as two handles onto
+ * one pipeline -- including recursively, if the clone itself is cloned again.
+ */
+function wireCloneToBackend(
+  track: MediaStreamTrack,
+  nativeTrackId: NativeTrackId,
+  kind: "audio" | "video",
+  source: string,
+  deviceId: string | undefined,
+): void {
+  const originalClone = track.clone.bind(track);
+  track.clone = (): MediaStreamTrack => {
+    const cloned = originalClone();
+    wireNativeTrack(cloned, nativeTrackId, kind, source, deviceId);
+    return cloned;
+  };
+}
+
+/**
+ * FIX 2: report the device Rust actually opened, not the synthetic canvas/AudioContext id.
+ *
+ * livekit-client verifies a device switch by checking
+ * `track.getSettings().deviceId === <requested id>`. Our `deviceId` is whatever
+ * `canvas.captureStream()` or `AudioContext`'s destination stream assigned -- an id for a
+ * local rendering object, never the id of a camera or microphone. That made every switch
+ * check read as a mismatch even when the backend had switched correctly. `deviceId` here is
+ * the one already resolved at track-creation time from the caller's constraints (or, for a
+ * screen/window share, the capture source id) -- the actual thing that was opened -- so
+ * nothing is invented. Every other field still comes from the real implementation.
+ */
+function wireNativeDeviceId(track: MediaStreamTrack, deviceId: string | undefined): void {
+  if (!deviceId) return; // Unknown (e.g. default device): leave the underlying report alone.
+  const originalGetSettings = track.getSettings.bind(track);
+  track.getSettings = (): MediaTrackSettings => ({
+    ...originalGetSettings(),
+    deviceId,
+  });
+}
+
+/**
+ * FIX 3: `applyConstraints` and `getCapabilities` have nothing native behind them.
+ *
+ * `grep -n "tauri::command" src-tauri/src/commands/media_devices.rs` turns up
+ * `enumerate_devices`, `get_user_media`, `stop_track`, `get_video_frame` and the screen-share
+ * pipeline/mute commands -- nothing that can reconfigure a running capture or report its real
+ * capability ranges. `applyConstraints` resolving silently while changing nothing about real
+ * capture is exactly the "plausible stub" shape this codebase keeps tripping over, so instead
+ * of pretending, the request is logged loudly (which keys were asked for, and that they will
+ * not reach Rust) and still resolved -- rejecting would break callers, notably livekit-client,
+ * that treat `applyConstraints` as best-effort and do not expect it to throw. A native
+ * implementation would need a new command (e.g. `apply_track_constraints`) that can
+ * reconfigure or restart the running pipeline in media_devices.rs, plus one that reports the
+ * opened device's real capability ranges for `getCapabilities` instead of the canvas/
+ * AudioContext stand-in's.
+ */
+function wireConstraintDishonesty(track: MediaStreamTrack, kind: "audio" | "video"): void {
+  const originalApply = track.applyConstraints?.bind(track);
+  track.applyConstraints = async (constraints?: MediaTrackConstraints): Promise<void> => {
+    const keys = constraints ? Object.keys(constraints) : [];
+    console.warn(
+      `[Elementium] applyConstraints(${kind}) cannot reach native capture: [${keys.join(", ")}] ` +
+        `will change the local ${kind === "video" ? "canvas" : "AudioContext"} stand-in at most, ` +
+        "not the device Rust is actually capturing from.",
+    );
+    if (originalApply) {
+      // Best-effort against the stand-in, matching what the warning above told the caller.
+      await originalApply(constraints).catch(() => {});
+    }
+  };
+
+  const originalGetCapabilities = track.getCapabilities?.bind(track);
+  if (originalGetCapabilities) {
+    track.getCapabilities = (): MediaTrackCapabilities => {
+      console.warn(
+        `[Elementium] getCapabilities(${kind}) reports the local stand-in's capabilities ` +
+          "(canvas geometry / AudioContext defaults), not the camera or microphone's real ranges.",
+      );
+      return originalGetCapabilities();
+    };
+  }
+}
+
+/**
+ * Apply every per-instance fix in this file to one track: FIX 1 (stop refcounting and
+ * clone wiring), FIX 2 (native deviceId in getSettings), FIX 3 (honest
+ * applyConstraints/getCapabilities), plus the pre-existing stop and mute wiring. Called once
+ * when a track is created, and again -- by `wireCloneToBackend` -- every time it is cloned,
+ * so a clone ends up wired exactly like the track it came from.
+ */
+function wireNativeTrack(
+  track: MediaStreamTrack,
+  nativeTrackId: NativeTrackId,
+  kind: "audio" | "video",
+  source: string,
+  deviceId?: string,
+): void {
+  wireStopToBackend(track, nativeTrackId);
+  wireMuteToBackend(track, kind, source);
+  wireCloneToBackend(track, nativeTrackId, kind, source, deviceId);
+  wireNativeDeviceId(track, deviceId);
+  wireConstraintDishonesty(track, kind);
 }
 
 /**
