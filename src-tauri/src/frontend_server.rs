@@ -248,9 +248,10 @@ impl std::io::Read for FrameStreamReader {
 
 impl Drop for FrameStreamReader {
     fn drop(&mut self) {
-        let dropped = self.streams.unsubscribe(&self.track_id);
+        let (sent, dropped) = self.streams.unsubscribe(&self.track_id);
         info!(
             track_id = %self.track_id,
+            frames_sent = sent,
             frames_dropped = dropped,
             "encoded stream ended"
         );

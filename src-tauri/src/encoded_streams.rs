@@ -63,6 +63,10 @@ struct TrackQueue {
     dropped: u64,
     /// Set when a reader is attached, so frames are not accumulated for nobody.
     subscribed: bool,
+    /// Frames accepted for this reader, so an empty stream can be told apart from an
+    /// unattached one. A reader that decodes nothing while this climbs is a decoder problem;
+    /// one where this stays at zero never had any input, which is a routing problem.
+    pushed: u64,
     /// When this reader's first frame arrived, so timestamps start near zero.
     ///
     /// `VideoDecoder` only requires timestamps to increase, but starting a fresh stream at
@@ -109,27 +113,30 @@ impl EncodedStreams {
                 frames: std::collections::VecDeque::new(),
                 dropped: 0,
                 subscribed: false,
+                pushed: 0,
                 started: None,
             });
             queue.frames.clear();
             queue.subscribed = true;
+            queue.pushed = 0;
             queue.started = None;
         }
     }
 
-    /// Detach the reader for a track and report how many frames were dropped while it was
-    /// attached.
-    pub fn unsubscribe(&self, track_id: &str) -> u64 {
-        let mut dropped = 0;
+    /// Detach the reader for a track, reporting how many frames it was given and how many
+    /// were dropped before it could take them.
+    pub fn unsubscribe(&self, track_id: &str) -> (u64, u64) {
+        let mut counts = (0, 0);
         if let Ok(mut queues) = self.0.lock()
             && let Some(queue) = queues.get_mut(track_id)
         {
             queue.subscribed = false;
             queue.frames.clear();
-            dropped = queue.dropped;
+            counts = (queue.pushed, queue.dropped);
+            queue.pushed = 0;
             queue.dropped = 0;
         }
-        dropped
+        counts
     }
 
     /// Offer a frame to whoever is reading this track. A no-op when nobody is.
@@ -149,6 +156,7 @@ impl EncodedStreams {
         if !queue.subscribed {
             return;
         }
+        queue.pushed = queue.pushed.saturating_add(1);
         let started = *queue.started.get_or_insert(now);
         let timestamp_us = u64::try_from(now.duration_since(started).as_micros()).unwrap_or(0);
         Self::enqueue(
@@ -305,7 +313,7 @@ mod tests {
         for i in 0..70u64 {
             streams.push("t", frame(1, i));
         }
-        assert_eq!(streams.unsubscribe("t"), 10);
+        assert_eq!(streams.unsubscribe("t"), (0, 10));
         streams.push("t", frame(1, 999));
         assert!(streams.pop("t").is_none());
     }

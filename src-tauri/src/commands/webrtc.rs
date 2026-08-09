@@ -762,6 +762,11 @@ fn route_pc_event(
                 routing.encoded.push_encoded(&track_key, data);
                 return None;
             }
+            // Counted per track key, because a stream that decodes nothing and a stream that
+            // was never offered anything look identical from the page. If a track the page
+            // has open shows up here, the two sides disagree about its key -- which is a
+            // routing fault, not a decoder one.
+            stats.note_unrouted_video(&track_key);
             // Was `let _ =`: video dropped between here and the decoder was invisible, so a
             // decoder that could not keep up looked exactly like a peer that sent nothing.
             if routing
@@ -909,9 +914,27 @@ struct ForwardStats {
     max_batch: usize,
     dropped_audio: u64,
     dropped_video: u64,
+    /// Video frames that found no encoded-stream reader, by track key.
+    ///
+    /// Expected to be busy while the native decode path is in use -- that is the normal
+    /// case. It earns its place when the page *has* opened a stream for a key that appears
+    /// here anyway: the two sides then disagree about the key, and nothing else in either
+    /// log says so.
+    unrouted_video: std::collections::BTreeMap<String, u64>,
 }
 
 impl ForwardStats {
+    /// Note a video frame that no page-side stream claimed.
+    fn note_unrouted_video(&mut self, track_key: &str) {
+        // Bounded by the number of remote tracks on one connection, which is small; a key
+        // that is already present is the overwhelmingly common case.
+        if let Some(count) = self.unrouted_video.get_mut(track_key) {
+            *count = count.saturating_add(1);
+        } else if self.unrouted_video.len() < 32 {
+            self.unrouted_video.insert(track_key.to_owned(), 1);
+        }
+    }
+
     /// Report and reset, so each line describes the interval it covers rather than all of
     /// time -- a cumulative counter cannot show that a stall started.
     fn report(&mut self, pc_id: &str, elapsed: std::time::Duration) {
@@ -941,6 +964,7 @@ impl ForwardStats {
             max_batch = self.max_batch,
             dropped_audio = self.dropped_audio,
             dropped_video = self.dropped_video,
+            unrouted_video = ?self.unrouted_video,
             "Inbound event forwarding"
         );
         *self = Self::default();
