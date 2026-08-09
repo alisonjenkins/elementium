@@ -267,6 +267,49 @@ async function getTransportStatsReport(pcId: string | null): Promise<RTCStatsRep
  * Silently accepting them is exactly the bug this module exists to remove: `setParameters`
  * resolving successfully while doing nothing.
  */
+/** The four properties livekit reads off a `track` event. */
+export interface TrackEventParts {
+  track: MediaStreamTrack;
+  streams: MediaStream[];
+  receiver: RTCRtpReceiver;
+  transceiver: RTCRtpTransceiver;
+}
+
+/**
+ * Build the `track` event for an arriving remote track, however hostile the environment.
+ *
+ * `RTCTrackEvent` is not constructable here. It is part of the WebRTC API this shim exists
+ * to replace, so the webview does not expose the constructor -- and the call that built one
+ * threw on every remote track that has ever arrived. That `new` sat inside a `try` whose
+ * `catch` only wrote a log line reading "Track event dispatch", so it looked in every log
+ * exactly like a success. The consequence was total and silent: `dispatchEvent` and
+ * `ontrack` were never reached, livekit was never told a remote track existed, and no remote
+ * participant could render. Rust decoded their video correctly the whole time and served it
+ * at 25fps to a canvas nothing had been told to display.
+ *
+ * So the fallback is not defensive coding for an unlikely environment -- it is the only path
+ * that has ever run in production. A plain `Event` carrying the same four properties is
+ * enough: nothing downstream does an `instanceof RTCTrackEvent`, it reads `.track`,
+ * `.streams`, `.receiver` and `.transceiver`.
+ */
+export function buildTrackEvent(parts: TrackEventParts): Event {
+  const ctor = (globalThis as Record<string, unknown>)["RTCTrackEvent"] as
+    | (new (type: string, init: TrackEventParts) => Event)
+    | undefined;
+  if (typeof ctor === "function") {
+    try {
+      return new ctor("track", parts);
+    } catch {
+      // Present but not constructable. Fall through rather than propagate: a remote track
+      // that cannot be announced is a participant nobody can see.
+    }
+  }
+  // The properties are assigned rather than passed, because `Event`'s own initialiser
+  // ignores anything it does not know. They are not standard on `Event`, so nothing is being
+  // shadowed or made read-only.
+  return Object.assign(new Event("track"), parts);
+}
+
 function reportUnsupportedSetParameters(params: RTCRtpSendParameters): void {
   (params.encodings ?? []).forEach((encoding, index) => {
     if (encoding.scaleResolutionDownBy !== undefined && encoding.scaleResolutionDownBy !== 1) {
@@ -719,19 +762,10 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // Dispatch the track event, carrying the same receiver/transceiver objects just
     // registered above -- not fresh `{}` ones the caller can never find again through
     // `getReceivers()`/`getTransceivers()`.
-    try {
-      const trackEvent = new RTCTrackEvent("track", {
-        track,
-        streams: [stream],
-        receiver,
-        transceiver,
-      });
-      this.dispatchEvent(trackEvent);
-      this.ontrack?.call(this as unknown as RTCPeerConnection, trackEvent);
-    } catch (e) {
-      // RTCTrackEvent may not be constructable in all environments
-      console.log(`[Elementium] Track event dispatch: ${kind} mid=${mid}`);
-    }
+    const trackEvent = buildTrackEvent({ track, streams: [stream], receiver, transceiver });
+    this.dispatchEvent(trackEvent);
+    this.ontrack?.call(this as unknown as RTCPeerConnection, trackEvent);
+    console.log(`[Elementium] Track event delivered: ${kind} mid=${mid}`);
   }
 
   /**
