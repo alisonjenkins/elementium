@@ -19,7 +19,7 @@ Two audits came back clean, which is worth as much as the findings:
   pre-approved `send_to_device` action, and nothing in this repository intercepts widget
   postMessage traffic. The 92-second key delay is not ours.
 
-## Open
+## Findings — all closed, 2026-08-09
 
 - [x] **S1. FIXED. The page cannot learn that the connection broke.** HIGH. `connectionState` is
   assigned `"connected"` by a hardcoded line in the shim and never changes again:
@@ -34,7 +34,7 @@ Two audits came back clean, which is worth as much as the findings:
   This also cost us diagnostic honesty: "ICE never reported failed" was used as evidence in
   the reconnect backlog, and it could not have reported anything else.
 
-- [ ] **S2. Bitrate and simulcast control is inert.** HIGH. `sender.setParameters` resolves
+- [x] **S2. FIXED. Bitrate and simulcast control is inert.** HIGH. `sender.setParameters` resolves
   successfully and stores nothing; `getParameters` returns the encodings frozen at creation,
   so it never reflects a later `setParameters`. livekit-client drives layer switching,
   bitrate and `degradationPreference` through these — 15 call sites in the shipped bundle.
@@ -103,7 +103,7 @@ Two audits came back clean, which is worth as much as the findings:
   fallback names the source that was not recognised, so the fix next time is to add the
   name rather than to spend a call and a screenshot rediscovering the collision.
 
-- [ ] **S11. Non-PipeWire camera selection is silently ignored.** LOW. On the nokhwa
+- [x] **S11. MADE AUDIBLE. Non-PipeWire camera selection is silently ignored.** LOW. On the nokhwa
   fallback path device ids cannot be resolved back to a node, and the capture path takes the
   first source that works. The code says so in a comment; the user is not told.
 
