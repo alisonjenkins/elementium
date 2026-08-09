@@ -1292,7 +1292,13 @@ fn framing(frame: &[u8], kind: MediaKind) -> Framing {
 }
 
 /// Determine how many bytes at the start of the frame should remain unencrypted.
-fn unencrypted_header_size(frame: &[u8], kind: MediaKind) -> usize {
+///
+/// Public so the outbound video path can *report* the framing it is about to apply. A
+/// remote-only decode failure looks identical for "wrong framing" and "bytes mangled after
+/// encryption", and the computed header size in the sender's log is the only artifact that
+/// separates them without a receiver-side debugger.
+#[must_use]
+pub fn unencrypted_header_size(frame: &[u8], kind: MediaKind) -> usize {
     framing(frame, kind).header_size
 }
 
