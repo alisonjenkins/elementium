@@ -240,6 +240,12 @@ pub struct PeerConnectionInner {
     pub transmit_log_count: u64,
     /// Counter for UDP receive logging (throttle after first 10).
     pub recv_log_count: u64,
+    /// Counter for the "recv refused" warning logged when `recv_from` reports
+    /// `ConnectionRefused` -- a routine ICMP port-unreachable from a dead ICE candidate,
+    /// not a fault. Separate from `recv_log_count` because this condition can repeat
+    /// continuously while ICE is probing, and needs its own throttle window rather than
+    /// borrowing (and skewing) the one for successfully received packets.
+    pub recv_refused_log_count: u64,
     /// Cached remote ICE candidate SDP strings, re-added after SDP renegotiation.
     /// str0m's `accept_offer` may clear remote candidates, so we re-add them.
     pub remote_candidates: Vec<String>,
@@ -346,6 +352,7 @@ pub fn create_peer_connection(id: String) -> PeerConnectionInner {
         audio_send_pacing: AudioSendPacing::default(),
         transmit_log_count: 0,
         recv_log_count: 0,
+        recv_refused_log_count: 0,
         remote_candidates: Vec::new(),
         egress_stats: HashMap::new(),
         ingress_stats: HashMap::new(),
@@ -923,8 +930,7 @@ fn audio_wallclock(epoch: Instant, rtp_offset: u64, now: Instant) -> Instant {
 /// # Errors
 ///
 /// Returns an error if no audio mid/writer is configured, if no Opus payload
-/// type was negotiated, if the audio frame counter overflows, or if str0m
-/// fails to write the RTP packet.
+/// type was negotiated, or if str0m fails to write the RTP packet.
 ///
 /// # Panics
 ///
@@ -949,12 +955,14 @@ pub fn write_audio(
         .ok_or("No Opus payload type negotiated")?;
     pc.audio_pt = Some(*pt);
 
-    // Opus at 48kHz: each 20ms frame = 960 samples
+    // Opus at 48kHz: each 20ms frame = 960 samples. Saturating, not fallible: a u64 frame
+    // counter multiplied by 960 does not wrap before the counter itself has run for
+    // geological time, and an error here existed only to satisfy the
+    // `arithmetic_side_effects` lint, not because a caller could ever hit it -- it made a
+    // frame write, which the caller cannot meaningfully retry, into a fallible path for a
+    // condition that cannot occur.
     let samples_per_frame: u64 = 960;
-    let rtp_offset = pc
-        .audio_frame_count
-        .checked_mul(samples_per_frame)
-        .ok_or("audio frame offset overflow")?;
+    let rtp_offset = pc.audio_frame_count.saturating_mul(samples_per_frame);
     // 48_000 is a non-zero literal, so this NonZeroU32 construction is infallible.
     #[allow(clippy::unwrap_used)]
     let rtp_time = MediaTime::new(rtp_offset, NonZeroU32::new(48_000).unwrap().into());
@@ -967,10 +975,11 @@ pub fn write_audio(
         .write(pt, wallclock, rtp_time, opus_data)
         .map_err(|e| format!("Failed to write audio: {e}"))?;
 
-    pc.audio_frame_count = pc
-        .audio_frame_count
-        .checked_add(1)
-        .ok_or("audio frame counter overflow")?;
+    // Saturating for the same reason as the offset above: a frame counter that has run
+    // long enough to overflow u64 has run for longer than any call lasts, so pinning it at
+    // u64::MAX rather than erroring costs nothing real and stops routing every frame write
+    // through a fallible path for it.
+    pc.audio_frame_count = pc.audio_frame_count.saturating_add(1);
     Ok(())
 }
 
@@ -1016,8 +1025,7 @@ fn dump_frame_head(direction: &str, codec: &str, len: usize, bytes: &[u8]) {
 /// # Errors
 ///
 /// Returns an error if no video mid/writer is configured, if no VP8 payload
-/// type was negotiated, if the video frame counter overflows, or if str0m
-/// fails to write the RTP packet.
+/// type was negotiated, or if str0m fails to write the RTP packet.
 ///
 /// # Panics
 ///
@@ -1100,10 +1108,10 @@ pub fn write_video(
         .write(pt, now, rtp_time, frame_data)
         .map_err(|e| format!("Failed to write video: {e}"))?;
 
-    pc.video_frame_count = pc
-        .video_frame_count
-        .checked_add(1)
-        .ok_or("video frame counter overflow")?;
+    // Saturating for the same reason as `write_audio`'s frame counter: overflow needs a
+    // call lasting longer than any call does, so an error here was an unreachable path a
+    // caller still had to handle.
+    pc.video_frame_count = pc.video_frame_count.saturating_add(1);
     Ok(())
 }
 
@@ -1162,9 +1170,16 @@ pub fn poll_once(
     // negotiation). So we must not call poll_output until SDP has been exchanged.
     if !pc.dtls_initialized {
         tracing::trace!(pc_id = %pc.id, "poll_once: DTLS not initialized, skipping");
+        // `checked_add` here can only fail if `Instant::now()` were already within 50ms of
+        // the platform's monotonic clock ceiling -- not a caller-reachable condition, but
+        // unlike the frame/log counters below, saturating is the wrong fallback for a
+        // deadline: a saturated (effectively infinite) deadline would make the caller wait
+        // forever instead of polling again. Falling back to `now` instead makes this loop
+        // iteration spin once more rather than stall, which is the safe direction to be
+        // wrong in.
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(50))
-            .ok_or("deadline computation overflow")?;
+            .unwrap_or_else(Instant::now);
         return Ok((Vec::new(), deadline));
     }
 
@@ -1179,10 +1194,11 @@ pub fn poll_once(
 
         match pc.rtc.poll_output() {
             Ok(Output::Transmit(transmit)) => {
-                pc.transmit_log_count = pc
-                    .transmit_log_count
-                    .checked_add(1)
-                    .ok_or("transmit log counter overflow")?;
+                // Saturating: this counter exists only to throttle a diagnostic log line
+                // (below), so overflowing it costs nothing but a resumed throttle window --
+                // whereas erroring here would tear down the whole io loop over a counter
+                // whose only job is deciding whether to print.
+                pc.transmit_log_count = pc.transmit_log_count.saturating_add(1);
                 let pkt_type = classify_packet(&transmit.contents);
                 // Throttled for *all* packet types, media included. Emitting a formatted
                 // log line per packet costs time inside the send loop, on the same thread
@@ -1249,13 +1265,28 @@ pub fn poll_once(
     }
 }
 
+/// Whether an io error from `recv_from` on the ICE socket is a routine ICMP
+/// port-unreachable, not a fault.
+///
+/// Linux surfaces an ICMP port-unreachable as `ConnectionRefused` on the *next*
+/// `recv_from` call after the kernel receives it -- for a UDP datagram sent to a port
+/// nobody is listening on any more, not for whatever packet is actually queued next. ICE
+/// probes candidates that go dead by design (a peer's other interface, a stale relay
+/// allocation), so this fires continuously while probing is in progress on an entirely
+/// healthy connection. A pure function over the error kind so the classification can be
+/// tested without needing an actual ICMP round trip.
+const fn is_routine_icmp_refusal(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::ConnectionRefused)
+}
+
 /// Try to receive a UDP packet and feed it to str0m.
 ///
 /// # Errors
 ///
-/// Returns an error if setting the socket read timeout fails, if the receive
-/// log counter overflows, if the received length exceeds `recv_buf`, or if
-/// str0m fails to process the input.
+/// Returns an error if setting the socket read timeout fails, or if str0m fails to process
+/// the input. A routine ICE-probe error from the OS -- a genuine timeout, or a refused
+/// connection (see [`is_routine_icmp_refusal`]) -- is not an error return; it comes back as
+/// `Ok(false)`, same as a genuine timeout.
 /// Receive and feed a single UDP datagram into str0m, or wait up to `timeout` for one.
 ///
 /// Returns `Ok(true)` if a datagram was actually received (the caller should immediately
@@ -1264,8 +1295,8 @@ pub fn poll_once(
 /// keyframe/motion burst can queue several datagrams in the kernel receive buffer within
 /// one 20ms audio period; only pulling one per caller iteration lets that backlog build up
 /// behind bursty video, and once the kernel buffer fills the OS drops silently before
-/// str0m ever sees the packet). Returns `Ok(false)` on a genuine timeout (no data was
-/// waiting).
+/// str0m ever sees the packet). Returns `Ok(false)` on a genuine timeout, or on a routine
+/// ICE-probe error, neither of which means a datagram was waiting.
 pub fn recv_and_feed(
     pc: &mut PeerConnectionInner,
     socket: &UdpSocket,
@@ -1278,13 +1309,24 @@ pub fn recv_and_feed(
 
     match socket.recv_from(recv_buf) {
         Ok((len, source)) => {
-            pc.recv_log_count = pc
-                .recv_log_count
-                .checked_add(1)
-                .ok_or("recv log counter overflow")?;
-            let recv_slice = recv_buf
-                .get(..len)
-                .ok_or("received length exceeds recv buffer")?;
+            // Saturating: this counter only decides when to throttle the log line below,
+            // so overflowing it costs a resumed throttle window, not a lost packet -- an
+            // error here would kill the receive loop over a diagnostic counter.
+            pc.recv_log_count = pc.recv_log_count.saturating_add(1);
+            // `recv_from` cannot report a length longer than the buffer it filled -- this
+            // is unreachable by contract, not by luck. Rather than unwind the receive loop
+            // over a violation of a guarantee the standard library documents (which would
+            // discard every subsequent datagram on this socket), log it and drop just this
+            // one datagram, keeping the loop -- and the connection -- alive.
+            let Some(recv_slice) = recv_buf.get(..len) else {
+                tracing::warn!(
+                    pc_id = %pc.id,
+                    len,
+                    buf_len = recv_buf.len(),
+                    "recv_from reported a length longer than its own buffer; dropping this datagram"
+                );
+                return Ok(false);
+            };
             let pkt_type = classify_packet(recv_slice);
             if pc.recv_log_count <= 20
                 || pc.recv_log_count.is_multiple_of(100)
@@ -1302,16 +1344,13 @@ pub fn recv_and_feed(
                 dest.set_ip(real_ip);
             }
 
-            let contents_slice = recv_buf
-                .get(..len)
-                .ok_or("received length exceeds recv buffer")?;
             let input = Input::Receive(
                 Instant::now(),
                 Receive {
                     proto: Protocol::Udp,
                     source,
                     destination: dest,
-                    contents: contents_slice.try_into().map_err(|e| format!("{e:?}"))?,
+                    contents: recv_slice.try_into().map_err(|e| format!("{e:?}"))?,
                 },
             );
             pc.rtc
@@ -1326,6 +1365,22 @@ pub fn recv_and_feed(
             pc.rtc
                 .handle_input(Input::Timeout(Instant::now()))
                 .map_err(|e| format!("timeout error: {e}"))?;
+        }
+        Err(e) if is_routine_icmp_refusal(e.kind()) => {
+            // Routine, but throttled and logged rather than silently swallowed: this is
+            // exactly the "silent early return is a defect" case (constitution principle
+            // II) -- without this, a real spike in refused connections (e.g. a peer that
+            // vanished entirely) cannot be told apart from ordinary ICE probing.
+            pc.recv_refused_log_count = pc.recv_refused_log_count.saturating_add(1);
+            if pc.recv_refused_log_count <= 5 || pc.recv_refused_log_count.is_multiple_of(200) {
+                tracing::warn!(
+                    pc_id = %pc.id,
+                    err = %e,
+                    count = pc.recv_refused_log_count,
+                    "recv_from refused (ICMP port-unreachable from a dead ICE candidate); \
+                     routine while ICE is probing"
+                );
+            }
         }
         Err(e) => {
             return Err(format!("recv error: {e}").into());
@@ -2467,6 +2522,58 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "must not hang well past the requested timeout, took {elapsed:?}"
+        );
+    }
+
+    /// `is_routine_icmp_refusal` is the pure classification `recv_and_feed` uses to decide
+    /// whether a `recv_from` error is the routine "a dead ICE candidate's ICMP
+    /// port-unreachable landed on the next call" case, versus a real fault. Before this fix,
+    /// `recv_and_feed` treated `ConnectionRefused` as fatal and returned `Err`, ending the
+    /// caller's io loop -- on Linux this happens continuously while ICE is still probing
+    /// candidates that never answer, which is completely routine.
+    #[test]
+    fn is_routine_icmp_refusal_accepts_only_connection_refused() {
+        assert!(is_routine_icmp_refusal(std::io::ErrorKind::ConnectionRefused));
+        assert!(!is_routine_icmp_refusal(std::io::ErrorKind::WouldBlock));
+        assert!(!is_routine_icmp_refusal(std::io::ErrorKind::TimedOut));
+        assert!(!is_routine_icmp_refusal(std::io::ErrorKind::PermissionDenied));
+        assert!(!is_routine_icmp_refusal(std::io::ErrorKind::Other));
+    }
+
+    /// End-to-end version of the same regression: a real ICMP port-unreachable, produced by
+    /// sending a datagram to a closed loopback port, must come back from `recv_and_feed` as
+    /// `Ok(false)` ("no datagram this time"), not `Err`. This is inherently dependent on the
+    /// OS delivering the ICMP promptly, so a short retry loop tolerates the (rare) case where
+    /// it has not landed by the first poll -- what must never happen is `Err`.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn recv_and_feed_treats_a_refused_connection_as_no_datagram() {
+        // A bound-but-unconnected socket on a port nobody is listening on: sending to it
+        // provokes the kernel to deliver ICMP port-unreachable back to our own socket once
+        // it is `connect()`-ed, which is what turns a future `recv_from` into
+        // `ConnectionRefused` on Linux.
+        let dead = UdpSocket::bind("127.0.0.1:0").expect("bind dead socket");
+        let dead_addr = dead.local_addr().expect("dead socket addr");
+        drop(dead); // Nobody is listening on `dead_addr` any more.
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        socket.connect(dead_addr).expect("connect to the dead port");
+        socket.send(b"probe").expect("send provokes the ICMP");
+
+        let mut pc = create_peer_connection("icmp-refused-test-pc".to_string());
+        let mut recv_buf = vec![0u8; 2000];
+
+        let mut result = Ok(false);
+        for _ in 0..20 {
+            result = recv_and_feed(&mut pc, &socket, &mut recv_buf, Duration::from_millis(20));
+            if matches!(result, Ok(true)) || result.is_err() {
+                break;
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "a refused connection is routine ICE-probe noise, not a fault: {result:?}"
         );
     }
 
