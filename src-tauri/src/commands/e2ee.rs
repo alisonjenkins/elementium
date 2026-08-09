@@ -44,6 +44,10 @@ pub async fn e2ee_init(
 ) -> Result<(), String> {
     tracing::info!("E2EE init requested");
 
+    let ratchet_window_size = options
+        .as_ref()
+        .and_then(|o| o.ratchet_window_size)
+        .unwrap_or(0);
     let opts = E2eeOptions {
         ratchet_window_size: options
             .as_ref()
@@ -53,13 +57,24 @@ pub async fn e2ee_init(
         auto_ratchet: true,
     };
 
-    let ctx = E2eeContext::new(opts);
-    {
-        let mut guard = state.ctx.lock_str()?;
-        *guard = EncryptionPolicy::Encrypted(ctx);
+    // A repeat init updates the options and keeps the keys.
+    //
+    // Replacing the context wholesale discarded every key installed so far, and inits do
+    // repeat: livekit sends one per key provider, and the bridge synthesises another
+    // whenever a key arrives before the real one. In a real call that sequence ran
+    // key, key, key, init -- and the init threw all three away.
+    let mut guard = state.ctx.lock_str()?;
+    if let EncryptionPolicy::Encrypted(existing) = &*guard {
+        existing.set_options(opts);
+        tracing::info!(
+            ratchet_window_size,
+            "E2EE re-initialised: options updated, keys kept"
+        );
+    } else {
+        *guard = EncryptionPolicy::Encrypted(E2eeContext::new(opts));
+        tracing::info!(ratchet_window_size, "E2EE context initialized");
     }
-
-    tracing::info!("E2EE context initialized");
+    drop(guard);
     Ok(())
 }
 

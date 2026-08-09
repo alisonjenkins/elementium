@@ -511,6 +511,27 @@ impl E2eeContext {
         }
     }
 
+    /// Replace the options without disturbing the keys.
+    ///
+    /// livekit's key provider does not guarantee that its `init` reaches us before its
+    /// first key: in a real call a key arrived two seconds ahead of it, so the bridge had
+    /// to synthesise an init with no options at all -- which leaves the ratchet window at
+    /// zero and ratcheting therefore off. Rebuilding the context when the real options
+    /// finally arrive would throw away every key installed in between, so the options are
+    /// updated in place and the keyring is left alone.
+    pub fn set_options(&self, options: E2eeOptions) {
+        let Ok(mut inner) = self.inner.write() else {
+            tracing::error!("E2EE lock poisoned; options not updated");
+            return;
+        };
+        tracing::info!(
+            ratchet_window_size = options.ratchet_window_size,
+            auto_ratchet = options.auto_ratchet,
+            "E2EE options updated, keys preserved"
+        );
+        inner.options = options;
+    }
+
     /// Every key currently held, as `participant@index:fingerprint`, for diagnostics.
     ///
     /// Never includes key material -- only the [`key_fingerprint`] hash prefix.
@@ -1555,6 +1576,34 @@ mod tests {
             MediaKind::Audio,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn options_can_be_updated_without_losing_keys() {
+        // The ordering that caused this: a key arrives before livekit's `init`, the bridge
+        // synthesises one with no options, and the real options turn up afterwards. If
+        // that rebuilt the context the keys would be gone, and ratcheting would stay off
+        // until the sender happened to send fresh ones.
+        let ctx = E2eeContext::new(E2eeOptions::default());
+        ctx.set_local_identity("alice");
+        ctx.set_key("alice", 0, &[3_u8; 16]);
+        assert!(ctx.has_encryption_key(), "the key must be installed");
+
+        ctx.set_options(E2eeOptions {
+            ratchet_window_size: 10,
+            ratchet_salt: None,
+            auto_ratchet: true,
+        });
+
+        assert!(
+            ctx.has_encryption_key(),
+            "updating the options must not discard the keyring"
+        );
+        let frame = PlaintextMedia::from_encoder(vec![0x10, 0x20, 0x30, 0x40]);
+        assert!(
+            ctx.encrypt_frame(&frame, MediaKind::Audio).is_some(),
+            "and the key must still encrypt"
+        );
     }
 
     #[test]
