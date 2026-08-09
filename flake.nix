@@ -133,6 +133,81 @@
           '';
         };
 
+        # Run a snapshot of Elementium: `nix run`
+        #
+        # Why a snapshot runner rather than a hermetic package. Tauri embeds the frontend
+        # into the binary at build time, and this project's frontend is `element-web-dist`
+        # -- 134MB, gitignored, produced by `scripts/prepare-build.sh`, which downloads an
+        # Element Web release and builds the shims with pnpm. A `nix build` that produced it
+        # would need that download pinned as a fixed-output derivation with a hash that
+        # changes on every Element Web bump, which is real work and a separate change.
+        #
+        # What this gives instead is the thing the snapshot is *for*: a build frozen at a
+        # moment, runnable while the working tree keeps moving. Snapshots live outside the
+        # repo, so `git checkout`, a rebuild, or an unfinished refactor cannot disturb one
+        # that is already running.
+        apps.default = {
+          type = "app";
+          program = "${pkgs.writeShellApplication {
+            name = "elementium-snapshot";
+            runtimeInputs = [ pkgs.coreutils ];
+            text = ''
+              root="''${ELEMENTIUM_SNAPSHOTS:-$HOME/.local/share/elementium/snapshots}"
+              latest="$root/latest"
+              if [ ! -x "$latest/elementium" ]; then
+                echo "No Elementium snapshot found in $root." >&2
+                echo "Build one with:  nix run .#snapshot" >&2
+                exit 1
+              fi
+              echo "Running snapshot: $(readlink -f "$latest")" >&2
+              exec "$latest/elementium" "$@"
+            '';
+          }}/bin/elementium-snapshot";
+        };
+
+        # Build a new snapshot: `nix run .#snapshot`
+        #
+        # Runs the ordinary release build inside the dev shell, then copies the result out
+        # of the tree. Copied rather than symlinked on purpose: a symlink into `target/`
+        # would make the "snapshot" change under the user the next time anything is rebuilt,
+        # which is exactly what it exists to prevent.
+        apps.snapshot = {
+          type = "app";
+          program = "${pkgs.writeShellApplication {
+            name = "elementium-take-snapshot";
+            runtimeInputs = [ pkgs.coreutils pkgs.nix pkgs.git ];
+            text = ''
+              repo="''${ELEMENTIUM_REPO:-$PWD}"
+              if [ ! -f "$repo/src-tauri/tauri.conf.json" ]; then
+                echo "Run this from the Elementium checkout, or set ELEMENTIUM_REPO." >&2
+                exit 1
+              fi
+              root="''${ELEMENTIUM_SNAPSHOTS:-$HOME/.local/share/elementium/snapshots}"
+              stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+              rev="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+              dest="$root/$stamp-$rev"
+
+              echo "Building a release snapshot from $repo ($rev)..." >&2
+              # `--no-bundle`: a snapshot wants the binary, and bundling additionally builds
+              # an AppImage, which fails on NixOS because linuxdeploy expects
+              # /usr/bin/xdg-open. The binary is what gets run here either way.
+              ( cd "$repo" && nix develop -c cargo tauri build --no-bundle )
+
+              binary="$repo/target/release/elementium"
+              if [ ! -x "$binary" ]; then
+                echo "The build did not produce $binary." >&2
+                exit 1
+              fi
+              mkdir -p "$dest"
+              cp "$binary" "$dest/elementium"
+              git -C "$repo" rev-parse HEAD > "$dest/REVISION" 2>/dev/null || true
+              ln -sfn "$dest" "$root/latest"
+              echo "Snapshot ready: $dest" >&2
+              echo "Run it with:    nix run" >&2
+            '';
+          }}/bin/elementium-take-snapshot";
+        };
+
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "elementium";
           version = "0.1.0";

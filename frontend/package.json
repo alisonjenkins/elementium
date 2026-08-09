@@ -12,7 +12,7 @@
     "test:unit": "vitest run"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-deep-link": "^2",
     "@tauri-apps/plugin-notification": "^2",
     "@tauri-apps/plugin-store": "^2",
