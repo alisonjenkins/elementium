@@ -133,7 +133,19 @@ pub async fn create_peer_connection(
     let _enter = span.enter();
 
     if let Some(ref cfg) = config {
-        tracing::info!(?cfg, "ICE servers from signaling");
+        // Counted and named by URL, never printed whole. `RtcConfiguration`'s derived
+        // `Debug` includes each server's `username` and `credential`, which for TURN are
+        // live credentials the SFU just issued -- exactly the class of leak the full-SDP
+        // logging turned out to be. Unexercised in the logs seen so far only because this
+        // deployment sends no ICE servers; the first one that does would have written them
+        // to disk.
+        let servers = cfg.ice_servers.as_deref().unwrap_or_default();
+        tracing::info!(
+            count = servers.len(),
+            urls = ?servers.iter().flat_map(|s| s.urls.iter()).collect::<Vec<_>>(),
+            with_credentials = servers.iter().filter(|s| s.credential.is_some()).count(),
+            "ICE servers from signaling"
+        );
     }
     tracing::info!(pc_id = %id, "peer connection created");
 
