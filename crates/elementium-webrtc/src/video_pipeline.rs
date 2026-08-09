@@ -9,7 +9,6 @@
 //! - Writing decoded frames to a shared buffer for the webview
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -41,7 +40,7 @@ impl VideoPipeline {
     /// `specs/BACKLOG-2026-08-09-errors.md` X4.
     pub fn start_playback(
         &mut self,
-        event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>,
+        mut event_rx: mpsc::Receiver<PcEvent>,
         frame_buffer: VideoFrameBuffer,
         pc_id: String,
     ) {
@@ -64,71 +63,68 @@ impl VideoPipeline {
 
             tracing::info!(pc_id = %pc_id, "Video playback pipeline started");
 
-            loop {
-                let event = {
-                    let Ok(mut rx) = event_rx.lock() else {
-                        return;
-                    };
-                    rx.try_recv().ok()
+            // Blocks until a packet arrives rather than polling and sleeping -- see the
+            // same change in `audio_pipeline`. Decoding is the expensive half of this
+            // thread's work; the old shape spent the cheap half waking up to find an empty
+            // queue, and could not tell an empty queue from a closed one, so the thread
+            // outlived its connection forever.
+            while let Some(event) = event_rx.blocking_recv() {
+                // Other events (audio, state changes) are not routed here.
+                let PcEvent::VideoData {
+                    mid,
+                    data: packet,
+                    codec,
+                } = event
+                else {
+                    continue;
                 };
-
-                match event {
-                    Some(PcEvent::VideoData {
-                        mid,
-                        data: packet,
-                        codec,
-                    }) => {
-                        let decoder = match decoders.entry((mid.clone(), codec)) {
-                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                match NegotiatedDecoder::new(codec) {
-                                    Ok(d) => v.insert(d),
-                                    Err(e) => {
-                                        tracing::error!(mid, ?codec, error = %e, "Failed to create decoder for track");
-                                        continue;
-                                    }
+                {
+                    let decoder = match decoders.entry((mid.clone(), codec)) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            match NegotiatedDecoder::new(codec) {
+                                Ok(d) => v.insert(d),
+                                Err(e) => {
+                                    tracing::error!(mid, ?codec, error = %e, "Failed to create decoder for track");
+                                    continue;
                                 }
-                            }
-                        };
-
-                        // One display slot per track, not per connection.
-                        //
-                        // On an SFU every remote participant's video arrives on the same
-                        // subscriber connection, told apart only by mid. Keyed by connection,
-                        // two people on camera write to one slot sixty times a second and
-                        // overwrite each other -- the viewer gets one flickering picture of
-                        // two people, and no way to show the second at all. The decoders were
-                        // already split per mid; only the display key was not.
-                        let track_key = format!("{pc_id}-{mid}");
-                        match VideoDecoder::decode(decoder, &packet) {
-                            Ok(frames) => {
-                                for i420_frame in frames {
-                                    // Convert I420 to RGBA for display
-                                    let rgba_frame = elementium_codec::i420_to_rgba(&i420_frame);
-
-                                    // Store in the shared frame buffer.
-                                    if let Ok(mut buf) = frame_buffer.lock() {
-                                        if let Some(existing) = buf.get_mut(&track_key) {
-                                            *existing = rgba_frame;
-                                        } else {
-                                            buf.insert(track_key.clone(), rgba_frame);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(mid, ?codec, "video decode error: {e}");
                             }
                         }
-                    }
-                    Some(_) => {
-                        // Other events (audio, state changes) are not handled here
-                    }
-                    None => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    };
+
+                    // One display slot per track, not per connection.
+                    //
+                    // On an SFU every remote participant's video arrives on the same
+                    // subscriber connection, told apart only by mid. Keyed by connection,
+                    // two people on camera write to one slot sixty times a second and
+                    // overwrite each other -- the viewer gets one flickering picture of
+                    // two people, and no way to show the second at all. The decoders were
+                    // already split per mid; only the display key was not.
+                    let track_key = format!("{pc_id}-{mid}");
+                    match VideoDecoder::decode(decoder, &packet) {
+                        Ok(frames) => {
+                            for i420_frame in frames {
+                                // Convert I420 to RGBA for display
+                                let rgba_frame = elementium_codec::i420_to_rgba(&i420_frame);
+
+                                // Store in the shared frame buffer.
+                                if let Ok(mut buf) = frame_buffer.lock() {
+                                    if let Some(existing) = buf.get_mut(&track_key) {
+                                        *existing = rgba_frame;
+                                    } else {
+                                        buf.insert(track_key.clone(), rgba_frame);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(mid, ?codec, "video decode error: {e}");
+                        }
                     }
                 }
             }
+
+            tracing::info!(pc_id = %pc_id, "Video playback stopped: the event channel closed");
         });
     }
 

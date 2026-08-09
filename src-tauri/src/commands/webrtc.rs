@@ -93,7 +93,10 @@ pub enum WebRtcEvent {
 /// Split out of the forwarding loop because it has nothing to do with polling or locking
 /// -- it is pure data massaging, and keeping it separate is what makes that loop's own
 /// logic (which fires only when there is something new) readable on its own.
-fn data_channel_event_to_webrtc(pc_id: &str, event: peer_connection::DataChannelEvent) -> WebRtcEvent {
+fn data_channel_event_to_webrtc(
+    pc_id: &str,
+    event: peer_connection::DataChannelEvent,
+) -> WebRtcEvent {
     match event {
         peer_connection::DataChannelEvent::Open { label } => WebRtcEvent::DataChannelOpen {
             pc_id: pc_id.to_string(),
@@ -793,7 +796,12 @@ fn request_camera_keyframe(app: &AppHandle, pc_id: &str, mid: &str) {
         tracing::debug!(pc_id, mid, "keyframe requested with no video running");
         return;
     }
-    tracing::debug!(pc_id, mid, asked, "keyframe request passed to video encoders");
+    tracing::debug!(
+        pc_id,
+        mid,
+        asked,
+        "keyframe request passed to video encoders"
+    );
 }
 
 /// Feed loss measured by the peers back into the Opus encoder's FEC sizing.
@@ -894,7 +902,9 @@ impl ForwardStats {
         // Integer throughout: a rate is easier to read than a count and an interval, and
         // the workspace forbids `as` conversions, which is the only cheap way to a float
         // here.
-        let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX).max(1);
+        let millis = u64::try_from(elapsed.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
         let per_sec = self
             .media_events
             .saturating_mul(1000)
@@ -936,7 +946,10 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
             return;
         };
         let Some(receivers) = managed.take_receivers() else {
-            tracing::error!(pc_id, "event forwarding is already running for this connection");
+            tracing::error!(
+                pc_id,
+                "event forwarding is already running for this connection"
+            );
             return;
         };
         (
@@ -952,7 +965,6 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     } = receivers;
 
     // Start audio playback pipeline (receives Opus → decodes → cpal output)
-    let audio_rx = Arc::new(Mutex::new(audio_rx));
     match shared_player {
         Some(player) => {
             // Infallible: decode failures are handled and logged inside the pipeline rather
@@ -970,7 +982,6 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     }
 
     // Start video playback pipeline (receives VP8 → decodes → frame buffer)
-    let video_rx = Arc::new(Mutex::new(video_rx));
     let mut video_pipeline = VideoPipeline::new();
     // Infallible, for the same reason as the audio pipeline above.
     video_pipeline.start_playback(video_rx, video_frames, pc_id.to_string());

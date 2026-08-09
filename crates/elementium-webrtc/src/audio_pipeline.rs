@@ -7,7 +7,6 @@
 //! with the real capture implementation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -74,7 +73,7 @@ fn is_decodable_opus(
 /// there is no `Err` this function can ever produce. A `Result` that is always `Ok` taught
 /// every caller to write error handling that could never run; see
 /// `specs/BACKLOG-2026-08-09-errors.md` X4.
-pub fn start_playback(event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>, pc_id: String, player: AudioSink) {
+pub fn start_playback(mut event_rx: mpsc::Receiver<PcEvent>, pc_id: String, player: AudioSink) {
     std::thread::spawn(move || {
         // AudioSink::play() resamples/remixes to the device's actual negotiated
         // rate/channels internally, so the decoder can stay fixed at Opus's native
@@ -102,122 +101,126 @@ pub fn start_playback(event_rx: Arc<Mutex<mpsc::Receiver<PcEvent>>>, pc_id: Stri
         // instead of having to be inferred from raw SDP dumps.
         let mut seen_mids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        loop {
-            let event = {
-                let Ok(mut rx) = event_rx.lock() else {
-                    return;
-                };
-                rx.try_recv().ok()
+        // Blocks until a frame arrives rather than polling and sleeping. The old shape
+        // woke two hundred times a second to find nothing, took a lock per packet, and --
+        // because `try_recv().ok()` renders "closed" and "empty" identically -- never
+        // noticed the channel had closed. One such thread was left spinning for the life
+        // of the process per peer connection, and a call that reconnects creates several.
+        while let Some(event) = event_rx.blocking_recv() {
+            // `contiguous` intentionally unused -- see the comment below on why
+            // gap-triggered concealment is disabled. Audio is the only kind routed to
+            // this pipeline; anything else is a caller mistake with nothing useful to do.
+            let PcEvent::AudioData {
+                mid,
+                data: opus_packet,
+                contiguous: _,
+            } = event
+            else {
+                continue;
             };
+            {
+                let is_new_track = seen_mids.insert(mid.clone());
+                if is_new_track {
+                    tracing::info!(
+                        pc_id,
+                        mid,
+                        distinct_tracks_seen = seen_mids.len(),
+                        "New audio track mid observed on this PC's playback pipeline"
+                    );
+                }
 
-            match event {
-                // `contiguous` intentionally unused -- see the comment below on why
-                // gap-triggered concealment is disabled.
-                Some(PcEvent::AudioData {
-                    mid,
-                    data: opus_packet,
-                    contiguous: _,
-                }) => {
-                    let is_new_track = seen_mids.insert(mid.clone());
-                    if is_new_track {
-                        tracing::info!(
-                            pc_id,
-                            mid,
-                            distinct_tracks_seen = seen_mids.len(),
-                            "New audio track mid observed on this PC's playback pipeline"
-                        );
-                    }
-
-                    let decoder = match decoders.entry(mid.clone()) {
-                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            match OpusDecoder::new(48000, 2) {
-                                Ok(d) => v.insert(d),
-                                Err(e) => {
-                                    tracing::error!(pc_id, mid, error = %e, "Failed to create Opus decoder for track");
-                                    continue;
-                                }
+                let decoder = match decoders.entry(mid.clone()) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        match OpusDecoder::new(48000, 2) {
+                            Ok(d) => v.insert(d),
+                            Err(e) => {
+                                tracing::error!(pc_id, mid, error = %e, "Failed to create Opus decoder for track");
+                                continue;
                             }
                         }
-                    };
-
-                    // Gap-triggered Opus PLC (calling `OpusDecoder::conceal` when str0m
-                    // reports `contiguous == false`) was tried and reverted: a test
-                    // (`interleaved_plc_calls_corrupt_subsequent_real_decodes`,
-                    // elementium-codec/opus_codec.rs) proved `conceal()` corrupts the
-                    // *next real packet's* decode, not just the concealment frame itself,
-                    // and the corruption doesn't heal on its own. str0m's own docs on
-                    // `MediaData::contiguous` warn "For audio this flag most likely
-                    // doesn't matter", so there was no reliable way to know the flag
-                    // wasn't firing on a healthy connection -- and the failure mode
-                    // (silent corruption of real audio) was worse than the gap it was
-                    // meant to smooth over.
-
-                    // Fail closed: never hand non-Opus bytes to the decoder, because it
-                    // renders them as noise instead of rejecting them. Silence is a far
-                    // better failure mode than screeching at the user.
-                    if !is_decodable_opus(decoder, &opus_packet, &pc_id, &mid) {
-                        continue;
                     }
+                };
 
-                    // Decode the Opus packet
-                    // 20ms at 48kHz = 960 samples per channel
-                    match decoder.decode(&opus_packet, 960) {
-                        Ok(decoded_frame) => {
-                            decoded_count = decoded_count.saturating_add(1);
-                            // Logged on the very first frame per mid (so short test calls
-                            // still produce evidence) and then every 20th -- includes peak
-                            // amplitude so silent/garbage decodes are visible without
-                            // having to listen to the audio to know something's wrong.
-                            if decoded_count == 1 || decoded_count.is_multiple_of(20) {
-                                let peak = decoded_frame
-                                    .data
-                                    .iter()
-                                    .fold(0.0_f32, |acc, s| acc.max(s.abs()));
-                                let clipped =
-                                    decoded_frame.data.iter().filter(|s| s.abs() >= 1.0).count();
-                                tracing::info!(
-                                    pc_id,
-                                    mid,
-                                    count = decoded_count,
-                                    opus_len = opus_packet.len(),
-                                    decoded_samples = decoded_frame.data.len(),
-                                    decoded_sample_rate = decoded_frame.sample_rate,
-                                    decoded_channels = decoded_frame.channels,
-                                    peak_amplitude = peak,
-                                    clipped_samples = clipped,
-                                    "Decoded inbound Opus audio frame"
-                                );
-                            }
-                            // `{pc_id}-{mid}` uniquely identifies this remote track: one
-                            // PeerConnection can carry several audio mids, and several
-                            // PeerConnections share one output stream. The mixer needs
-                            // this to play a track's own frames sequentially while
-                            // summing distinct tracks -- see `AudioSink::play`.
-                            let track_id = format!("{pc_id}-{mid}");
-                            elementium_media::audio_debug_dump::maybe_dump(
-                                &track_id,
-                                decoded_frame.sample_rate,
-                                decoded_frame.channels,
-                                &decoded_frame.data,
-                            );
-                            player.play(&track_id, decoded_frame);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
+                // Gap-triggered Opus PLC (calling `OpusDecoder::conceal` when str0m
+                // reports `contiguous == false`) was tried and reverted: a test
+                // (`interleaved_plc_calls_corrupt_subsequent_real_decodes`,
+                // elementium-codec/opus_codec.rs) proved `conceal()` corrupts the
+                // *next real packet's* decode, not just the concealment frame itself,
+                // and the corruption doesn't heal on its own. str0m's own docs on
+                // `MediaData::contiguous` warn "For audio this flag most likely
+                // doesn't matter", so there was no reliable way to know the flag
+                // wasn't firing on a healthy connection -- and the failure mode
+                // (silent corruption of real audio) was worse than the gap it was
+                // meant to smooth over.
+
+                // Fail closed: never hand non-Opus bytes to the decoder, because it
+                // renders them as noise instead of rejecting them. Silence is a far
+                // better failure mode than screeching at the user.
+                if !is_decodable_opus(decoder, &opus_packet, &pc_id, &mid) {
+                    continue;
+                }
+
+                // Decode the Opus packet
+                // 20ms at 48kHz = 960 samples per channel
+                match decoder.decode(&opus_packet, 960) {
+                    Ok(decoded_frame) => {
+                        decoded_count = decoded_count.saturating_add(1);
+                        // Logged on the very first frame per mid (so short test calls
+                        // still produce evidence) and then every 20th -- includes peak
+                        // amplitude so silent/garbage decodes are visible without
+                        // having to listen to the audio to know something's wrong.
+                        if decoded_count == 1 || decoded_count.is_multiple_of(20) {
+                            let peak = decoded_frame
+                                .data
+                                .iter()
+                                .fold(0.0_f32, |acc, s| acc.max(s.abs()));
+                            let clipped =
+                                decoded_frame.data.iter().filter(|s| s.abs() >= 1.0).count();
+                            tracing::info!(
                                 pc_id,
                                 mid,
+                                count = decoded_count,
                                 opus_len = opus_packet.len(),
-                                error = %e,
-                                "Failed to decode inbound Opus frame, dropping"
+                                decoded_samples = decoded_frame.data.len(),
+                                decoded_sample_rate = decoded_frame.sample_rate,
+                                decoded_channels = decoded_frame.channels,
+                                peak_amplitude = peak,
+                                clipped_samples = clipped,
+                                "Decoded inbound Opus audio frame"
                             );
                         }
+                        // `{pc_id}-{mid}` uniquely identifies this remote track: one
+                        // PeerConnection can carry several audio mids, and several
+                        // PeerConnections share one output stream. The mixer needs
+                        // this to play a track's own frames sequentially while
+                        // summing distinct tracks -- see `AudioSink::play`.
+                        let track_id = format!("{pc_id}-{mid}");
+                        elementium_media::audio_debug_dump::maybe_dump(
+                            &track_id,
+                            decoded_frame.sample_rate,
+                            decoded_frame.channels,
+                            &decoded_frame.data,
+                        );
+                        player.play(&track_id, decoded_frame);
                     }
-                }
-                _ => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    Err(e) => {
+                        tracing::warn!(
+                            pc_id,
+                            mid,
+                            opus_len = opus_packet.len(),
+                            error = %e,
+                            "Failed to decode inbound Opus frame, dropping"
+                        );
+                    }
                 }
             }
         }
+
+        tracing::info!(
+            pc_id,
+            decoded_count,
+            "Audio playback stopped: the event channel closed"
+        );
     });
 }
