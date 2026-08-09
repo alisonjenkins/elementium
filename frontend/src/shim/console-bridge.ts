@@ -43,10 +43,31 @@ function safeJson(value: unknown): string {
   }
 }
 
+/**
+ * Which frame this bridge is running in.
+ *
+ * Every line from the main window and every line from the Element Call widget iframe land
+ * in one log stream, and until now nothing distinguished them. That is not cosmetic: the
+ * two run different Matrix clients, and a question as basic as "did the widget's client see
+ * this membership change, or only Element Web's?" was unanswerable from a complete log.
+ *
+ * Detected by frame identity rather than by URL, because both are served from the same
+ * loopback origin and their paths have changed more than once.
+ */
+function frameTag(): string {
+  try {
+    return window.parent === window ? "main" : "widget";
+  } catch {
+    // A cross-origin parent throws on comparison. Only the widget can be in that position.
+    return "widget";
+  }
+}
+
 export function setupConsoleBridge(): void {
   const w = window as unknown as Record<string, unknown>;
   if (w.__elementium_console_bridged) return;
   w.__elementium_console_bridged = true;
+  const frame = frameTag();
 
   const orig = {
     log: console.log.bind(console),
@@ -64,7 +85,7 @@ export function setupConsoleBridge(): void {
       }
       const t = w.__TAURI_INTERNALS__ as { invoke?: (cmd: string, args: unknown) => Promise<void> } | undefined;
       if (t?.invoke) {
-        t.invoke("console_log", { level, args: strs }).catch(() => {});
+        t.invoke("console_log", { level, args: [`[${frame}]`, ...strs] }).catch(() => {});
       }
     } catch {
       // Silently ignore bridge errors
