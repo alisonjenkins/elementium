@@ -33,9 +33,25 @@ collected here because they were all found in the same session.
   | 720p @ 2764 kbps | 8852 kbps | 320% |
   | 1080p @ 4000 kbps | 21285 kbps | 532% |
 
-  Fixed (`frame_duration_ticks`, plus the real-time buffer model libvpx does not default to);
-  the same measurement now reads 114%, 84% and 86% after the opening keyframe. Reproducible
-  without a call: `cargo run --release -p elementium-codec --example encode_bitrate`.
+  Fixed (`frame_duration_ticks`, plus the real-time buffer model libvpx does not default to).
+  Reproducible without a call:
+  `cargo run --release -p elementium-codec --example encode_bitrate`.
+
+  **The residual overshoot was the measurement, not the encoder.** The first reading of the
+  fixed build -- 114%, 84% and 86% after the opening keyframe -- was taken against a picture
+  built to be incompressible, moving diagonal bands over a checker. Against that picture VP8
+  saturates its quantizer and cannot obey any budget it is given, so those numbers are a
+  property of the content. The example now encodes a camera-like picture as well, and on that
+  one the same build holds **96%, 96% and 96%** over the whole run, keyframes included.
+
+  **A second thing libvpx does not do by default: bound the keyframe.** Everything above
+  budgets the average; `VP8E_SET_MAX_INTRA_BITRATE_PCT` defaults to no cap, and a receiver
+  that cannot decode asks for a keyframe about once a second. Now set to libwebrtc's
+  `MaxIntraTarget` derivation -- half the rate controller's buffer in frame budgets, 900% at
+  30fps. Honestly: at 900% it does not bind on either test picture, and tightening it to 100%
+  shrinks the keyframe from 122KB to 72KB while making the average *worse* (154% to 170%),
+  because frames referencing a starved keyframe cost more to correct. It bounds the
+  pathological case; it is not a knob to tune down.
 
   **Why this is a candidate for the frozen picture.** A sender emitting five times its
   allowance does not get five times the throughput -- it gets loss, wherever the narrowest
@@ -143,6 +159,42 @@ collected here because they were all found in the same session.
   conformant response, since indices are independent keys and index N-1 is not derivable
   from N. Thousands of them is not expected and is worth a second look once M5 is fixed.
 
+- [ ] **M11. The bitrate uplift has never fired in a live call.** `uplift_bitrate_kbps` is
+  unit-tested -- 1700 kbps becomes 3825 for a 720p budget spent on 1080p -- and has never once
+  run in a call. Every run since it was written has captured 1280x720, which is exactly what
+  the page asks for, so there is correctly nothing to uplift and the branch is never entered.
+
+  Blocked on the camera, not on the code. Verification is one run:
+  `ELEMENTIUM_CAPTURE_RESOLUTION=1920x1080 just test-app-call-video`, expecting
+  `camera capture 1920x1080` and a line reading `sfu_kbps=1700 applied_kbps=3825`. Checked
+  again 2026-08-10T18:00Z: `/dev/video7` is held by an Element Desktop electron process
+  (`fuser` shows it mmap'd, nearly four hours), and PipeWire negotiates one format per device
+  shared across clients -- see M10 -- so whatever that client settled on is what we get.
+  Nothing here is worth working around; it needs the camera free.
+
+- [ ] **M12. The forwarder census has never seen the leak it was built to catch.** The
+  `ACTIVE_FORWARDERS` count and its `ForwarderCensus` guard exist because a forwarder that
+  outlives its connection sends into nothing. Two clean calls have created two connections and
+  removed none -- which is the shape of a leak and also the shape of a call that simply ends
+  with its connections alive.
+
+  So the guard's arithmetic is pinned by a test and its *diagnosis* is unproven. A leak needs
+  reconnection churn to show up: a run that drops and re-establishes the publisher connection
+  several times and then asserts the census returns to zero. Worth writing once N1 or M3 gives
+  us a reconnection path to drive.
+
+- [ ] **M13. Neither of the two settings this file added has a way to set it.** The frame rate
+  (M1) and the capture resolution (M9) are both persisted, both live, both clamped honestly --
+  and both reachable only from a Tauri command or an environment variable. Nobody who is not
+  holding a debugger can change either.
+
+  Deliberately not built alongside the settings themselves, and the reason is worth keeping:
+  the app's own window is the embedded Element Web bundle, so a control has nowhere to live
+  that is not a patch to somebody else's UI. That is a real decision to make -- a separate
+  Elementium settings window, a tray menu, or a patch to the bundle -- and it is not one to
+  make from a backlog note. Until it is made, both settings are developer-only, which is
+  what the M1 entry says and what this entry exists to stop us forgetting.
+
 - [x] **M8. A dead virtual camera enumerates first and costs ten seconds of every camera
   open.** Fixed by ranking, not filtering. `list_video_sources` returned:
 
@@ -163,6 +215,39 @@ collected here because they were all found in the same session.
   merely *called* "Virtual" is unaffected; the test pins that.
 
 ## Closed
+
+- [x] **M9. Raising the capture resolution does not raise the bitrate cap.** Found while
+  verifying the new capture-resolution setting. Element Call asks `getUserMedia` for 1280x720
+  and budgets 1700 kbps for *that*; the setting overrode the request without the page ever
+  hearing about it, so 2.25x the pixels went out on a 720p budget and the setting was quietly
+  counter-productive -- more pixels, worse picture. Every frame still arrived (1200 encoded,
+  1200 decoded at three participants, none lost); this was about how good each one was.
+
+  Two fixes, complementary rather than alternatives. `scaleResolutionDownBy` is now honoured
+  (`set_video_scale`, `scale_i420`), and the cap is raised in proportion to the extra pixels
+  when the publish exceeds what the page asked for (`uplift_bitrate_kbps`, 1700 -> 3825 for
+  720p -> 1080p) -- deliberately exceeding a number that is partly a congestion estimate, paid
+  only by someone who explicitly asked for more. Still unverified in a call: see [M11].
+
+  Recorded here because the first reading was wrong and the correction is worth keeping:
+  ignoring `scaleResolutionDownBy` was blamed, and reading one encoding out of three is how.
+  livekit sends three simulcast encodings (scales 1, 2 and 2.667); this app publishes one
+  stream and resolves them to the best layer, which is scale 1. It was never being asked to
+  shrink.
+
+- [x] **M10. A requested capture size was honoured or not depending on who else had the
+  camera.** Two runs of the same test, same code, same camera, same
+  `ELEMENTIUM_CAPTURE_RESOLUTION=1920x1080`, negotiating 1920x1080 on one and 1280x720 on the
+  next. Misdiagnosed twice on the way -- a raw-format race, then first-pipeline pinning --
+  before `pw-dump` showed a browser holding the camera and PipeWire negotiating **one format
+  per device, shared across every client**. Whoever opens it first decides, and the second
+  client is told what it got.
+
+  Our side of it is fixed: `format_params` now offers each parameter twice, once demanding the
+  size exactly and once merely preferring it, so a source that *can* give us the size does,
+  and one that cannot still starts rather than falling back silently to a range default.
+  What remains is not ours -- a camera already streaming at 720p for another application will
+  stream at 720p for us.
 
 - [x] **M1. The frame rate is not configurable by a person.** Implemented, unverified until
   a real call. `set_max_encode_fps`/`get_max_encode_fps` (Tauri commands in
