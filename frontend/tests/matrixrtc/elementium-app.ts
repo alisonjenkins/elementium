@@ -129,9 +129,13 @@ export function startElementium(options: {
   const started = Date.now();
 
   // One file per application, named by start time and pid so two runs cannot interleave into
-  // one file and be read as a single call. Under `test-results/`, which is already
-  // gitignored and already where Playwright puts a failure's artefacts.
-  const logDir = path.join(REPO, "frontend", "test-results");
+  // one file and be read as a single call.
+  //
+  // Under `target/`, not `test-results/`: Playwright empties its output directory at the
+  // start of every run, so a log written there survives only until the next one -- which is
+  // exactly the moment someone goes looking for it, having just watched a run fail and rerun
+  // it. `target/` is already gitignored and is not Playwright's to clear.
+  const logDir = path.join(REPO, "target", "app-logs");
   mkdirSync(logDir, { recursive: true });
   const logPath = path.join(logDir, `elementium-app-${started}-${process.pid}.log`);
   const log: WriteStream = createWriteStream(logPath, { flags: "a" });
