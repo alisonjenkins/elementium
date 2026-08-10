@@ -365,6 +365,43 @@ fn find_window(target_id: u32) -> Result<xcap::Window, ElementiumError> {
     })
 }
 
+/// The geometry the X server reports for a source, before any frame has been captured.
+///
+/// A push-based capturer has nothing to negotiate, so until this existed the first frame was
+/// the first anyone -- including the log line that announces a pipeline starting -- learned
+/// how big the shared thing was, and that line reported `width=0 height=0` for every X11
+/// share. The X server knows the answer at start, so ask it.
+///
+/// This is what the source *declares*, not a promise about frames: a window can be resized
+/// the moment after this returns, and every consumer downstream already takes its geometry
+/// from the frame in hand. It is here so that "we are sharing a 1280x800 monitor" is
+/// answerable at the point of starting, which is when it is most useful and was previously
+/// unanswerable.
+///
+/// # Errors
+///
+/// As [`X11Capturer::start`]: an unrecognised or malformed source id, no X11 display, or a
+/// source that no longer exists. A source whose dimensions the X server refuses to report is
+/// a `Backend` error rather than a silent zero, for the same reason zeroes were the fault
+/// being fixed.
+pub fn source_size(source_id: &str) -> Result<(u32, u32), ElementiumError> {
+    let (kind, id) = parse_source_id(source_id)?;
+    let dimensions = match kind {
+        SourceIdKind::Monitor => {
+            let monitor = find_monitor(id)?;
+            monitor.width().and_then(|w| monitor.height().map(|h| (w, h)))
+        }
+        SourceIdKind::Window => {
+            let window = find_window(id)?;
+            window.width().and_then(|w| window.height().map(|h| (w, h)))
+        }
+    };
+    dimensions.map_err(|e| ElementiumError::Backend {
+        description: format!("X11 source {source_id} would not report its size: {e}"),
+        cause: Box::new(e),
+    })
+}
+
 /// Build a frame from an xcap-captured image (xcap returns BGRA data).
 ///
 /// Converted to planar YUV here because that is capture's output contract: every video
@@ -422,6 +459,17 @@ mod tests {
             result.is_err(),
             "start() must not report success for a target that cannot be captured"
         );
+    }
+
+    /// M6: `source_size` exists so a share's geometry is knowable before its first frame,
+    /// and its failures must be as honest as `start()`'s -- an id it cannot resolve has to be
+    /// an error, never `(0, 0)`, because a zero that reads as a real size is the exact fault
+    /// it was added to remove. Without a display, every real id fails the same way here.
+    #[test]
+    fn source_size_refuses_to_report_zero_for_a_source_it_cannot_find() {
+        assert!(source_size("not-a-real-id").is_err(), "a malformed id must be rejected");
+        assert!(source_size("monitor-4294967295").is_err(), "an absent monitor must be an error");
+        assert!(source_size("window-4294967295").is_err(), "an absent window must be an error");
     }
 
     /// A malformed source id must be rejected by `start()` itself, naming the id, rather
