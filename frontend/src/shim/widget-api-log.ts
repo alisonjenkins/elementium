@@ -36,6 +36,8 @@
  * already in the log -- see the frame tag in `console-bridge.ts`.
  */
 
+import { noteKeyDistributed } from "./key-distribution-watch";
+
 /** Every spelling of the MatrixRTC membership event this stack has used. */
 const MEMBERSHIP_EVENT_TYPES = new Set([
   "org.matrix.msc3401.call.member",
@@ -212,7 +214,19 @@ export function describeWidgetMessage(message: WidgetMessage): WidgetLogLine | n
   };
 }
 
+/** Whether this message is Element Call handing somebody a key. */
+function isOutboundDistribution(message: WidgetMessage): boolean {
+  return (
+    message.api === "fromWidget" &&
+    (message.action === "send_to_device" ||
+      message.action === "org.matrix.msc3819.send_to_device")
+  );
+}
+
 function report(message: WidgetMessage): void {
+  // The only signal that a membership change was answered. Noted before the line is
+  // formatted so that a distribution still clears the expectation if the description throws.
+  if (isOutboundDistribution(message)) noteKeyDistributed();
   const line = describeWidgetMessage(message);
   if (line === null) return;
   if (line.oncePerAction) {

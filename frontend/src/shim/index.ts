@@ -15,6 +15,7 @@ import { setupMembershipLog } from "./membership-log";
 import { setupWidgetApiLog } from "./widget-api-log";
 import { setupMatrixRtcMembershipSetLog } from "./matrixrtc-membership-set";
 import { setupWebCodecsProbe } from "./webcodecs-probe";
+import { setupKeyDistributionWatch } from "./key-distribution-watch";
 import { Room, RoomEvent, ConnectionState, Track, RemoteTrack, LocalTrack, Participant, RemoteParticipant, LocalParticipant, TrackKind, TrackSource } from "./livekit-bridge";
 import { install, isPatched, record } from "./install-report";
 
@@ -61,6 +62,21 @@ install(
   "Worker.prototype.postMessage, crypto.subtle.importKey",
   setupE2eeBridge,
   () => isPatched(Worker.prototype.postMessage) && isPatched(crypto.subtle.importKey),
+);
+
+// membership-log and widget-api-log see a membership change and a key distribution
+// respectively, and nothing compared them: an absence is not an event and never appeared in
+// the log. This installs the comparison, and goes first because both of those arm it. Main
+// frame only, which is the only frame that sees both -- in the widget frame the membership
+// signal never arrives, so it arms nothing and reports nothing.
+install(
+  "key-distribution-watch",
+  "membership-log and widget-api-log",
+  setupKeyDistributionWatch,
+  () =>
+    Boolean(
+      (window as unknown as Record<string, unknown>)["__elementium_key_distribution_watched"],
+    ),
 );
 
 // Puts joins and leaves in the same stream as key changes, so a silence that follows a

@@ -20,6 +20,8 @@
  * that it gave up and the rest of the application is unaffected.
  */
 
+import { armKeyDistributionWatch } from "./key-distribution-watch";
+
 /** Every spelling of the membership event this stack has used. */
 const MEMBERSHIP_EVENT_TYPES = new Set([
   "org.matrix.msc3401.call.member",
@@ -64,9 +66,14 @@ function handleStateEvent(event: MatrixEventLike): void {
 
   const content = event.getContent?.() ?? {};
   const count = membershipCount(content);
+  const member = event.getStateKey?.() ?? "?";
+  // A key distribution is expected to follow this, and until now nothing checked that one
+  // did -- see `key-distribution-watch.ts`. Armed from here rather than from the widget
+  // frame's tally because only the main frame can also see the distribution.
+  armKeyDistributionWatch(`${count === 0 ? "LEFT" : "JOINED/UPDATED"} member=${member}`);
   console.log(
     `[Elementium] MatrixRTC membership: ${count === 0 ? "LEFT" : "JOINED/UPDATED"} ` +
-      `room=${event.getRoomId?.() ?? "?"} member=${event.getStateKey?.() ?? "?"} ` +
+      `room=${event.getRoomId?.() ?? "?"} member=${member} ` +
       `sender=${event.getSender?.() ?? "?"} devices=${count} type=${type}. ` +
       `Element Call rotates its key on every leaver, and on a joiner when the current key ` +
       `is over ten seconds old -- so a key change just after this line is caused by it.`,
