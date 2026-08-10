@@ -189,30 +189,33 @@ collected here because they were all found in the same session.
     as a budget -- the cost of honouring an explicit choice, paid only by someone who made
     one.
 
-- [ ] **M10. A requested capture size is honoured or not depending on which format the source
-  settles on.** Two runs of the same test, same code, same camera, same
-  `ELEMENTIUM_CAPTURE_RESOLUTION=1920x1080`:
+- [x] **M10. A requested capture size is honoured only when no other application is already
+  streaming the camera.** Found while verifying M9's fix, misdiagnosed twice on the way, and
+  the evidence that settled it:
 
   ```
-  run A  Camera capture started via PipeWire node_id=349 width=1920 height=1080
-  run B  Camera capture started via PipeWire node_id=349 width=1280 height=720
+  Video/Source        v4l2_input...usb-0_1.1_1.0   mjpg 1280x720
+  Stream/Input/Video  zen                          mjpg 1280x720
   ```
 
-  The size we ask for is the *default* of a range offered inside each format parameter, and
-  `format_params` offers several: the raw layouts first when the CPU decodes JPEG (which it
-  does here -- `gpu_jpeg_decode=false`), MJPEG after. On this camera only MJPG advertises
-  1920x1080 and 3840x2160; the raw layouts stop lower. So whether the request is honoured
-  depends on which parameter the source matches first, and that has come out differently on
-  consecutive runs.
+  `PipeWire` negotiates one format per device and shares it between clients. With a browser
+  holding the camera at 720p, every other client gets 720p whatever it asks for -- so the same
+  code, camera and request produced 1920x1080 on one run and 1280x720 on the next two, purely
+  by whether something else had the camera open at the time.
 
-  The in-code comment on `format_params` already names the proper fix and declines it: read
-  the node's own `EnumFormat` and rank what it actually offers, rather than offering a menu
-  and hoping. This is that, with a second reason now: not just "which format" but "at what
-  size".
+  Two readings discarded on the way, recorded so they are not re-derived: it is not the raw
+  layouts winning the format race (this camera's raw formats stop at 640x480, so both outcomes
+  were MJPG), and it is not the first pipeline pinning the format for the second (both
+  pipelines see whatever the *device* settled on, including for another application).
 
-  Consequence today: the resolution setting works, and then sometimes does not, with nothing
-  in the log to say why beyond the negotiated size. A person who set 1080p and got 720p has no
-  way to tell that from the setting having failed to load.
+  What changed: the size is now offered twice, `Exact` then `Preferred` (`SizePolicy`). The
+  exact pass decides the case where we are first -- which is the case a person's setting is
+  about -- and the permissive pass is what lets us join a device someone else has already
+  fixed at another size, rather than refusing to start.
+
+  Nothing can be done about the shared-format case itself, and it is not a fault: two
+  applications cannot have one camera in two formats. Worth knowing when a resolution setting
+  appears not to work.
 
 ## Closed
 

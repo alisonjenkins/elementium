@@ -1544,15 +1544,22 @@ fn format_params(request: CaptureRequest) -> Vec<Vec<u8>> {
         .first()
         .is_some_and(|f| *f == elementium_codec::CaptureFormat::Mjpeg);
 
-    let mut params = Vec::with_capacity(2);
-    if mjpeg_first {
-        params.push(mjpeg_format_param(request));
-    }
-    if !raw.is_empty() {
-        params.push(raw_format_param(request, &raw));
-    }
-    if !mjpeg_first {
-        params.push(mjpeg_format_param(request));
+    // Every parameter twice: once demanding the requested size, once merely preferring it.
+    // A source satisfies the first one it can, so an exact match wins wherever the device can
+    // manage it, and a device that cannot still negotiates rather than failing to start. See
+    // `SizePolicy` for what this is fixing -- without the exact pass, the same camera honoured
+    // a 1920x1080 request on one run and quietly produced 1280x720 on the next two.
+    let mut params = Vec::with_capacity(4);
+    for size in [SizePolicy::Exact, SizePolicy::Preferred] {
+        if mjpeg_first {
+            params.push(mjpeg_format_param(request, size));
+        }
+        if !raw.is_empty() {
+            params.push(raw_format_param(request, &raw, size));
+        }
+        if !mjpeg_first {
+            params.push(mjpeg_format_param(request, size));
+        }
     }
     params
 }
@@ -1831,10 +1838,61 @@ fn video_modifier_property() -> libspa::pod::Property {
     }
 }
 
+/// Whether a format parameter demands the requested frame size or merely prefers it.
+///
+/// A range lets the source settle on any size it supports, which is what makes negotiation
+/// work on a camera that cannot do what was asked. It also leaves the requested size a
+/// suggestion, and a suggestion is not what a person setting a resolution has expressed.
+///
+/// So the size is offered twice. `Exact` first, which a source can only satisfy by producing
+/// that size; then `Preferred`, the permissive range, so a camera that cannot manage it still
+/// negotiates instead of failing to start.
+///
+/// This does *not* override a format the device has already settled on for someone else.
+/// `PipeWire` negotiates one format per device and shares it: with another application
+/// streaming this camera at 1280x720, every client gets 1280x720 whatever it asks for, and
+/// the permissive pass is what lets us join at all rather than refusing (M10). Being
+/// unambiguous about the preference is still worth it -- it decides the case where we are
+/// first, which is the case a person's setting is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizePolicy {
+    /// One size, take it or leave it.
+    Exact,
+    /// A range from the minimum this can convert up to the profile's maximum, defaulting to
+    /// what was asked for.
+    Preferred,
+}
+
+/// The `VideoSize` property for a format parameter, as either a demand or a preference.
+fn video_size_property(
+    size: SizePolicy,
+    target_size: libspa::utils::Rectangle,
+    max_size: libspa::utils::Rectangle,
+) -> libspa::pod::Property {
+    use libspa::pod::property;
+    match size {
+        SizePolicy::Exact => property!(
+            libspa::param::format::FormatProperties::VideoSize,
+            Rectangle,
+            target_size
+        ),
+        SizePolicy::Preferred => property!(
+            libspa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            target_size,
+            libspa::utils::Rectangle { width: 160, height: 120 },
+            max_size
+        ),
+    }
+}
+
 /// Ask for any of these raw pixel layouts, preferring the first.
 fn raw_format_param(
     request: CaptureRequest,
     formats: &[libspa::param::video::VideoFormat],
+    size: SizePolicy,
 ) -> Vec<u8> {
     use libspa::pod::{object, property};
     let target_fps = request.target_fps;
@@ -1873,15 +1931,7 @@ fn raw_format_param(
         // uncompressed 720p60 stream is 110 MB/s and will not fit down USB 2.0; a camera
         // advertises each format only at the rates it can sustain, so an infeasible one
         // simply fails to match here rather than needing to be predicted.
-        property!(
-            libspa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            target_size,
-            libspa::utils::Rectangle { width: 160, height: 120 },
-            max_size
-        ),
+        video_size_property(size, target_size, max_size),
         property!(
             libspa::param::format::FormatProperties::VideoFramerate,
             Choice,
@@ -1904,7 +1954,7 @@ fn raw_format_param(
 ///
 /// No `VideoFormat` property: there is no pixel layout to state, and including one makes
 /// the parameter fail to match a camera that would otherwise have satisfied it.
-fn mjpeg_format_param(request: CaptureRequest) -> Vec<u8> {
+fn mjpeg_format_param(request: CaptureRequest, size: SizePolicy) -> Vec<u8> {
     use libspa::pod::{object, property};
     let target_fps = request.target_fps;
     // Clamped to the profile's own bound, so a caller asking for more than the profile will
@@ -1929,15 +1979,7 @@ fn mjpeg_format_param(request: CaptureRequest) -> Vec<u8> {
             Id,
             libspa::param::format::MediaSubtype::Mjpg
         ),
-        property!(
-            libspa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            target_size,
-            libspa::utils::Rectangle { width: 160, height: 120 },
-            max_size
-        ),
+        video_size_property(size, target_size, max_size),
         property!(
             libspa::param::format::FormatProperties::VideoFramerate,
             Choice,
