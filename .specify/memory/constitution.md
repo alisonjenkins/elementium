@@ -35,6 +35,30 @@ lost exactly the information a reader would need.
 - **An error that is returned is logged or handled by its caller, never both dropped and
   silent.** A silent `Err` is invisible twice: absent from the log and absent from the
   behaviour until something downstream misbehaves.
+- **A function that receives an error returns one.** If something fallible told you why it
+  failed, that reason belongs in a `Result` for the caller to act on or report. Anything that
+  converts it to an absence — `Result::ok`, `.ok()?`, `let _ = fallible()`, `if let Ok(v)`
+  with no `else` — discards a diagnosis someone else has already paid to produce. The absence
+  then travels: a caller sees `None` and cannot say whether the thing was missing, malformed
+  or refused, and neither can the log line it writes.
+
+  This binds a private helper as much as a public boundary. A helper returning `Option` where
+  it could return `Result` has destroyed the information before its caller had the chance to
+  report it, and the caller's warning can then only describe the input as a whole.
+  `"1920 x 1080".parse::<u32>()` says precisely which character is wrong; collapse that to
+  `None` and someone who typed one stray space must guess which of their two numbers was
+  rejected.
+
+  Two good reasons not to, and they are the only ones that need no argument:
+
+  - **There is no diagnosis to carry.** A `strip_prefix` that did not match, a lookup that
+    found nothing, a `next()` on an empty iterator. Nothing was diagnosed, so `Option` is the
+    honest type and no cause is being thrown away.
+  - **The cause cannot be propagated from where it arises** — a `Drop` impl, a best-effort
+    debug feature, a callback with a fixed signature. Then drop it *loudly*: log it at the
+    point of discard, with a comment saying why it cannot be returned.
+
+  Any other reason is one to state in a comment at the call site, not to leave implied.
 
 This principle is not aesthetic. On 2026-08-09 a single
 `ok_or("No pending offer to match answer")?` — a bare string, with no source, no variant and
@@ -121,4 +145,4 @@ rewritten or the principle is amended deliberately — not waived in passing.
 Amendments are made when a failure teaches something general. Each principle here was
 written after it was paid for.
 
-**Version**: 1.2.0 | **Ratified**: 2026-08-09 | **Last Amended**: 2026-08-09
+**Version**: 1.3.0 | **Ratified**: 2026-08-09 | **Last Amended**: 2026-08-10
