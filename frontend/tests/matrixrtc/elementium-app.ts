@@ -93,7 +93,17 @@ export function num(e: AppEvent | undefined, name: string): number | undefined {
  * Killing only the child leaves the rest holding port 5173, which the next run reads as a
  * mysteriously stale Element Web.
  */
-export function startElementium(options: { video: boolean }): ElementiumApp {
+export function startElementium(options: {
+  video: boolean;
+  /**
+   * Extra environment for the application, e.g. `ELEMENTIUM_AUDIO_DUMP`.
+   *
+   * Passed through `just` to `cargo tauri dev` like everything else here. It exists because
+   * the audio tests need the application to write its decoded inbound PCM to disk, which is
+   * an environment switch and has no other trigger.
+   */
+  env?: Record<string, string>;
+}): ElementiumApp {
   const events: AppEvent[] = [];
   const started = Date.now();
 
@@ -107,6 +117,7 @@ export function startElementium(options: { video: boolean }): ElementiumApp {
       // allowed to stop it. Letting `app-join` bring it up again restarts the homeserver in
       // the middle of the call being measured -- see the comment on the recipe.
       ELEMENTIUM_STACK_READY: "1",
+      ...(options.env ?? {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
