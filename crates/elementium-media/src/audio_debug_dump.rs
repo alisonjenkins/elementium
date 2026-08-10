@@ -15,9 +15,27 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::{Mutex, OnceLock};
 
-/// Cap per dumped stream: 30s at 48kHz stereo f32, so a long-running call can't fill the
-/// disk from a debug feature nobody remembered was on.
-const MAX_SAMPLES_PER_STREAM: usize = 48_000 * 2 * 30;
+/// How long each dumped stream may run, so a long call cannot fill the disk from a debug
+/// feature nobody remembered was on.
+///
+/// Seconds, not samples. As a fixed sample count -- it was `48_000 * 2 * 30` -- the cap meant
+/// thirty seconds only for 48kHz stereo: the same call's mono capture ran a full minute while
+/// its stereo capture stopped at thirty seconds. Two dumps of one call then covered different
+/// spans, and comparing them measured the difference between two halves of a call rather than
+/// between two points in the pipeline. That produced a confident, wrong conclusion about the
+/// automatic gain control within minutes of the files existing.
+const MAX_SECONDS_PER_STREAM: usize = 30;
+
+/// The cap in samples for a given format, which is what the writer counts.
+///
+/// Saturating rather than wrapping: a nonsensical rate or channel count from a misbehaving
+/// device must produce a large cap, never a small one that silently truncates every dump.
+fn max_samples(sample_rate: u32, channels: u16) -> usize {
+    usize::try_from(sample_rate)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(usize::from(channels))
+        .saturating_mul(MAX_SECONDS_PER_STREAM)
+}
 
 struct DumpState {
     writer: BufWriter<File>,
@@ -163,7 +181,7 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
         }
     };
 
-    if state.samples_written >= MAX_SAMPLES_PER_STREAM {
+    if state.samples_written >= max_samples(sample_rate, channels) {
         if !state.capped_logged {
             state.capped_logged = true;
             tracing::info!(
@@ -174,7 +192,7 @@ pub fn maybe_dump(stream_key: &str, sample_rate: u32, channels: u16, samples: &[
         return;
     }
 
-    let remaining = MAX_SAMPLES_PER_STREAM.saturating_sub(state.samples_written);
+    let remaining = max_samples(sample_rate, channels).saturating_sub(state.samples_written);
     let to_write = samples.len().min(remaining);
     for sample in samples.iter().take(to_write) {
         // Only a successful write advances `samples_written` -- previously it advanced by
