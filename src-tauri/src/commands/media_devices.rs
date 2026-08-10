@@ -531,6 +531,8 @@ pub fn set_video_bitrate(
 /// that survives a restart" M1 needs, not a mechanism worth inventing a second time.
 const SETTINGS_STORE: &str = "settings.json";
 const MAX_ENCODE_FPS_KEY: &str = "max_encode_fps";
+const CAPTURE_WIDTH_KEY: &str = "capture_width";
+const CAPTURE_HEIGHT_KEY: &str = "capture_height";
 
 /// Load the persisted frame-rate setting into the process-wide atomic, once at startup.
 ///
@@ -645,6 +647,189 @@ pub fn set_max_encode_fps(
     drop(pipelines);
     tracing::info!(fps = clamped, pipelines = applied_to, "max encode frame rate changed");
     Ok(clamped)
+}
+
+/// The person's persisted capture-resolution setting, or `(0, 0)` when they have never set
+/// one.
+///
+/// Two atomics rather than one packed value, because they are only ever read together and a
+/// torn read between them is harmless: [`clamp_capture_resolution`] guarantees both are
+/// either zero or a sane pair, and the negotiation treats the result as a preference, not a
+/// demand. `static` for the same reason as [`MAX_ENCODE_FPS_SETTING`] -- a pipeline that has
+/// not started yet has to see it.
+static CAPTURE_WIDTH_SETTING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAPTURE_HEIGHT_SETTING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The largest frame this app will ask a camera for.
+///
+/// 4096 is what the `PipeWire` camera profile already caps its negotiation at
+/// (`SourceProfile::max_size`), so asking for more could only ever be silently reduced --
+/// and a setting that reports back a number the camera was never asked for is worse than one
+/// that says what it clamped to.
+const MAX_CAPTURE_DIMENSION: u32 = 4096;
+
+/// The smallest, matching the low end of the same negotiated range.
+const MIN_CAPTURE_WIDTH: u32 = 160;
+const MIN_CAPTURE_HEIGHT: u32 = 120;
+
+/// The person's capture resolution for this run, if they have set one.
+fn capture_resolution_setting() -> Option<(u32, u32)> {
+    let width = CAPTURE_WIDTH_SETTING.load(std::sync::atomic::Ordering::Relaxed);
+    let height = CAPTURE_HEIGHT_SETTING.load(std::sync::atomic::Ordering::Relaxed);
+    (width != 0 && height != 0).then_some((width, height))
+}
+
+/// Clamp a requested capture resolution to something a camera could be asked for, reporting
+/// whether clamping changed it.
+///
+/// Even dimensions, not merely bounded ones: VP8 cannot encode odd geometry, and
+/// `ensure_encoder` already refuses it -- so an odd number here would be a setting that
+/// produces a black picture and an error log rather than a slightly different one. Rounded
+/// down, so clamping can never push a value past the ceiling it was just clamped to.
+fn clamp_capture_resolution(width: u32, height: u32) -> ((u32, u32), bool) {
+    let clamped_width = width.clamp(MIN_CAPTURE_WIDTH, MAX_CAPTURE_DIMENSION) & !1;
+    let clamped_height = height.clamp(MIN_CAPTURE_HEIGHT, MAX_CAPTURE_DIMENSION) & !1;
+    (
+        (clamped_width, clamped_height),
+        clamped_width != width || clamped_height != height,
+    )
+}
+
+/// Resolve the frame size a camera pipeline should ask for: the page's own `width`/`height`
+/// constraint, or the person's persisted setting when one is set.
+///
+/// The setting wins outright, for the same reason it does for the frame rate
+/// ([`resolve_encode_fps`]): it exists because the page's ask could not be relied upon. Here
+/// the failure was one layer lower than the `camelCase` bug -- even once `width`/`height`
+/// arrived, the `PipeWire` path ignored them and negotiated a hardcoded 1280x720, so a camera
+/// offering 1080p and 4K was asked for 720p on every call this project has ever made.
+///
+/// Returns the size to ask for and whether it overrode a page constraint asking for something
+/// different, so the caller can log the two disagreeing rather than let one silently win.
+fn resolve_capture_size(
+    page: (Option<u32>, Option<u32>),
+    setting: Option<(u32, u32)>,
+) -> ((Option<u32>, Option<u32>), bool) {
+    match setting {
+        None => (page, false),
+        Some((width, height)) => {
+            let overrode = page.0.is_some_and(|w| w != width) || page.1.is_some_and(|h| h != height);
+            ((Some(width), Some(height)), overrode)
+        }
+    }
+}
+
+/// Load the persisted capture resolution into the process-wide atomics, once at startup.
+///
+/// As [`load_persisted_max_encode_fps`], including why it happens here rather than lazily.
+/// A stored pair that is missing either half is ignored rather than half-applied: a width
+/// with no height is not a resolution, and guessing the other from it would be inventing a
+/// preference nobody expressed.
+pub fn load_persisted_capture_resolution(app: &tauri::App) {
+    use tauri_plugin_store::StoreExt as _;
+    let Ok(store) = app.store(SETTINGS_STORE) else {
+        tracing::warn!("could not open the settings store; the resolution setting starts unset");
+        return;
+    };
+    let read = |key: &str| {
+        store
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+    };
+    let (Some(width), Some(height)) = (read(CAPTURE_WIDTH_KEY), read(CAPTURE_HEIGHT_KEY)) else {
+        return;
+    };
+    let ((clamped_width, clamped_height), was_clamped) = clamp_capture_resolution(width, height);
+    if was_clamped {
+        tracing::warn!(
+            persisted_width = width,
+            persisted_height = height,
+            applied_width = clamped_width,
+            applied_height = clamped_height,
+            "persisted capture resolution is outside the sane range; clamped"
+        );
+    }
+    tracing::info!(
+        width = clamped_width,
+        height = clamped_height,
+        "loaded persisted capture-resolution setting"
+    );
+    CAPTURE_WIDTH_SETTING.store(clamped_width, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE_HEIGHT_SETTING.store(clamped_height, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a camera will be asked for on the next pipeline start: the person's setting if they
+/// have one, otherwise the negotiation's own default.
+///
+/// Reported as a real pair rather than an optional one so a UI can show the effective value
+/// without having to know what the default is.
+#[command]
+pub fn get_capture_resolution() -> (u32, u32) {
+    capture_resolution_setting().unwrap_or((
+        elementium_media::pipewire_capture::DEFAULT_CAPTURE_SIZE.width,
+        elementium_media::pipewire_capture::DEFAULT_CAPTURE_SIZE.height,
+    ))
+}
+
+/// Change the resolution cameras are opened at: persisted so it survives a restart, and
+/// applied to the next camera pipeline that starts.
+///
+/// Companion to [`set_max_encode_fps`], and it fixes a deeper version of the same fault. The
+/// frame rate at least reached the encoder; the frame *size* never reached the camera at all
+/// on the `PipeWire` path, which asked for a hardcoded 1280x720 default whatever the page
+/// requested. On the camera this was developed against -- an OBSBOT Tiny 2 Lite offering
+/// 1920x1080 and 3840x2160 -- every call this project has ever made was 720p for that reason.
+///
+/// **This does not change a camera that is already open.** A frame size is negotiated once,
+/// when the stream opens, and reopening a camera mid-call risks the `EBUSY` window
+/// `start_camera_pipeline` already waits out; nor is it a setting worth dropping a call over.
+/// It takes effect on the next join, device change or call -- the same rule the frame-rate
+/// setting states for its capture-side half.
+///
+/// The size is a preference, not a demand: it becomes the default of the range offered to the
+/// source, so a camera that cannot manage it settles on a size it can rather than failing to
+/// start. What the camera actually agreed to is in `video pipeline started`.
+///
+/// # Errors
+///
+/// Returns an error if the setting could not be persisted.
+#[allow(clippy::needless_pass_by_value)]
+#[command]
+pub fn set_capture_resolution(
+    app: tauri::AppHandle,
+    width: u32,
+    height: u32,
+) -> Result<(u32, u32), String> {
+    use tauri_plugin_store::StoreExt as _;
+
+    let ((clamped_width, clamped_height), was_clamped) = clamp_capture_resolution(width, height);
+    if was_clamped {
+        tracing::warn!(
+            requested_width = width,
+            requested_height = height,
+            applied_width = clamped_width,
+            applied_height = clamped_height,
+            max_dimension = MAX_CAPTURE_DIMENSION,
+            "set_capture_resolution requested a size outside the sane range, or an odd one; \
+             clamped"
+        );
+    }
+
+    let store = app.store(SETTINGS_STORE).map_err(|e| e.to_string())?;
+    store.set(CAPTURE_WIDTH_KEY, serde_json::json!(clamped_width));
+    store.set(CAPTURE_HEIGHT_KEY, serde_json::json!(clamped_height));
+    store.save().map_err(|e| e.to_string())?;
+
+    CAPTURE_WIDTH_SETTING.store(clamped_width, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE_HEIGHT_SETTING.store(clamped_height, std::sync::atomic::Ordering::Relaxed);
+
+    tracing::info!(
+        width = clamped_width,
+        height = clamped_height,
+        "capture resolution changed; it applies to the next camera pipeline, not a running one"
+    );
+    Ok((clamped_width, clamped_height))
 }
 
 /// The index inside an `audio-input-{n}` device id, which is cpal's own enumeration order.
@@ -988,6 +1173,66 @@ fn chosen_microphone(constraints: &MediaConstraints) -> Option<usize> {
         .and_then(microphone_index)
 }
 
+/// What to ask a camera for, once the person's settings have had their say over the page's
+/// constraints.
+#[derive(Debug, Clone, Copy)]
+struct CameraRequest {
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: u32,
+}
+
+/// Resolve the page's video constraints against the persisted settings, logging each place
+/// the two disagree.
+///
+/// Separate from [`start_camera_pipeline`] because it is the whole of the policy and none of
+/// the plumbing: which size and which rate to ask for is a decision with two sources and a
+/// documented precedence, while the caller around it is thread and channel setup.
+fn camera_request(
+    track_id: &TrackId,
+    video_constraints: &elementium_types::VideoConstraints,
+) -> CameraRequest {
+    // The person's persisted resolution wins over the page's constraint, for the reason
+    // `resolve_capture_size` gives: until today the `PipeWire` path ignored the constraint
+    // outright and negotiated 720p regardless.
+    let ((width, height), size_overridden) = resolve_capture_size(
+        (video_constraints.width, video_constraints.height),
+        capture_resolution_setting(),
+    );
+    if size_overridden {
+        tracing::info!(
+            track_id = %track_id,
+            page_width = video_constraints.width,
+            page_height = video_constraints.height,
+            setting_width = width,
+            setting_height = height,
+            "persisted resolution setting overrides the page's width/height constraint"
+        );
+    }
+
+    // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
+    // Asking for what will be consumed means the surplus is never decoded.
+    let page_fps = video_constraints
+        .frame_rate
+        .map_or_else(max_encode_fps_u32, requested_fps);
+    // The person's persisted setting, when they have one, wins outright over the page's
+    // own ask -- see `resolve_encode_fps` for why. This is also what makes the setting
+    // reach the capture-side rate limiter noted in P5/M1: `fps` here is what
+    // `VideoCaptureSource::Camera` asks `pipewire_capture` for, so a pipeline that starts
+    // after a setting change opens its camera at the corrected rate, not just its encoder.
+    let (fps, fps_overridden) = resolve_encode_fps(page_fps, encode_fps_setting());
+    if fps_overridden {
+        tracing::info!(
+            track_id = %track_id,
+            page_fps,
+            setting_fps = fps,
+            "persisted frame-rate setting overrides the page's frameRate constraint"
+        );
+    }
+
+    CameraRequest { width, height, fps }
+}
+
 /// Start a camera pipeline for one `getUserMedia` video request, returning its track id.
 ///
 /// Split out of `get_user_media`, which handles both the audio and video halves of one
@@ -1015,27 +1260,8 @@ fn start_camera_pipeline(
     let (had_previous, inherited_connection) = take_over_camera_pipeline(media_state, &track_id);
 
     let req_node_id = camera_node_id(video_constraints.device_id.as_deref());
-    let req_width = video_constraints.width;
-    let req_height = video_constraints.height;
-    // Honour the caller's frame rate: a call wants 30, streaming wants 60 or more.
-    // Asking for what will be consumed means the surplus is never decoded.
-    let page_fps = video_constraints
-        .frame_rate
-        .map_or_else(max_encode_fps_u32, requested_fps);
-    // The person's persisted setting, when they have one, wins outright over the page's
-    // own ask -- see `resolve_encode_fps` for why. This is also what makes the setting
-    // reach the capture-side rate limiter noted in P5/M1: `req_fps` below is what
-    // `VideoCaptureSource::Camera` asks `pipewire_capture` for, so a pipeline that starts
-    // after a setting change opens its camera at the corrected rate, not just its encoder.
-    let (req_fps, fps_overridden) = resolve_encode_fps(page_fps, encode_fps_setting());
-    if fps_overridden {
-        tracing::info!(
-            track_id = %track_id,
-            page_fps,
-            setting_fps = req_fps,
-            "persisted frame-rate setting overrides the page's frameRate constraint"
-        );
-    }
+    let CameraRequest { width: req_width, height: req_height, fps: req_fps } =
+        camera_request(&track_id, video_constraints);
 
     let encode_tx: Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>> =
         Arc::new(Mutex::new(inherited_connection));
@@ -4328,6 +4554,100 @@ mod encode_pacer_tests {
         assert!(
             kept >= 29,
             "raising the rate mid-run must admit (almost) every frame at the new rate, got {kept} of 30"
+        );
+    }
+}
+
+/// The resolution setting's two decisions, without a camera or a store.
+///
+/// Same shape and same reasoning as `max_encode_fps_setting_tests`: what a caller-supplied
+/// size is reduced to before anything acts on it, and how it composes with the page's own
+/// `width`/`height` constraint.
+#[cfg(test)]
+mod capture_resolution_setting_tests {
+    use super::{
+        MAX_CAPTURE_DIMENSION, MIN_CAPTURE_HEIGHT, MIN_CAPTURE_WIDTH, clamp_capture_resolution,
+        resolve_capture_size,
+    };
+
+    /// A size the camera could actually be asked for passes through unflagged, so that "was
+    /// this clamped" stays a signal rather than a constant.
+    #[test]
+    fn a_size_inside_the_range_is_not_clamped() {
+        assert_eq!(clamp_capture_resolution(1920, 1080), ((1920, 1080), false));
+        assert_eq!(clamp_capture_resolution(1280, 720), ((1280, 720), false));
+        assert_eq!(
+            clamp_capture_resolution(MAX_CAPTURE_DIMENSION, MAX_CAPTURE_DIMENSION),
+            ((MAX_CAPTURE_DIMENSION, MAX_CAPTURE_DIMENSION), false),
+            "the ceiling itself is a legal request"
+        );
+    }
+
+    /// Beyond the range in either direction, the answer is the nearest thing a camera could
+    /// be asked for -- and it is reported as clamped, because a setting that quietly returns
+    /// a different number from the one requested is how a person concludes the feature does
+    /// nothing.
+    #[test]
+    fn a_size_outside_the_range_is_clamped_and_says_so() {
+        assert_eq!(
+            clamp_capture_resolution(7680, 4320),
+            ((MAX_CAPTURE_DIMENSION, MAX_CAPTURE_DIMENSION), true),
+            "8K is past what the camera profile will negotiate"
+        );
+        assert_eq!(
+            clamp_capture_resolution(1, 1),
+            ((MIN_CAPTURE_WIDTH, MIN_CAPTURE_HEIGHT), true),
+            "below the floor of the negotiated range"
+        );
+        assert_eq!(clamp_capture_resolution(0, 0), ((MIN_CAPTURE_WIDTH, MIN_CAPTURE_HEIGHT), true));
+    }
+
+    /// Odd dimensions are the case that would otherwise produce no picture at all: VP8
+    /// cannot encode them and `ensure_encoder` refuses to build for them, so a setting of
+    /// 1921x1081 would be a black call rather than a slightly different one. Rounded down,
+    /// never up, so rounding cannot push a value back past the ceiling.
+    #[test]
+    fn odd_dimensions_are_rounded_down_to_even_ones() {
+        assert_eq!(clamp_capture_resolution(1921, 1081), ((1920, 1080), true));
+        assert_eq!(
+            clamp_capture_resolution(MAX_CAPTURE_DIMENSION.saturating_add(1), 4097),
+            ((MAX_CAPTURE_DIMENSION, MAX_CAPTURE_DIMENSION), true),
+            "clamping to an even ceiling must not round back above it"
+        );
+    }
+
+    /// With no setting, the page's constraint is passed through untouched -- including the
+    /// half-specified and unspecified cases, which are the page's business and not ours to
+    /// complete.
+    #[test]
+    fn without_a_setting_the_page_decides() {
+        assert_eq!(
+            resolve_capture_size((Some(1280), Some(720)), None),
+            ((Some(1280), Some(720)), false)
+        );
+        assert_eq!(resolve_capture_size((None, None), None), ((None, None), false));
+        assert_eq!(resolve_capture_size((Some(640), None), None), ((Some(640), None), false));
+    }
+
+    /// A setting wins outright, and the override is only *reported* when the page actually
+    /// asked for something else: overriding a page that expressed no preference is not a
+    /// disagreement, and logging it as one trains a reader to ignore the line.
+    #[test]
+    fn a_setting_overrides_the_page_and_reports_only_real_disagreement() {
+        assert_eq!(
+            resolve_capture_size((Some(1280), Some(720)), Some((1920, 1080))),
+            ((Some(1920), Some(1080)), true),
+            "a page asking for something else is a disagreement worth logging"
+        );
+        assert_eq!(
+            resolve_capture_size((None, None), Some((1920, 1080))),
+            ((Some(1920), Some(1080)), false),
+            "a page with no preference is not being overridden"
+        );
+        assert_eq!(
+            resolve_capture_size((Some(1920), Some(1080)), Some((1920, 1080))),
+            ((Some(1920), Some(1080)), false),
+            "agreeing with the setting is not an override either"
         );
     }
 }

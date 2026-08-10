@@ -171,6 +171,8 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         commands::media_devices::set_video_bitrate,
         commands::media_devices::get_max_encode_fps,
         commands::media_devices::set_max_encode_fps,
+        commands::media_devices::get_capture_resolution,
+        commands::media_devices::set_capture_resolution,
         commands::livekit::livekit_disconnect,
         commands::livekit::livekit_set_subscriber_volume,
         commands::secrets::secret_get,
@@ -233,6 +235,7 @@ fn setup_app(app: &tauri::App, init_script: &str) -> Result<(), SetupError> {
     // capture thread via a plain atomic that this is the only thing that ever loads from
     // disk. See `load_persisted_max_encode_fps`.
     commands::media_devices::load_persisted_max_encode_fps(app);
+    commands::media_devices::load_persisted_capture_resolution(app);
 
     tray::create_tray(app).map_err(SetupError::Tray)?;
 
