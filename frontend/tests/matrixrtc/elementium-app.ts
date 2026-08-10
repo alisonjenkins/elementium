@@ -39,8 +39,19 @@ export interface ElementiumApp {
   events: AppEvent[];
   /** The most recent event matching `match`, or `undefined`. */
   latest: (match: (e: AppEvent) => boolean) => AppEvent | undefined;
-  /** Wait for an event matching `match`, or fail saying what was never seen. */
-  waitFor: (what: string, match: (e: AppEvent) => boolean, timeoutMs: number) => Promise<AppEvent>;
+  /**
+   * Wait for an event matching `match`, or fail saying what was never seen.
+   *
+   * `failOn` names events that mean the wait can only end in the timeout -- the application
+   * has already reported that the thing being waited for will not happen. Without it a test
+   * spends its whole deadline on a question that was answered in the first half-minute.
+   */
+  waitFor: (
+    what: string,
+    match: (e: AppEvent) => boolean,
+    timeoutMs: number,
+    failOn?: (e: AppEvent) => boolean,
+  ) => Promise<AppEvent>;
   /** A redacted tail, for a failure message. Numbers and booleans only -- see the header. */
   tail: (count: number) => string[];
   /**
@@ -204,13 +215,23 @@ export function startElementium(options: {
     tail: (count: number) => events.slice(-count).map(redacted),
     output: (count: number) => other.slice(-count),
     logPath,
-    waitFor: async (what, match, timeoutMs) => {
+    waitFor: async (what, match, timeoutMs, failOn) => {
       const deadline = Date.now() + timeoutMs;
       // Bounded, and bounded loudly: an unbounded wait on a log line that never comes is how
       // a test run turns into an hour of nothing. Every deadline here is a stated number.
       while (Date.now() < deadline) {
         const found = latest(match);
         if (found) return found;
+        // A wait that the application has already answered "no" to should not run its clock
+        // out. Elementium said "another application is using the camera" twenty-four seconds
+        // in; the test then waited twelve minutes to report that it had never seen video.
+        const fatal = failOn ? latest(failOn) : undefined;
+        if (fatal) {
+          throw new Error(
+            `Elementium will not be ${what}: it reported "${fatal.message}" ` +
+              `after ${(fatal.at / 1000).toFixed(1)}s. Full log: ${logPath}`,
+          );
+        }
         if (child.exitCode !== null) {
           throw new Error(
             `Elementium exited (code ${child.exitCode}) before ${what}.\n` +

@@ -247,6 +247,11 @@ test.describe.serial("Elementium's video, frame by frame", () => {
       "a camera capture pipeline",
       (e) => e.message === "video pipeline started" && e.fields["source"] === "camera",
       APP_READY_MS,
+      // A camera another application already holds is the one failure this wait cannot
+      // outlast, and it is not rare on a desktop machine: a video-call app in the background
+      // is enough. Elementium says so in the first half-minute; without this the test spent
+      // twelve more waiting for a picture that could never arrive.
+      (e) => e.message.startsWith("failed to start video capture"),
     );
     await app.waitFor(
       "sending encoded video",
