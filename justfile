@@ -114,6 +114,28 @@ test-app-call:
     cd frontend && ELEMENTIUM_APP_CALL=1 pnpm exec playwright test \
         tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
 
+# Is the audio that comes out the other end the audio that went in?
+#
+# `just test-app-call` measures that audio flows. This measures that it is the *same audio*:
+# every participant transmits a ladder of six pure tones cycling in a fixed order, each
+# participant's ladder drawn from a different set of frequencies, and each end asserts that
+# the tones it received are the right ones, in the right order, with no gap over 300ms.
+# Nothing else here can tell a voice from a chainsaw -- packets, samples and decoded frames
+# all read healthy for the fault this exists to find.
+#
+# Nothing on this machine is reconfigured: no default is changed, no sound-server module is
+# loaded and no microphone is opened. Elementium plays the generated signal as its microphone
+# (ELEMENTIUM_FAKE_MIC) and its own playback is silenced by an ALSA config that applies to
+# that one process, so the room can neither be heard nor transmitted. The camera is not used
+# either -- this joins audio-only.
+#
+# Three participants: Elementium and two Element Web browsers, so a fault that only appears
+# when the SFU forwards to several is in range.
+test-app-call-audio:
+    cargo build -p elementium
+    cd frontend && ELEMENTIUM_APP_CALL_AUDIO=1 pnpm exec playwright test \
+        tests/matrixrtc/app-call-audio.spec.ts --reporter=list --workers=1
+
 # Move to an Element Web release, and find out whether we still work on it.
 #
 # Fetches the version, rebuilds and re-injects the shims, and runs the shim contract checks
