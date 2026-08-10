@@ -73,7 +73,7 @@ fn main() {
         .expect("fixture");
     println!("fixture: {}KB", jpeg.len() / 1024);
 
-    let mut encoder = Vp8Encoder::new(W, H, 2764).expect("encoder");
+    let mut encoder = Vp8Encoder::new(W, H, 2764, 30).expect("encoder");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut frames = 0_u64;
     // The app rate-limits the self-view independently of capture, because nothing consumes

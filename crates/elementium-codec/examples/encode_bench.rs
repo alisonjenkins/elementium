@@ -26,7 +26,7 @@ use elementium_types::I420Frame;
 fn main() {
     let (width, height) = (1280_u32, 720_u32);
     let frames = 120_u32;
-    let mut encoder = Vp8Encoder::new(width, height, 2764).expect("encoder");
+    let mut encoder = Vp8Encoder::new(width, height, 2764, 30).expect("encoder");
 
     let w = width as usize;
     let h = height as usize;

@@ -71,7 +71,7 @@ fn main() {
             .as_ref()
             .is_none_or(|e| e.size() != (frame.width(), frame.height()))
         {
-            encoder = Vp8Encoder::new(frame.width(), frame.height(), 2764).ok();
+            encoder = Vp8Encoder::new(frame.width(), frame.height(), 2764, 30).ok();
         }
         if let Some(enc) = encoder.as_mut() {
             // No conversion: capture already produces the encoder's input format.

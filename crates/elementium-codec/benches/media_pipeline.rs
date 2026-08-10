@@ -224,7 +224,7 @@ fn stages(c: &mut Criterion) {
     // mistake the first version of this benchmark made.
     group.bench_function("vp8_encode_keyframe", |b| {
         b.iter_batched_ref(
-            || Vp8Encoder::new(W, H, 2764).expect("encoder"),
+            || Vp8Encoder::new(W, H, 2764, 30).expect("encoder"),
             |enc| enc.encode(&i420),
             BatchSize::PerIteration,
         );
@@ -236,7 +236,7 @@ fn stages(c: &mut Criterion) {
     // identical frame repeatedly is trivially cheap and measures nothing real.
     let frames = moving_sequence(8);
     group.bench_function("vp8_encode_interframe", |b| {
-        let mut enc = Vp8Encoder::new(W, H, 2764).expect("encoder");
+        let mut enc = Vp8Encoder::new(W, H, 2764, 30).expect("encoder");
         for f in &frames {
             let _ = enc.encode(f);
         }
@@ -265,7 +265,7 @@ fn whole_frame(c: &mut Criterion) {
     // What the pipeline used to do: decode to RGBA, downscale in RGBA for the preview,
     // then convert back to YUV for the encoder.
     group.bench_function("capture_to_encoded_frame_via_rgba", |b| {
-        let mut enc = Vp8Encoder::new(W, H, 2764).expect("encoder");
+        let mut enc = Vp8Encoder::new(W, H, 2764, 30).expect("encoder");
         for f in &moving_sequence(4) {
             let _ = enc.encode(f);
         }
@@ -280,7 +280,7 @@ fn whole_frame(c: &mut Criterion) {
     // What it does now: decode straight to the encoder's input format, and derive the
     // preview from that. No colour conversion happens in either direction.
     group.bench_function("capture_to_encoded_frame_via_i420", |b| {
-        let mut enc = Vp8Encoder::new(W, H, 2764).expect("encoder");
+        let mut enc = Vp8Encoder::new(W, H, 2764, 30).expect("encoder");
         for f in &moving_sequence(4) {
             let _ = enc.encode(f);
         }

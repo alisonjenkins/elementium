@@ -116,7 +116,7 @@ fn adopting_a_decoded_buffer_allocates_nothing() {
 /// copied the frame first would allocate at least `FRAME_BYTES` here.
 #[test]
 fn encoding_does_not_copy_the_frame() {
-    let mut encoder = Vp8Encoder::new(W, H, 2764).expect("encoder");
+    let mut encoder = Vp8Encoder::new(W, H, 2764, 30).expect("encoder");
     let y_stride = (W as usize).next_multiple_of(32);
     let uv_stride = ((W as usize) / 2).next_multiple_of(32);
     let frame =

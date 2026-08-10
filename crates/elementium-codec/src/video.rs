@@ -282,6 +282,7 @@ impl NegotiatedEncoder {
                 config.width,
                 config.height,
                 config.bitrate_kbps,
+                config.max_framerate,
             )?)),
             #[cfg(all(target_os = "linux", feature = "vaapi"))]
             VideoCodec::H264 => {

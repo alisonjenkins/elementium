@@ -20,6 +20,23 @@ const CPU_USED: i32 = 8;
 /// libvpx's default assumes offline encoding where that does not matter.
 const LAG_IN_FRAMES: u32 = 0;
 
+/// The rate controller's buffer, in milliseconds of budget.
+///
+/// One second, half of it available at the start, six tenths as the level it aims to hold.
+/// These are the values libwebrtc uses for real-time VP8 and the reasoning is the same: a
+/// deep buffer smooths quality by spending future budget now, which in a call means latency
+/// -- the one thing that cannot be recovered later.
+const RC_BUFFER_MS: u32 = 1_000;
+const RC_BUFFER_INITIAL_MS: u32 = 500;
+const RC_BUFFER_OPTIMAL_MS: u32 = 600;
+
+/// How far a frame may overshoot or undershoot its share of the budget, as a percentage.
+///
+/// libvpx defaults to allowing a large overshoot, which suits a file and not a call: the
+/// spike lands on a congestion controller that can only respond by dropping it.
+const RC_OVERSHOOT_PCT: u32 = 15;
+const RC_UNDERSHOOT_PCT: u32 = 100;
+
 /// Longest run of frames without a keyframe, as a backstop.
 ///
 /// A receiver that joins mid-call cannot decode anything until it sees one. Keyframe
@@ -29,6 +46,17 @@ const LAG_IN_FRAMES: u32 = 0;
 const KEYFRAME_MAX_DIST: u32 = 150;
 
 /// VP8 encoder over libvpx, configured for real-time use.
+/// One frame's duration in 90kHz ticks, for a stated frame rate.
+///
+/// 3000 at 30fps. Clamped to a sane rate rather than trusting the caller: a zero would divide
+/// by zero, and a nonsense rate would give libvpx a clock that runs at the wrong speed, which
+/// is precisely the fault this exists to fix.
+fn frame_duration_ticks(max_framerate: u32) -> i64 {
+    const TICKS_PER_SECOND: i64 = 90_000;
+    let fps = i64::from(max_framerate.clamp(1, 240));
+    TICKS_PER_SECOND.checked_div(fps).unwrap_or(3_000).max(1)
+}
+
 pub struct Vp8Encoder {
     ctx: vpx_sys::vpx_codec_ctx_t,
     /// Kept so the bitrate can be retargeted without rebuilding the encoder: congestion
@@ -38,6 +66,15 @@ pub struct Vp8Encoder {
     height: u32,
     bitrate_kbps: u32,
     pts: i64,
+    /// How long one frame lasts, in the 90kHz ticks `g_timebase` counts.
+    ///
+    /// Handed to `vpx_codec_encode` as the frame's duration and added to `pts` afterwards, so
+    /// libvpx's clock advances at the rate frames are actually produced. It was `1` for both:
+    /// one tick at 90kHz is 11 microseconds, so the encoder believed it was encoding 90,000
+    /// frames a second and its rate control never saw a second pass. Measured against a
+    /// moving 720p picture asked for 1700 kbps, it produced 9045 -- five times the budget,
+    /// with the congestion controller downstream left to throw the excess away.
+    frame_duration_ticks: i64,
     /// Set by [`Vp8Encoder::force_keyframe`], consumed by the next [`Vp8Encoder::encode`].
     force_keyframe: bool,
 }
@@ -66,7 +103,12 @@ impl Vp8Encoder {
     /// produce a default configuration, or [`CodecErrorKind::EncoderInit`] if it refuses the
     /// configuration built from it.
     #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, CodecError> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        max_framerate: u32,
+    ) -> Result<Self, CodecError> {
         use std::mem::MaybeUninit;
         use vpx_sys::{
             VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION, vp8e_enc_control_id::VP8E_SET_CPUUSED,
@@ -104,6 +146,21 @@ impl Vp8Encoder {
             // over a file.
             cfg.rc_end_usage = VPX_CBR;
             cfg.g_lag_in_frames = LAG_IN_FRAMES;
+            // The buffer model, without which "constant bitrate" is a suggestion. libvpx's
+            // defaults are sized for offline encoding and let a hard scene run far over
+            // budget before rate control pulls it back: measured on a moving 720p picture
+            // asked for 1700 kbps, 2335 with the clock fixed but these left at their
+            // defaults. A conferencing encoder wants a shallow buffer -- one second of
+            // budget, half of it to start -- because latency is the thing being protected
+            // and a deep buffer converts an overshoot into delay.
+            cfg.rc_buf_sz = RC_BUFFER_MS;
+            cfg.rc_buf_initial_sz = RC_BUFFER_INITIAL_MS;
+            cfg.rc_buf_optimal_sz = RC_BUFFER_OPTIMAL_MS;
+            // How far over the per-frame budget a frame may go. The default lets a keyframe
+            // or a hard scene spend several frames' worth at once, which is exactly the
+            // spike a congestion controller downstream then has to absorb.
+            cfg.rc_overshoot_pct = RC_OVERSHOOT_PCT;
+            cfg.rc_undershoot_pct = RC_UNDERSHOOT_PCT;
             cfg.kf_mode = VPX_KF_AUTO;
             cfg.kf_max_dist = KEYFRAME_MAX_DIST;
             // Let libvpx recover from packet loss without needing a fresh keyframe for
@@ -173,6 +230,7 @@ impl Vp8Encoder {
                 height,
                 bitrate_kbps,
                 pts: 0,
+                frame_duration_ticks: frame_duration_ticks(max_framerate),
                 force_keyframe: false,
             })
         }
@@ -338,7 +396,7 @@ impl Vp8Encoder {
                 std::ptr::addr_of_mut!(self.ctx),
                 img,
                 self.pts,
-                1,
+                u64::try_from(self.frame_duration_ticks).unwrap_or(3_000),
                 i64::from(flags),
                 VPX_DL_REALTIME.into(),
             );
@@ -359,10 +417,11 @@ impl Vp8Encoder {
             packets.extend(Self::collect_encoded_packets(&mut self.ctx));
         }
 
-        // One frame's worth of 90kHz ticks is added by the caller's cadence, not assumed
-        // here: `pts` only has to increase, and the RTP timestamps are derived separately
-        // from real elapsed time.
-        self.pts = self.pts.saturating_add(1);
+        // One frame's worth of 90kHz ticks, matching the duration handed to the encoder
+        // above. The RTP timestamps are still derived separately from real elapsed time --
+        // this clock exists for libvpx's rate control, which needs to believe time passes at
+        // the rate frames arrive or it cannot hold a bitrate.
+        self.pts = self.pts.saturating_add(self.frame_duration_ticks);
         Ok(packets)
     }
 
@@ -721,7 +780,7 @@ mod tests {
         let frame = I420Frame::from_planes(width, height, &y_plane, &u_plane, &v_plane, 0)
             .expect("planes match the geometry");
 
-        let mut encoder = Vp8Encoder::new(width, height, 500).expect("encoder creation");
+        let mut encoder = Vp8Encoder::new(width, height, 500, 30).expect("encoder creation");
         let mut decoder = Vp8Decoder::new().expect("decoder creation");
 
         // Encode the frame
@@ -764,7 +823,7 @@ mod tests {
     fn odd_dimensions_are_refused_before_touching_libvpx() {
         // `expect_err` needs `Vp8Encoder: Debug`, which it is not; a `let else` reaches the
         // error without that bound.
-        let Err(err) = Vp8Encoder::new(321, 240, 500) else {
+        let Err(err) = Vp8Encoder::new(321, 240, 500, 30) else {
             panic!("321 is odd");
         };
         assert_eq!(err.codec, crate::codec_error::Codec::Vp8);
@@ -784,7 +843,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn encode_rejects_mismatched_frame_dimensions() {
-        let mut encoder = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
+        let mut encoder = Vp8Encoder::new(320, 240, 500, 30).expect("encoder creation");
         let frame = I420Frame::from_planes(
             640,
             480,
@@ -832,7 +891,7 @@ mod tests {
     #[allow(clippy::expect_used)]
     fn force_keyframe_makes_the_next_frame_decodable_on_its_own() {
         let (width, height) = (320_u32, 240_u32);
-        let mut encoder = Vp8Encoder::new(width, height, 500).expect("encoder creation");
+        let mut encoder = Vp8Encoder::new(width, height, 500, 30).expect("encoder creation");
 
         // Drive several frames so the encoder has settled past its initial keyframe.
         let mut produced_keyframe = false;
@@ -873,7 +932,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn force_keyframe_preserves_the_configured_size() {
-        let mut encoder = Vp8Encoder::new(640, 480, 500).expect("encoder creation");
+        let mut encoder = Vp8Encoder::new(640, 480, 500, 30).expect("encoder creation");
         encoder.force_keyframe();
         assert_eq!(encoder.size(), (640, 480));
     }
