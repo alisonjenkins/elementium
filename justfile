@@ -169,6 +169,20 @@ test-app-call-dumps:
     cd frontend && ELEMENTIUM_APP_CALL=1 ELEMENTIUM_AUDIO_DUMP=1 \
         pnpm exec playwright test tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
     just audio-dumps
+# Frame-by-frame accounting of Elementium's video, and a screen share, in a real call.
+#
+# `just test-app-call` asks whether the far end decodes *at a rate*. This asks the harder
+# question: of the frames Elementium encoded in a stated window, how many did each of three
+# other participants decode -- reconciled, with the difference attributed to the network or
+# to the receiver rather than left as a number. It also starts a screen share and measures
+# it as a second track, against a stage put on the virtual display (see
+# tests/matrixrtc/xvfb-stage.ts) so there is something other than black to capture.
+#
+# THIS USES THE CAMERA AND MICROPHONE, for the reason `just app-join` gives.
+test-app-call-video:
+    cargo build -p elementium
+    cd frontend && ELEMENTIUM_APP_CALL=1 pnpm exec playwright test \
+        tests/matrixrtc/app-call-video.spec.ts --reporter=list --workers=1
 
 # Move to an Element Web release, and find out whether we still work on it.
 #
