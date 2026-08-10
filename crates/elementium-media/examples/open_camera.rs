@@ -22,7 +22,7 @@ const WATCH: Duration = Duration::from_secs(3);
 
 fn main() {
     let preferred: Option<u32> = std::env::args().nth(1).and_then(|a| a.parse().ok());
-    println!("preferred node: {}", preferred.map_or("none".to_owned(), |n| n.to_string()));
+    println!("preferred node: {}", preferred.map_or_else(|| "none".to_owned(), |n| n.to_string()));
 
     let started = Instant::now();
     let source = match elementium_media::video_source::VideoSource::start_at_device(
