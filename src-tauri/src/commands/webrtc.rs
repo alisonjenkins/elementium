@@ -900,6 +900,65 @@ const DATA_CHANNEL_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// How often to report forwarder throughput. See [`ForwardStats`].
 const FORWARD_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many event forwarders are running right now.
+///
+/// The leak that reached 31GB was arithmetic anyone could have done at the time -- 175 peer
+/// connections created, five playback threads stopped -- but nothing published either number
+/// while it was happening, so it was only done afterwards, from a post-mortem log. This makes
+/// the same arithmetic available during a call: see [`ForwarderCensus`].
+static ACTIVE_FORWARDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a running forwarder for as long as it lives.
+///
+/// A guard rather than a pair of calls because `forward_events` returns from several places --
+/// four early returns before the loop, two inside it -- and a decrement missed on one of them
+/// would make this instrument report a leak that is not there, which is worse than not
+/// reporting one at all.
+struct ForwarderCensus;
+
+impl ForwarderCensus {
+    fn enter() -> Self {
+        ACTIVE_FORWARDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+
+    fn active() -> usize {
+        ACTIVE_FORWARDERS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for ForwarderCensus {
+    fn drop(&mut self) {
+        ACTIVE_FORWARDERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Say so when more forwarders are alive than there are connections to forward for.
+///
+/// One per connection is the whole design, so any excess is a forwarder that outlived what it
+/// was forwarding -- each one holding a media channel open, and behind it an audio and a video
+/// decode thread that will never see their channel close. That is the shape of the leak, and
+/// it is visible here long before it is visible in the process's memory.
+///
+/// Reported at the throughput interval, and only when the numbers disagree: a census line
+/// every ten seconds per connection saying "one and one" is noise.
+fn report_forwarder_census(state: &WebRtcState) {
+    let forwarders = ForwarderCensus::active();
+    let Ok(engine) = state.0.lock() else {
+        return;
+    };
+    let connections = engine.connection_count();
+    drop(engine);
+    if forwarders > connections {
+        tracing::warn!(
+            forwarders,
+            connections,
+            "more event forwarders are running than there are peer connections; each excess \
+             one is holding a media channel and two decode threads open"
+        );
+    }
+}
+
 /// What the forwarder managed to move, so a stall is visible as a number rather than
 /// inferred from the absence of pictures.
 ///
@@ -972,6 +1031,10 @@ impl ForwardStats {
 }
 
 async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
+    // Taken before anything else, so every return path below is counted -- including the four
+    // that give up before the loop starts.
+    let _census = ForwarderCensus::enter();
+
     // Create relay channels for audio and video playback pipelines
     let (audio_tx, audio_rx) = tokio_mpsc::channel::<PcEvent>(256);
     let (video_tx, video_rx) = tokio_mpsc::channel::<PcEvent>(256);
@@ -1150,6 +1213,11 @@ fn housekeep(
     let elapsed = last_report.elapsed();
     if elapsed >= FORWARD_REPORT_EVERY {
         metrics.report(args.pc_id, elapsed);
+        // On the same interval, but outside `report`: that one stays silent for an idle
+        // connection, and a leaked forwarder is idle by definition -- it is forwarding for a
+        // connection that has gone. Reporting the census only when something moved would hide
+        // precisely the case it exists to catch.
+        report_forwarder_census(args.state);
         *last_report = tokio::time::Instant::now();
     }
     // Both event sources are gone and nothing more can arrive.

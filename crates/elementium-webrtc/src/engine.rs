@@ -268,6 +268,18 @@ impl WebRtcEngine {
         }
     }
 
+    /// How many connections the engine holds.
+    ///
+    /// Separate from [`WebRtcEngine::connection_ids`] because the count has a caller that runs
+    /// on a timer -- the forwarder's leak census, which compares it against how many event
+    /// forwarders are alive -- and cloning every id to then call `.len()` on the vector is a
+    /// waste in exactly the situation the census exists to notice, where there are far too
+    /// many of them.
+    #[must_use]
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     /// Get the IDs of all active connections.
     #[must_use]
     pub fn connection_ids(&self) -> Vec<String> {
