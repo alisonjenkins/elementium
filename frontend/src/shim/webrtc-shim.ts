@@ -315,14 +315,9 @@ export function buildTrackEvent(parts: TrackEventParts): Event {
 }
 
 function reportUnsupportedSetParameters(params: RTCRtpSendParameters): void {
-  (params.encodings ?? []).forEach((encoding, index) => {
-    if (encoding.scaleResolutionDownBy !== undefined && encoding.scaleResolutionDownBy !== 1) {
-      console.warn(
-        `[Elementium] setParameters asked for scaleResolutionDownBy=${encoding.scaleResolutionDownBy} ` +
-          `on encoding ${index}; there is no dynamic resize path, so this is not honoured`,
-      );
-    }
-  });
+  // `scaleResolutionDownBy` is no longer in here: it is forwarded to `set_video_scale` and
+  // applied by the capture path before the encoder sees a frame. What remains is the field
+  // that genuinely has nowhere to go.
   if (params.degradationPreference !== undefined) {
     console.warn(
       `[Elementium] setParameters asked for degradationPreference=${params.degradationPreference}; ` +
@@ -1288,6 +1283,18 @@ export class ElementiumRTCPeerConnection extends EventTarget {
             await invoke("set_video_bitrate", { kind, source: trackSource, maxBitratesBps });
           } catch (e) {
             console.error(`[Elementium] set_video_bitrate(${kind}/${trackSource}) failed:`, e);
+          }
+          // Sent as its own call rather than folded into the one above: the two are separate
+          // decisions in the backend -- a bitrate the encoder is told, and a geometry the
+          // capture path applies before the encoder exists -- and a failure in one must not
+          // discard the other.
+          const scaleDownBy = (params.encodings ?? []).map(
+            (encoding) => encoding.scaleResolutionDownBy ?? null,
+          );
+          try {
+            await invoke("set_video_scale", { kind, source: trackSource, scaleDownBy });
+          } catch (e) {
+            console.error(`[Elementium] set_video_scale(${kind}/${trackSource}) failed:`, e);
           }
         }
         return params;

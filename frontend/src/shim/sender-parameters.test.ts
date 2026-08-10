@@ -7,8 +7,9 @@
  * What these pin: `setParameters` forwards the aggregate `maxBitrate` (bits per second,
  * converted to kbps) to the Rust pipeline that actually owns the encoder; `getParameters`
  * echoes back whatever was last set, so a caller reading back its own change sees it; and
- * fields this app cannot honour (`scaleResolutionDownBy`, `degradationPreference`) are
- * reported rather than dropped without a trace.
+ * `scaleResolutionDownBy` reaches the capture path that applies it; and
+ * `degradationPreference`, which this app genuinely cannot honour, is reported rather than
+ * dropped without a trace.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -129,18 +130,63 @@ describe("RTCRtpSender.setParameters / getParameters", () => {
     expect(after.encodings).toEqual(requested.encodings);
   });
 
-  it("reports scaleResolutionDownBy rather than silently dropping it", async () => {
+  it("forwards scaleResolutionDownBy to the pipeline that will apply it", async () => {
     const pc = await connection();
     const transceiver = pc.addTransceiver(videoTrack());
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoked.length = 0;
 
     await transceiver.sender.setParameters({
       ...transceiver.sender.getParameters(),
       encodings: [{ scaleResolutionDownBy: 2 }],
     });
 
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("scaleResolutionDownBy=2"));
-    warn.mockRestore();
+    // This used to be a warning that it could not be honoured. It can: the capture path
+    // scales the frame before the encoder sees it. Honouring it is what makes livekit's
+    // bitrate cap match the picture it was chosen for -- ignoring it did not save the
+    // bitrate, it spent the same allowance on four times the pixels.
+    const call = invoked.find((c) => c.cmd === "set_video_scale");
+    expect(call?.args).toMatchObject({ scaleDownBy: [2] });
+  });
+
+  it("sends the bitrate even when the scale is absent, and the other way round", async () => {
+    const pc = await connection();
+    const transceiver = pc.addTransceiver(videoTrack());
+    invoked.length = 0;
+
+    // Two separate backend calls, so an encoding carrying only one of the two must not
+    // suppress the other -- they are different decisions in different parts of the pipeline.
+    await transceiver.sender.setParameters({
+      ...transceiver.sender.getParameters(),
+      encodings: [{ maxBitrate: 500_000 }],
+    });
+
+    expect(invoked.find((c) => c.cmd === "set_video_bitrate")?.args).toMatchObject({
+      maxBitratesBps: [500_000],
+    });
+    expect(invoked.find((c) => c.cmd === "set_video_scale")?.args).toMatchObject({
+      scaleDownBy: [null],
+    });
+  });
+
+  it("takes the smallest scale across encodings, matching the largest bitrate", async () => {
+    const pc = await connection();
+    const transceiver = pc.addTransceiver(videoTrack());
+    invoked.length = 0;
+
+    // Simulcast layers: the backend resolves the bitrate by taking the largest and the scale
+    // by taking the smallest, which are the same encoding -- the best layer on offer. Sending
+    // the small layer's geometry at the large layer's bitrate would be the worst of both.
+    await transceiver.sender.setParameters({
+      ...transceiver.sender.getParameters(),
+      encodings: [
+        { maxBitrate: 150_000, scaleResolutionDownBy: 4 },
+        { maxBitrate: 900_000, scaleResolutionDownBy: 1.5 },
+      ],
+    });
+
+    expect(invoked.find((c) => c.cmd === "set_video_scale")?.args).toMatchObject({
+      scaleDownBy: [4, 1.5],
+    });
   });
 
   it("reports degradationPreference rather than silently dropping it", async () => {

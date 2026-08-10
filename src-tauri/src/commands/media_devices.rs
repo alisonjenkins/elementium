@@ -76,6 +76,19 @@ pub enum PipelineExtras {
         /// `bitrate_override`, there is no "nothing requested yet" state, because the
         /// pacer needs a real interval from the moment the pipeline starts.
         fps_override: Arc<std::sync::atomic::AtomicU32>,
+        /// How far the SFU has asked us to scale this pipeline's frames down before
+        /// encoding, in thousandths -- 1000 is full size, 2667 is livekit's
+        /// `scaleResolutionDownBy=2.6666666666666665`.
+        ///
+        /// A level, for the same reason as the two above: `setParameters` can be called at
+        /// any moment and the capture thread only needs the latest value. Thousandths
+        /// because the value is fractional and an atomic float is not available; the
+        /// conversion happens once per frame next to the scale itself, where the ratio it
+        /// represents is visible.
+        ///
+        /// `1000` rather than `0` for "nothing requested": a scale of zero has no meaning,
+        /// and a pipeline that has never been asked to scale is asked for full size.
+        scale_override: Arc<std::sync::atomic::AtomicU32>,
     },
 }
 
@@ -142,6 +155,15 @@ impl PipelineHandle {
     pub const fn fps_override(&self) -> Option<&Arc<std::sync::atomic::AtomicU32>> {
         match &self.extras {
             PipelineExtras::Video { fps_override, .. } => Some(fps_override),
+            PipelineExtras::Audio { .. } => None,
+        }
+    }
+
+    /// The live downscale factor in thousandths, if this is a video pipeline.
+    #[must_use]
+    pub const fn scale_override(&self) -> Option<&Arc<std::sync::atomic::AtomicU32>> {
+        match &self.extras {
+            PipelineExtras::Video { scale_override, .. } => Some(scale_override),
             PipelineExtras::Audio { .. } => None,
         }
     }
@@ -233,6 +255,11 @@ pub fn start_screen_share_pipeline(
         encode_fps_setting().unwrap_or_else(max_encode_fps_u32),
     ));
     let fps_override_clone = Arc::clone(&fps_override);
+    // Full size until the SFU says otherwise -- see `PipelineExtras::Video::scale_override`.
+    // A share is offered the same mechanism as a camera: livekit scales a screen share down
+    // too, and a share that ignores the ask has the same bitrate-per-pixel problem.
+    let scale_override = Arc::new(std::sync::atomic::AtomicU32::new(SCALE_UNITY));
+    let scale_override_clone = Arc::clone(&scale_override);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let muted_clone = Arc::clone(&muted);
@@ -282,6 +309,7 @@ pub fn start_screen_share_pipeline(
         active_codec: active_codec_clone,
         bitrate_override: bitrate_override_clone,
         fps_override: fps_override_clone,
+        scale_override: scale_override_clone,
     };
     std::thread::spawn(move || {
         let _guard = span.enter();
@@ -313,6 +341,7 @@ pub fn start_screen_share_pipeline(
                     active_codec,
                     bitrate_override,
                     fps_override,
+                    scale_override,
                 },
             },
         );
@@ -522,6 +551,92 @@ pub fn set_video_bitrate(
     flag.store(kbps, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(track = %key, kbps, "video bitrate changed via setParameters");
     Ok(Some(kbps))
+}
+
+/// The downscale to honour out of the ones `setParameters` supplied.
+///
+/// The *smallest*, which is the largest picture. This app publishes one stream, and
+/// [`requested_bitrate_kbps`] resolves several encodings by taking the largest bitrate --
+/// the two have to agree, or we would encode the small layer's geometry at the large layer's
+/// bitrate. They are the same encoding: the best one on offer.
+///
+/// `None` when no encoding carried a `scaleResolutionDownBy`, which per policy means "change
+/// nothing" and must not be read as "scale by nothing".
+fn requested_scale(scale_down_by: &[Option<f64>]) -> Option<f64> {
+    scale_down_by
+        .iter()
+        .filter_map(|maybe| *maybe)
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .fold(None, |best: Option<f64>, scale| Some(best.map_or(scale, |b| b.min(scale))))
+}
+
+/// Apply an `RTCRtpSender.setParameters` resolution-scale request to a running video
+/// pipeline.
+///
+/// The companion to [`set_video_bitrate`], and the half that was missing. livekit sets a
+/// bitrate for the size it expects to receive and asks for that size with
+/// `scaleResolutionDownBy`; this app honoured the first and warned that it could not honour
+/// the second, so a 1080p capture was published whole against a cap chosen for 720x405 --
+/// roughly a third of the bitrate that picture needs (M9 in the media backlog).
+///
+/// Applied as a level the capture thread reads once per frame, the same shape as the bitrate
+/// and frame-rate overrides, because the scale must not require a new encoder from the IPC
+/// thread: `ensure_encoder` already rebuilds when the geometry changes, so writing the level
+/// is the whole of it.
+///
+/// Returns the scale actually applied, or `None` if no encoding carried one.
+///
+/// # Errors
+///
+/// Returns an error if the kind/source pair is not one we publish, or if there is no video
+/// pipeline running for it.
+#[allow(clippy::needless_pass_by_value)]
+#[command]
+pub fn set_video_scale(
+    media_state: State<'_, MediaState>,
+    kind: String,
+    source: String,
+    scale_down_by: Vec<Option<f64>>,
+) -> Result<Option<f64>, String> {
+    let key = super::livekit::track_key("set_video_scale", &kind, &source)?;
+
+    let Some(requested) = requested_scale(&scale_down_by) else {
+        tracing::info!(
+            track = %key,
+            encodings = scale_down_by.len(),
+            "setParameters carried no scaleResolutionDownBy; leaving the capture size as is"
+        );
+        return Ok(None);
+    };
+
+    let (thousandths, clamped) = scale_to_thousandths(requested);
+    if clamped {
+        tracing::warn!(
+            track = %key,
+            requested,
+            applied = f64::from(thousandths) / 1000.0,
+            max_scale = f64::from(SCALE_MAX) / 1000.0,
+            "setParameters requested a scale outside the range this will honour; clamped"
+        );
+    }
+
+    let level = {
+        let pipelines = media_state.pipelines.lock_str("set_video_scale")?;
+        pipelines.get(&key).and_then(PipelineHandle::scale_override).cloned()
+    };
+    let Some(level) = level else {
+        // Expected rather than a fault, for the same reason `set_video_bitrate` documents:
+        // livekit can call `setParameters` before the pipeline has (re)started.
+        tracing::warn!(
+            track = %key,
+            "setParameters requested a scale for a track with no running video pipeline"
+        );
+        return Err(format!("no video pipeline is running for {key}"));
+    };
+    level.store(thousandths, std::sync::atomic::Ordering::Relaxed);
+    let applied = f64::from(thousandths) / 1000.0;
+    tracing::info!(track = %key, scale = applied, "capture downscale changed via setParameters");
+    Ok(Some(applied))
 }
 
 /// Where the frame-rate setting is persisted.
@@ -1397,6 +1512,9 @@ fn start_camera_pipeline(
     let bitrate_override_clone = Arc::clone(&bitrate_override);
     let fps_override = Arc::new(std::sync::atomic::AtomicU32::new(req_fps));
     let fps_override_clone = Arc::clone(&fps_override);
+    // Full size until the SFU says otherwise -- see `PipelineExtras::Video::scale_override`.
+    let scale_override = Arc::new(std::sync::atomic::AtomicU32::new(SCALE_UNITY));
+    let scale_override_clone = Arc::clone(&scale_override);
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let muted_clone = Arc::clone(&muted);
@@ -1421,6 +1539,7 @@ fn start_camera_pipeline(
         active_codec: active_codec_clone,
         bitrate_override: bitrate_override_clone,
         fps_override: fps_override_clone,
+        scale_override: scale_override_clone,
     };
     std::thread::spawn(move || {
         let _guard = camera_span.enter();
@@ -1460,6 +1579,7 @@ fn start_camera_pipeline(
                     active_codec,
                     bitrate_override,
                     fps_override,
+                    scale_override,
                 },
             },
         );
@@ -2053,6 +2173,53 @@ fn resolve_encode_fps(page_fps: u32, setting_fps: Option<u32>) -> (u32, bool) {
     setting_fps.map_or((page_fps, false), |fps| (fps, fps != page_fps))
 }
 
+/// `scale_override` in its "no downscale" position, in thousandths.
+///
+/// Thousandths throughout, because the value arrives fractional from `setParameters` and
+/// there is no atomic float. See [`scale_from_thousandths`] for the one place it becomes a
+/// ratio again.
+const SCALE_UNITY: u32 = 1000;
+
+/// The largest downscale that will be honoured, in thousandths.
+///
+/// 16x linear is 1/256th of the pixels -- past any ladder a conferencing SFU asks for, and
+/// far enough past it that a nonsense value cannot reduce a call to a handful of pixels.
+const SCALE_MAX: u32 = 16_000;
+
+/// A `setParameters` scale factor as thousandths, clamped to what will be honoured, and
+/// whether clamping changed it.
+///
+/// The `(value, was_clamped)` shape of [`clamp_bitrate_kbps`] and
+/// [`clamp_capture_resolution`], for the same reason and one more: the caller cannot
+/// rediscover "was this clamped" by comparing floats without deciding on an epsilon, which is
+/// a decision that belongs here rather than at every call site.
+///
+/// `SCALE_UNITY` for anything that is not a downscale -- a value at or below 1, an infinity,
+/// a NaN -- and that is *not* reported as clamping: "do not scale" is exactly what those mean
+/// to a caller, and warning about a scale of 1.0 would fire on every ordinary call.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::as_conversions
+)]
+fn scale_to_thousandths(scale: f64) -> (u32, bool) {
+    if !scale.is_finite() || scale <= 1.0 {
+        return (SCALE_UNITY, false);
+    }
+    let requested = (scale * 1000.0).round();
+    if requested >= f64::from(SCALE_MAX) {
+        return (SCALE_MAX, requested > f64::from(SCALE_MAX));
+    }
+    (requested as u32, false)
+}
+
+/// The ratio a stored `scale_override` represents.
+#[allow(clippy::cast_precision_loss, clippy::as_conversions)]
+fn scale_from_thousandths(thousandths: u32) -> f32 {
+    (thousandths as f32) / 1000.0
+}
+
 /// How early a frame may arrive and still count as this slot's frame, as a fraction of the
 /// interval. A quarter of a frame at 30fps is 8ms.
 const ENCODE_EARLY_TOLERANCE_DIVISOR: u32 = 4;
@@ -2446,6 +2613,7 @@ struct VideoPipelineControls {
     active_codec: Arc<ActiveCodec>,
     bitrate_override: Arc<std::sync::atomic::AtomicU32>,
     fps_override: Arc<std::sync::atomic::AtomicU32>,
+    scale_override: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2503,6 +2671,7 @@ fn video_pipeline_loop(
         keyframe: KeyframeState::new(),
         stats: OutboundVideoStats::default(),
         applied_bitrate_kbps: 0,
+        applied_scale: SCALE_UNITY,
     };
     let mut frame_count: u64 = 0;
     let mut keyframe = KeyframeState::new();
@@ -2834,6 +3003,12 @@ impl NotConnectedWatch {
 struct OutboundVideoStats {
     captured: u64,
     sent: u64,
+    /// Frames that should have been scaled down for the SFU and could not be.
+    ///
+    /// Counted rather than merely logged because the consequence is invisible in the
+    /// picture: a frame sent at full size when the receiver's bitrate was set for a
+    /// smaller one looks like a frame that was scaled, only starved.
+    scale_failures: u64,
     /// Frames the rate limiter held back to keep the encode rate at the cap.
     ///
     /// Expected to be non-zero whenever the camera runs faster than the cap -- that is the
@@ -2983,6 +3158,10 @@ struct VideoOutState {
     /// encoder (which starts from `bitrate_for`'s default, not the override) picks the
     /// override back up instead of `apply_bitrate_override` mistaking it for unchanged.
     applied_bitrate_kbps: u32,
+    /// The downscale currently in force, in thousandths -- see [`SCALE_UNITY`]. Tracked so a
+    /// change is logged once rather than thirty times a second, the same reason
+    /// `applied_bitrate_kbps` is tracked apart from the override it comes from.
+    applied_scale: u32,
 }
 
 impl VideoOutState {
@@ -3063,6 +3242,88 @@ fn apply_fps_override(
     tracing::info!(track_id, fps, "applied frame-rate setting to running pacer");
 }
 
+/// Scale a captured frame down to what the SFU asked for, or `None` to send it as captured.
+///
+/// WebRTC's `scaleResolutionDownBy` is how a conferencing SFU manages what each publisher
+/// costs: it sets a bitrate for the size it expects to receive. Ignoring the ask -- which
+/// this app did until now, logging "there is no dynamic resize path" -- does not save the
+/// bitrate, it spends the same allowance on more pixels. Measured at 1080p against
+/// livekit's 1700 kbps cap, that is roughly a third of what the picture wants (M9).
+///
+/// A downscale forces a decode on the MJPEG path, which otherwise reaches the encoder
+/// without ever being decoded. That cost is real and it is the point: the alternative is
+/// sending a frame the receiver's bitrate cannot carry.
+///
+/// Both failure paths are logged rather than silently sending full size, because "we scaled"
+/// and "we could not scale" produce identical pictures at the far end -- one merely arrives
+/// at a bitrate that cannot afford it.
+fn downscale_for_sender(
+    frame: &elementium_media::captured_frame::CapturedFrame,
+    controls: &VideoPipelineControls,
+    out: &mut VideoOutState,
+    track_id: &str,
+) -> Option<elementium_media::captured_frame::CapturedFrame> {
+    let thousandths = controls.scale_override.load(std::sync::atomic::Ordering::Relaxed);
+    if thousandths != out.applied_scale {
+        tracing::info!(
+            track_id,
+            scale = f64::from(thousandths) / 1000.0,
+            "applying the SFU's requested downscale to this pipeline"
+        );
+        out.applied_scale = thousandths;
+    }
+    if thousandths <= SCALE_UNITY {
+        return None;
+    }
+
+    let (out_w, out_h) = elementium_codec::scaled_dimensions(
+        frame.width(),
+        frame.height(),
+        scale_from_thousandths(thousandths),
+    );
+    if (out_w, out_h) == (frame.width(), frame.height()) {
+        return None;
+    }
+
+    let Some(planar) = frame.to_planar() else {
+        out.stats.scale_failures = out.stats.scale_failures.saturating_add(1);
+        if should_log_scale_failure(out.stats.scale_failures) {
+            tracing::warn!(
+                track_id,
+                scale_failures = out.stats.scale_failures,
+                "a frame could not be decoded to scale it down; sending it at full size, \
+                 which the SFU's bitrate was not set for"
+            );
+        }
+        return None;
+    };
+    let Some(scaled) = elementium_codec::scale_i420(&planar, out_w, out_h) else {
+        out.stats.scale_failures = out.stats.scale_failures.saturating_add(1);
+        if should_log_scale_failure(out.stats.scale_failures) {
+            tracing::warn!(
+                track_id,
+                width = frame.width(),
+                height = frame.height(),
+                target_width = out_w,
+                target_height = out_h,
+                scale_failures = out.stats.scale_failures,
+                "a frame could not be scaled to the requested size; sending it at full size"
+            );
+        }
+        return None;
+    };
+    Some(elementium_media::captured_frame::CapturedFrame::Planar(scaled))
+}
+
+/// Whether a given count of consecutive scaling failures is one worth logging.
+///
+/// The same throttle shape as every other per-frame warning here: the first one always, then
+/// periodically, because a fault on this path recurs thirty times a second.
+#[must_use]
+const fn should_log_scale_failure(failures: u64) -> bool {
+    failures == 1 || failures.is_multiple_of(100)
+}
+
 /// Encode one captured frame, keeping the encoder valid and honouring keyframe requests.
 fn encode_and_send_video_frame(
     id: PipelineId<'_>,
@@ -3073,6 +3334,11 @@ fn encode_and_send_video_frame(
     encode_tx: &Arc<Mutex<Option<tokio_mpsc::Sender<IoCommand>>>>,
 ) {
     let wanted = controls.active_codec.get();
+    // Downscaled before anything else looks at its geometry, so the encoder is built for
+    // what will actually be encoded and `ensure_encoder`'s existing rebuild-on-size-change
+    // does the rest.
+    let scaled = downscale_for_sender(frame, controls, out, id.track_id);
+    let frame = scaled.as_ref().unwrap_or(frame);
     let existed = encoder.as_ref().is_some_and(|e| e.codec() == wanted);
     ensure_encoder(encoder, frame.width(), frame.height(), &mut out.keyframe, wanted);
     if !existed {
@@ -4810,5 +5076,93 @@ mod capture_resolution_setting_tests {
             ((Some(1920), Some(1080)), false),
             "agreeing with the setting is not an override either"
         );
+    }
+}
+
+/// The two decisions behind honouring `scaleResolutionDownBy`, without a pipeline.
+///
+/// M9: livekit sets a bitrate for the size it expects to receive and asks for that size with
+/// `scaleResolutionDownBy`. This app honoured the cap and ignored the ask, which did not save
+/// the bitrate -- it spent the same allowance on the full frame.
+#[cfg(test)]
+mod video_scale_tests {
+    use super::{SCALE_MAX, SCALE_UNITY, requested_scale, scale_from_thousandths, scale_to_thousandths};
+
+    /// The largest picture on offer, because `requested_bitrate_kbps` takes the largest
+    /// bitrate. Picking the smallest layer's geometry against the largest layer's bitrate
+    /// would be the worst of both, and picking them from different encodings is how that
+    /// happens.
+    #[test]
+    fn the_smallest_scale_wins_matching_the_largest_bitrate() {
+        assert_eq!(requested_scale(&[Some(4.0), Some(1.5)]), Some(1.5));
+        assert_eq!(requested_scale(&[Some(2.0)]), Some(2.0));
+        assert_eq!(
+            requested_scale(&[None, Some(3.0), None]),
+            Some(3.0),
+            "an encoding with no scale contributes nothing rather than defaulting to 1"
+        );
+    }
+
+    /// No scale anywhere means "change nothing", which the caller must not confuse with
+    /// "scale by nothing" -- the first leaves a previously applied downscale in place, the
+    /// second would silently undo it.
+    #[test]
+    fn no_encoding_carrying_a_scale_is_not_a_request_to_stop_scaling() {
+        assert_eq!(requested_scale(&[]), None);
+        assert_eq!(requested_scale(&[None, None]), None);
+    }
+
+    /// A value that is not a positive, finite ratio is not a request at all. livekit computes
+    /// these, and a division by zero upstream must not reach the capture path as a demand for
+    /// an infinitely small picture.
+    #[test]
+    fn a_nonsense_scale_is_ignored_rather_than_honoured() {
+        assert_eq!(requested_scale(&[Some(f64::NAN)]), None);
+        assert_eq!(requested_scale(&[Some(f64::INFINITY)]), None);
+        assert_eq!(requested_scale(&[Some(0.0)]), None);
+        assert_eq!(requested_scale(&[Some(-2.0)]), None);
+        assert_eq!(
+            requested_scale(&[Some(f64::NAN), Some(2.0)]),
+            Some(2.0),
+            "one bad entry must not discard a good one"
+        );
+    }
+
+    /// Thousandths, because the value is fractional and there is no atomic float. The
+    /// round-trip has to survive the ratio livekit actually sends.
+    #[test]
+    fn a_scale_survives_the_trip_through_thousandths() {
+        assert_eq!(scale_to_thousandths(2.0), (2000, false));
+        assert_eq!(scale_to_thousandths(2.666_666_666_666_666_5), (2667, false));
+        assert!((scale_from_thousandths(2667) - 2.667).abs() < 0.000_1);
+        assert!((scale_from_thousandths(SCALE_UNITY) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Anything that is not a downscale becomes "full size" rather than an error: refusing
+    /// the whole `setParameters` call over a scale of 1.0 -- which is what an encoding says
+    /// when it wants no downscale at all -- would discard the bitrate alongside it.
+    #[test]
+    fn only_a_real_downscale_reaches_the_pipeline() {
+        assert_eq!(scale_to_thousandths(1.0), (SCALE_UNITY, false));
+        assert_eq!(scale_to_thousandths(0.5), (SCALE_UNITY, false), "upscaling is not offered");
+        assert_eq!(scale_to_thousandths(f64::NAN), (SCALE_UNITY, false));
+        assert_eq!(
+            scale_to_thousandths(f64::INFINITY),
+            (SCALE_UNITY, false),
+            "not a downscale, and not worth warning about either"
+        );
+    }
+
+    /// Bounded, because the value crosses an IPC boundary. 16x linear is 1/256th of the
+    /// pixels, past any conferencing ladder; beyond it a call would be a handful of pixels.
+    #[test]
+    fn an_extreme_scale_is_clamped_to_what_is_honoured() {
+        assert_eq!(scale_to_thousandths(1000.0), (SCALE_MAX, true));
+        assert_eq!(
+            scale_to_thousandths(16.0),
+            (SCALE_MAX, false),
+            "the ceiling itself is legal and is not a clamp"
+        );
+        assert_eq!(scale_to_thousandths(15.5), (15_500, false));
     }
 }

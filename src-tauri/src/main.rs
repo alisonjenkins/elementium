@@ -171,6 +171,7 @@ fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<taur
         commands::media_devices::set_video_bitrate,
         commands::media_devices::get_max_encode_fps,
         commands::media_devices::set_max_encode_fps,
+        commands::media_devices::set_video_scale,
         commands::media_devices::get_capture_resolution,
         commands::media_devices::set_capture_resolution,
         commands::livekit::livekit_disconnect,
