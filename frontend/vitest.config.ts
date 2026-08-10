@@ -9,7 +9,11 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   test: {
-    include: ["src/**/*.test.ts"],
+    // `tests/` is Playwright's, with one exception: the tone analyser the call tests judge
+    // audio with is pure arithmetic, and an instrument that is only ever exercised by a
+    // twelve-minute call is an instrument nobody has calibrated. Only `*.test.ts` matches,
+    // so the specs themselves are still Playwright's alone.
+    include: ["src/**/*.test.ts", "tests/**/*.test.ts"],
     environment: "node",
   },
 });
