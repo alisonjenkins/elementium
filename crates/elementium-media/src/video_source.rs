@@ -127,8 +127,10 @@ pub enum VideoSource {
 impl VideoSource {
     /// Start capturing, preferring `PipeWire`.
     ///
-    /// `width`/`height` are honoured only by the `V4L2` path; the `PipeWire` source
-    /// negotiates its own geometry with the device and reports it per frame.
+    /// `width`/`height` are what both paths ask their device for. On the `PipeWire` path
+    /// they are the *default* of the size range offered, so a camera that cannot manage them
+    /// settles on a size it can rather than failing; the negotiated size is reported per
+    /// frame either way and is the only one anything downstream should believe.
     ///
     /// # Errors
     ///
@@ -185,7 +187,12 @@ impl VideoSource {
         target: elementium_codec::EncodeTarget,
         preferred_node: Option<u32>,
     ) -> Result<Self, String> {
-        let pipewire_err = match start_pipewire(target_fps, target, preferred_node) {
+        let pipewire_err = match start_pipewire(
+            target_fps,
+            requested_size(width, height),
+            target,
+            preferred_node,
+        ) {
             Ok(source) => return Ok(source),
             Err(e) => e,
         };
@@ -233,6 +240,9 @@ impl VideoSource {
             node_id,
             crate::pipewire_capture::CaptureRequest {
                 target_fps: crate::pipewire_capture::DEFAULT_CAPTURE_FPS,
+                // A share's geometry is the monitor's or the window's; there is nothing to
+                // prefer, and the portal has already decided what is being captured.
+                target_size: crate::pipewire_capture::DEFAULT_CAPTURE_SIZE,
                 target,
                 profile: crate::pipewire_capture::SourceProfile::Screencast,
             },
@@ -400,8 +410,27 @@ fn wait_for_first_frame(capturer: &PipewireCapturer) -> Result<(), String> {
 /// The cost is one frame, which is consumed to prove the stream is live and cannot be put
 /// back. That is a fair price for knowing the difference between a working camera and a
 /// convincing impression of one.
+/// The frame size to ask a `PipeWire` camera for, from a caller's optional width and height.
+///
+/// A caller that names neither gets [`crate::pipewire_capture::DEFAULT_CAPTURE_SIZE`], which
+/// is what this negotiation asked for unconditionally until the size became a parameter. One
+/// that names only a width gets that width with the default's height, rather than nothing:
+/// half an answer is still a preference, and dropping it silently is how the page's
+/// constraints came to have no effect for the life of the project.
+fn requested_size(width: Option<u32>, height: Option<u32>) -> libspa::utils::Rectangle {
+    let default = crate::pipewire_capture::DEFAULT_CAPTURE_SIZE;
+    if width.is_none() && height.is_none() {
+        return default;
+    }
+    libspa::utils::Rectangle {
+        width: width.unwrap_or(default.width),
+        height: height.unwrap_or(default.height),
+    }
+}
+
 fn start_pipewire(
     target_fps: u32,
+    target_size: libspa::utils::Rectangle,
     target: elementium_codec::EncodeTarget,
     preferred_node: Option<u32>,
 ) -> Result<VideoSource, String> {
@@ -429,7 +458,7 @@ fn start_pipewire(
 
     let mut last_error = String::new();
     for source in ordered {
-        match PipewireCapturer::start_at(source.node_id, target_fps, target) {
+        match PipewireCapturer::start_at(source.node_id, target_fps, target_size, target) {
             Ok(capturer) => match wait_for_first_frame(&capturer) {
                 Ok(()) => {
                     let (width, height) = capturer.size();

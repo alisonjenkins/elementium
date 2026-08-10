@@ -75,9 +75,25 @@ impl SourceProfile {
 #[derive(Debug, Clone, Copy)]
 pub struct CaptureRequest {
     pub target_fps: u32,
+    /// The frame size to ask for, as the *default* of the size range offered.
+    ///
+    /// Not a demand: the property is a range from 160x120 to the profile's maximum, and a
+    /// source that cannot manage this exact size settles on one it can. But the default is
+    /// what a source takes when it can manage it, and until this was a parameter it was the
+    /// hardcoded 1280x720 below -- so a camera offering 1920x1080 and 3840x2160 was asked
+    /// for 720p on every call, whatever the page's `width`/`height` constraint said, and
+    /// whatever the person had chosen.
+    pub target_size: libspa::utils::Rectangle,
     pub target: elementium_codec::EncodeTarget,
     pub profile: SourceProfile,
 }
+
+/// The frame size asked for when a caller expresses no preference.
+///
+/// 720p: what this negotiation has always defaulted to, kept as the default so that adding
+/// the parameter changes nothing for a caller that does not set it.
+pub const DEFAULT_CAPTURE_SIZE: libspa::utils::Rectangle =
+    libspa::utils::Rectangle { width: 1280, height: 720 };
 
 /// Frames buffered before the oldest is dropped.
 ///
@@ -749,6 +765,7 @@ impl PipewireCapturer {
         Self::start_at(
             node_id,
             DEFAULT_CAPTURE_FPS,
+            DEFAULT_CAPTURE_SIZE,
             elementium_codec::EncodeTarget::software(),
         )
     }
@@ -775,12 +792,14 @@ impl PipewireCapturer {
     pub fn start_at(
         node_id: u32,
         target_fps: u32,
+        target_size: libspa::utils::Rectangle,
         target: elementium_codec::EncodeTarget,
     ) -> Result<Self, PipewireError> {
         Self::start_with(
             node_id,
             CaptureRequest {
                 target_fps,
+                target_size,
                 target,
                 profile: SourceProfile::Camera,
             },
@@ -1819,7 +1838,14 @@ fn raw_format_param(
 ) -> Vec<u8> {
     use libspa::pod::{object, property};
     let target_fps = request.target_fps;
+    // Clamped to the profile's own bound, so a caller asking for more than the profile will
+    // ever agree to gets the largest thing it can have rather than a range whose default
+    // sits outside it -- which negotiates as if no preference had been expressed at all.
     let max_size = request.profile.max_size();
+    let target_size = libspa::utils::Rectangle {
+        width: request.target_size.width.clamp(160, max_size.width),
+        height: request.target_size.height.clamp(120, max_size.height),
+    };
     let min_framerate = request.profile.min_framerate();
     let mut obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
@@ -1852,7 +1878,7 @@ fn raw_format_param(
             Choice,
             Range,
             Rectangle,
-            libspa::utils::Rectangle { width: 1280, height: 720 },
+            target_size,
             libspa::utils::Rectangle { width: 160, height: 120 },
             max_size
         ),
@@ -1881,7 +1907,14 @@ fn raw_format_param(
 fn mjpeg_format_param(request: CaptureRequest) -> Vec<u8> {
     use libspa::pod::{object, property};
     let target_fps = request.target_fps;
+    // Clamped to the profile's own bound, so a caller asking for more than the profile will
+    // ever agree to gets the largest thing it can have rather than a range whose default
+    // sits outside it -- which negotiates as if no preference had been expressed at all.
     let max_size = request.profile.max_size();
+    let target_size = libspa::utils::Rectangle {
+        width: request.target_size.width.clamp(160, max_size.width),
+        height: request.target_size.height.clamp(120, max_size.height),
+    };
     let min_framerate = request.profile.min_framerate();
     let obj = object! {
         libspa::utils::SpaTypes::ObjectParamFormat,
@@ -1901,7 +1934,7 @@ fn mjpeg_format_param(request: CaptureRequest) -> Vec<u8> {
             Choice,
             Range,
             Rectangle,
-            libspa::utils::Rectangle { width: 1280, height: 720 },
+            target_size,
             libspa::utils::Rectangle { width: 160, height: 120 },
             max_size
         ),

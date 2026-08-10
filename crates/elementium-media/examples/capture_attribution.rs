@@ -278,6 +278,7 @@ fn first_delivering_source(
         match elementium_media::pipewire_capture::PipewireCapturer::start_at(
             source.node_id,
             TARGET_FPS,
+            elementium_media::pipewire_capture::DEFAULT_CAPTURE_SIZE,
             target,
         ) {
             Ok(capturer) => {

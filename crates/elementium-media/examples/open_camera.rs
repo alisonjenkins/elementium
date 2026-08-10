@@ -10,6 +10,7 @@
 //! ```text
 //! nix develop -c cargo run -p elementium-media --example open_camera        # no preference
 //! nix develop -c cargo run -p elementium-media --example open_camera 349    # ask for one
+//! nix develop -c cargo run -p elementium-media --example open_camera 349 1920 1080
 //! ```
 //!
 //! Captures a handful of frames and reports their size, then stops. Nothing is written to
@@ -24,10 +25,22 @@ fn main() {
     let preferred: Option<u32> = std::env::args().nth(1).and_then(|a| a.parse().ok());
     println!("preferred node: {}", preferred.map_or_else(|| "none".to_owned(), |n| n.to_string()));
 
+    // Optional, and separate from the node id, because "which camera" and "how big" are
+    // different questions and this example has been used to answer each without the other.
+    let width: Option<u32> = std::env::args().nth(2).and_then(|a| a.parse().ok());
+    let height: Option<u32> = std::env::args().nth(3).and_then(|a| a.parse().ok());
+    println!(
+        "requested size: {}",
+        match (width, height) {
+            (Some(w), Some(h)) => format!("{w}x{h}"),
+            _ => "none (the negotiation's own default)".to_owned(),
+        }
+    );
+
     let started = Instant::now();
     let source = match elementium_media::video_source::VideoSource::start_at_device(
-        None,
-        None,
+        width,
+        height,
         30,
         elementium_codec::EncodeTarget::software(),
         preferred,
