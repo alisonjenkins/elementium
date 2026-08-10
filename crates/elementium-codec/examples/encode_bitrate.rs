@@ -52,12 +52,16 @@ fn main() {
         let mut bytes = 0_u64;
         let mut steady_bytes = 0_u64;
         let mut frames_out = 0_u32;
+        let mut largest_keyframe = 0_u64;
         for i in 0..FRAMES {
             let frame = moving(width, height, i);
             match encoder.encode(&frame) {
                 Ok(packets) => {
                     for packet in &packets {
                         let len = packet.data.as_bytes().len() as u64;
+                        if packet.is_keyframe {
+                            largest_keyframe = largest_keyframe.max(len);
+                        }
                         bytes = bytes.saturating_add(len);
                         // After the first second, so the opening keyframe -- which is
                         // hundreds of kilobytes and unavoidable -- is not charged against a
@@ -81,9 +85,15 @@ fn main() {
         let steady_kbps = (steady_bytes as f64) * 8.0 / 1000.0 / steady_seconds;
         let share = kbps / f64::from(target_kbps) * 100.0;
         let steady_share = steady_kbps / f64::from(target_kbps) * 100.0;
+        // What one frame is worth at the target rate, so the keyframe can be stated in the
+        // unit libvpx budgets in: a keyframe is always several frames' worth, and the
+        // question is how many before the link has to absorb it.
+        let frame_budget_bytes = f64::from(target_kbps) * 1000.0 / 8.0 / f64::from(FPS);
+        let keyframe_budgets = largest_keyframe as f64 / frame_budget_bytes;
         println!(
             "{label}: asked {target_kbps} | whole run {kbps:.0} ({share:.0}%) | \
-             after the keyframe {steady_kbps:.0} ({steady_share:.0}%) | {frames_out} packets"
+             after the keyframe {steady_kbps:.0} ({steady_share:.0}%) | {frames_out} packets | \
+             largest keyframe {largest_keyframe} bytes ({keyframe_budgets:.0}x a frame's budget)"
         );
     }
 }
