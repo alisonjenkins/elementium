@@ -31,7 +31,10 @@ pub enum CaptureError {
 
 /// Captures audio from the default input device.
 pub struct AudioCapturer {
-    _stream: Stream,
+    /// Absent when the source is a file rather than a device -- see [`crate::fake_mic`].
+    _stream: Option<Stream>,
+    /// Present only when the source is a file. Dropping it stops the playing thread.
+    _fake: Option<crate::fake_mic::FakeMic>,
     receiver: mpsc::Receiver<AudioFrame>,
     sample_rate: u32,
     channels: u16,
@@ -127,6 +130,14 @@ impl AudioCapturer {
     /// Returns [`CaptureError`] if no input device is available, the device config cannot
     /// be read, or the audio stream cannot be built or started.
     pub fn start_on_device(index: Option<usize>) -> Result<Self, CaptureError> {
+        // A file instead of a device, when a test asked for one. Checked before anything is
+        // enumerated or opened, so no microphone is claimed and no camera-light equivalent
+        // happens: the point is to publish a signal the test already knows, and a device
+        // opened alongside it would only add the room to the measurement.
+        if let Some(path) = crate::fake_mic::requested() {
+            return Self::start_on_file(&path);
+        }
+
         let host = cpal::default_host();
         let chosen = index.and_then(|i| {
             let found = host.input_devices().ok().and_then(|mut d| d.nth(i));
@@ -222,12 +233,39 @@ impl AudioCapturer {
         );
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
+            _fake: None,
             receiver: rx,
             sample_rate,
             channels,
             device_id,
         })
+    }
+
+    /// Play a WAV file as though it were the microphone. See [`crate::fake_mic`].
+    ///
+    /// A failure here is never a fall back to a real device: a test that asked for a known
+    /// signal and silently got a room instead would report, at length, on the room.
+    fn start_on_file(path: &std::path::Path) -> Result<Self, CaptureError> {
+        match crate::fake_mic::start(path) {
+            Ok(started) => Ok(Self {
+                _stream: None,
+                _fake: Some(started.mic),
+                receiver: started.receiver,
+                sample_rate: started.sample_rate,
+                channels: started.channels,
+                device_id: "fake-mic".to_owned(),
+            }),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %path.display(),
+                    "ELEMENTIUM_FAKE_MIC is set but unusable; refusing to open a real \
+                     microphone in its place"
+                );
+                Err(CaptureError::NoDevice)
+            }
+        }
     }
 
     /// Receive the next audio frame (blocking).

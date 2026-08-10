@@ -114,6 +114,28 @@ test-app-call:
     cd frontend && ELEMENTIUM_APP_CALL=1 pnpm exec playwright test \
         tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
 
+# Is the audio that comes out the other end the audio that went in?
+#
+# `just test-app-call` measures that audio flows. This measures that it is the *same audio*:
+# every participant transmits a ladder of six pure tones cycling in a fixed order, each
+# participant's ladder drawn from a different set of frequencies, and each end asserts that
+# the tones it received are the right ones, in the right order, with no gap over 300ms.
+# Nothing else here can tell a voice from a chainsaw -- packets, samples and decoded frames
+# all read healthy for the fault this exists to find.
+#
+# Nothing on this machine is reconfigured: no default is changed, no sound-server module is
+# loaded and no microphone is opened. Elementium plays the generated signal as its microphone
+# (ELEMENTIUM_FAKE_MIC) and its own playback is silenced by an ALSA config that applies to
+# that one process, so the room can neither be heard nor transmitted. The camera is not used
+# either -- this joins audio-only.
+#
+# Three participants: Elementium and two Element Web browsers, so a fault that only appears
+# when the SFU forwards to several is in range.
+test-app-call-audio:
+    cargo build -p elementium
+    cd frontend && ELEMENTIUM_APP_CALL_AUDIO=1 pnpm exec playwright test \
+        tests/matrixrtc/app-call-audio.spec.ts --reporter=list --workers=1
+
 # The same call, with a crowd in it before Elementium arrives.
 #
 # The twenty-frames-a-minute fault has never reproduced against a single peer, and one
@@ -133,14 +155,14 @@ test-app-call-crowd peers="3":
         ELEMENTIUM_TEST_PARTICIPANTS=$(({{peers}} + 2)) \
         pnpm exec playwright test tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
 
-# The same call, recording what the microphone path actually produces.
+# The ordinary call, recording what the *real* microphone path produces.
 #
-# Writes the three capture points described in `just audio-dumps` -- the raw microphone, the
-# frame handed to Opus after gain and resampling, and our own encoder's output decoded back --
-# then converts them to WAV. The last of those is the closest thing to what the far end hears,
-# and listening to it settles in thirty seconds a question that has twice survived being
-# reasoned about.
-test-app-call-audio:
+# `just test-app-call-audio` is the stronger test and should be preferred: it transmits a
+# known signal and checks the far end received that signal. This one exists for the case that
+# cannot cover -- a real microphone in a real room, where the question is what a human voice
+# and the gain applied to it actually sound like. It writes the three capture points and
+# converts them to WAV for listening.
+test-app-call-dumps:
     cargo build -p elementium
     rm -f /tmp/elementium_audio_dump_*.f32le /tmp/elementium_audio_dump_*.wav
     cd frontend && ELEMENTIUM_APP_CALL=1 ELEMENTIUM_AUDIO_DUMP=1 \
