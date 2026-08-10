@@ -126,8 +126,23 @@ fn parse_extra_clear_bytes(raw: Option<&str>) -> ClearExtraOutcome {
 fn extra_clear_bytes() -> usize {
     static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
-        let raw = std::env::var("ELEMENTIUM_H264_CLEAR_EXTRA").ok();
-        let outcome = parse_extra_clear_bytes(raw.as_deref());
+        // `var_os` and an explicit UTF-8 check, not `var(..).ok()`: that collapses "not set"
+        // and "set to bytes that are not UTF-8" into the same `None`, and for a switch that
+        // decides how much plaintext goes on the wire, "we ignored what you set" has to be
+        // something the log says rather than something a reader infers from silence.
+        let raw = std::env::var_os("ELEMENTIUM_H264_CLEAR_EXTRA");
+        let text = raw.as_ref().and_then(|value| {
+            let text = value.to_str();
+            if text.is_none() {
+                tracing::warn!(
+                    value = ?value,
+                    "ELEMENTIUM_H264_CLEAR_EXTRA is not valid UTF-8; ignoring it and keeping \
+                     livekit's framing"
+                );
+            }
+            text
+        });
+        let outcome = parse_extra_clear_bytes(text);
         if let Some(warning) = outcome.warning {
             // Said once, because get_or_init runs the closure at most once per process --
             // a machine running with this set should say so once, loudly, not stay quiet.
