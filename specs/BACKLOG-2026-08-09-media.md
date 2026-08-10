@@ -142,6 +142,44 @@ collected here because they were all found in the same session.
   Worth noting that a loopback *with* a producer is a legitimate camera -- OBS virtual camera
   is exactly that -- so it must not simply be filtered out.
 
+- [ ] **M9. Raising the capture resolution does not raise the bitrate cap, and we ignore the
+  downscale the SFU asks for.** Found while verifying the new resolution setting
+  (2026-08-10). Element Call's `setParameters` asks for two things we do not do:
+
+  ```
+  setParameters asked for scaleResolutionDownBy=2.6666666666666665 on encoding 0;
+    there is no dynamic resize path, so this is not honoured
+  setParameters asked for degradationPreference=balanced; not honoured
+  video bitrate changed via setParameters kbps=1700
+  ```
+
+  The cap *is* honoured. The downscale is not. So livekit sets a bitrate appropriate to the
+  720x405 it believes it is publishing, and we spend it on the full frame instead -- and the
+  larger the capture, the thinner it is spread. Measured over the same 40s window, per 10s
+  reporting interval:
+
+  | capture | encoder configured | actually sent |
+  |---|---:|---:|
+  | 1280x720 | 2764 kbps | ~384-970 kbps |
+  | 1920x1080 | 4000 kbps (clamped) | ~824-1296 kbps |
+
+  1080p30 over VP8 wants 3-4 Mbps to look clean. At ~1.2 Mbps it will be softer per pixel
+  than 720p at the same rate, so **1080p may not look better to the far end, and in motion it
+  may look worse.** Every frame still arrives -- 1200 encoded, 1200 decoded at three
+  participants, zero lost -- this is about how good each one is, not whether it gets there.
+
+  Two ways out, and they are different products:
+
+  - **Honour `scaleResolutionDownBy`** (a real dynamic resize path). Element Call's ladder
+    then works as designed, and the capture setting becomes a ceiling rather than a promise.
+    This is what a browser does.
+  - **Treat the cap as advisory when someone has explicitly asked for a resolution.** Simpler,
+    and wrong on a congested link: livekit's number is partly a bandwidth estimate, and
+    ignoring it degrades the call for everyone rather than just us.
+
+  Not decided here: it changes what other participants receive, which is not a judgement to
+  make from a backlog note.
+
 ## Closed
 
 - [x] **M1. The frame rate is not configurable by a person.** Implemented, unverified until
