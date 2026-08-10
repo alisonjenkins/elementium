@@ -181,6 +181,7 @@ if [[ "${ELEMENTIUM_AUTOJOIN:-}" == "1" ]]; then
     # Participant index 0 by default; `just call-peers` uses the rest, so the app takes
     # tester1 and meets them.
     AUTOJOIN_JSON=$(ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-0}" \
+        ELEMENTIUM_AUTOJOIN_SCREENSHARE="${ELEMENTIUM_AUTOJOIN_SCREENSHARE:-0}" \
         ELEMENTIUM_TRACE_PC="${ELEMENTIUM_TRACE_PC:-0}" python3 - "$FIXTURE" <<'PYEOF'
 import json, os, sys, urllib.request
 
@@ -208,6 +209,9 @@ print(json.dumps({
     "deviceId": who["device_id"],
     "roomId": env["room_id"],
     "video": os.environ.get("ELEMENTIUM_AUTOJOIN_VIDEO") == "1",
+    # Waits for the harness to drop `elementium-share-now` into the served directory before
+    # it shares anything, so a screen share never happens on a run that did not ask for one.
+    "screenShare": os.environ.get("ELEMENTIUM_AUTOJOIN_SCREENSHARE") == "1",
     # Records every property read and method call on the peer connection, in order.
     # Off unless asked for: it is the only way to see a call the far end makes that our
     # shim does not implement, because an unimplemented call logs nothing at all.
