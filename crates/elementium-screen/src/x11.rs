@@ -174,6 +174,7 @@ impl ScreenCapturer for X11Capturer {
         let (kind, id) = parse_source_id(source_id)?;
         match kind {
             SourceIdKind::Monitor => {
+                refuse_monitor_capture_on_wayland(source_id)?;
                 find_monitor(id)?;
             }
             SourceIdKind::Window => {
@@ -365,6 +366,56 @@ fn find_window(target_id: u32) -> Result<xcap::Window, ElementiumError> {
     })
 }
 
+/// Whether xcap will send a *monitor* capture to the Wayland portal rather than to X11.
+///
+/// This mirrors xcap 0.4's own `wayland_detect` exactly, including its oddities -- it is a
+/// prediction of what that library will do, so any divergence would make this wrong rather
+/// than merely different. `xcap::linux::capture::capture_monitor` branches on it and, when it
+/// is true, takes a screenshot of the *Wayland* desktop via `org.gnome.Shell.Screenshot` or
+/// `org.freedesktop.portal.Screenshot`, ignoring `DISPLAY` entirely. Window capture has no
+/// such branch and always goes through `XGetImage`, which is why only monitors are refused.
+fn xcap_captures_monitors_through_the_wayland_portal() -> bool {
+    let session_type = std::env::var_os("XDG_SESSION_TYPE").unwrap_or_default();
+    let wayland_display = std::env::var_os("WAYLAND_DISPLAY").unwrap_or_default();
+    is_wayland_session(&session_type.to_string_lossy(), &wayland_display.to_string_lossy())
+}
+
+/// The decision itself, over the two variables rather than over the environment.
+///
+/// Separated so it can be pinned without a test setting environment variables -- which is
+/// `unsafe` in this edition and, worse, visible to every other test in the same process.
+/// Both halves of xcap's condition are reproduced, including that the session type is an
+/// exact match while the display name is a case-insensitive substring.
+#[must_use]
+fn is_wayland_session(session_type: &str, wayland_display: &str) -> bool {
+    session_type == "wayland" || wayland_display.to_lowercase().contains("wayland")
+}
+
+/// Refuse an X11 monitor capture that xcap would silently answer from the Wayland desktop.
+///
+/// Measured, not assumed: capturing a 1280x800 Xvfb monitor took 5.1ms a frame (170fps) with
+/// these variables clear and 406ms a frame (2.4fps) with `XDG_SESSION_TYPE=wayland` set, on
+/// the same display in the same build. That is the whole of M7's "X11 capture runs at about
+/// 3.3fps" -- it was never `XGetImage` being slow, it was a per-frame D-Bus screenshot round
+/// trip that writes a PNG to disk, reads it back and decodes it.
+///
+/// It is refused rather than merely logged because the rate is the lesser problem: the frames
+/// come from the *real desktop*, whole, whatever `DISPLAY` and whichever monitor the person
+/// picked. A caller that asked to share one X11 monitor and got everything on screen instead
+/// has had something disclosed that nobody chose to share. On a Wayland session the portal
+/// path in `share.rs` is the one to use, and it asks the person what to share.
+fn refuse_monitor_capture_on_wayland(source_id: &str) -> Result<(), ElementiumError> {
+    if !xcap_captures_monitors_through_the_wayland_portal() {
+        return Ok(());
+    }
+    Err(ElementiumError::InvalidSource(format!(
+        "refusing to capture X11 monitor {source_id} on a Wayland session: xcap would ignore \
+         DISPLAY and screenshot the whole Wayland desktop through the portal instead, at about \
+         2fps. Use the PipeWire/portal share path, or clear XDG_SESSION_TYPE and \
+         WAYLAND_DISPLAY if this really is an X11 session"
+    )))
+}
+
 /// The geometry the X server reports for a source, before any frame has been captured.
 ///
 /// A push-based capturer has nothing to negotiate, so until this existed the first frame was
@@ -459,6 +510,40 @@ mod tests {
             result.is_err(),
             "start() must not report success for a target that cannot be captured"
         );
+    }
+
+    /// M7: this predicate decides whether an X11 monitor share is refused, and it has to
+    /// match xcap's own `wayland_detect` rather than be merely reasonable -- it is a
+    /// prediction of that library's branch. Both halves matter: `XDG_SESSION_TYPE=wayland`
+    /// alone was enough to take a headless Xvfb capture from 170fps to 2.4fps, because the
+    /// harness cleared `WAYLAND_DISPLAY` and stopped there.
+    #[test]
+    fn a_wayland_session_is_detected_from_either_variable_the_way_xcap_detects_it() {
+        assert!(is_wayland_session("wayland", ""), "the session type alone is enough");
+        assert!(is_wayland_session("", "wayland-1"), "the display name alone is enough");
+        assert!(is_wayland_session("", "WAYLAND-1"), "the display name match is case-insensitive");
+        assert!(!is_wayland_session("x11", ""), "an X11 session with no display set is X11");
+        assert!(!is_wayland_session("", ""), "neither variable set is not a Wayland session");
+        assert!(
+            !is_wayland_session("wayland-ish", ""),
+            "the session type is an exact match in xcap, not a substring one"
+        );
+    }
+
+    /// The refusal itself must name the source and the way out, since the person seeing it
+    /// asked to share a screen and is owed more than a failure: on a Wayland session the
+    /// portal path works and is the one to use.
+    #[test]
+    fn a_monitor_capture_that_would_go_through_the_portal_is_refused_by_name() {
+        let refused = refuse_monitor_capture_on_wayland("monitor-0");
+        if xcap_captures_monitors_through_the_wayland_portal() {
+            assert!(refused.is_err(), "a Wayland session must refuse an X11 monitor capture");
+            let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(message.contains("monitor-0"), "the refusal must name the source: {message}");
+            assert!(message.contains("PipeWire"), "the refusal must name the way out: {message}");
+        } else {
+            assert!(refused.is_ok(), "an X11 session must not refuse an X11 monitor capture");
+        }
     }
 
     /// M6: `source_size` exists so a share's geometry is knowable before its first frame,
