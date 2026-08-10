@@ -37,6 +37,21 @@ const RC_BUFFER_OPTIMAL_MS: u32 = 600;
 const RC_OVERSHOOT_PCT: u32 = 15;
 const RC_UNDERSHOOT_PCT: u32 = 100;
 
+/// How much of the rate controller's buffer a keyframe may spend, as a fraction.
+///
+/// libwebrtc's `MaxIntraTarget` uses a half, and the reasoning is that a keyframe drains the
+/// buffer it is allowed to fill from: spend all of it and the frames immediately after the
+/// keyframe -- the ones a receiver needs in order to keep the picture it just recovered --
+/// have nothing left to spend.
+const KEYFRAME_BUFFER_SHARE: u32 = 2;
+
+/// The smallest keyframe cap worth setting, as a percentage of one frame's budget.
+///
+/// Three frames' worth. Below this a keyframe cannot carry a picture at all, and the encoder
+/// would answer every keyframe request with something unusable, which is worse than the
+/// burst the cap exists to prevent.
+const KEYFRAME_MIN_PCT: u32 = 300;
+
 /// Longest run of frames without a keyframe, as a backstop.
 ///
 /// A receiver that joins mid-call cannot decode anything until it sees one. Keyframe
@@ -55,6 +70,28 @@ fn frame_duration_ticks(max_framerate: u32) -> i64 {
     const TICKS_PER_SECOND: i64 = 90_000;
     let fps = i64::from(max_framerate.clamp(1, 240));
     TICKS_PER_SECOND.checked_div(fps).unwrap_or(3_000).max(1)
+}
+
+/// The largest keyframe libvpx may produce, as a percentage of one frame's budget.
+///
+/// 900 at 30fps. The target bitrate cancels out of the derivation -- half the rate
+/// controller's buffer, divided by one frame's share of the same rate -- which is why this
+/// depends on the frame rate and the buffer depth and not on the bitrate. Matches libwebrtc's
+/// `MaxIntraTarget`, and libvpx's own default is no cap at all.
+///
+/// It is a ceiling and not a setting to tune down. Measured with `encode_bitrate` against a
+/// deliberately incompressible picture at 720p/1700 kbps, tightening it to 100 shrank the
+/// keyframe from 122KB to 72KB and made the *average* worse -- 154% of budget to 170% --
+/// because every frame after a starved keyframe references a worse picture and costs more to
+/// correct. A generous ceiling that bounds the pathological case is the trade libwebrtc makes
+/// too, and the far end is usually libwebrtc.
+fn max_intra_bitrate_pct(max_framerate: u32) -> u32 {
+    let fps = max_framerate.clamp(1, 240);
+    RC_BUFFER_OPTIMAL_MS
+        .saturating_mul(fps)
+        .checked_div(KEYFRAME_BUFFER_SHARE.saturating_mul(10))
+        .unwrap_or(KEYFRAME_MIN_PCT)
+        .max(KEYFRAME_MIN_PCT)
 }
 
 pub struct Vp8Encoder {
@@ -111,8 +148,8 @@ impl Vp8Encoder {
     ) -> Result<Self, CodecError> {
         use std::mem::MaybeUninit;
         use vpx_sys::{
-            VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION, vp8e_enc_control_id::VP8E_SET_CPUUSED,
-            vpx_codec_enc_config_default, vpx_codec_enc_init_ver, vpx_codec_vp8_cx,
+            VPX_CODEC_OK, VPX_ENCODER_ABI_VERSION, vpx_codec_enc_config_default,
+            vpx_codec_enc_init_ver, vpx_codec_vp8_cx,
             vpx_kf_mode::VPX_KF_AUTO, vpx_rc_mode::VPX_CBR,
         };
 
@@ -206,19 +243,15 @@ impl Vp8Encoder {
                 ));
             }
 
-            // The speed/quality control the previous wrapper never applied to VP8.
-            let ret = vpx_sys::vpx_codec_control_(&raw mut ctx, VP8E_SET_CPUUSED as i32, CPU_USED);
-            if ret != VPX_CODEC_OK {
-                // Not fatal: the encoder works, just slowly. Worth knowing about, because
-                // "the encoder is slow" is otherwise indistinguishable from a slow machine.
-                tracing::warn!(vpx_error_code = ?ret, "could not set VP8 cpu_used; encoding will be slower");
-            }
+            // SAFETY: `ctx` was just initialised successfully by `vpx_codec_enc_init_ver`.
+            let max_intra = Self::apply_realtime_controls(&mut ctx, max_framerate);
 
             tracing::info!(
                 width,
                 height,
                 bitrate_kbps,
                 cpu_used = CPU_USED,
+                max_intra_pct = max_intra,
                 threads = cfg.g_threads,
                 "VP8 encoder initialized"
             );
@@ -234,6 +267,66 @@ impl Vp8Encoder {
                 force_keyframe: false,
             })
         }
+    }
+
+    /// Apply the controls that cannot be expressed in the configuration struct, and return
+    /// the keyframe cap that was asked for so the caller can log what it got.
+    ///
+    /// Neither failure is fatal -- an encoder that ignored them still encodes -- but both
+    /// change how it behaves in a call, so both say so rather than failing silently.
+    ///
+    /// Split out of [`Vp8Encoder::new`] so that function stays under the workspace's line
+    /// limit.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be an encoder context that `vpx_codec_enc_init_ver` initialised
+    /// successfully and that has not been destroyed.
+    #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
+    unsafe fn apply_realtime_controls(
+        ctx: &mut vpx_sys::vpx_codec_ctx_t,
+        max_framerate: u32,
+    ) -> u32 {
+        use vpx_sys::{VPX_CODEC_OK, vp8e_enc_control_id};
+
+        let max_intra = max_intra_bitrate_pct(max_framerate);
+        // SAFETY: as documented on this function.
+        unsafe {
+            // The speed/quality control the previous wrapper never applied to VP8.
+            let ret = vpx_sys::vpx_codec_control_(
+                std::ptr::addr_of_mut!(*ctx),
+                vp8e_enc_control_id::VP8E_SET_CPUUSED as i32,
+                CPU_USED,
+            );
+            if ret != VPX_CODEC_OK {
+                // Not fatal: the encoder works, just slowly. Worth knowing about, because
+                // "the encoder is slow" is otherwise indistinguishable from a slow machine.
+                tracing::warn!(vpx_error_code = ?ret, "could not set VP8 cpu_used; encoding will be slower");
+            }
+
+            // Bound the keyframe. Everything else here budgets the *average*, and a keyframe
+            // is the one frame that does not obey it: measured at 720p on a 1700 kbps target,
+            // libvpx produced a 195KB keyframe, 28 frames' worth of budget arriving in one
+            // frame time. A receiver asking for a keyframe once a second -- which is what a
+            // receiver does when it cannot decode -- then means a burst a second, and each
+            // burst is another chance to be the loss that caused the request.
+            let ret = vpx_sys::vpx_codec_control_(
+                std::ptr::addr_of_mut!(*ctx),
+                vp8e_enc_control_id::VP8E_SET_MAX_INTRA_BITRATE_PCT as i32,
+                max_intra,
+            );
+            if ret != VPX_CODEC_OK {
+                // Not fatal for the same reason as cpu_used: the encoder works, it just
+                // spikes. Worth a line, because the spike is otherwise attributed to the
+                // network that dropped it.
+                tracing::warn!(
+                    vpx_error_code = ?ret,
+                    max_intra_pct = max_intra,
+                    "could not cap VP8 keyframe size; keyframes may burst over budget"
+                );
+            }
+        }
+        max_intra
     }
 
     /// The geometry this encoder was configured for.
@@ -935,6 +1028,30 @@ mod tests {
         let mut encoder = Vp8Encoder::new(640, 480, 500, 30).expect("encoder creation");
         encoder.force_keyframe();
         assert_eq!(encoder.size(), (640, 480));
+    }
+
+    /// The keyframe cap is half the rate controller's buffer expressed in frame budgets, so
+    /// a slower frame rate -- where one frame is a larger share of a second -- must give a
+    /// smaller multiple, not a larger one. Pinned because the derivation reads backwards:
+    /// the multiple falls as the frame rate falls, while the keyframe's absolute size does
+    /// not change.
+    #[test]
+    fn the_keyframe_cap_tracks_the_frame_rate() {
+        assert_eq!(max_intra_bitrate_pct(30), 900, "600ms of buffer, halved, at 30fps");
+        assert_eq!(max_intra_bitrate_pct(60), 1800);
+        assert_eq!(max_intra_bitrate_pct(15), 450);
+    }
+
+    /// A rate low enough to compute a cap smaller than one usable keyframe must not be
+    /// honoured: an encoder that answers every keyframe request with something undecodable
+    /// is worse than the burst the cap exists to prevent. Nor may a nonsense rate divide by
+    /// zero or wrap.
+    #[test]
+    fn the_keyframe_cap_never_falls_below_a_usable_keyframe() {
+        assert_eq!(max_intra_bitrate_pct(10), KEYFRAME_MIN_PCT, "600*10/20 = 300, at the floor");
+        assert_eq!(max_intra_bitrate_pct(1), KEYFRAME_MIN_PCT);
+        assert_eq!(max_intra_bitrate_pct(0), KEYFRAME_MIN_PCT, "clamped before dividing");
+        assert_eq!(max_intra_bitrate_pct(u32::MAX), max_intra_bitrate_pct(240));
     }
 
     #[allow(clippy::expect_used)]
