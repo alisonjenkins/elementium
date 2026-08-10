@@ -697,12 +697,26 @@ fn capture_resolution_from_env() -> Option<(u32, u32)> {
     static RESOLVED: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
         let raw = std::env::var_os("ELEMENTIUM_CAPTURE_RESOLUTION")?;
-        let Some((width, height)) = raw.to_str().and_then(parse_resolution) else {
+        // The two ways this can fail are reported separately: bytes that are not UTF-8 at all
+        // is a different mistake from a size that does not parse, and one message covering
+        // both would name neither.
+        let Some(text) = raw.to_str() else {
             tracing::warn!(
                 value = ?raw,
-                "ELEMENTIUM_CAPTURE_RESOLUTION is not a WIDTHxHEIGHT size; ignoring it"
+                "ELEMENTIUM_CAPTURE_RESOLUTION is not valid UTF-8; ignoring it"
             );
             return None;
+        };
+        let (width, height) = match parse_resolution(text) {
+            Ok(size) => size,
+            Err(e) => {
+                tracing::warn!(
+                    value = text,
+                    error = %e,
+                    "ELEMENTIUM_CAPTURE_RESOLUTION is not a size; ignoring it"
+                );
+                return None;
+            }
         };
         let ((clamped_width, clamped_height), was_clamped) =
             clamp_capture_resolution(width, height);
@@ -724,14 +738,57 @@ fn capture_resolution_from_env() -> Option<(u32, u32)> {
     })
 }
 
-/// Parse a `WIDTHxHEIGHT` size, or `None` if it is not one.
+/// Why a string is not a `WIDTHxHEIGHT` size.
 ///
-/// Deliberately strict: `1920 x 1080`, `1920X1080` and `1920*1080` are all rejected rather
-/// than guessed at, because a setting that half-understands its input is how someone ends up
-/// believing they asked for something they did not.
-fn parse_resolution(raw: &str) -> Option<(u32, u32)> {
-    let (width, height) = raw.split_once('x')?;
-    Some((width.parse().ok()?, height.parse().ok()?))
+/// Three variants because there are three distinct mistakes, and they have different fixes:
+/// the separator is missing, or one of the two numbers is not a number. A single "malformed"
+/// would leave someone who typed `1920 x 1080` unable to tell which of their numbers the
+/// parser rejected -- both look right to them, and only one is.
+#[derive(Debug)]
+enum ResolutionParseError {
+    /// No `x` separating two parts at all.
+    NoSeparator,
+    /// The part before the `x` is not a number.
+    Width(std::num::ParseIntError),
+    /// The part after the `x` is not a number.
+    Height(std::num::ParseIntError),
+}
+
+impl std::fmt::Display for ResolutionParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSeparator => write!(f, "expected WIDTHxHEIGHT, e.g. 1920x1080"),
+            Self::Width(e) => write!(f, "the width is not a number: {e}"),
+            Self::Height(e) => write!(f, "the height is not a number: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolutionParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoSeparator => None,
+            Self::Width(e) | Self::Height(e) => Some(e),
+        }
+    }
+}
+
+/// Parse a `WIDTHxHEIGHT` size, saying which half was wrong when it is not one.
+///
+/// Deliberately strict about the spelling: `1920 x 1080`, `1920X1080` and `1920*1080` are
+/// rejected rather than guessed at, because a setting that half-understands its input is how
+/// someone ends up believing they asked for something they did not.
+///
+/// Returns the cause rather than `None`. `parse` has already worked out precisely what is
+/// wrong with the input, and `.ok()` would throw that away one call before the only place
+/// equipped to report it -- see the constitution's first principle, which this line was the
+/// occasion for.
+fn parse_resolution(raw: &str) -> Result<(u32, u32), ResolutionParseError> {
+    let (width, height) = raw.split_once('x').ok_or(ResolutionParseError::NoSeparator)?;
+    Ok((
+        width.parse().map_err(ResolutionParseError::Width)?,
+        height.parse().map_err(ResolutionParseError::Height)?,
+    ))
 }
 
 /// Clamp a requested capture resolution to something a camera could be asked for, reporting
@@ -786,11 +843,22 @@ pub fn load_persisted_capture_resolution(app: &tauri::App) {
         tracing::warn!("could not open the settings store; the resolution setting starts unset");
         return;
     };
+    // A key that is absent is the ordinary "never set" case and says nothing. A key that is
+    // *present but not a frame dimension* is a corrupted or hand-edited store, and reading it
+    // as "never set" would silently ignore a setting someone believes they have -- the whole
+    // failure mode this reader exists to avoid.
     let read = |key: &str| {
-        store
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok())
+        store.get(key).and_then(|value| {
+            let dimension = value.as_u64().and_then(|v| u32::try_from(v).ok());
+            if dimension.is_none() {
+                tracing::warn!(
+                    key,
+                    value = %value,
+                    "the stored capture resolution is not a frame dimension; ignoring it"
+                );
+            }
+            dimension
+        })
     };
     let (Some(width), Some(height)) = (read(CAPTURE_WIDTH_KEY), read(CAPTURE_HEIGHT_KEY)) else {
         return;
@@ -4621,8 +4689,8 @@ mod encode_pacer_tests {
 #[cfg(test)]
 mod capture_resolution_setting_tests {
     use super::{
-        MAX_CAPTURE_DIMENSION, MIN_CAPTURE_HEIGHT, MIN_CAPTURE_WIDTH, clamp_capture_resolution,
-        parse_resolution, resolve_capture_size,
+        MAX_CAPTURE_DIMENSION, MIN_CAPTURE_HEIGHT, MIN_CAPTURE_WIDTH, ResolutionParseError,
+        clamp_capture_resolution, parse_resolution, resolve_capture_size,
     };
 
     /// The environment override's parser takes exactly one spelling. A value it half-accepts
@@ -4630,14 +4698,37 @@ mod capture_resolution_setting_tests {
     /// have no way to tell from the picture which number had been ignored.
     #[test]
     fn only_a_plain_width_by_height_parses() {
-        assert_eq!(parse_resolution("1920x1080"), Some((1920, 1080)));
-        assert_eq!(parse_resolution("640x480"), Some((640, 480)));
-        assert_eq!(parse_resolution("1920 x 1080"), None, "spaces are not a spelling we accept");
-        assert_eq!(parse_resolution("1920X1080"), None, "nor is a capital X");
-        assert_eq!(parse_resolution("1920*1080"), None);
-        assert_eq!(parse_resolution("1920"), None, "one number is not a resolution");
-        assert_eq!(parse_resolution("wide x tall"), None);
-        assert_eq!(parse_resolution(""), None);
+        assert_eq!(parse_resolution("1920x1080").ok(), Some((1920, 1080)));
+        assert_eq!(parse_resolution("640x480").ok(), Some((640, 480)));
+        assert!(parse_resolution("1920 x 1080").is_err(), "spaces are not a spelling we accept");
+        assert!(parse_resolution("1920X1080").is_err(), "nor is a capital X");
+        assert!(parse_resolution("1920*1080").is_err());
+        assert!(parse_resolution("1920").is_err(), "one number is not a resolution");
+        assert!(parse_resolution("").is_err());
+    }
+
+    /// The reason a rejection is a `Result` and not a `None`: three different mistakes, three
+    /// different fixes, and the person who made one cannot see which from the picture. A
+    /// stray space in `1920 x 1080` makes *both* halves unparseable, and a reader told only
+    /// "malformed" would not know whether their width or their height was the problem.
+    #[test]
+    fn a_rejection_says_which_half_was_wrong() {
+        assert!(
+            matches!(parse_resolution("1920"), Err(ResolutionParseError::NoSeparator)),
+            "no separator at all is its own mistake, not a bad number"
+        );
+        assert!(matches!(parse_resolution("widex1080"), Err(ResolutionParseError::Width(_))));
+        assert!(matches!(parse_resolution("1920xtall"), Err(ResolutionParseError::Height(_))));
+
+        let Err(e) = parse_resolution("1920xtall") else {
+            unreachable!("just asserted this is an error")
+        };
+        let message = e.to_string();
+        assert!(message.contains("height"), "the message must name the half: {message}");
+        assert!(
+            std::error::Error::source(&e).is_some(),
+            "the parse error itself must survive as the source: {message}"
+        );
     }
 
     /// A size the camera could actually be asked for passes through unflagged, so that "was

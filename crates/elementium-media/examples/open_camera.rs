@@ -21,14 +21,37 @@ use std::time::{Duration, Instant};
 /// How long to watch for frames once a source has been opened.
 const WATCH: Duration = Duration::from_secs(3);
 
+/// One optional numeric argument, or a refusal naming it.
+///
+/// `.ok()` here would turn a typo into "no preference": ask for node `394` instead of `349`
+/// and the run would open some other camera and print a confident report about it. A
+/// diagnostic tool that quietly answers a different question than the one asked is worse than
+/// one that refuses.
+fn numeric_arg(position: usize, name: &str) -> Result<Option<u32>, String> {
+    let Some(raw) = std::env::args().nth(position) else {
+        return Ok(None);
+    };
+    raw.parse()
+        .map(Some)
+        .map_err(|e| format!("{name} argument {raw:?} is not a number: {e}"))
+}
+
 fn main() {
-    let preferred: Option<u32> = std::env::args().nth(1).and_then(|a| a.parse().ok());
+    let (preferred, width, height) = match (
+        numeric_arg(1, "node id"),
+        numeric_arg(2, "width"),
+        numeric_arg(3, "height"),
+    ) {
+        (Ok(node), Ok(w), Ok(h)) => (node, w, h),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            eprintln!("{e}");
+            return;
+        }
+    };
     println!("preferred node: {}", preferred.map_or_else(|| "none".to_owned(), |n| n.to_string()));
 
-    // Optional, and separate from the node id, because "which camera" and "how big" are
-    // different questions and this example has been used to answer each without the other.
-    let width: Option<u32> = std::env::args().nth(2).and_then(|a| a.parse().ok());
-    let height: Option<u32> = std::env::args().nth(3).and_then(|a| a.parse().ok());
+    // Size is separate from the node id because "which camera" and "how big" are different
+    // questions and this example has been used to answer each without the other.
     println!(
         "requested size: {}",
         match (width, height) {
