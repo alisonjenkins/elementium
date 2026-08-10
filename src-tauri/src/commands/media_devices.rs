@@ -673,10 +673,65 @@ const MIN_CAPTURE_WIDTH: u32 = 160;
 const MIN_CAPTURE_HEIGHT: u32 = 120;
 
 /// The person's capture resolution for this run, if they have set one.
+///
+/// Falls back to `ELEMENTIUM_CAPTURE_RESOLUTION` (`1920x1080`), which exists for the same
+/// reason `ELEMENTIUM_MAX_FPS` does and for one more: the persisted store is per-profile, and
+/// `just app-join` deletes its profile on every start, so a headless run has no way to carry
+/// a stored setting at all. The store wins when both are set -- a person who changed the
+/// setting in the app meant it more recently than whoever exported the variable.
 fn capture_resolution_setting() -> Option<(u32, u32)> {
     let width = CAPTURE_WIDTH_SETTING.load(std::sync::atomic::Ordering::Relaxed);
     let height = CAPTURE_HEIGHT_SETTING.load(std::sync::atomic::Ordering::Relaxed);
-    (width != 0 && height != 0).then_some((width, height))
+    if width != 0 && height != 0 {
+        return Some((width, height));
+    }
+    capture_resolution_from_env()
+}
+
+/// `ELEMENTIUM_CAPTURE_RESOLUTION`, parsed once.
+///
+/// Read through a `OnceLock` because it is consulted on every camera start and cannot change
+/// within a run, and so that a malformed value is complained about once rather than on every
+/// join.
+fn capture_resolution_from_env() -> Option<(u32, u32)> {
+    static RESOLVED: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var_os("ELEMENTIUM_CAPTURE_RESOLUTION")?;
+        let Some((width, height)) = raw.to_str().and_then(parse_resolution) else {
+            tracing::warn!(
+                value = ?raw,
+                "ELEMENTIUM_CAPTURE_RESOLUTION is not a WIDTHxHEIGHT size; ignoring it"
+            );
+            return None;
+        };
+        let ((clamped_width, clamped_height), was_clamped) =
+            clamp_capture_resolution(width, height);
+        if was_clamped {
+            tracing::warn!(
+                requested_width = width,
+                requested_height = height,
+                applied_width = clamped_width,
+                applied_height = clamped_height,
+                "ELEMENTIUM_CAPTURE_RESOLUTION is outside the sane range, or odd; clamped"
+            );
+        }
+        tracing::info!(
+            width = clamped_width,
+            height = clamped_height,
+            "capture resolution set from ELEMENTIUM_CAPTURE_RESOLUTION"
+        );
+        Some((clamped_width, clamped_height))
+    })
+}
+
+/// Parse a `WIDTHxHEIGHT` size, or `None` if it is not one.
+///
+/// Deliberately strict: `1920 x 1080`, `1920X1080` and `1920*1080` are all rejected rather
+/// than guessed at, because a setting that half-understands its input is how someone ends up
+/// believing they asked for something they did not.
+fn parse_resolution(raw: &str) -> Option<(u32, u32)> {
+    let (width, height) = raw.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
 }
 
 /// Clamp a requested capture resolution to something a camera could be asked for, reporting
@@ -4567,8 +4622,23 @@ mod encode_pacer_tests {
 mod capture_resolution_setting_tests {
     use super::{
         MAX_CAPTURE_DIMENSION, MIN_CAPTURE_HEIGHT, MIN_CAPTURE_WIDTH, clamp_capture_resolution,
-        resolve_capture_size,
+        parse_resolution, resolve_capture_size,
     };
+
+    /// The environment override's parser takes exactly one spelling. A value it half-accepts
+    /// is worse than one it rejects: someone who wrote `1920 x 1080` and got 1920x720 would
+    /// have no way to tell from the picture which number had been ignored.
+    #[test]
+    fn only_a_plain_width_by_height_parses() {
+        assert_eq!(parse_resolution("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_resolution("640x480"), Some((640, 480)));
+        assert_eq!(parse_resolution("1920 x 1080"), None, "spaces are not a spelling we accept");
+        assert_eq!(parse_resolution("1920X1080"), None, "nor is a capital X");
+        assert_eq!(parse_resolution("1920*1080"), None);
+        assert_eq!(parse_resolution("1920"), None, "one number is not a resolution");
+        assert_eq!(parse_resolution("wide x tall"), None);
+        assert_eq!(parse_resolution(""), None);
+    }
 
     /// A size the camera could actually be asked for passes through unflagged, so that "was
     /// this clamped" stays a signal rather than a constant.
