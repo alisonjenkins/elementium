@@ -567,3 +567,226 @@ mod odd_geometry_tests {
         assert!(halved.y().iter().any(|&v| v != 0));
     }
 }
+
+/// The frame size that results from dividing `width`x`height` by `scale`.
+///
+/// Even in both axes, because VP8 cannot encode odd geometry and an encoder handed it fails
+/// at construction rather than rounding for you. Never below 2x2: a scale factor large enough
+/// to round a dimension to zero would otherwise produce a frame nothing can encode, from a
+/// request that merely asked for something very small.
+///
+/// `scale` is the divisor WebRTC's `scaleResolutionDownBy` uses -- 2.0 means half as wide and
+/// half as tall, a quarter of the pixels -- and values at or below 1.0 mean no downscale.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::as_conversions
+)]
+pub fn scaled_dimensions(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    if !scale.is_finite() || scale <= 1.0 {
+        return (width, height);
+    }
+    let round_even = |n: u32| -> u32 {
+        let scaled = ((n as f32) / scale).round() as u32;
+        scaled.max(2) & !1
+    };
+    (round_even(width), round_even(height))
+}
+
+/// Scale an I420 frame to `out_width`x`out_height`, averaging the source area each output
+/// sample covers.
+///
+/// An area average rather than nearest-neighbour sampling, because the ratios this is asked
+/// for are not integers -- WebRTC's `scaleResolutionDownBy` arrives as values like
+/// 2.6666666666666665 -- and dropping samples at a non-integer step produces the shimmering
+/// edges that a video encoder then spends its bitrate on. Averaging costs a little more per
+/// frame and gives the encoder something quieter to compress.
+///
+/// Returns `None` for degenerate geometry, for an upscale (the caller wants a smaller frame;
+/// asking this to invent detail is a bug in the caller, not a service to provide), or for
+/// planes that do not match the frame's stated size -- rather than producing a subtly wrong
+/// image from a wrong assumption, which is [`halve_i420`]'s rule too.
+#[must_use]
+#[allow(clippy::many_single_char_names)]
+pub fn scale_i420(frame: &I420Frame, out_width: u32, out_height: u32) -> Option<I420Frame> {
+    let (w, h) = (dim(frame.width()), dim(frame.height()));
+    let (out_w, out_h) = (dim(out_width), dim(out_height));
+    if out_w < 2 || out_h < 2 || out_w > w || out_h > h {
+        return None;
+    }
+    if out_w == w && out_h == h {
+        return Some(frame.clone());
+    }
+
+    let (uv_w, uv_h) = (chroma_dim(w), chroma_dim(h));
+    let (out_uv_w, out_uv_h) = (chroma_dim(out_w), chroma_dim(out_h));
+
+    let y = scale_plane(frame.y(), w, h, frame.y_stride(), out_w, out_h)?;
+    let u = scale_plane(frame.u(), uv_w, uv_h, frame.uv_stride(), out_uv_w, out_uv_h)?;
+    let v = scale_plane(frame.v(), uv_w, uv_h, frame.uv_stride(), out_uv_w, out_uv_h)?;
+
+    I420Frame::from_planes(
+        u32::try_from(out_w).ok()?,
+        u32::try_from(out_h).ok()?,
+        &y,
+        &u,
+        &v,
+        frame.timestamp_us(),
+    )
+}
+
+/// Scale one 8-bit plane by averaging the source rectangle each output sample covers.
+///
+/// The source rectangle is computed from the output index rather than by stepping a
+/// fractional accumulator, so rounding error cannot accumulate across a row and leave the
+/// right-hand edge sampled from the wrong place -- a fault that is invisible on a test
+/// pattern and shows up as a smeared column on a real picture.
+///
+/// Every output sample covers at least one source sample: `x1` is floored to `x0 + 1`, so a
+/// ratio just above 1.0 cannot produce an empty rectangle and a division by zero.
+#[allow(clippy::arithmetic_side_effects)]
+fn scale_plane(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || out_w == 0 || out_h == 0 {
+        return None;
+    }
+    // The last row must be fully present: a plane shorter than its stated geometry is a
+    // frame we have misunderstood, and averaging over the shortfall would read whatever
+    // follows it in memory.
+    if src.len() < stride.checked_mul(height - 1)?.checked_add(width)? {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(out_w.checked_mul(out_h)?);
+    for oy in 0..out_h {
+        let y0 = oy * height / out_h;
+        let y1 = (((oy + 1) * height).div_ceil(out_h)).max(y0 + 1).min(height);
+        for ox in 0..out_w {
+            let x0 = ox * width / out_w;
+            let x1 = (((ox + 1) * width).div_ceil(out_w)).max(x0 + 1).min(width);
+
+            let mut total: u32 = 0;
+            let mut count: u32 = 0;
+            for y in y0..y1 {
+                let row_start = y * stride;
+                let row = src.get(row_start + x0..row_start + x1)?;
+                for sample in row {
+                    total = total.saturating_add(u32::from(*sample));
+                    count = count.saturating_add(1);
+                }
+            }
+            // `count` cannot be zero: `x1 > x0` and `y1 > y0` by construction above.
+            let mean = total.checked_div(count)?;
+            out.push(u8::try_from(mean).unwrap_or(u8::MAX));
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+// A test fixture builds plane buffers from literal dimensions, where a `try_from` dance for
+// each would obscure what the fixture is: a frame of a stated size filled with a stated value.
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::as_conversions, clippy::arithmetic_side_effects)]
+mod scale_tests {
+    use super::{scale_i420, scaled_dimensions};
+    use elementium_types::I420Frame;
+
+    /// A frame whose luma is a known constant, so an average can be checked exactly.
+    fn flat(width: u32, height: u32, luma: u8) -> I420Frame {
+        let uv_w = width.div_ceil(2) as usize;
+        let uv_h = height.div_ceil(2) as usize;
+        I420Frame::from_planes(
+            width,
+            height,
+            &vec![luma; (width as usize) * (height as usize)],
+            &vec![128; uv_w * uv_h],
+            &vec![128; uv_w * uv_h],
+            0,
+        )
+        .expect("a flat frame is valid")
+    }
+
+    /// The geometry a `scaleResolutionDownBy` produces has to be encodable, and VP8 refuses
+    /// odd dimensions -- `ensure_encoder` logs an error and builds nothing for them, so an
+    /// odd result here would be a black call rather than a slightly smaller picture.
+    #[test]
+    fn scaled_dimensions_are_always_even_and_never_degenerate() {
+        assert_eq!(scaled_dimensions(1920, 1080, 2.0), (960, 540));
+        assert_eq!(
+            scaled_dimensions(1920, 1080, 2.666_666_7),
+            (720, 404),
+            "the awkward ratio livekit actually asks for, rounded to even"
+        );
+        assert_eq!(scaled_dimensions(640, 480, 1000.0), (2, 2), "never smaller than 2x2");
+        for scale in [1.5_f32, 2.3, 3.7, 7.9] {
+            let (w, h) = scaled_dimensions(1280, 720, scale);
+            assert_eq!(w % 2, 0, "width must be even at scale {scale}");
+            assert_eq!(h % 2, 0, "height must be even at scale {scale}");
+        }
+    }
+
+    /// A scale of 1 or less is not a downscale, and a nonsense one must not be treated as a
+    /// very large one: livekit sends this value, and an infinity or a NaN reaching the
+    /// geometry calculation would otherwise produce a 2x2 stream nobody asked for.
+    #[test]
+    fn a_scale_at_or_below_one_or_not_a_number_changes_nothing() {
+        assert_eq!(scaled_dimensions(1280, 720, 1.0), (1280, 720));
+        assert_eq!(scaled_dimensions(1280, 720, 0.5), (1280, 720), "upscaling is not our job");
+        assert_eq!(scaled_dimensions(1280, 720, f32::NAN), (1280, 720));
+        assert_eq!(scaled_dimensions(1280, 720, f32::INFINITY), (1280, 720));
+    }
+
+    /// Averaging a constant picture must give back that constant. Trivial, and it is what
+    /// catches an off-by-one in the source rectangle: a rectangle that runs past the row
+    /// reads the next row's padding, and on a flat frame that is the only visible symptom.
+    #[test]
+    fn scaling_a_flat_frame_preserves_its_value() {
+        let scaled = scale_i420(&flat(64, 48, 200), 24, 18).expect("a valid downscale");
+        assert_eq!((scaled.width(), scaled.height()), (24, 18));
+        assert!(
+            scaled.y().iter().all(|&s| s == 200),
+            "every output sample must be the average of identical inputs"
+        );
+    }
+
+    /// The awkward real-world case end to end: 1080p by 2.667, which is neither an integer
+    /// ratio nor one that divides evenly, at the size it will actually run at.
+    #[test]
+    fn the_ratio_livekit_asks_for_produces_an_encodable_frame() {
+        let (w, h) = scaled_dimensions(1920, 1080, 2.666_666_7);
+        let scaled = scale_i420(&flat(1920, 1080, 77), w, h).expect("a valid downscale");
+        assert_eq!((scaled.width(), scaled.height()), (720, 404));
+        assert_eq!(scaled.y().len(), 720 * 404, "the luma plane must cover the frame");
+        assert!(scaled.y().iter().all(|&s| s == 77));
+    }
+
+    /// Refused rather than invented: a caller asking this to make a frame bigger has made a
+    /// mistake, and returning a blurred upscale would hide it.
+    #[test]
+    fn an_upscale_or_a_degenerate_target_is_refused() {
+        let frame = flat(64, 48, 10);
+        assert!(scale_i420(&frame, 128, 96).is_none(), "upscaling is refused");
+        assert!(scale_i420(&frame, 64, 96).is_none(), "so is a taller output");
+        assert!(scale_i420(&frame, 0, 0).is_none());
+        assert!(scale_i420(&frame, 1, 1).is_none(), "below 2x2 there is no chroma to carry");
+    }
+
+    /// Same size in, same size out, without going through the averaging path at all -- a
+    /// scale of exactly 1.0 is the common case on every call that never asks for a downscale,
+    /// and it must not pay for a full resample.
+    #[test]
+    fn scaling_to_the_same_size_returns_the_frame_unchanged() {
+        let frame = flat(32, 24, 42);
+        let same = scale_i420(&frame, 32, 24).expect("an identity scale is valid");
+        assert_eq!((same.width(), same.height()), (32, 24));
+        assert_eq!(same.y(), frame.y());
+    }
+}
