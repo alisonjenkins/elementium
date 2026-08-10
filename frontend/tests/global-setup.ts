@@ -126,7 +126,19 @@ export default async function globalSetup(): Promise<void> {
   // Participants and a room, regenerated every run. Cheap, and it keeps one test's
   // membership changes from leaking into the next -- which matters here more than
   // usual, since the faults being chased are *about* membership changes.
-  const { stdout } = await run("./provision.sh", [], { cwd: TEST_ENV });
+  // `COUNT` reaches `provision.sh`, which registers that many testers and puts them all in
+  // the room. Tests that want more participants than the default three set
+  // `ELEMENTIUM_TEST_PARTICIPANTS`; without it they fall back to logging in as testers
+  // `provision.sh` never made, and Element Web stops those sessions at a "Verify this
+  // device" dialog behind which the composer never appears -- a two-minute timeout whose
+  // message says nothing about participants.
+  const { stdout } = await run("./provision.sh", [], {
+    cwd: TEST_ENV,
+    env: {
+      ...process.env,
+      COUNT: process.env["ELEMENTIUM_TEST_PARTICIPANTS"] ?? "3",
+    },
+  });
   await writeFile(FIXTURE, stdout);
   const fixture = JSON.parse(stdout) as { participants: unknown[]; room_id: string };
   console.log(

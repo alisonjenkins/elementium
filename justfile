@@ -125,7 +125,12 @@ test-app-call:
 # nothing left to guess about.
 test-app-call-crowd peers="3":
     cargo build -p elementium
+    # The fixture is removed so the stack re-provisions with enough testers. Logging in as
+    # one `provision.sh` never made gets as far as Element Web and then stops at a "Verify
+    # this device" dialog, which surfaces two minutes later as a missing message composer.
+    rm -f target/test-env-fixture.json
     cd frontend && ELEMENTIUM_APP_CALL=1 ELEMENTIUM_APP_CALL_PEERS={{peers}} \
+        ELEMENTIUM_TEST_PARTICIPANTS=$(({{peers}} + 2)) \
         pnpm exec playwright test tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
 
 # The same call, recording what the microphone path actually produces.

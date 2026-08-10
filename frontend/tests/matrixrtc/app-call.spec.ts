@@ -106,6 +106,8 @@ let roomId: string;
 let peers: Credentials[];
 /** The participants publishing alongside `early`, held only so they can be closed. */
 let crowd: Participant[] = [];
+/** Index in `peers` of the first session not already in the call. */
+let lateIndex = 1;
 
 /**
  * How many frames of remote video Elementium has decoded, from whichever path it used.
@@ -222,7 +224,20 @@ test.describe.serial("Elementium in a real call", () => {
     // One session for Elementium's own tester1 (dropped below), `EARLY_PEERS` to publish
     // before it joins, and one spare for the participant who arrives afterwards.
     // `freshSessions` registers anyone `provision.sh` did not, so the count is free.
-    peers = (await freshSessions(EARLY_PEERS + 2)).slice(1);
+    // Only sessions `provision.sh` actually created. Logging in as a tester it never made
+    // succeeds at the API and then stops in Element Web at a device-verification dialog,
+    // which surfaces two minutes later as a missing message composer. `test-app-call-crowd`
+    // provisions enough; asking for more than exist is clamped here rather than left to
+    // fail in a way that names the wrong thing.
+    const available = env.participants.length - 1;
+    if (EARLY_PEERS > available) {
+      console.log(
+        `  asked for ${EARLY_PEERS} early participants but only ${available} are ` +
+          `provisioned; using ${available}. Re-run with ELEMENTIUM_TEST_PARTICIPANTS set.`,
+      );
+    }
+    const earlyCount = Math.min(EARLY_PEERS, available);
+    peers = (await freshSessions(env.participants.length)).slice(1);
     const [first] = peers;
     if (!first) throw new Error("provision.sh produced nobody to be the other side");
 
@@ -233,7 +248,7 @@ test.describe.serial("Elementium in a real call", () => {
     // The rest of the crowd, joined before Elementium for the same reason `early` is: the
     // fault is reported by people who were already in the call when it arrived.
     crowd = [];
-    for (const who of peers.slice(1, EARLY_PEERS)) {
+    for (const who of peers.slice(1, earlyCount)) {
       // Sequential rather than concurrent: each join is a Matrix sync and an SFU
       // negotiation, and starting several at once makes a failure hard to attribute.
       // eslint-disable-next-line no-await-in-loop
@@ -242,9 +257,10 @@ test.describe.serial("Elementium in a real call", () => {
       await joinCall(peer);
       crowd.push(peer);
     }
-    if (EARLY_PEERS > 1) {
-      console.log(`  ${EARLY_PEERS} participants publishing before Elementium joins`);
+    if (earlyCount > 1) {
+      console.log(`  ${earlyCount} participants publishing before Elementium joins`);
     }
+    lateIndex = earlyCount;
 
     // Elementium joins *after* the first participant, because that is the order a person
     // joins a call in and the order every reported fault was seen in.
@@ -418,7 +434,7 @@ test.describe.serial("Elementium in a real call", () => {
 
     // The first session not already in the call: `peers[0]` is `early` and the next
     // `EARLY_PEERS - 1` are the crowd.
-    const third = peers[EARLY_PEERS];
+    const third = peers[lateIndex];
     if (!third) throw new Error("no spare session for the participant who joins late");
     late = await openRoom(await browserRef.newContext(), server, third, roomId);
     await joinCall(late);
