@@ -139,8 +139,18 @@ export function startElementium(options: {
   mkdirSync(logDir, { recursive: true });
   const logPath = path.join(logDir, `elementium-app-${started}-${process.pid}.log`);
   const log: WriteStream = createWriteStream(logPath, { flags: "a" });
-  /** Write one already-rendered line, unless it looks like it carries a secret. */
+  /**
+   * Write one already-rendered line, unless it looks like it carries a secret.
+   *
+   * Silent after `stop` has ended the stream. The application goes on printing for as long as
+   * it takes SIGTERM to be honoured -- up to ten seconds -- and a write to an ended stream
+   * throws "write after end" from inside the stdout handler, which Playwright attributes to
+   * whichever test happens to be running. That failed a passing run and named an innocent
+   * test; the lines themselves are the tail of a call already measured, and dropping them
+   * costs nothing.
+   */
   const record = (line: string) => {
+    if (log.writableEnded) return;
     if (!SECRET.test(line)) log.write(`${line}\n`);
   };
 
