@@ -350,4 +350,39 @@ test.describe.serial("audio arrives intact", () => {
       ).toBe(0);
     }
   });
+
+  /**
+   * M5: a key distributed once at join and never again is why a far end freezes mid-call.
+   *
+   * A peer that never received our key cannot decrypt our frames however well our encoder is
+   * running, and until `key-distribution-watch.ts` nothing in this project could tell that
+   * apart from an encoder fault -- an absence is not an event, and the log recorded the join
+   * and the silence after it without saying anything was wrong.
+   *
+   * Asserted from Elementium's own log rather than from the far end on purpose: the far end
+   * already proves it *received* keys, and the fault being watched for is the case where it
+   * does not, which is precisely when there is no far end to ask. This is cheap and applies to
+   * whatever membership happened to occur during the call above.
+   *
+   * Both directions are checked. Asserting only the absence of the error would pass on a run
+   * where the watch never armed at all -- an absence of failures is not evidence when nothing
+   * was tested.
+   */
+  test("every membership change was answered with a key distribution", () => {
+    const overdue = app.events.filter((e) => e.message.includes("no key was distributed"));
+    const answered = app.events.filter((e) =>
+      e.message.includes("a key distribution followed the membership change"),
+    );
+    for (const e of answered) console.log(`  ${e.message.split(". ")[0]}`);
+    expect(
+      overdue.map((e) => `${(e.at / 1000).toFixed(1)}s ${e.message}`),
+      "a MatrixRTC membership change went unanswered by any key distribution -- see M5",
+    ).toEqual([]);
+    expect(
+      answered.length,
+      "no membership change was ever answered by a key distribution, so the assertion above " +
+        "passed without testing anything. Either the call had no membership change or the " +
+        "watch is not installed; check for a shim install line naming key-distribution-watch.",
+    ).toBeGreaterThan(0);
+  });
 });
