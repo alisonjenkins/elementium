@@ -121,101 +121,24 @@ collected here because they were all found in the same session.
   conformant response, since indices are independent keys and index N-1 is not derivable
   from N. Thousands of them is not expected and is worth a second look once M5 is fixed.
 
-- [ ] **M8. A dead virtual camera enumerates first and costs ten seconds of every camera
-  open.** On this machine `list_video_sources` returns, in this order:
+- [x] **M8. A dead virtual camera enumerates first and costs ten seconds of every camera
+  open.** Fixed by ranking, not filtering. `list_video_sources` returned:
 
   ```
   [0] node 161  ...virtual/video4linux/video11  (Unknown device (V4L2))   <- v4l2loopback, no producer
   [1] node 349  ...usb-0_1.1_1.0                (OBSBOT Tiny 2 Lite)
   ```
 
-  `start_pipewire` tries them in order and skips one that yields no frame, which is the right
-  behaviour and is why calls still work -- but skipping costs the full `FIRST_FRAME_TIMEOUT`,
-  so opening a camera takes 12.3s instead of 2 (`cargo run -p elementium-media --example
-  open_camera`). The same list is what `enumerate_devices` offers the page, so a
-  default-configured client is offered a loopback as device zero, and since the `camelCase`
-  fix its `deviceId` now actually reaches Rust.
+  That order is both what the page is offered and what capture falls back through, so Element
+  Call asked for the loopback by `deviceId: {exact: video-input-pw-161}` and every camera open
+  waited out the full `FIRST_FRAME_TIMEOUT` before reaching the camera that works: 12.3s
+  against 0.3s once the order is right.
 
-  Not fixed here because both plausible remedies need a judgement this session has no evidence
-  for: deprioritising sources under `/sys/devices/virtual/` is a heuristic about what "virtual"
-  means, and shortening the first-frame timeout trades this delay against a slow real camera.
-  Worth noting that a loopback *with* a producer is a legitimate camera -- OBS virtual camera
-  is exactly that -- so it must not simply be filtered out.
-
-- [x] **M9. Raising the capture resolution does not raise the bitrate cap, and we ignore the
-  downscale the SFU asks for.** Found while verifying the new resolution setting
-  (2026-08-10). Element Call's `setParameters` asks for two things we do not do:
-
-  ```
-  setParameters asked for scaleResolutionDownBy=2.6666666666666665 on encoding 0;
-    there is no dynamic resize path, so this is not honoured
-  setParameters asked for degradationPreference=balanced; not honoured
-  video bitrate changed via setParameters kbps=1700
-  ```
-
-  The cap *is* honoured. The downscale is not. So livekit sets a bitrate appropriate to the
-  720x405 it believes it is publishing, and we spend it on the full frame instead -- and the
-  larger the capture, the thinner it is spread. Measured over the same 40s window, per 10s
-  reporting interval:
-
-  | capture | encoder configured | actually sent |
-  |---|---:|---:|
-  | 1280x720 | 2764 kbps | ~384-970 kbps |
-  | 1920x1080 | 4000 kbps (clamped) | ~824-1296 kbps |
-
-  1080p30 over VP8 wants 3-4 Mbps to look clean. At ~1.2 Mbps it will be softer per pixel
-  than 720p at the same rate, so **1080p may not look better to the far end, and in motion it
-  may look worse.** Every frame still arrives -- 1200 encoded, 1200 decoded at three
-  participants, zero lost -- this is about how good each one is, not whether it gets there.
-
-  **Corrected 2026-08-10, after both halves were built.** The first reading -- that ignoring
-  `scaleResolutionDownBy` was the mechanism -- was wrong, and reading one encoding out of
-  three is how. livekit sends three simulcast encodings (scales 1, 2 and 2.667); this app
-  publishes one stream and resolves them to the best layer, which is scale 1. It is not being
-  asked to shrink at all.
-
-  The actual mechanism: Element Call asks `getUserMedia` for 1280x720 and budgets 1700 kbps
-  for *that*. A person's capture-resolution setting overrides the request without the page
-  ever hearing about it, so 2.25x the pixels go out on a 720p budget. The setting was
-  quietly counter-productive: more pixels, worse picture.
-
-  Both are now done, and they are complementary rather than alternatives:
-
-  - `scaleResolutionDownBy` **is** honoured (`set_video_scale`, `scale_i420`). It was real,
-    it just was not this. It will matter the moment livekit does ask.
-  - The bitrate cap is **raised in proportion to the extra pixels** when the publish exceeds
-    what the page asked for (`uplift_bitrate_kbps`): 1700 becomes 3825 for 720p -> 1080p.
-    This deliberately exceeds what the SFU asked for, which is a congestion estimate as well
-    as a budget -- the cost of honouring an explicit choice, paid only by someone who made
-    one.
-
-- [x] **M10. A requested capture size is honoured only when no other application is already
-  streaming the camera.** Found while verifying M9's fix, misdiagnosed twice on the way, and
-  the evidence that settled it:
-
-  ```
-  Video/Source        v4l2_input...usb-0_1.1_1.0   mjpg 1280x720
-  Stream/Input/Video  zen                          mjpg 1280x720
-  ```
-
-  `PipeWire` negotiates one format per device and shares it between clients. With a browser
-  holding the camera at 720p, every other client gets 720p whatever it asks for -- so the same
-  code, camera and request produced 1920x1080 on one run and 1280x720 on the next two, purely
-  by whether something else had the camera open at the time.
-
-  Two readings discarded on the way, recorded so they are not re-derived: it is not the raw
-  layouts winning the format race (this camera's raw formats stop at 640x480, so both outcomes
-  were MJPG), and it is not the first pipeline pinning the format for the second (both
-  pipelines see whatever the *device* settled on, including for another application).
-
-  What changed: the size is now offered twice, `Exact` then `Preferred` (`SizePolicy`). The
-  exact pass decides the case where we are first -- which is the case a person's setting is
-  about -- and the permissive pass is what lets us join a device someone else has already
-  fixed at another size, rather than refusing to start.
-
-  Nothing can be done about the shared-format case itself, and it is not a fault: two
-  applications cannot have one camera in two formats. Worth knowing when a resolution setting
-  appears not to work.
+  Kernel virtual devices (`/sys/devices/virtual/video4linux/`, which `PipeWire` renders into
+  the node name) now sort last. Ranked rather than removed on purpose: a loopback *with*
+  something feeding it is a legitimate camera -- OBS's virtual camera is exactly that -- and
+  the substring alone is not enough to remove a device someone chose deliberately. A camera
+  merely *called* "Virtual" is unaffected; the test pins that.
 
 ## Closed
 

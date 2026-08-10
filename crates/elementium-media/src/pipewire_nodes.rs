@@ -136,12 +136,20 @@ pub fn list_video_sources() -> Result<Vec<PipewireVideoSource>, PipewireError> {
     // which a UI shows as "no devices"; a poisoned lock means the enumeration thread panicked
     // and we know nothing, which a UI would then show as "no devices" too. One of those is
     // a fact about the machine and the other is a bug in here.
-    let sources = match found.lock() {
+    let mut sources = match found.lock() {
         Ok(list) => list.clone(),
         Err(_) => {
             return Err(PipewireError::Enumerate { kind: "video" });
         }
     };
+    // Real capture devices first. The order here is the order the page is offered devices in
+    // and the order capture falls back through, and a `v4l2loopback` with nothing feeding it
+    // was sorting ahead of the only real camera on this machine: the page then asked for it
+    // by `deviceId: {exact: ...}`, and every call paid the full ten-second first-frame
+    // timeout before falling through to the camera that works. Stable, so two real cameras
+    // keep the order `PipeWire` gave them.
+    sources.sort_by_key(|s| u8::from(is_virtual_device(&s.name, s.device_path.as_deref())));
+
     tracing::info!(count = sources.len(), "PipeWire video sources enumerated");
     for s in &sources {
         tracing::info!(
@@ -180,6 +188,23 @@ fn video_source_from_global(
             .or_else(|| props.get("device.path"))
             .map(str::to_owned),
     })
+}
+
+/// Whether a node names a kernel *virtual* video device rather than a real capture device.
+///
+/// `v4l2loopback` and friends appear under `/sys/devices/virtual/video4linux/`, which
+/// `PipeWire` renders into the node name -- `v4l2_input._sys_devices_virtual_video4linux_video11`
+/// against a real camera's `v4l2_input.pci-0000_15_00.0-usb-0_1.1_1.0`. That substring is the
+/// only signal available here: a loopback advertises the same `media.class` and the same
+/// formats as a camera, and reports no `api.v4l2.path` at all.
+///
+/// Used to *rank*, never to filter. A loopback with something feeding it is a legitimate
+/// camera -- OBS's virtual camera is exactly that -- and removing it would take away a device
+/// people deliberately use.
+#[must_use]
+pub fn is_virtual_device(name: &str, device_path: Option<&str>) -> bool {
+    let path_is_virtual = device_path.is_some_and(|p| p.contains("/devices/virtual/"));
+    path_is_virtual || name.contains("_devices_virtual_") || name.contains("/devices/virtual/")
 }
 
 /// Whether a `media.class` names something that produces video frames.
@@ -446,5 +471,39 @@ mod pipewire_error_tests {
         };
         assert!(matches!(err, PipewireError::StreamSetup { .. }));
         assert!(std::error::Error::source(&err).is_none());
+    }
+}
+
+/// M8: which video source is offered first decides which camera a default-configured page
+/// opens, and it was offering a `v4l2loopback` with nothing feeding it. Element Call then
+/// asked for that device by `deviceId: {exact: ...}` and every call paid the ten-second
+/// first-frame timeout before falling through to the only real camera on the machine.
+#[cfg(test)]
+mod virtual_device_tests {
+    use super::is_virtual_device;
+
+    /// The two node names this machine actually produces, which is where the rule comes from.
+    #[test]
+    fn a_kernel_virtual_device_is_recognised_from_its_node_name() {
+        assert!(is_virtual_device("v4l2_input._sys_devices_virtual_video4linux_video11", None));
+        assert!(!is_virtual_device("v4l2_input.pci-0000_15_00.0-usb-0_1.1_1.0", None));
+    }
+
+    /// The device path says the same thing when it is present, and this camera reports none
+    /// at all -- so neither signal may be required, and either is enough.
+    #[test]
+    fn the_device_path_is_believed_when_there_is_one() {
+        assert!(is_virtual_device("anything", Some("/sys/devices/virtual/video4linux/video11")));
+        assert!(!is_virtual_device("anything", Some("/dev/video6")));
+        assert!(!is_virtual_device("anything", None), "no signal is not a virtual device");
+    }
+
+    /// A name that merely contains the word must not be caught: this ranks real hardware
+    /// below a loopback if it is wrong, and a camera called "Virtual Background Cam" is a
+    /// real camera.
+    #[test]
+    fn the_word_alone_does_not_make_a_device_virtual() {
+        assert!(!is_virtual_device("v4l2_input.usb-VirtualCam_Pro-01", None));
+        assert!(!is_virtual_device("Virtual Background Camera", None));
     }
 }
