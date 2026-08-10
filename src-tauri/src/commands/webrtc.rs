@@ -1051,6 +1051,19 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     // forwarding to nobody.
     let mut housekeeping = tokio::time::interval(DATA_CHANNEL_POLL);
     housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Also checked after every batch, not only when the timer arm is reached.
+    //
+    // `biased` polls the arms in order and takes the first that is ready, so a media channel
+    // with something in it every time round the loop starves the timer arm completely -- and
+    // the timer arm holds the only check for "is this connection still in the engine". A
+    // real session created 175 peer connections and stopped five playback threads: the
+    // forwarder never exited, so it never dropped its senders, so the decode threads never
+    // saw a closed channel, and every reconnect left an I/O loop, a forwarder and two
+    // decoders behind. The process reached 31GB and the kernel killed it.
+    //
+    // Priority between control and media still wants `biased`; what it must not do is let
+    // either of them postpone liveness indefinitely.
+    let mut last_housekeeping = tokio::time::Instant::now();
 
     // A closed channel yields `None` immediately and forever. Without these the matching
     // select arm would be re-polled every iteration and complete instantly, turning
@@ -1059,6 +1072,19 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
     let mut control_open = true;
 
     loop {
+        // Before waiting, and therefore reachable however busy the channels are.
+        if last_housekeeping.elapsed() >= DATA_CHANNEL_POLL {
+            last_housekeeping = tokio::time::Instant::now();
+            if !housekeep(
+                &mut metrics,
+                &mut last_report,
+                HousekeepArgs { state, app, pc_id, handle: &handle },
+                media_open || control_open,
+            ) {
+                return;
+            }
+        }
+
         tokio::select! {
             // Control first, deliberately. These are the transitions media is *about* --
             // a track added, a connection state changed -- and a burst of media must never
@@ -1080,25 +1106,59 @@ async fn forward_events(state: &WebRtcState, app: &AppHandle, pc_id: &str) {
             }
 
             _ = housekeeping.tick() => {
-                if !drain_data_channels(state, app, pc_id, &handle) {
-                    return;
-                }
-                let elapsed = last_report.elapsed();
-                if elapsed >= FORWARD_REPORT_EVERY {
-                    metrics.report(pc_id, elapsed);
-                    last_report = tokio::time::Instant::now();
-                }
-                // Both event sources are gone and nothing more can arrive. Returning here
-                // rather than lingering is what stops a reconnect from leaving a forwarder
-                // per closed connection behind it.
-                if !media_open && !control_open {
-                    metrics.report(pc_id, last_report.elapsed());
-                    tracing::info!(pc_id, "event forwarding stopped: both event channels closed");
+                last_housekeeping = tokio::time::Instant::now();
+                if !housekeep(
+                    &mut metrics,
+                    &mut last_report,
+                    HousekeepArgs { state, app, pc_id, handle: &handle },
+                    media_open || control_open,
+                ) {
                     return;
                 }
             }
         }
     }
+}
+
+/// What `housekeep` needs to reach the connection, bundled to stay inside the workspace's
+/// argument-count lint.
+#[derive(Clone, Copy)]
+struct HousekeepArgs<'a> {
+    state: &'a WebRtcState,
+    app: &'a AppHandle,
+    pc_id: &'a str,
+    handle: &'a elementium_webrtc::peer_connection::PeerConnectionHandle,
+}
+
+/// Drain data channels, report throughput, and decide whether this forwarder should carry
+/// on. Returns `false` when it should return.
+///
+/// Split out because it is now called from two places -- the timer arm, and unconditionally
+/// at the top of the loop. One implementation, so the liveness check cannot be present in
+/// one path and missing from the other, which is exactly the shape of the bug it fixes.
+fn housekeep(
+    metrics: &mut ForwardStats,
+    last_report: &mut tokio::time::Instant,
+    args: HousekeepArgs<'_>,
+    still_open: bool,
+) -> bool {
+    if !drain_data_channels(args.state, args.app, args.pc_id, args.handle) {
+        metrics.report(args.pc_id, last_report.elapsed());
+        tracing::info!(args.pc_id, "event forwarding stopped: the connection has gone");
+        return false;
+    }
+    let elapsed = last_report.elapsed();
+    if elapsed >= FORWARD_REPORT_EVERY {
+        metrics.report(args.pc_id, elapsed);
+        *last_report = tokio::time::Instant::now();
+    }
+    // Both event sources are gone and nothing more can arrive.
+    if !still_open {
+        metrics.report(args.pc_id, last_report.elapsed());
+        tracing::info!(args.pc_id, "event forwarding stopped: both event channels closed");
+        return false;
+    }
+    true
 }
 
 /// Forward one control event and everything queued behind it, in arrival order.
