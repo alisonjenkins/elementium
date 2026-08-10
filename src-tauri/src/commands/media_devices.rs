@@ -310,6 +310,10 @@ pub fn start_screen_share_pipeline(
         bitrate_override: bitrate_override_clone,
         fps_override: fps_override_clone,
         scale_override: scale_override_clone,
+        // A share has no page-requested size to be publishing more than: `getDisplayMedia`
+        // carries no width or height here, and the share is whatever the monitor or window
+        // is. Nothing to uplift against, so the SFU's cap stands as given.
+        page_pixels: 0,
     };
     std::thread::spawn(move || {
         let _guard = span.enter();
@@ -1540,6 +1544,13 @@ fn start_camera_pipeline(
         bitrate_override: bitrate_override_clone,
         fps_override: fps_override_clone,
         scale_override: scale_override_clone,
+        // The page's own constraint, *not* what the setting resolved it to: the whole point
+        // is to notice when the two differ, because the SFU budgets its bitrate for the
+        // former while we publish the latter.
+        page_pixels: video_constraints
+            .width
+            .unwrap_or(0)
+            .saturating_mul(video_constraints.height.unwrap_or(0)),
     };
     std::thread::spawn(move || {
         let _guard = camera_span.enter();
@@ -2614,6 +2625,14 @@ struct VideoPipelineControls {
     bitrate_override: Arc<std::sync::atomic::AtomicU32>,
     fps_override: Arc<std::sync::atomic::AtomicU32>,
     scale_override: Arc<std::sync::atomic::AtomicU32>,
+    /// How many pixels the *page* asked for, or `0` if it asked for no particular size.
+    ///
+    /// Not the size being published, which the capture thread reads off each frame. The two
+    /// differ exactly when a person's resolution setting has overridden the page's
+    /// constraint, and that difference is what [`uplift_bitrate_kbps`] exists to correct:
+    /// livekit budgets its bitrate for the size it requested, so publishing more pixels than
+    /// that on the same budget starves the picture.
+    page_pixels: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3184,10 +3203,24 @@ fn apply_bitrate_override<E: VideoEncoder>(
     bitrate_override: &Arc<std::sync::atomic::AtomicU32>,
     applied: &mut u32,
     track_id: &str,
+    geometry: BitratePixels,
 ) {
-    let requested = bitrate_override.load(std::sync::atomic::Ordering::Relaxed);
+    let asked = bitrate_override.load(std::sync::atomic::Ordering::Relaxed);
+    let (requested, uplifted) =
+        uplift_bitrate_kbps(asked, geometry.page_pixels, geometry.publish_pixels);
     if requested == 0 || requested == *applied {
         return;
+    }
+    if uplifted {
+        tracing::info!(
+            track_id,
+            sfu_kbps = asked,
+            applied_kbps = requested,
+            page_pixels = geometry.page_pixels,
+            publish_pixels = geometry.publish_pixels,
+            "raising the SFU's bitrate cap in proportion to the extra pixels this pipeline \
+             publishes; the cap was budgeted for the size the page asked for"
+        );
     }
     match enc.set_bitrate(requested) {
         Ok(()) => {
@@ -3207,6 +3240,48 @@ fn apply_bitrate_override<E: VideoEncoder>(
             );
         }
     }
+}
+
+/// The two pixel counts [`uplift_bitrate_kbps`] compares, bundled so `apply_bitrate_override`
+/// stays inside the workspace's argument-count limit.
+#[derive(Debug, Clone, Copy)]
+struct BitratePixels {
+    /// What the page's `getUserMedia` constraint asked for, or `0` if it asked for no size.
+    page_pixels: u32,
+    /// What is actually being encoded, from the frame in hand.
+    publish_pixels: u32,
+}
+
+/// Raise a `setParameters` bitrate cap in proportion to pixels the page did not ask for.
+///
+/// Element Call chooses a bitrate for the resolution *it* requested -- 1700 kbps for the
+/// 1280x720 it asks this app for. A person's capture-resolution setting overrides that
+/// request without the page ever hearing about it, so a 1920x1080 publish carries 2.25x the
+/// pixels on a budget set for 720p: measured, about a third of what the picture needs (M9).
+/// The cap is a budget for a size, so when the size changes underneath it the budget has to
+/// move with it or the setting silently makes the picture worse rather than better.
+///
+/// Clamped to [`MAX_BITRATE_KBPS`], the same ceiling every other bitrate path here is held
+/// to. Returns the kbps to apply and whether it was raised, so the caller can log the two
+/// numbers side by side rather than leaving a reader to wonder why the encoder was told
+/// something the SFU never said.
+///
+/// **This deliberately exceeds what the SFU asked for.** That number is partly a congestion
+/// estimate, so on a constrained link this sends more than the SFU wanted. It is the price of
+/// honouring an explicit resolution choice, and it is only paid when someone has made one:
+/// with no page constraint, or a publish no larger than the page asked for, nothing changes.
+fn uplift_bitrate_kbps(requested_kbps: u32, page_pixels: u32, publish_pixels: u32) -> (u32, bool) {
+    if requested_kbps == 0 || page_pixels == 0 || publish_pixels <= page_pixels {
+        return (requested_kbps, false);
+    }
+    // In u64 throughout: 4000 kbps against a 4096x4096 publish overflows a u32 halfway.
+    let scaled = u64::from(requested_kbps)
+        .saturating_mul(u64::from(publish_pixels))
+        .checked_div(u64::from(page_pixels))
+        .unwrap_or_else(|| u64::from(requested_kbps));
+    let capped = scaled.min(u64::from(MAX_BITRATE_KBPS));
+    let applied = u32::try_from(capped).unwrap_or(MAX_BITRATE_KBPS);
+    (applied, applied != requested_kbps)
 }
 
 /// Push a live frame-rate setting into the pacer that gates this pipeline's encoder.
@@ -3362,6 +3437,10 @@ fn encode_and_send_video_frame(
         &controls.bitrate_override,
         &mut out.applied_bitrate_kbps,
         id.track_id,
+        BitratePixels {
+            page_pixels: controls.page_pixels,
+            publish_pixels: frame.width().saturating_mul(frame.height()),
+        },
     );
     if encode_and_send(id, enc, frame, encode_tx, &mut out.stats) {
         out.keyframe.watch.observed_keyframe();
@@ -5164,5 +5243,59 @@ mod video_scale_tests {
             "the ceiling itself is legal and is not a clamp"
         );
         assert_eq!(scale_to_thousandths(15.5), (15_500, false));
+    }
+}
+
+/// The bitrate uplift that keeps an overridden capture resolution from starving itself.
+///
+/// M9: Element Call budgets its bitrate for the resolution *it* requested. A person's
+/// capture-resolution setting overrides that request without the page hearing about it, so a
+/// 1080p publish carried 2.25x the pixels on a 720p budget -- about a third of what the
+/// picture needs, which made the setting quietly counter-productive.
+#[cfg(test)]
+mod bitrate_uplift_tests {
+    use super::{MAX_BITRATE_KBPS, uplift_bitrate_kbps};
+
+    /// The measured case, end to end: livekit asks for 720p and caps at 1700; the person has
+    /// set 1080p. 2.25x the pixels, so 2.25x the budget.
+    #[test]
+    fn publishing_more_pixels_than_the_page_asked_for_raises_the_cap() {
+        let page = 1280 * 720;
+        let publish = 1920 * 1080;
+        assert_eq!(uplift_bitrate_kbps(1700, page, publish), (3825, true));
+    }
+
+    /// Nothing to correct is the common case and must cost nothing: no page constraint at all
+    /// (a screen share), a publish the page asked for, or a publish smaller than it asked for
+    /// -- which is livekit's own `scaleResolutionDownBy` doing its job and must not be
+    /// undone by inflating the cap in the other direction.
+    #[test]
+    fn a_publish_within_what_was_asked_for_changes_nothing() {
+        let page = 1280 * 720;
+        assert_eq!(uplift_bitrate_kbps(1700, 0, 1920 * 1080), (1700, false), "no constraint");
+        assert_eq!(uplift_bitrate_kbps(1700, page, page), (1700, false), "exactly as asked");
+        assert_eq!(
+            uplift_bitrate_kbps(1700, page, 640 * 360),
+            (1700, false),
+            "a downscale must not raise the cap"
+        );
+    }
+
+    /// "Change nothing" survives the uplift: `set_video_bitrate` never writes a zero, and a
+    /// zero here means no cap has been requested yet, which must not become a real number.
+    #[test]
+    fn no_requested_cap_stays_no_requested_cap() {
+        assert_eq!(uplift_bitrate_kbps(0, 1280 * 720, 1920 * 1080), (0, false));
+    }
+
+    /// Held to the same ceiling as every other bitrate path here. A 4096x4096 publish against
+    /// a 320x240 constraint is a 218x ratio, and without the clamp the arithmetic would also
+    /// overflow a u32 on the way.
+    #[test]
+    fn the_uplift_is_capped_and_cannot_overflow() {
+        let (applied, uplifted) = uplift_bitrate_kbps(4000, 320 * 240, 4096 * 4096);
+        assert_eq!(applied, MAX_BITRATE_KBPS);
+        assert!(uplifted || applied == 4000, "clamped to the ceiling, not wrapped");
+        assert!(applied <= MAX_BITRATE_KBPS);
     }
 }
