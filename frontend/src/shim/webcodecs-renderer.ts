@@ -63,11 +63,15 @@ export function webCodecsAvailable(): boolean {
  * from the network boundary has no relationship to a frame boundary: one read can carry half
  * a frame, or three frames and a fragment.
  */
-export function takeFrames(buffer: Uint8Array): {
-  frames: { keyframe: boolean; timestamp: number; data: Uint8Array }[];
-  rest: Uint8Array;
+export function takeFrames(buffer: Uint8Array<ArrayBufferLike>): {
+  frames: { keyframe: boolean; timestamp: number; data: Uint8Array<ArrayBufferLike> }[];
+  rest: Uint8Array<ArrayBufferLike>;
 } {
-  const frames: { keyframe: boolean; timestamp: number; data: Uint8Array }[] = [];
+  // `ArrayBufferLike` rather than `ArrayBuffer`: a `ReadableStream` reader yields views whose
+  // buffer type is not narrowed, and asserting the narrower one here would be a claim about
+  // someone else's allocation rather than a fact.
+  const frames: { keyframe: boolean; timestamp: number; data: Uint8Array<ArrayBufferLike> }[] =
+    [];
   let offset = 0;
   while (buffer.byteLength - offset >= HEADER_BYTES) {
     const view = new DataView(buffer.buffer, buffer.byteOffset + offset);
@@ -88,7 +92,10 @@ export function takeFrames(buffer: Uint8Array): {
 }
 
 /** Join two byte arrays. */
-function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+function concat(
+  a: Uint8Array<ArrayBufferLike>,
+  b: Uint8Array<ArrayBufferLike>,
+): Uint8Array<ArrayBufferLike> {
   if (a.byteLength === 0) return b;
   const out = new Uint8Array(a.byteLength + b.byteLength);
   out.set(a, 0);
@@ -183,7 +190,7 @@ export function startWebCodecsRender(
         return;
       }
       const reader = body.getReader();
-      let pending = new Uint8Array(0);
+      let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
 
       while (running) {
         // eslint-disable-next-line no-await-in-loop

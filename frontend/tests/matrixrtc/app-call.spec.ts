@@ -76,6 +76,21 @@ const MIN_FPS = 10;
  */
 const MAX_KEYFRAME_RATIO = 0.2;
 
+/**
+ * How many browser participants are already publishing when Elementium joins.
+ *
+ * One by default, which is the smallest call that can exhibit anything. Raised to probe a
+ * specific suspicion: the twenty-frames-a-minute fault has never reproduced here against a
+ * single peer, and one difference between this and the calls where it does is the number of
+ * people -- the point at which an SFU stops relaying and starts making forwarding decisions
+ * about who gets what. `just test-app-call-crowd` sets it to three.
+ *
+ * Every assertion below applies unchanged at any size; only the population differs, which is
+ * the point. If the fault appears at three and not at one, it is reproducible on demand and
+ * there is nothing left to guess about.
+ */
+const EARLY_PEERS = Math.max(1, Number(process.env["ELEMENTIUM_APP_CALL_PEERS"] ?? "1"));
+
 interface Fixture {
   room_id: string;
   participants: Credentials[];
@@ -89,6 +104,8 @@ let server: Awaited<ReturnType<typeof startElementWeb>>;
 let browserRef: Browser;
 let roomId: string;
 let peers: Credentials[];
+/** The participants publishing alongside `early`, held only so they can be closed. */
+let crowd: Participant[] = [];
 
 /**
  * How many frames of remote video Elementium has decoded, from whichever path it used.
@@ -202,13 +219,32 @@ test.describe.serial("Elementium in a real call", () => {
     // tester1 is Elementium's: `scripts/patch-element-web.sh` logs in as tester1 when it
     // injects the autojoin driver. Taking it here too would put two devices of one user in
     // the call, which is a different situation from two people.
-    peers = (await freshSessions(env.participants.length)).slice(1);
+    // One session for Elementium's own tester1 (dropped below), `EARLY_PEERS` to publish
+    // before it joins, and one spare for the participant who arrives afterwards.
+    // `freshSessions` registers anyone `provision.sh` did not, so the count is free.
+    peers = (await freshSessions(EARLY_PEERS + 2)).slice(1);
     const [first] = peers;
     if (!first) throw new Error("provision.sh produced nobody to be the other side");
 
     server = await startElementWeb();
     early = await openRoom(await browser.newContext(), server, first, roomId);
     await joinCall(early);
+
+    // The rest of the crowd, joined before Elementium for the same reason `early` is: the
+    // fault is reported by people who were already in the call when it arrived.
+    crowd = [];
+    for (const who of peers.slice(1, EARLY_PEERS)) {
+      // Sequential rather than concurrent: each join is a Matrix sync and an SFU
+      // negotiation, and starting several at once makes a failure hard to attribute.
+      // eslint-disable-next-line no-await-in-loop
+      const peer = await openRoom(await browser.newContext(), server, who, roomId);
+      // eslint-disable-next-line no-await-in-loop
+      await joinCall(peer);
+      crowd.push(peer);
+    }
+    if (EARLY_PEERS > 1) {
+      console.log(`  ${EARLY_PEERS} participants publishing before Elementium joins`);
+    }
 
     // Elementium joins *after* the first participant, because that is the order a person
     // joins a call in and the order every reported fault was seen in.
@@ -239,6 +275,10 @@ test.describe.serial("Elementium in a real call", () => {
 
   test.afterAll(async () => {
     await app?.stop();
+    for (const peer of crowd) {
+      // eslint-disable-next-line no-await-in-loop
+      await peer.context.close();
+    }
     await early?.context.close();
     await late?.context.close();
     await server?.close();
@@ -376,8 +416,10 @@ test.describe.serial("Elementium in a real call", () => {
   test("a participant who joins after Elementium can decrypt its media", async () => {
     test.setTimeout(6 * 60 * 1000);
 
-    const third = peers[1];
-    if (!third) throw new Error("this needs a third participant; provision.sh made two");
+    // The first session not already in the call: `peers[0]` is `early` and the next
+    // `EARLY_PEERS - 1` are the crowd.
+    const third = peers[EARLY_PEERS];
+    if (!third) throw new Error("no spare session for the participant who joins late");
     late = await openRoom(await browserRef.newContext(), server, third, roomId);
     await joinCall(late);
     console.log(`  ${late.who.user_id} joined after Elementium`);

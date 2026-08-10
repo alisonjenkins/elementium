@@ -75,9 +75,14 @@ function reportPlaybackSupport(): void {
   );
 }
 
-interface VideoDecoderLike {
+/**
+ * Only what this module calls. Declared as a constructor type as well as carrying the static
+ * method, because the guard below is `typeof decoder !== "function"` -- against a plain
+ * object type TypeScript narrows that to `never` and every later use is an error.
+ */
+type VideoDecoderLike = (new (init: unknown) => unknown) & {
   isConfigSupported?: (config: unknown) => Promise<{ supported?: boolean }>;
-}
+};
 
 /**
  * Ask the runtime what it can decode and write the answer to the log.

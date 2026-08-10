@@ -813,7 +813,13 @@ export class ElementiumRTCPeerConnection extends EventTarget {
     // `getReceivers()`/`getTransceivers()`.
     const trackEvent = buildTrackEvent({ track, streams: [stream], receiver, transceiver });
     this.dispatchEvent(trackEvent);
-    this.ontrack?.call(this as unknown as RTCPeerConnection, trackEvent);
+    // `buildTrackEvent` returns an `Event` because that is what `dispatchEvent` requires and
+    // what the fallback can actually construct; it carries the four properties `ontrack`
+    // reads. The cast states that, rather than widening the handler's own type.
+    this.ontrack?.call(
+      this as unknown as RTCPeerConnection,
+      trackEvent as unknown as RTCTrackEvent,
+    );
     console.log(`[Elementium] Track event delivered: ${kind} mid=${mid}`);
   }
 

@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "build:shims": "vite build --config vite.shims.config.ts",
+    "typecheck": "tsc --noEmit",
     "test:browser": "playwright test",
     "test:unit": "vitest run"
   },

@@ -114,6 +114,34 @@ test-app-call:
     cd frontend && ELEMENTIUM_APP_CALL=1 pnpm exec playwright test \
         tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
 
+# The same call, with a crowd in it before Elementium arrives.
+#
+# The twenty-frames-a-minute fault has never reproduced against a single peer, and one
+# difference between this harness and the calls where it does reproduce is simply how many
+# people are in them -- the point at which an SFU stops relaying and starts choosing what to
+# forward to whom. Every assertion is the same; only the population changes.
+#
+# If this fails where `test-app-call` passes, the fault is reproducible on demand and there is
+# nothing left to guess about.
+test-app-call-crowd peers="3":
+    cargo build -p elementium
+    cd frontend && ELEMENTIUM_APP_CALL=1 ELEMENTIUM_APP_CALL_PEERS={{peers}} \
+        pnpm exec playwright test tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
+
+# The same call, recording what the microphone path actually produces.
+#
+# Writes the three capture points described in `just audio-dumps` -- the raw microphone, the
+# frame handed to Opus after gain and resampling, and our own encoder's output decoded back --
+# then converts them to WAV. The last of those is the closest thing to what the far end hears,
+# and listening to it settles in thirty seconds a question that has twice survived being
+# reasoned about.
+test-app-call-audio:
+    cargo build -p elementium
+    rm -f /tmp/elementium_audio_dump_*.f32le /tmp/elementium_audio_dump_*.wav
+    cd frontend && ELEMENTIUM_APP_CALL=1 ELEMENTIUM_AUDIO_DUMP=1 \
+        pnpm exec playwright test tests/matrixrtc/app-call.spec.ts --reporter=list --workers=1
+    just audio-dumps
+
 # Move to an Element Web release, and find out whether we still work on it.
 #
 # Fetches the version, rebuilds and re-injects the shims, and runs the shim contract checks
