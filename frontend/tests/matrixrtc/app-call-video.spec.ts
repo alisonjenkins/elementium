@@ -412,10 +412,12 @@ test.describe.serial("Elementium's video, frame by frame", () => {
     );
     const share = pipelines(app).find((p) => p.at === started.at);
     if (!share) throw new Error("the share pipeline was logged and then could not be re-read");
-    // The X11 capturer reports 0x0 for its own size until it has produced a frame, so the
-    // pipeline log cannot be the expected resolution the way the camera's can. The display's
-    // own geometry can: a monitor share of an `xvfb-run` display is exactly `-screen 0 WxHxD`,
-    // which `runningXvfb` read off the server's command line.
+    // The X11 capturer now asks the X server for its source's size at start (M6), so this
+    // usually is the real resolution. The fallback stays because it still can be 0x0 -- a
+    // source that will not report its size starts anyway and learns its geometry from its
+    // first frame, which is after this line. The display's own geometry covers that case: a
+    // monitor share of an `xvfb-run` display is exactly `-screen 0 WxHxD`, which
+    // `runningXvfb` read off the server's command line.
     const expectedShare =
       share.width > 0 && share.height > 0
         ? { width: share.width, height: share.height }

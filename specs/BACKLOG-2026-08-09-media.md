@@ -140,12 +140,19 @@ collected here because they were all found in the same session.
 Both from the screen-share work. Neither is why anyone complained; both are real, and
 neither had anywhere to be recorded before there was a test that exercised the path.
 
-- [ ] **M6. The X11 capturer reports its own size as 0x0.** `video pipeline started` logs
-  `width=0 height=0` for an X11 share, so nothing downstream that reasons about the source
-  geometry can. The test works around it by taking the expected resolution from the Xvfb
-  `-screen` argument instead, which is a workaround in a test for a gap in the product.
-  Encoding and delivery are unaffected -- 300 encoded reached 300 decoded at three
-  participants at the right resolution -- so this is about what we can say, not what we send.
+- [x] **M6. The X11 capturer reports its own size as 0x0.** Fixed, unverified against a real
+  X server. `video pipeline started` logged `width=0 height=0` for an X11 share because a push
+  capturer negotiates nothing and its size was seeded at zero until a frame arrived -- a zero
+  that reads as a measurement rather than as "not yet known".
+
+  `elementium_screen::x11::source_size` now asks the X server, and `VideoSource::start_push`
+  takes what the producer declares. The first frame still overrides it: a declared size is a
+  claim and a frame is a fact, and a window can be resized between the two. A source that
+  refuses to report its size starts anyway, with a warning, since the frames carry their own
+  geometry regardless.
+
+  The share test keeps its Xvfb `-screen` fallback for exactly that case, but should now
+  normally read the resolution out of the pipeline log like the camera's does.
 
 - [ ] **M7. X11 capture runs at about 3.3fps under Xvfb.** A full `XGetImage` per frame with
   no shared memory. That is why the share test's floor is 2fps rather than anything like the
