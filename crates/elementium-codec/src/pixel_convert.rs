@@ -202,14 +202,22 @@ pub fn halve_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(Vec<u8>, u32,
     Some((out, u32::try_from(out_w).ok()?, u32::try_from(out_h).ok()?))
 }
 
-/// Mean of four samples. Cannot overflow: four `u8`s sum to at most 1020.
+/// Mean of four samples, rounded to nearest. Cannot overflow: four `u8`s sum to at most
+/// 1020, and the `+2` that does the rounding leaves that comfortably inside a `u16`.
+///
+/// Rounded, not truncated. Truncation loses up to three quarters of a level on every sample
+/// and always downwards, so a halved picture came out fractionally darker than its source and
+/// a picture halved repeatedly -- the self-view, every frame -- drifted further each time.
+/// `scale_i420` rounds for the same reason, and the two must agree: exactly-half requests are
+/// routed here, so a difference between them would make the same downscale produce different
+/// pixels depending on the ratio that asked for it.
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
     clippy::as_conversions
 )]
 const fn mean4(a: u8, b: u8, c: u8, d: u8) -> u8 {
-    ((a as u16 + b as u16 + c as u16 + d as u16) / 4) as u8
+    ((a as u16 + b as u16 + c as u16 + d as u16 + 2) / 4) as u8
 }
 
 /// Halve an I420 frame's width and height, averaging each 2x2 block per plane.
@@ -644,6 +652,19 @@ pub fn scale_i420(frame: &I420Frame, out_width: u32, out_height: u32) -> Option<
     )
 }
 
+/// `total / count` as a `u8`, rounded to nearest.
+///
+/// Rounded rather than truncated because this is the last step of an average and truncation
+/// biases every output sample downwards -- a picture scaled by a non-integer ratio comes out
+/// measurably darker than the one it came from, which is not a thing a resize should do.
+#[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
+fn mean_of(total: u32, count: u32) -> u8 {
+    let divisor = count.max(1);
+    let half = divisor.checked_div(2).unwrap_or(0);
+    let rounded = total.saturating_add(half).checked_div(divisor).unwrap_or(0);
+    rounded.min(u32::from(u8::MAX)) as u8
+}
+
 /// Scale one 8-bit plane by averaging the source rectangle each output sample covers.
 ///
 /// The source rectangle is computed from the output index rather than by stepping a
@@ -688,6 +709,7 @@ fn scale_plane(
     for oy in 0..out_h {
         let y0 = oy * height / out_h;
         let y1 = (((oy + 1) * height).div_ceil(out_h)).max(y0 + 1).min(height);
+        let rows = y1 - y0;
         for &(x0, x1) in &columns {
             let mut total: u32 = 0;
             for y in y0..y1 {
@@ -698,9 +720,8 @@ fn scale_plane(
                 total = total.saturating_add(row.iter().map(|s| u32::from(*s)).sum::<u32>());
             }
             // Cannot be zero: `x1 > x0` and `y1 > y0` by construction above.
-            let count = u32::try_from((x1 - x0) * (y1 - y0)).unwrap_or(u32::MAX).max(1);
-            let mean = total / count;
-            out.push(u8::try_from(mean).unwrap_or(u8::MAX));
+            let count = u32::try_from((x1 - x0) * rows).unwrap_or(u32::MAX).max(1);
+            out.push(mean_of(total, count));
         }
     }
     Some(out)
@@ -781,6 +802,38 @@ mod scale_tests {
         assert_eq!((scaled.width(), scaled.height()), (720, 404));
         assert_eq!(scaled.y().len(), 720 * 404, "the luma plane must cover the frame");
         assert!(scaled.y().iter().all(|&s| s == 77));
+    }
+
+    /// Truncating the last step of an average biases every output sample downwards, so a
+    /// picture scaled by a non-integer ratio came out darker than the one it came from. A
+    /// resize is not a place to lose brightness: this pins that a block averaging to exactly
+    /// x.5 rounds up rather than down, and that a whole frame's mean survives the trip.
+    #[test]
+    fn averaging_rounds_to_nearest_rather_than_darkening_the_picture() {
+        // Each 2x2 block averages exactly 200.5, which is the case that decides whether the
+        // last step rounds or truncates. 4x4 rather than 2x2 because 2x2 is the smallest
+        // frame `scale_i420` will produce, so a 2x2 input has nowhere to go.
+        let wide = I420Frame::from_planes(
+            4,
+            4,
+            &[
+                200, 200, 200, 200, //
+                201, 201, 201, 201, //
+                200, 200, 200, 200, //
+                201, 201, 201, 201,
+            ],
+            &[128, 128, 128, 128],
+            &[128, 128, 128, 128],
+            0,
+        )
+        .expect("a 4x4 frame is valid");
+
+        let scaled = scale_i420(&wide, 2, 2).expect("a valid downscale");
+        assert!(
+            scaled.y().iter().all(|&s| s == 201),
+            "200.5 must round up, not truncate to 200: got {:?}",
+            scaled.y()
+        );
     }
 
     /// Refused rather than invented: a caller asking this to make a frame bigger has made a
