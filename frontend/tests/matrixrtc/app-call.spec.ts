@@ -42,6 +42,7 @@ import {
   type Participant,
 } from "./element-call";
 import { num, startElementium, type ElementiumApp } from "./elementium-app";
+import { silentPlaybackEnv } from "./fake-audio";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../../..");
@@ -264,7 +265,13 @@ test.describe.serial("Elementium in a real call", () => {
 
     // Elementium joins *after* the first participant, because that is the order a person
     // joins a call in and the order every reported fault was seen in.
-    app = startElementium({ video: true });
+    // Silenced, not measured by ear. This joins a call with participants whose fake
+    // microphones play a continuous tone, and without this Elementium plays all of it out of
+    // the machine's speakers for the length of the run -- which is somebody's room. Playback
+    // only: the ALSA config is `asym`, capture is untouched, and no assertion here reads a
+    // speaker.
+    const quietEnv = await silentPlaybackEnv();
+    app = startElementium({ video: true, env: quietEnv });
     // "outbound video" is the encoder's own throttled report and carries `sent`, so this
     // waits for frames actually handed to the transport rather than for a track being
     // announced. Announced and sending are different states, and the gap between them is

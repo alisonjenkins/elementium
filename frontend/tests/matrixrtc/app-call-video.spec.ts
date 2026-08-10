@@ -53,6 +53,7 @@ import { startElementWeb, freshSessions, type Credentials } from "./element-web"
 import { joinCall, inboundAudio, type Participant } from "./element-call";
 import { ensureJoined, openRoomClean } from "./far-participants";
 import { startElementium, type ElementiumApp } from "./elementium-app";
+import { silentPlaybackEnv } from "./fake-audio";
 import {
   BOUNDARY_FRAMES,
   MAX_STALL_MS,
@@ -237,7 +238,13 @@ test.describe.serial("Elementium's video, frame by frame", () => {
 
     // Elementium joins last, as a person joining an existing call does.
     process.env["ELEMENTIUM_AUTOJOIN_SCREENSHARE"] = "1";
-    app = startElementium({ video: true });
+    // Silenced, not measured by ear. This joins a call with participants whose fake
+    // microphones play a continuous tone, and without this Elementium plays all of it out of
+    // the machine's speakers for the length of the run -- which is somebody's room. Playback
+    // only: the ALSA config is `asym`, capture is untouched, and no assertion here reads a
+    // speaker.
+    const quietEnv = await silentPlaybackEnv();
+    app = startElementium({ video: true, env: quietEnv });
     // Capture first, then encoding, as two waits rather than one. They fail for entirely
     // different reasons -- no camera at all against a camera whose frames never reach the
     // wire -- and a single wait on the second reports the first as "never reported sending

@@ -50,6 +50,14 @@ export default defineConfig({
         // so listening to it says nothing: a gap is what it sounds like when it is working.
         // A solid tone makes any gap mean something, by ear and in the concealment numbers.
         `--use-file-for-fake-audio-capture=${TONE}`,
+        // Do not play any of it out of the machine's speakers. Every participant here is a
+        // browser receiving other participants' audio, so a call test filled the room with
+        // tone ladders for its whole duration -- at three in the morning, on a machine
+        // somebody sleeps near. Nothing is measured by ear: the browser side reads an
+        // `AnalyserNode` tapped straight off the inbound `MediaStreamTrack`, which is never
+        // connected to `ctx.destination`, and the native side reads dumps written by Rust.
+        // Muting output therefore costs no assertion anything.
+        "--mute-audio",
         // Insertable streams back livekit's E2EE worker; without this the encrypted test
         // would fail for a reason unrelated to what it is measuring.
         "--enable-blink-features=RTCInsertableStreams",
