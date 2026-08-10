@@ -52,6 +52,11 @@ pub async fn get_capture_sources() -> Result<Vec<CaptureSource>, String> {
                 // an application what windows are open -- by design -- so any list we built
                 // would be empty or a lie. The empty list means "ask the portal", which is
                 // what `get_display_media` does when given no source id.
+                //
+                // The X11 backend now returns empty on a Wayland session deliberately, rather
+                // than by accident of enumeration failing. Xwayland does answer, so this used
+                // to offer monitors that could only be captured by screenshotting the whole
+                // real desktop through the portal -- see `x11::sources`.
                 tracing::info!(
                     "no enumerable capture sources; selection is delegated to the system picker"
                 );

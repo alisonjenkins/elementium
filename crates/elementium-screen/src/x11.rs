@@ -73,6 +73,23 @@ impl X11Capturer {
 
 impl ScreenCapturer for X11Capturer {
     fn sources(&self) -> Result<Vec<CaptureSource>, ElementiumError> {
+        // An empty list is how this backend says "ask the portal" -- see
+        // `get_capture_sources` in `src-tauri/src/commands/screen_capture.rs`, which falls
+        // through to the system picker when nothing enumerates. That fallthrough was written
+        // believing X11 enumeration simply comes back empty on a Wayland session. It does
+        // not: Xwayland answers, so the picker offered X11 monitors on a Wayland desktop,
+        // and choosing one took the capture through xcap's portal branch -- a screenshot of
+        // the whole real desktop, whichever monitor was picked (see
+        // `refuse_monitor_capture_on_wayland`). The list is also a half-truth for windows,
+        // since only Xwayland clients appear in it and native Wayland ones never do.
+        if xcap_captures_monitors_through_the_wayland_portal() {
+            tracing::info!(
+                "not enumerating X11 capture sources on a Wayland session; the portal picker \
+                 knows what is really shareable"
+            );
+            return Ok(Vec::new());
+        }
+
         let mut sources = Vec::new();
         let mut monitor_err = None;
         let mut window_err = None;
@@ -527,6 +544,21 @@ mod tests {
         assert!(
             !is_wayland_session("wayland-ish", ""),
             "the session type is an exact match in xcap, not a substring one"
+        );
+    }
+
+    /// Enumeration and capture must agree about a Wayland session: offering a source that
+    /// `start()` will then refuse is worse than offering nothing, because an empty list is
+    /// what routes selection to the portal picker -- the thing that does work there.
+    #[test]
+    fn a_wayland_session_enumerates_no_x11_sources_at_all() {
+        if !xcap_captures_monitors_through_the_wayland_portal() {
+            return;
+        }
+        let sources = X11Capturer::new().sources();
+        assert!(
+            sources.is_ok_and(|s| s.is_empty()),
+            "a Wayland session must enumerate nothing, so the portal picker is used instead"
         );
     }
 
