@@ -84,6 +84,7 @@ app-join:
     mkdir -p target/app-join-profile
     ELEMENTIUM_TEST_ENV=1 ELEMENTIUM_AUTOJOIN=1 \
         ELEMENTIUM_AUTOJOIN_VIDEO="${ELEMENTIUM_AUTOJOIN_VIDEO:-1}" \
+        ELEMENTIUM_AUTOJOIN_SCREENSHARE="${ELEMENTIUM_AUTOJOIN_SCREENSHARE:-0}" \
         XDG_DATA_HOME="$PWD/target/app-join-profile/data" \
         XDG_CONFIG_HOME="$PWD/target/app-join-profile/config" \
         XDG_CACHE_HOME="$PWD/target/app-join-profile/cache" \

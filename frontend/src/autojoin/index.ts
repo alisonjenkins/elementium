@@ -23,6 +23,15 @@ interface AutoJoinConfig {
   video?: boolean;
   /** Turn on the peer-connection trace and livekit-client's own debug logging. */
   tracePc?: boolean;
+  /**
+   * Share the screen once the harness asks for it. See {@link shareWhenAsked}.
+   *
+   * Not "share on join": a screen share published from the moment the call starts would be in
+   * every measurement of the camera, and the test that reconciles encoded against decoded
+   * frames would have two outbound tracks to disentangle before it could say anything about
+   * either.
+   */
+  screenShare?: boolean;
 }
 
 const CONFIG = (window as unknown as Record<string, unknown>)[
@@ -72,6 +81,18 @@ function byName(pattern: RegExp): () => HTMLElement | null {
       null
     );
   };
+}
+
+/**
+ * An element by its `data-testid`.
+ *
+ * Element Call's in-call controls are icon-only buttons whose visible name comes from a
+ * tooltip, so they have neither text content nor an `aria-label` for {@link byName} to match --
+ * which is why the screen-share button "never appeared" while sitting in the DOM the whole
+ * time. The test id is the handle upstream provides for exactly this.
+ */
+function byTestId(id: string): () => HTMLElement | null {
+  return () => document.querySelector<HTMLElement>(`[data-testid="${id}"]`);
 }
 
 /**
@@ -206,6 +227,69 @@ function refuseVideo(): void {
 }
 
 /**
+ * The path the harness creates when it wants a screen share started.
+ *
+ * A file, served by the same `http-server` that serves this page, because there is no channel
+ * *into* a Tauri webview from a test: Playwright cannot attach to it, and the application's
+ * own log only goes outward. Element Web's dist directory is a build output, so dropping a
+ * file into it costs nothing and is gone with the next build.
+ */
+const SHARE_SIGNAL = "/elementium-share-now";
+
+/**
+ * Wait for the harness to ask for a screen share, then click the control a person would.
+ *
+ * Clicking the real button rather than calling `getDisplayMedia` directly: the question is
+ * whether *a screen share works*, which includes Element Call deciding what to request,
+ * publishing a second track, and telling the SFU about it. A direct call would skip all of it
+ * and test the shim alone.
+ */
+async function shareWhenAsked(): Promise<void> {
+  const deadline = Date.now() + 15 * 60 * 1000;
+  let asked = false;
+  while (Date.now() < deadline) {
+    try {
+      // Cache-busted: `http-server` is started with `-c-1`, but a 404 cached anywhere between
+      // here and there would make the signal permanently invisible.
+      const res = await fetch(`${SHARE_SIGNAL}?t=${Date.now()}`, { cache: "no-store" });
+      if (res.ok) {
+        asked = true;
+        break;
+      }
+    } catch {
+      /* the server not answering yet is not a reason to stop asking */
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!asked) {
+    log("no screen-share signal arrived before the deadline; not sharing");
+    return;
+  }
+  log("screen-share signal seen; clicking share");
+  const share = byTestId("incall_screenshare");
+  try {
+    (await waitFor("the share screen button", () => share() ?? byName(/^share screen$/i)(), 60_000)).click();
+  } catch (e) {
+    // Which controls *are* there. Element Call omits the screen-share button entirely when it
+    // decides the platform cannot share, and "the button never appeared" cannot tell that
+    // apart from a renamed selector.
+    const ids = Array.from(document.querySelectorAll("[data-testid]"))
+      .map((el) => el.getAttribute("data-testid"))
+      .join(",");
+    log(`share button not found; controls present: ${ids}`);
+    throw e;
+  }
+  // `aria-checked` flips on the same button once the share is running, so this is the share
+  // actually starting rather than the click having been delivered.
+  await waitFor(
+    "the share to start",
+    () => (share()?.getAttribute("aria-checked") === "true" ? share() : null),
+    120_000,
+  );
+  log("screen share started");
+}
+
+/**
  * The Element Call widget: join the call.
  *
  * Joining uses the camera and microphone. Element Call takes both in its lobby, before any
@@ -227,6 +311,14 @@ async function driveElementCall(cfg: AutoJoinConfig): Promise<void> {
   // publishing, because the name differs between Element Call builds.
   await waitFor("the lobby to close", () => (byName(/^join call$/i)() ? null : document.body));
   log("in the call");
+
+  // Not awaited: the share is started on the harness's schedule, minutes later, and this
+  // function returning is what says the join succeeded.
+  if (cfg.screenShare) {
+    shareWhenAsked().catch((e: unknown) => {
+      console.error(`[Elementium autojoin] screen share: ${String(e)}`);
+    });
+  }
 }
 
 if (CONFIG) {
