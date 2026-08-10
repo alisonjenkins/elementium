@@ -134,3 +134,25 @@ collected here because they were all found in the same session.
   slider control (bounded 1..=120) wired to `set_max_encode_fps`, reading its initial
   value from `get_max_encode_fps` -- not built here because it would mean patching the
   embedded Element Web bundle rather than this app's own Rust/Tauri surface.
+
+## Found by the automated suite, 2026-08-10
+
+Both from the screen-share work. Neither is why anyone complained; both are real, and
+neither had anywhere to be recorded before there was a test that exercised the path.
+
+- [ ] **M6. The X11 capturer reports its own size as 0x0.** `video pipeline started` logs
+  `width=0 height=0` for an X11 share, so nothing downstream that reasons about the source
+  geometry can. The test works around it by taking the expected resolution from the Xvfb
+  `-screen` argument instead, which is a workaround in a test for a gap in the product.
+  Encoding and delivery are unaffected -- 300 encoded reached 300 decoded at three
+  participants at the right resolution -- so this is about what we can say, not what we send.
+
+- [ ] **M7. X11 capture runs at about 3.3fps under Xvfb.** A full `XGetImage` per frame with
+  no shared memory. That is why the share test's floor is 2fps rather than anything like the
+  camera's 30. Whether it is as slow on a real X server with a real GPU is unmeasured, and
+  worth measuring before optimising: the MIT-SHM extension is the obvious remedy and a
+  substantial change to make on the strength of a headless number alone.
+
+  Note the contrast in the same run: the camera path held exactly 30.0fps with `paced_out` at
+  zero on every attempt, so this is specific to X11 capture and not to the encode or send
+  path.
