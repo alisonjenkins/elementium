@@ -1947,6 +1947,19 @@ fn start_x11_video_source(
     // reading it here, that latch would be written and never read.
     let failed = capturer.failed_handle();
 
+    // Asked of the X server rather than waited for, so `video pipeline started` can say what
+    // is being shared instead of `width=0 height=0` (M6). A share that will not report its
+    // size is not worth failing to start over -- the frames are what matter and they carry
+    // their own geometry -- so this degrades to "unknown" and logs why.
+    let declared_size = elementium_screen::x11::source_size(source_id).unwrap_or_else(|e| {
+        tracing::warn!(
+            source_id = %source_id,
+            error = %e,
+            "X11 share would not report its size; its geometry is unknown until the first frame"
+        );
+        (0, 0)
+    });
+
     let capturer = Arc::new(Mutex::new(capturer));
     let stopper_capturer = Arc::clone(&capturer);
     let stopper: Box<dyn Fn() + Send + Sync> = Box::new(move || {
@@ -1957,7 +1970,11 @@ fn start_x11_video_source(
 
     Ok(
         elementium_media::video_source::VideoSource::start_push_with_health(
-            rx, stopper, "x11", failed,
+            rx,
+            stopper,
+            "x11",
+            declared_size,
+            failed,
         ),
     )
 }

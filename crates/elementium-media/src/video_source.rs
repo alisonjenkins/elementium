@@ -45,7 +45,9 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct PushCapturer {
     rx: Receiver<CapturedFrame>,
     /// Updated from the most recently received frame, since -- unlike `PipeWire` -- nothing
-    /// here negotiates a size up front; the first frame is the first anyone learns it.
+    /// here negotiates a size. Seeded from what the producer declared its source to be at
+    /// start, which is the only thing anyone can know before the first frame arrives, and
+    /// which the first frame then supersedes.
     width: AtomicU32,
     height: AtomicU32,
     /// Tells the producer thread to stop. Called from [`PushCapturer::stop`] and from
@@ -76,7 +78,8 @@ impl PushCapturer {
         Some(frame)
     }
 
-    /// The size of the most recently received frame, or `(0, 0)` before the first one.
+    /// The size of the most recently received frame; before the first one, whatever the
+    /// producer declared at start, and `(0, 0)` only if it declared nothing.
     #[must_use]
     pub fn size(&self) -> (u32, u32) {
         (self.width.load(Ordering::Relaxed), self.height.load(Ordering::Relaxed))
@@ -246,16 +249,20 @@ impl VideoSource {
     /// read them, until whatever owns it is torn down some other way. `label` names the
     /// producer in logs (`"x11"` today; see [`PushCapturer`] for why this crate cannot name
     /// it more specifically itself).
+    ///
+    /// `declared_size` is what the producer says its source is before any frame proves it,
+    /// or `(0, 0)` for a producer that cannot say. See [`PushCapturer::size`].
     #[must_use]
     pub fn start_push(
         rx: Receiver<CapturedFrame>,
         stopper: Box<dyn Fn() + Send + Sync>,
         label: &'static str,
+        declared_size: (u32, u32),
     ) -> Self {
         Self::Push(PushCapturer {
             rx,
-            width: AtomicU32::new(0),
-            height: AtomicU32::new(0),
+            width: AtomicU32::new(declared_size.0),
+            height: AtomicU32::new(declared_size.1),
             stopper,
             label,
             failed: None,
@@ -276,12 +283,13 @@ impl VideoSource {
         rx: Receiver<CapturedFrame>,
         stopper: Box<dyn Fn() + Send + Sync>,
         label: &'static str,
+        declared_size: (u32, u32),
         failed: Arc<AtomicBool>,
     ) -> Self {
         Self::Push(PushCapturer {
             rx,
-            width: AtomicU32::new(0),
-            height: AtomicU32::new(0),
+            width: AtomicU32::new(declared_size.0),
+            height: AtomicU32::new(declared_size.1),
             stopper,
             label,
             failed: Some(failed),
@@ -475,7 +483,7 @@ mod tests {
     #[test]
     fn a_pushed_frame_is_received_and_sizes_the_source() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push");
+        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push", (0, 0));
 
         assert_eq!(source.size(), (0, 0), "no frame has arrived yet");
         assert!(source.try_recv().is_none(), "nothing was pushed yet");
@@ -505,6 +513,7 @@ mod tests {
             rx,
             Box::new(move || stopped_writer.store(true, Ordering::Relaxed)),
             "test-push",
+            (0, 0),
         );
         assert!(!stopped.load(Ordering::Relaxed), "not stopped before either signal");
 
@@ -528,8 +537,13 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel::<CapturedFrame>();
         let failed = Arc::new(AtomicBool::new(false));
 
-        let source =
-            VideoSource::start_push_with_health(rx, Box::new(|| {}), "test-push", Arc::clone(&failed));
+        let source = VideoSource::start_push_with_health(
+            rx,
+            Box::new(|| {}),
+            "test-push",
+            (0, 0),
+            Arc::clone(&failed),
+        );
         assert!(!source.failed(), "must not report failure before the handle is set");
 
         failed.store(true, Ordering::Relaxed);
@@ -542,7 +556,23 @@ mod tests {
     #[test]
     fn a_push_source_with_no_health_handle_never_reports_failure() {
         let (_tx, rx) = std::sync::mpsc::channel::<CapturedFrame>();
-        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push");
+        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push", (0, 0));
         assert!(!source.failed(), "a producer with no health signal must not report failure");
+    }
+
+    /// M6: a push source's geometry was unknowable until its first frame, so the line that
+    /// announces a pipeline starting reported `width=0 height=0` for every X11 share. A
+    /// producer that can say what its source is (X11 asks the X server) now seeds it -- and
+    /// the first frame still wins, because a declared size is a claim and a frame is a fact.
+    #[test]
+    fn a_declared_size_is_reported_before_the_first_frame_and_superseded_by_it() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source = VideoSource::start_push(rx, Box::new(|| {}), "test-push", (1280, 800));
+
+        assert_eq!(source.size(), (1280, 800), "the declared size stands in before any frame");
+
+        let _ = tx.send(CapturedFrame::Planar(tiny_frame()));
+        assert!(source.try_recv().is_some(), "the pushed frame must be received");
+        assert_eq!(source.size(), (2, 2), "a real frame must override what was declared");
     }
 }
