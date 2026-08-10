@@ -17,6 +17,7 @@
  * a reader can check at a glance, which "be careful what you print" is not.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,6 +52,15 @@ export interface ElementiumApp {
    * was "no log events seen", which names nothing.
    */
   output: (count: number) => string[];
+  /**
+   * Where this run's redacted log is being written, for a reader to open afterwards.
+   *
+   * A failing run prints a tail; a passing one used to print nothing and keep everything in
+   * memory, so questions asked after the fact -- did every forwarder stop, did the peer
+   * connection count balance, what did the census say -- could only be answered by running
+   * the whole call again. Same redaction as `tail`: numeric and boolean fields only.
+   */
+  logPath: string;
   stop: () => Promise<void>;
 }
 
@@ -107,6 +117,18 @@ export function startElementium(options: {
   const events: AppEvent[] = [];
   const started = Date.now();
 
+  // One file per application, named by start time and pid so two runs cannot interleave into
+  // one file and be read as a single call. Under `test-results/`, which is already
+  // gitignored and already where Playwright puts a failure's artefacts.
+  const logDir = path.join(REPO, "frontend", "test-results");
+  mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `elementium-app-${started}-${process.pid}.log`);
+  const log: WriteStream = createWriteStream(logPath, { flags: "a" });
+  /** Write one already-rendered line, unless it looks like it carries a secret. */
+  const record = (line: string) => {
+    if (!SECRET.test(line)) log.write(`${line}\n`);
+  };
+
   const child: ChildProcess = spawn("just", ["app-join"], {
     cwd: REPO,
     detached: true,
@@ -122,6 +144,10 @@ export function startElementium(options: {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  // Printed, because a file nobody knows about is a file nobody reads. The path only; the
+  // contents obey the same rule as everything else here.
+  console.log(`  [elementium] log: ${logPath}`);
+
   let pending = "";
   /** The last few hundred non-event lines, for when the failure is that it never started. */
   const other: string[] = [];
@@ -132,7 +158,10 @@ export function startElementium(options: {
     for (const line of lines) {
       // Build output, patch-script progress and http-server noise all share this stream.
       if (!line.startsWith("{")) {
-        if (line.trim() !== "" && !SECRET.test(line)) other.push(line.trimEnd());
+        if (line.trim() !== "" && !SECRET.test(line)) {
+          other.push(line.trimEnd());
+          record(line.trimEnd());
+        }
         if (other.length > 400) other.shift();
         continue;
       }
@@ -144,13 +173,15 @@ export function startElementium(options: {
         };
         const fields = parsed.fields ?? {};
         const { message, ...rest } = fields;
-        events.push({
+        const event: AppEvent = {
           at: Date.now() - started,
           level: String(parsed.level ?? "?"),
           target: String(parsed.target ?? "?"),
           message: String(message ?? ""),
           fields: rest,
-        });
+        };
+        events.push(event);
+        record(redacted(event));
       } catch {
         /* a partial or non-event line is not worth failing a call test over */
       }
@@ -172,6 +203,7 @@ export function startElementium(options: {
     latest,
     tail: (count: number) => events.slice(-count).map(redacted),
     output: (count: number) => other.slice(-count),
+    logPath,
     waitFor: async (what, match, timeoutMs) => {
       const deadline = Date.now() + timeoutMs;
       // Bounded, and bounded loudly: an unbounded wait on a log line that never comes is how
@@ -195,6 +227,10 @@ export function startElementium(options: {
       );
     },
     stop: async () => {
+      // Closed first and unconditionally: an early return below (the process already gone)
+      // would otherwise leave the stream open and the last writes unflushed, which is
+      // precisely the run whose log someone would want to read.
+      log.end();
       if (child.pid === undefined || child.exitCode !== null) return;
       // The whole group, and TERM before KILL: the application holds a camera and an audio
       // device, and a SIGKILLed webview leaves both claimed until something notices.
