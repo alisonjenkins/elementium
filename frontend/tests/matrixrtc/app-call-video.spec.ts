@@ -95,21 +95,26 @@ const MIN_FPS = 10;
 /**
  * The frame rate below which a screen share is not a screen share.
  *
- * Two, not ten, and the difference is a measurement rather than a concession. The X11 capture
- * path takes a full `XGetImage` of the root window every frame with no shared-memory transport
- * (`crates/elementium-screen/src/x11.rs`), and on an `xvfb-run` display that measures ~3.3
- * frames a second -- so the *capture* is the ceiling, and every one of those frames does reach
- * the far end (the reconciliation below is what says so). A floor of ten here would fail a
- * share that is working exactly as this capture path can, and say nothing about whether the
- * frames it did produce arrived. What is worth catching at this end is a share that is not
- * moving at all.
+ * Two, not ten, and the earlier reasoning for that was wrong. It said a full `XGetImage` per
+ * frame was the ceiling at ~3.3fps; measurement (`cargo run -p elementium-screen --example
+ * x11_capture_rate`) says `XGetImage` plus the I420 conversion is 5.4ms a frame -- 170fps on
+ * the same 1280x800 Xvfb display. The 3.3 was xcap taking the *Wayland portal* path, because
+ * the harness left `XDG_SESSION_TYPE=wayland` set: a D-Bus screenshot of the real desktop,
+ * PNG-encoded to disk and read back, 406ms a frame.
+ *
+ * With that fixed the share should run at the encode cap like the camera does, and this floor
+ * should rise to `MIN_FPS`. It stays at two until a run says so, because a floor that has
+ * never been met is a red test rather than a measurement, and because what is worth catching
+ * at this end either way is a share that is not moving at all.
  */
 const MIN_SHARE_FPS = 2;
 /**
  * How long a screen share may go without a decoded frame.
  *
- * Four times `MAX_STALL_MS`, for the capture rate above: at ~3.3fps the expected gap is 300ms,
- * so the camera's 600ms threshold would call a healthy share stalled.
+ * Four times `MAX_STALL_MS`, sized for the ~3.3fps the share used to run at (see
+ * `MIN_SHARE_FPS`: that rate was an artefact, not a ceiling). Left generous rather than
+ * tightened alongside the floor, since a stall threshold that is too loose only fails to
+ * catch something, while one that is too tight fails a working share.
  */
 const MAX_SHARE_STALL_MS = 2400;
 

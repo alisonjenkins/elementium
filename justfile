@@ -41,6 +41,12 @@ call-peers:
 # GTK prefers Wayland when WAYLAND_DISPLAY is set and ignores the Xvfb display entirely, so
 # without them the window opens on the real desktop.
 #
+# XDG_SESSION_TYPE=x11 is the same trap one layer down, and blanking WAYLAND_DISPLAY is not
+# enough to escape it: xcap branches screen capture on *either* variable, and on a Wayland
+# session it ignores DISPLAY and screenshots the real desktop over D-Bus instead -- at about
+# 2fps, which is where M7's "X11 capture runs at 3.3fps" came from. The share test's frames
+# were coming from the desktop, not from the virtual display it had carefully staged.
+#
 # THIS USES THE CAMERA AND MICROPHONE. Element Call acquires both in its lobby, before
 # any control can decline them, so joining at all opens the webcam -- the light comes on.
 # ELEMENTIUM_AUTOJOIN_VIDEO=0 strips video from the request instead.
@@ -88,7 +94,7 @@ app-join:
         XDG_DATA_HOME="$PWD/target/app-join-profile/data" \
         XDG_CONFIG_HOME="$PWD/target/app-join-profile/config" \
         XDG_CACHE_HOME="$PWD/target/app-join-profile/cache" \
-        GDK_BACKEND=x11 WAYLAND_DISPLAY= \
+        GDK_BACKEND=x11 WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11 \
         nix shell nixpkgs#xvfb-run --command xvfb-run -a -s "-screen 0 1280x800x24" \
             cargo tauri dev
 

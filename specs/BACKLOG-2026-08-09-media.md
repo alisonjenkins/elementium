@@ -154,12 +154,42 @@ neither had anywhere to be recorded before there was a test that exercised the p
   The share test keeps its Xvfb `-screen` fallback for exactly that case, but should now
   normally read the resolution out of the pipeline log like the camera's does.
 
-- [ ] **M7. X11 capture runs at about 3.3fps under Xvfb.** A full `XGetImage` per frame with
-  no shared memory. That is why the share test's floor is 2fps rather than anything like the
-  camera's 30. Whether it is as slow on a real X server with a real GPU is unmeasured, and
-  worth measuring before optimising: the MIT-SHM extension is the obvious remedy and a
-  substantial change to make on the strength of a headless number alone.
+- [x] **M7. X11 capture runs at about 3.3fps under Xvfb.** Diagnosed and fixed, and the
+  diagnosis was not the one recorded here. The original entry blamed a full `XGetImage` per
+  frame with no shared memory and named MIT-SHM as the remedy. Measured
+  (`cargo run -p elementium-screen --example x11_capture_rate`, one 1280x800 Xvfb display,
+  same build, same run):
 
-  Note the contrast in the same run: the camera path held exactly 30.0fps with `paced_out` at
-  zero on every attempt, so this is specific to X11 capture and not to the encode or send
-  path.
+  | environment | `capture_image` | conversion | effective |
+  |---|---:|---:|---:|
+  | `XDG_SESSION_TYPE=wayland` (as the harness ran it) | 406ms | 0.3ms | 2.4fps |
+  | `XDG_SESSION_TYPE=x11` | 5.1ms | 0.3ms | 170fps |
+
+  `XGetImage` was never slow. xcap 0.4 branches *monitor* capture on `XDG_SESSION_TYPE` or
+  `WAYLAND_DISPLAY` and, if either says Wayland, ignores `DISPLAY` and screenshots the whole
+  Wayland desktop over D-Bus -- `org.gnome.Shell.Screenshot` or the portal -- writing a PNG to
+  `/tmp/screenshot`, reading it back and decoding it, once per frame. Window capture has no
+  such branch.
+
+  Two consequences, one of them not about speed at all:
+
+  - **The frames were of the real desktop.** `just app-join` blanked `WAYLAND_DISPLAY` but
+    left `XDG_SESSION_TYPE=wayland`, so the automated share test captured this machine's actual
+    screen rather than the Xvfb stage it had carefully set up, and sent it to the far-end test
+    participants. `/tmp/screenshot` exists on this machine, dated during that work.
+    In the product the same path means someone who picks one X11 monitor on a Wayland session
+    shares everything on screen instead.
+  - The 3.3fps figure, and the share test's 2fps floor built on it, described a D-Bus round
+    trip rather than a capture path.
+
+  Fixed by refusing an X11 *monitor* capture when xcap would route it to the portal (naming the
+  PipeWire path, which asks what to share), and by setting `XDG_SESSION_TYPE=x11` in
+  `just app-join` alongside the blanked `WAYLAND_DISPLAY`.
+
+  Next: with the harness fixed the share should run at the encode cap, so `MIN_SHARE_FPS` in
+  `app-call-video.spec.ts` should rise from 2 to `MIN_FPS`. Left at 2 until a run confirms it,
+  since a floor that has never been met is a red test rather than a measurement.
+
+  Note the contrast in the original run: the camera path held exactly 30.0fps with `paced_out`
+  at zero on every attempt, which is what pointed at the capture rather than the encode or send
+  path in the first place.
