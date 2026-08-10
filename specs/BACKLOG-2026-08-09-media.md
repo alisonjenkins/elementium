@@ -105,6 +105,27 @@ collected here because they were all found in the same session.
   conformant response, since indices are independent keys and index N-1 is not derivable
   from N. Thousands of them is not expected and is worth a second look once M5 is fixed.
 
+- [ ] **M8. A dead virtual camera enumerates first and costs ten seconds of every camera
+  open.** On this machine `list_video_sources` returns, in this order:
+
+  ```
+  [0] node 161  ...virtual/video4linux/video11  (Unknown device (V4L2))   <- v4l2loopback, no producer
+  [1] node 349  ...usb-0_1.1_1.0                (OBSBOT Tiny 2 Lite)
+  ```
+
+  `start_pipewire` tries them in order and skips one that yields no frame, which is the right
+  behaviour and is why calls still work -- but skipping costs the full `FIRST_FRAME_TIMEOUT`,
+  so opening a camera takes 12.3s instead of 2 (`cargo run -p elementium-media --example
+  open_camera`). The same list is what `enumerate_devices` offers the page, so a
+  default-configured client is offered a loopback as device zero, and since the `camelCase`
+  fix its `deviceId` now actually reaches Rust.
+
+  Not fixed here because both plausible remedies need a judgement this session has no evidence
+  for: deprioritising sources under `/sys/devices/virtual/` is a heuristic about what "virtual"
+  means, and shortening the first-frame timeout trades this delay against a slow real camera.
+  Worth noting that a loopback *with* a producer is a legitimate camera -- OBS virtual camera
+  is exactly that -- so it must not simply be filtered out.
+
 ## Closed
 
 - [x] **M1. The frame rate is not configurable by a person.** Implemented, unverified until
@@ -186,9 +207,18 @@ neither had anywhere to be recorded before there was a test that exercised the p
   PipeWire path, which asks what to share), and by setting `XDG_SESSION_TYPE=x11` in
   `just app-join` alongside the blanked `WAYLAND_DISPLAY`.
 
-  Next: with the harness fixed the share should run at the encode cap, so `MIN_SHARE_FPS` in
-  `app-call-video.spec.ts` should rise from 2 to `MIN_FPS`. Left at 2 until a run confirms it,
-  since a floor that has never been met is a red test rather than a measurement.
+  Confirmed end to end, 2026-08-10T10:57Z, three far-end participants:
+
+  | | before | after |
+  |---|---:|---:|
+  | share frames encoded | 300 in 90-118s | 892 in 29.8s |
+  | rate | ~3.3fps | ~30fps |
+  | longest gap between decoded frames | -- | 155ms |
+
+  892 encoded reached 892/891/892 decoded at 1280x800, zero dropped, zero of ~2496 packets
+  lost; the camera track in the same run reconciled 1200 encoded against 1200/1201/1200
+  decoded. `MIN_SHARE_FPS` has been raised from 2 to `MIN_FPS`, now that the floor has been
+  met rather than assumed.
 
   Note the contrast in the original run: the camera path held exactly 30.0fps with `paced_out`
   at zero on every attempt, which is what pointed at the capture rather than the encode or send

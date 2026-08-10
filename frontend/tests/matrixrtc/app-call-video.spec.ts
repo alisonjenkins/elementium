@@ -95,26 +95,28 @@ const MIN_FPS = 10;
 /**
  * The frame rate below which a screen share is not a screen share.
  *
- * Two, not ten, and the earlier reasoning for that was wrong. It said a full `XGetImage` per
- * frame was the ceiling at ~3.3fps; measurement (`cargo run -p elementium-screen --example
- * x11_capture_rate`) says `XGetImage` plus the I420 conversion is 5.4ms a frame -- 170fps on
- * the same 1280x800 Xvfb display. The 3.3 was xcap taking the *Wayland portal* path, because
- * the harness left `XDG_SESSION_TYPE=wayland` set: a D-Bus screenshot of the real desktop,
- * PNG-encoded to disk and read back, 406ms a frame.
+ * The same as the camera's, and it took a fix to get there. This was 2, on the reasoning that
+ * a full `XGetImage` per frame capped X11 capture at ~3.3fps. That reasoning was wrong:
+ * measurement (`cargo run -p elementium-screen --example x11_capture_rate`) puts `XGetImage`
+ * plus the I420 conversion at 5.4ms a frame, 170fps on the same 1280x800 Xvfb display. The
+ * 3.3 was xcap taking the *Wayland portal* path, because the harness left
+ * `XDG_SESSION_TYPE=wayland` set -- a D-Bus screenshot of the real desktop, PNG-encoded to
+ * disk and read back, at 406ms a frame.
  *
- * With that fixed the share should run at the encode cap like the camera does, and this floor
- * should rise to `MIN_FPS`. It stays at two until a run says so, because a floor that has
- * never been met is a red test rather than a measurement, and because what is worth catching
- * at this end either way is a share that is not moving at all.
+ * With that fixed the share measured 892 frames in 29.8s, and 301 in 10.1s with a longest gap
+ * of 155ms: the encode cap, like the camera. A floor of two would now pass a share running at
+ * a fifteenth of what it should.
  */
-const MIN_SHARE_FPS = 2;
+const MIN_SHARE_FPS = MIN_FPS;
 /**
  * How long a screen share may go without a decoded frame.
  *
  * Four times `MAX_STALL_MS`, sized for the ~3.3fps the share used to run at (see
- * `MIN_SHARE_FPS`: that rate was an artefact, not a ceiling). Left generous rather than
- * tightened alongside the floor, since a stall threshold that is too loose only fails to
- * catch something, while one that is too tight fails a working share.
+ * `MIN_SHARE_FPS`: that rate was an artefact, not a ceiling). Kept generous even though the
+ * measured longest gap is now 155ms, because a share is damage-driven in a way a camera is
+ * not: a still picture legitimately produces nothing for a while, and the frame rate above is
+ * what catches a share that has stopped. A loose stall threshold only fails to catch
+ * something; a tight one fails a share that is working as designed.
  */
 const MAX_SHARE_STALL_MS = 2400;
 
