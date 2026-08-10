@@ -138,8 +138,30 @@ collected here because they were all found in the same session.
   The room carries dozens of stale `LEFT` membership events for our user, one per past
   device, which is the obvious suspect for a broken changed-memberships diff.
 
-  Next: instrument `MatrixRTCSession`'s membership callbacks in the webview to see whether
-  the update fires at all, and whether the stale entries break the diff.
+  **The instrumentation this entry asked for now exists, and it is a verdict rather than a
+  trace** (`key-distribution-watch.ts`, 2026-08-10). Both halves were already logged and
+  nothing compared them: `membership-log.ts` records every join and leave, `widget-api-log.ts`
+  records every `fromWidget send_to_device` -- Element Call's only route for handing anybody a
+  key -- and its own comment said one "should follow this line" while leaving a person to read
+  two interleaved streams and notice an absence. A change now arms an expectation, a
+  distribution clears it with a latency, and twelve seconds of silence is reported once,
+  naming what it was waiting on.
+
+  Main frame only, and that is forced rather than chosen: `toWidget` traffic arrives at the
+  widget iframe and `fromWidget` at the main window, so the widget frame can see the
+  membership change and never the answer. Only the main frame sees both.
+
+  **On the local stack the path works.** In `just test-app-call-audio`: two participants joined
+  at 12.9s, one expectation armed (a flurry deliberately does not restart the clock), answered
+  after 2.1s. The audio suite now asserts both directions of that -- no overdue line, and at
+  least one answered one, since an absence of failures proves nothing on a run where the watch
+  never armed.
+
+  So the fault still has not reproduced here, and the untested shape is the one the incident
+  had: a participant joining *late*, after the ten-second grace period, when a rotation and a
+  distribution are both due. `app-call.spec.ts` already drives exactly that ("a participant who
+  joins after Elementium can decrypt its media") and needs a camera, which is why it has not
+  run -- see [M11].
 
 - [ ] **M4. Other participants' keys arrive up to 36 seconds after joining, or not at all.**
   Joined at 18:14:52; the first key belonging to anyone else arrived at 18:15:28, and a third
