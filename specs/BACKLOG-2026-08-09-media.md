@@ -142,7 +142,7 @@ collected here because they were all found in the same session.
   Worth noting that a loopback *with* a producer is a legitimate camera -- OBS virtual camera
   is exactly that -- so it must not simply be filtered out.
 
-- [ ] **M9. Raising the capture resolution does not raise the bitrate cap, and we ignore the
+- [x] **M9. Raising the capture resolution does not raise the bitrate cap, and we ignore the
   downscale the SFU asks for.** Found while verifying the new resolution setting
   (2026-08-10). Element Call's `setParameters` asks for two things we do not do:
 
@@ -168,17 +168,51 @@ collected here because they were all found in the same session.
   may look worse.** Every frame still arrives -- 1200 encoded, 1200 decoded at three
   participants, zero lost -- this is about how good each one is, not whether it gets there.
 
-  Two ways out, and they are different products:
+  **Corrected 2026-08-10, after both halves were built.** The first reading -- that ignoring
+  `scaleResolutionDownBy` was the mechanism -- was wrong, and reading one encoding out of
+  three is how. livekit sends three simulcast encodings (scales 1, 2 and 2.667); this app
+  publishes one stream and resolves them to the best layer, which is scale 1. It is not being
+  asked to shrink at all.
 
-  - **Honour `scaleResolutionDownBy`** (a real dynamic resize path). Element Call's ladder
-    then works as designed, and the capture setting becomes a ceiling rather than a promise.
-    This is what a browser does.
-  - **Treat the cap as advisory when someone has explicitly asked for a resolution.** Simpler,
-    and wrong on a congested link: livekit's number is partly a bandwidth estimate, and
-    ignoring it degrades the call for everyone rather than just us.
+  The actual mechanism: Element Call asks `getUserMedia` for 1280x720 and budgets 1700 kbps
+  for *that*. A person's capture-resolution setting overrides the request without the page
+  ever hearing about it, so 2.25x the pixels go out on a 720p budget. The setting was
+  quietly counter-productive: more pixels, worse picture.
 
-  Not decided here: it changes what other participants receive, which is not a judgement to
-  make from a backlog note.
+  Both are now done, and they are complementary rather than alternatives:
+
+  - `scaleResolutionDownBy` **is** honoured (`set_video_scale`, `scale_i420`). It was real,
+    it just was not this. It will matter the moment livekit does ask.
+  - The bitrate cap is **raised in proportion to the extra pixels** when the publish exceeds
+    what the page asked for (`uplift_bitrate_kbps`): 1700 becomes 3825 for 720p -> 1080p.
+    This deliberately exceeds what the SFU asked for, which is a congestion estimate as well
+    as a budget -- the cost of honouring an explicit choice, paid only by someone who made
+    one.
+
+- [ ] **M10. A requested capture size is honoured or not depending on which format the source
+  settles on.** Two runs of the same test, same code, same camera, same
+  `ELEMENTIUM_CAPTURE_RESOLUTION=1920x1080`:
+
+  ```
+  run A  Camera capture started via PipeWire node_id=349 width=1920 height=1080
+  run B  Camera capture started via PipeWire node_id=349 width=1280 height=720
+  ```
+
+  The size we ask for is the *default* of a range offered inside each format parameter, and
+  `format_params` offers several: the raw layouts first when the CPU decodes JPEG (which it
+  does here -- `gpu_jpeg_decode=false`), MJPEG after. On this camera only MJPG advertises
+  1920x1080 and 3840x2160; the raw layouts stop lower. So whether the request is honoured
+  depends on which parameter the source matches first, and that has come out differently on
+  consecutive runs.
+
+  The in-code comment on `format_params` already names the proper fix and declines it: read
+  the node's own `EnumFormat` and rank what it actually offers, rather than offering a menu
+  and hoping. This is that, with a second reason now: not just "which format" but "at what
+  size".
+
+  Consequence today: the resolution setting works, and then sometimes does not, with nothing
+  in the log to say why beyond the negotiated size. A person who set 1080p and got 720p has no
+  way to tell that from the setting having failed to load.
 
 ## Closed
 
