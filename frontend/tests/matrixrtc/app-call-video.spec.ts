@@ -236,6 +236,16 @@ test.describe.serial("Elementium's video, frame by frame", () => {
     // Elementium joins last, as a person joining an existing call does.
     process.env["ELEMENTIUM_AUTOJOIN_SCREENSHARE"] = "1";
     app = startElementium({ video: true });
+    // Capture first, then encoding, as two waits rather than one. They fail for entirely
+    // different reasons -- no camera at all against a camera whose frames never reach the
+    // wire -- and a single wait on the second reports the first as "never reported sending
+    // encoded video", which is true and points at the encoder when the camera is the fault.
+    // A run that lost twenty-four minutes to exactly that is why this is split.
+    await app.waitFor(
+      "a camera capture pipeline",
+      (e) => e.message === "video pipeline started" && e.fields["source"] === "camera",
+      APP_READY_MS,
+    );
     await app.waitFor(
       "sending encoded video",
       (e) => e.message === "outbound video",
