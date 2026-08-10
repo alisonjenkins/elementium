@@ -43,6 +43,22 @@ collected here because they were all found in the same session.
   stay in that state silently. Whatever the fix, `skipped_not_connected` climbing past a
   threshold deserves a warning in its own right.
 
+  **The warning half is done** (`NotConnectedWatch`): first warning after five seconds of
+  unattached frames -- headroom over `AUDIO_HANDOVER_TIMEOUT`, so an ordinary device swap does
+  not cry wolf -- then every fifteen. The decision is a pure function of instants, tested
+  without a clock.
+
+  **The recovery half cannot be fixed on this side, and that is worth stating rather than
+  rediscovering.** Reviewed 2026-08-10: the only reattachment mechanism we have is
+  `adopt_idle_pipelines`, which fills an empty slot from an existing engine connection. In this
+  incident there was no connection to adopt from -- livekit closed the publisher and built no
+  replacement -- so a timer that retried adoption would find nothing on every tick. Attaching
+  the microphone to some *other* live connection would be worse than the fault: a subscriber
+  peer connection is not where our audio goes.
+
+  So this is the negotiation rewrite's (N1) to fix, or livekit's. What our side owes is the
+  warning, which now exists, and not pretending to recover.
+
 - [ ] **M5. Our key is distributed once, at join, and never again -- which is what freezes
   the far end mid-call.** The strongest lead in this file, and the likely cause of both "they
   cannot see me" and "they cannot hear me".
