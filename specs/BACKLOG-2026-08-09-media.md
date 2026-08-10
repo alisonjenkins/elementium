@@ -22,10 +22,32 @@ collected here because they were all found in the same session.
   - Not the encode pacer (fixed today): dropping frames *before* the encoder cannot break
     the reference chain, because VP8 predicts from the last frame the encoder actually saw.
 
-  Untested and next: whether the bitrate we transmit matches what we configure. The encoder
-  was created at 2764 kbps and `setParameters` asked for 1700, but the measured rate was
-  ~336 kbps -- about a fifth of target. A picture starved to that degree at 720p is
-  pixelated, which is the other half of the user's description.
+  **Tested, 2026-08-10, and the answer is the opposite of the guess.** The bitrate did not
+  match what was configured -- the encoder was producing *five times* it. `vpx_codec_encode`
+  was handed a frame duration of 1 in a 1/90000 timebase, so libvpx believed it was encoding
+  90,000 frames a second and its rate control never saw a second pass:
+
+  | asked | produced | |
+  |---|---:|---:|
+  | 720p @ 1700 kbps | 9045 kbps | 532% |
+  | 720p @ 2764 kbps | 8852 kbps | 320% |
+  | 1080p @ 4000 kbps | 21285 kbps | 532% |
+
+  Fixed (`frame_duration_ticks`, plus the real-time buffer model libvpx does not default to);
+  the same measurement now reads 114%, 84% and 86% after the opening keyframe. Reproducible
+  without a call: `cargo run --release -p elementium-codec --example encode_bitrate`.
+
+  **Why this is a candidate for the frozen picture.** A sender emitting five times its
+  allowance does not get five times the throughput -- it gets loss, wherever the narrowest
+  point is, and loss in VP8 breaks the reference chain for every frame that follows. That
+  fits the evidence in this entry better than anything ruled out above: the receiver decoded
+  the keyframe, could not decode what followed, and asked again -- 215 PLIs in three and a
+  half minutes, answered with 192 keyframes, each keyframe itself a burst several times over
+  budget. The measured ~336 kbps arriving is then what survived, not what was sent.
+
+  Not proven: this was measured on a synthetic picture with no network in the path, and the
+  fault has never reproduced against the local SFU. What it does mean is that the sender was
+  behaving badly in a way that would produce exactly these symptoms, and it no longer is.
 
 - [ ] **M3. A mid-call device change can leave the microphone attached to nothing.** When the
   camera became available mid-call, livekit unpublished both tracks, closed the publisher
