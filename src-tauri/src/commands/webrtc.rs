@@ -1356,3 +1356,48 @@ fn generate_id() -> String {
         .as_nanos();
     format!("pc-{t:x}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The census is only as good as its arithmetic, and the arithmetic is the whole point:
+    /// it exists to make a forwarder that outlives its connection visible while the call is
+    /// still running. `forward_events` returns from six places, so the count is kept by a
+    /// guard rather than by a decrement someone has to remember -- this pins that dropping
+    /// one really does give the count back, including on the nested path where several are
+    /// alive at once.
+    ///
+    /// Not a parallel test: it reads a process-wide counter, so it asserts on differences
+    /// from whatever the count already was rather than on absolute values.
+    #[test]
+    fn a_forwarder_is_counted_while_it_lives_and_not_after() {
+        let before = ForwarderCensus::active();
+
+        {
+            let _one = ForwarderCensus::enter();
+            assert_eq!(
+                ForwarderCensus::active(),
+                before.saturating_add(1),
+                "entering must count a forwarder"
+            );
+
+            {
+                let _two = ForwarderCensus::enter();
+                assert_eq!(
+                    ForwarderCensus::active(),
+                    before.saturating_add(2),
+                    "two live forwarders must both be counted"
+                );
+            }
+
+            assert_eq!(
+                ForwarderCensus::active(),
+                before.saturating_add(1),
+                "dropping the inner one must give its count back"
+            );
+        }
+
+        assert_eq!(ForwarderCensus::active(), before, "no forwarder may outlive its guard");
+    }
+}
