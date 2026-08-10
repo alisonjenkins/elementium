@@ -172,6 +172,33 @@ Next: use the existing audio dump to capture what we actually encode, and listen
 converts a four-way guess into an observation. Guessing further without it is how the last
 two hours went.
 
+### Resolved: the gain control is not the fault, and the reading that says it is
+
+Three separate readings of the dumps concluded that the automatic gain control winds up
+through a silent room and transmits amplified noise. Each cited the same pair of numbers: a
+raw microphone peaking at 0.0006 and the frame handed to the encoder peaking at 0.174, about
+45dB apart.
+
+They cannot be the same audio. `MAX_GAIN` is 32, so 0.0006 cannot become 0.174 by any amount
+of winding up -- the arithmetic caps it at 0.019. What the pair actually showed is two
+different windows of one call: the dump cap was a fixed *sample* count, so a stereo raw
+capture stopped at thirty seconds while the mono encoder input ran a full minute, and the
+0.174 belongs to a later stretch in which real sound arrived. The cap is now time-based, so
+two dumps of one call cover the same span.
+
+Pinned by `a_silent_room_after_speech_is_not_amplified_to_audibility`: speak until the gain
+settles, then feed ten seconds of a room at exactly the measured 0.0006, and assert what
+reaches the encoder stays below -40dBFS. It does.
+
+The lesson is not about gain. Two capture points compared over different windows will produce
+a confident, false conclusion every time, and it did so three times in one day -- twice to me
+and once to an agent working independently. Anything comparing two dumps must first establish
+that they cover the same seconds.
+
+What P2 still needs is a real voice: every automated run so far has been a silent room or a
+generated tone, and neither can say what the maintainer sounds like to the far end.
+`just test-app-call-dumps` records exactly that.
+
 ## P3 — A mid-call device change can orphan the microphone
 
 When the camera became available mid-call, livekit unpublished both tracks, closed the

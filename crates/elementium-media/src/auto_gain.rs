@@ -230,3 +230,66 @@ mod tests {
         assert!(agc.gain() <= MAX_GAIN, "gain exceeded its cap: {}", agc.gain());
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::expect_used)]
+mod silence_after_speech_tests {
+    use super::{AutoGain, MAX_GAIN, NOISE_FLOOR};
+
+    /// One 20ms buffer at 48kHz at a constant amplitude, alternating sign.
+    fn buffer(amplitude: f32) -> Vec<f32> {
+        (0..960)
+            .map(|i| if i % 2 == 0 { amplitude } else { -amplitude })
+            .collect()
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0.0_f32, |m, s| m.max(s.abs()))
+    }
+
+    /// The question a real call raised twice, asked directly.
+    ///
+    /// Two dumps from one call showed a raw microphone peaking at 0.0006 and the frame handed
+    /// to the encoder peaking at 0.174 -- read, on both occasions, as the gain winding up
+    /// through a silent room and transmitting amplified noise. This is that scenario as an
+    /// experiment: speak, stop, and measure what a silent room comes out at.
+    ///
+    /// It cannot be that mechanism -- the gain is capped at 32, so 0.0006 cannot become 0.174
+    /// by any amount of winding up -- and this pins the behaviour so the reading is not made
+    /// a third time.
+    #[test]
+    fn a_silent_room_after_speech_is_not_amplified_to_audibility() {
+        let mut agc = AutoGain::new();
+
+        // Half a second of speech-level input, enough for the gain to settle where it wants.
+        for _ in 0..25 {
+            agc.apply(&mut buffer(0.05));
+        }
+        let gain_after_speech = agc.gain();
+        assert!(
+            gain_after_speech > 1.0,
+            "a quiet speaker should have been brought up, got {gain_after_speech}"
+        );
+
+        // Then ten seconds of a room at the level the real dump measured.
+        let room = 0.0006_f32;
+        assert!(room < NOISE_FLOOR, "the test's premise: this is under the gate");
+        let mut loudest = 0.0_f32;
+        for _ in 0..500 {
+            let mut buf = buffer(room);
+            agc.apply(&mut buf);
+            loudest = loudest.max(peak(&buf));
+        }
+
+        // -40dBFS. Comfortably inaudible against speech, and two orders of magnitude below
+        // the 0.174 the dumps were read as showing.
+        assert!(
+            loudest < 0.01,
+            "a silent room reached {loudest} at the encoder ({}x gain); \
+             room noise is being transmitted at an audible level",
+            agc.gain()
+        );
+        // The cap is what makes the 0.174 reading arithmetically impossible, so state it.
+        assert!(room * MAX_GAIN < 0.02, "the gain cap bounds what silence can become");
+    }
+}
