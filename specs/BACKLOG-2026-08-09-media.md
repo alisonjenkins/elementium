@@ -181,6 +181,35 @@ collected here because they were all found in the same session.
   conformant response, since indices are independent keys and index N-1 is not derivable
   from N. Thousands of them is not expected and is worth a second look once M5 is fixed.
 
+- [ ] **M14. The console bridge writes whatever the page logs, and only somebody else's
+  redaction keeps frame keys out of it.** Found by reading an app log for something else,
+  2026-08-10. `console-bridge.ts` forwards every page `console.log` into Rust's `tracing` at
+  INFO, verbatim. matrix-widget-api's `PostmessageTransport` logs each widget message in full,
+  so the app log contains complete `update_state` batches -- room ids, event ids, display
+  names -- and, six times in a fifty-second call, the body of a `send_to_device`:
+
+  ```
+  "messages":{"@tester2:localhost":{"KTPMRTXAHK":{"keys":{"index":0,"key":"<redacted>"
+  ```
+
+  That is `io.element.call.encryption_keys`: the frame encryption keys this whole subsystem
+  exists to protect. **The `<redacted>` is not ours.** Nothing in this repository substitutes
+  it -- our own redaction (`livekit-signal.ts`) only rewrites URL query parameters, and the
+  test harness's drops whole lines rather than editing them. It comes from upstream's logger,
+  which means the only thing standing between a frame key and a plaintext file on disk is a
+  third party's decision to keep redacting it.
+
+  Every module in this codebase that touches key material is careful about this on purpose --
+  `widget-api-log.ts` counts recipients and refuses to read `data.messages` at all, and says
+  so in its header. The bridge then forwards the same payload wholesale, because it does not
+  know what it is carrying. The care is real and it is being routed around.
+
+  Not urgent and not theoretical: it is a plaintext-at-rest question, not an exfiltration one,
+  and the key is redacted *today*. What to do about it is a judgement -- a deny-list by
+  message shape, a size cap, dropping `PostmessageTransport` lines specifically, or forwarding
+  page logs at DEBUG so a release build does not keep them -- and picking one from a backlog
+  note is how a diagnostic ends up quietly discarding the line somebody needed.
+
 - [ ] **M11. The bitrate uplift has never fired in a live call.** `uplift_bitrate_kbps` is
   unit-tested -- 1700 kbps becomes 3825 for a 720p budget spent on 1080p -- and has never once
   run in a call. Every run since it was written has captured 1280x720, which is exactly what
@@ -301,8 +330,35 @@ collected here because they were all found in the same session.
 
 ## Found by the automated suite, 2026-08-10
 
-Both from the screen-share work. Neither is why anyone complained; both are real, and
-neither had anywhere to be recorded before there was a test that exercised the path.
+The first two are from the screen-share work; M15 and M16 are the suite's own faults rather
+than the product's, found by running it. None of them is why anyone complained; all are real,
+and none had anywhere to be recorded before there was a test that exercised the path.
+
+- [x] **M15. The call tests played their audio out of the machine's speakers.** Found the way
+  these things are found: the maintainer was trying to sleep near the machine. Every
+  participant in these tests receives audio from participants whose fake microphones play a
+  continuous tone, and two of the three paths played all of it aloud for the length of every
+  run. Only `app-call-audio.spec.ts` silenced Elementium (`silentPlaybackEnv`, which has
+  existed all along), and *nothing* silenced the browser participants in any spec.
+
+  Fixed at both sources: Chromium gets `--mute-audio` in `playwright.config.ts`, which every
+  browser participant in every spec inherits, and the other two call specs now use the same
+  `silentPlaybackEnv`. No assertion is weakened and neither change touches capture -- the
+  browser side reads an `AnalyserNode` tapped straight off the inbound `MediaStreamTrack` and
+  never connected to `ctx.destination`, the native side reads dumps written by Rust, and the
+  ALSA config is `asym`, so playback is redirected and the microphone is left alone. Confirmed
+  by rerunning the audio suite: 6/6 tones in order at 90% coverage on every path, silently.
+
+- [x] **M16. A passing run was reported flaky, naming a test that had already finished.**
+  `startElementium`'s `stop` ends the log stream first and unconditionally -- deliberately, so
+  a run whose process is already gone still flushes what it collected -- and then gives the
+  application up to ten seconds to honour SIGTERM. It keeps printing in that window, and every
+  line written in it threw `write after end` from inside the stdout handler, which Playwright
+  attributes to whichever test happens to be running.
+
+  Worth recording rather than just fixing, because of how it reads: the blamed test was simply
+  the last one in the file, and the failure had nothing to do with what it asserted. Guarded on
+  `log.writableEnded`; the dropped lines are the tail of a call already measured.
 
 - [x] **M6. The X11 capturer reports its own size as 0x0.** Fixed, unverified against a real
   X server. `video pipeline started` logged `width=0 height=0` for an X11 share because a push
